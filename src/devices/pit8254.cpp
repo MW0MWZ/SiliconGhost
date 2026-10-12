@@ -22,11 +22,29 @@ void Pit8254::reset() {
         auto timer = std::move(k.timer);
         k = Counter{};
         k.timer = std::move(timer);
+        k.cycle_base = scheduler_.now();
     }
 }
 
 double Pit8254::now_ticks(unsigned c) const {
-    return std::floor(static_cast<double>(scheduler_.now()) * clock_hz_[c] / cpu_hz_);
+    const Counter& k = counters_[c];
+    return std::floor(k.tick_base + static_cast<double>(scheduler_.now() - k.cycle_base) * clock_hz_[c] / cpu_hz_);
+}
+
+void Pit8254::set_clock(unsigned c, double hz) {
+    Counter& k = counters_[c];
+    if (hz == clock_hz_[c]) return;
+    const u64 now = scheduler_.now();
+    k.tick_base += static_cast<double>(now - k.cycle_base) * clock_hz_[c] / cpu_hz_;
+    k.cycle_base = now;
+    clock_hz_[c] = hz;
+    schedule_next(c);
+}
+
+double Pit8254::output_frequency(unsigned c) const {
+    const Counter& k = counters_[c];
+    if (!k.running || (k.mode != 2 && k.mode != 3) || k.reload == 0) return 0;
+    return clock_hz_[c] / static_cast<double>(k.reload);
 }
 
 void Pit8254::set_out(unsigned c, bool level) {
@@ -120,7 +138,12 @@ void Pit8254::schedule_next(unsigned c) {
         k.timer->cancel();
         return;
     }
-    u64 cycle = static_cast<u64>(std::ceil(edge * cpu_hz_ / clock_hz_[c]));
+    if (clock_hz_[c] <= 0) {  // not clocked
+        k.timer->cancel();
+        return;
+    }
+    const double cycles_from_base = (edge - k.tick_base) * cpu_hz_ / clock_hz_[c];
+    u64 cycle = k.cycle_base + static_cast<u64>(std::ceil(std::max(0.0, cycles_from_base)));
     if (cycle <= scheduler_.now()) cycle = scheduler_.now() + 1;
     k.timer->schedule_at(cycle);
 }

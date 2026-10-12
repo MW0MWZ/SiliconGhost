@@ -51,10 +51,15 @@ docs/              this document, hardware notes
   xkphys/xkseg, user/supervisor variants) with address-error checking.
 * COP1: register moves, CFC1/CTC1 and FP loads/stores honour `Status.FR`.
 
-**Not yet:** FPU arithmetic (M1), cache model for the `CACHE` instruction and
-PROM cache diagnostics (M1), watchpoints, reverse-endian user mode, NMI/soft
-reset, cycle-accurate pipeline timing (we use 1 instruction = 1 cycle and
-Count = cycles/2).
+* COP1: full R4000 FPU. Arithmetic runs on the host FPU under the guest
+  rounding mode; denormal and quiet-NaN operands, tiny results and
+  out-of-range integer conversions raise Unimplemented Operation exactly as
+  the R4000 does, so the operating system's software completion path runs.
+* `CACHE`: primary and secondary tag arrays (no cached data, so memory is
+  always coherent) with index/hit/create-dirty/fill operations and Status.CH.
+
+**Not yet:** watchpoints, reverse-endian user mode, NMI/soft reset,
+pipeline timing (1 instruction = 1 cycle; Count = cycles/2).
 
 ### Memory access path
 
@@ -109,11 +114,11 @@ before device models depend on them):
 | Range | Device | Status |
 |---|---|---|
 | `0000_0000–0007_FFFF` | Low-memory alias of first 512 KiB of RAM | done |
-| `0800_0000–17FF_FFFF` | Main memory (16–256 MiB) | done (MC bank config: M2) |
-| `1F00_0000–1F3F_FFFF` | GIO64 graphics slot. REX3 at `1F0F_0000` | stub |
-| `1F40_0000`, `1F60_0000` | GIO expansion slots 0/1 | unmapped (bus error) |
-| `1FA0_0000` | MC (memory controller, sysid, timers, DMA, bus error regs) | stub |
-| `1FB8_0000–1FBF_FFFF` | HPC3: SCSI DMA, Ethernet, PBUS. IOC2 at `1FBD_9800`, RTC at `1FBE_0000` | stub |
+| `0800_0000–17FF_FFFF`, `2000_0000–2FFF_FFFF` | Main memory (16–256 MiB), decoded from MC MEMCFG bank registers | done |
+| `1F00_0000–1F3F_FFFF` | GIO64 graphics slot. REX3 at `1F0F_0000` | not yet (slot reads as empty) |
+| `1F40_0000`, `1F60_0000` | GIO expansion slots 0/1 | empty (bus error) |
+| `1FA0_0000–1FA1_FFFF` | MC: control, SYSID, MEMCFG, error latches, RPSS, semaphores | done (virtual DMA: storage only) |
+| `1FB8_0000–1FBF_FFFF` | HPC3: DMA channels, EEPROM, PBUS. IOC2/INT3/8254/Z85230/8042 at `1FBD_9800`, DS1386 at `1FBE_0000` | IOC2, INT3, timers, serial, keyboard controller, EEPROM, RTC/NVRAM done; DMA, SCSI, Ethernet, audio: storage only |
 | `1FC0_0000–1FC7_FFFF` | Boot PROM (512 KiB) | done |
 
 Planned device models, in the order the PROM needs them:
@@ -170,7 +175,7 @@ possible") throttles at frame boundaries.
 | | Goal | Done when |
 |---|---|---|
 | **M0** | Scaffold: bus, R4000 integer interpreter, TLB, tests, CLI | ✅ |
-| **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | FPU and cache behaviour match the R4400 manual |
+| **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
 | **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | PROM prints to serial console and reaches the command monitor |
 | **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | graphical PROM menu displays and accepts input |
 | **M4** | WD33C93A SCSI + disk/CD images | IRIX 5.3/6.5 boots from disk image; install from CD |

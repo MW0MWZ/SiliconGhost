@@ -27,6 +27,10 @@ public:
     void write(unsigned reg, u8 value);
     void set_gate(unsigned counter, bool level);
     bool output(unsigned counter) const { return counters_[counter].out; }
+    // Changes a counter's input clock (e.g. when it is fed by another counter).
+    void set_clock(unsigned counter, double hz);
+    // Frequency of a counter's OUT pin when it runs periodically (modes 2/3), else 0.
+    double output_frequency(unsigned counter) const;
     void set_output_callback(OutputCallback cb) { on_output_ = std::move(cb); }
 
 private:
@@ -41,6 +45,8 @@ private:
         bool armed = false;       // mode 0/1/4/5: terminal count not yet reached
         u32 reload = 0x10000;     // effective count (0 is 65536 binary / 10000 BCD)
         double start_tick = 0;    // tick at which the current count was loaded
+        double tick_base = 0;     // ticks accumulated before cycle_base at earlier clock rates
+        u64 cycle_base = 0;
         // Register access state
         bool write_msb_next = false;
         bool read_msb_next = false;

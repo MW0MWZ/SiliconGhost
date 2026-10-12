@@ -35,10 +35,13 @@ add_library(sg_emu STATIC
   src/cpu/r4000/fpu.cpp
   src/devices/ds1386.cpp
   src/devices/eeprom93cxx.cpp
+  src/devices/kbc8042.cpp
   src/devices/pit8254.cpp
-  src/devices/stub_device.cpp
   src/devices/z85230.cpp
+  src/machine/ip22/hpc3.cpp
   src/machine/ip22/indy.cpp
+  src/machine/ip22/ioc2.cpp
+  src/machine/ip22/mc.cpp
 )
 target_include_directories(sg_emu PUBLIC src)
 target_link_libraries(sg_emu PRIVATE sg_warnings)
@@ -61,6 +64,7 @@ if(SG_BUILD_TESTS)
     tests/misc_tests.cpp
     tests/device_tests.cpp
     tests/fpu_cache_tests.cpp
+    tests/ip22_tests.cpp
   )
   target_link_libraries(sg_tests PRIVATE sg_emu sg_warnings)
   add_test(NAME sg_tests COMMAND sg_tests)

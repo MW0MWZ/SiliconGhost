@@ -5,6 +5,7 @@
 // the inline fast path.
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "core/endian.h"
@@ -43,6 +44,13 @@ public:
     // The pointer is valid to the end of the containing bus page.
     u8* host_read_ptr(u64 paddr) const;
     u8* host_write_ptr(u64 paddr) const;  // nullptr for ROM as well as MMIO
+
+    // Called for accesses that nothing answers (unmapped space, or a device
+    // returning false). Reads then fail (the CPU takes a bus error exception);
+    // writes are posted and complete normally, so error reporting for them is
+    // up to the handler (on IP22 the MC raises an interrupt).
+    using ErrorHandler = std::function<void(u64 paddr, unsigned size, bool is_write)>;
+    void set_error_handler(ErrorHandler handler) { error_handler_ = std::move(handler); }
 
     template <typename T>
     SG_FORCEINLINE bool read(u64 paddr, T& out) {
@@ -84,6 +92,7 @@ private:
     bool write_slow(u64 paddr, unsigned size, u64 value);
 
     std::vector<Page> pages_;
+    ErrorHandler error_handler_;
 };
 
 }  // namespace sg

@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// SiliconGhost command-line front end (headless for now; SDL3 display is M3).
+// SiliconGhost command-line front end. The Indy's serial ports are connected
+// to the terminal; a graphical front end comes with Newport support.
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "core/log.h"
 #include "cpu/r4000/disasm.h"
 #include "machine/ip22/indy.h"
+
+#if !defined(_WIN32)
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -24,10 +33,13 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --prom FILE [options]\n"
                  "  --prom FILE      IP22 boot PROM image (raw, big-endian)\n"
+                 "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved on exit\n"
                  "  --ram MB         memory size, 16..256 (default 64)\n"
-                 "  --max N          stop after N instructions (default: run until Ctrl-C)\n"
-                 "  --trace          disassemble every instruction (very slow)\n"
-                 "  --log LEVEL      trace|debug|info|warn|error (default info)\n",
+                 "  --cpu-mhz N      R4400 pipeline clock (default 150)\n"
+                 "  --max N          stop after N cycles (default: run until Ctrl-C)\n"
+                 "  --trace          disassemble every instruction to stderr (very slow)\n"
+                 "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
+                 "Both serial ports are connected to this terminal; Ctrl-C quits.\n",
                  argv0);
 }
 
@@ -45,13 +57,51 @@ void dump_state(sg::mips::R4000& cpu) {
     std::fprintf(stderr, "\n");
 }
 
+// Puts the terminal into character-at-a-time mode for the serial console and
+// restores it on destruction. Ctrl-C keeps working.
+class RawTerminal {
+public:
+    RawTerminal() {
+#if !defined(_WIN32)
+        if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &saved_) != 0) return;
+        termios raw = saved_;
+        raw.c_lflag &= ~static_cast<tcflag_t>(ICANON | ECHO);
+        raw.c_iflag &= ~static_cast<tcflag_t>(ICRNL | IXON);
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        active_ = tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0;
+#endif
+    }
+    ~RawTerminal() {
+#if !defined(_WIN32)
+        if (active_) tcsetattr(STDIN_FILENO, TCSANOW, &saved_);
+#endif
+    }
+    RawTerminal(const RawTerminal&) = delete;
+    RawTerminal& operator=(const RawTerminal&) = delete;
+
+private:
+#if !defined(_WIN32)
+    termios saved_{};
+#endif
+    bool active_ = false;
+};
+
+bool load_file(const std::string& path, std::vector<sg::u8>& data) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string prom;
+    std::string prom, nvram;
     sg::ip22::IndyConfig config;
-    unsigned long long max_insns = ~0ull;
+    unsigned long long max_cycles = ~0ull;
     bool trace = false;
+    sg::log::set_level(sg::log::Level::Warn);
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -63,14 +113,16 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (!std::strcmp(a, "--prom")) prom = next();
+        else if (!std::strcmp(a, "--nvram")) nvram = next();
         else if (!std::strcmp(a, "--ram")) config.ram_mb = static_cast<unsigned>(std::strtoul(next(), nullptr, 0));
-        else if (!std::strcmp(a, "--max")) max_insns = std::strtoull(next(), nullptr, 0);
+        else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
+        else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
         else if (!std::strcmp(a, "--log")) {
             const std::string l = next();
             using sg::log::Level;
-            sg::log::set_level(l == "trace" ? Level::Trace : l == "debug" ? Level::Debug : l == "warn" ? Level::Warn
-                               : l == "error" ? Level::Error : Level::Info);
+            sg::log::set_level(l == "trace" ? Level::Trace : l == "debug" ? Level::Debug : l == "info" ? Level::Info
+                               : l == "error" ? Level::Error : Level::Warn);
         } else {
             usage(argv[0]);
             return 2;
@@ -88,24 +140,47 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
             return 1;
         }
+        if (!nvram.empty() && !load_file(nvram, machine.rtc().memory()))
+            std::fprintf(stderr, "note: %s not found, starting with empty NVRAM\n", nvram.c_str());
+
+        machine.set_serial_output([](unsigned, sg::u8 byte) {
+            std::fputc(byte, stdout);
+            std::fflush(stdout);
+        });
         machine.reset();
         g_machine = &machine;
         std::signal(SIGINT, on_sigint);
 
+        RawTerminal terminal;
+        std::thread([&machine] {
+            int c;
+            while ((c = std::getchar()) != EOF) {
+                machine.serial_input(0, static_cast<sg::u8>(c));
+                machine.serial_input(1, static_cast<sg::u8>(c));
+            }
+        }).detach();
+
         auto& cpu = machine.cpu();
         if (trace) {
-            for (unsigned long long n = 0; n < max_insns && !g_interrupted; ++n) {
+            for (unsigned long long n = 0; n < max_cycles && !g_interrupted && !machine.powered_off(); ++n) {
                 sg::u32 inst = 0;
                 const bool ok = cpu.debug_read32(cpu.pc, inst);
-                std::printf("%016llx: %s\n", static_cast<unsigned long long>(cpu.pc),
-                            ok ? sg::mips::disassemble(inst, cpu.pc).c_str() : "<unreadable>");
-                cpu.step();
+                std::fprintf(stderr, "%016llx: %s\n", static_cast<unsigned long long>(cpu.pc),
+                             ok ? sg::mips::disassemble(inst, cpu.pc).c_str() : "<unreadable>");
+                machine.run(1);
             }
         } else {
-            machine.run(max_insns);
+            machine.run(max_cycles);
         }
         g_machine = nullptr;
+        if (machine.powered_off()) std::fprintf(stderr, "\n[powered off]\n");
         dump_state(cpu);
+
+        if (!nvram.empty()) {
+            std::ofstream f(nvram, std::ios::binary);
+            const auto& mem = machine.rtc().memory();
+            f.write(reinterpret_cast<const char*>(mem.data()), static_cast<std::streamsize>(mem.size()));
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

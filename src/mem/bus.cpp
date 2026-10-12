@@ -50,27 +50,31 @@ u8* Bus::host_write_ptr(u64 paddr) const {
 bool Bus::read_slow(u64 paddr, unsigned size, u64& out) {
     if ((paddr >> 32) == 0) {
         const Page& p = pages_[paddr >> kPageShift];
-        if (p.device) return p.device->read(static_cast<u32>(paddr) - p.device_base, size, out);
+        if (p.device && p.device->read(static_cast<u32>(paddr) - p.device_base, size, out)) return true;
     }
-    SG_LOG(Debug, "bus", "unmapped read%u @ %09llx", size * 8, static_cast<unsigned long long>(paddr));
+    SG_LOG(Debug, "bus", "bus error: read%u @ %09llx", size * 8, static_cast<unsigned long long>(paddr));
+    if (error_handler_) error_handler_(paddr, size, false);
     return false;
 }
 
 bool Bus::write_slow(u64 paddr, unsigned size, u64 value) {
     if ((paddr >> 32) == 0) {
         const Page& p = pages_[paddr >> kPageShift];
-        if (p.device) return p.device->write(static_cast<u32>(paddr) - p.device_base, size, value);
+        if (p.device) {
+            if (p.device->write(static_cast<u32>(paddr) - p.device_base, size, value)) return true;
+            SG_LOG(Debug, "bus", "bus error: write%u @ %09llx", size * 8, static_cast<unsigned long long>(paddr));
+            if (error_handler_) error_handler_(paddr, size, true);
+            return true;
+        }
         if (p.host) {
             SG_LOG(Debug, "bus", "write%u to ROM @ %08llx ignored", size * 8,
                    static_cast<unsigned long long>(paddr));
             return true;
         }
     }
-    // On IP22 a write to nothing is reported asynchronously by the MC (bus
-    // error interrupt), not as a synchronous exception; the MC model will own
-    // that policy. For now unmapped writes are dropped.
-    SG_LOG(Debug, "bus", "unmapped write%u @ %09llx = %llx", size * 8,
-           static_cast<unsigned long long>(paddr), static_cast<unsigned long long>(value));
+    SG_LOG(Debug, "bus", "bus error: write%u @ %09llx = %llx", size * 8, static_cast<unsigned long long>(paddr),
+           static_cast<unsigned long long>(value));
+    if (error_handler_) error_handler_(paddr, size, true);
     return true;
 }
 
