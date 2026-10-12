@@ -31,6 +31,7 @@ public:
 
     void receive(unsigned ch, u8 byte);
     bool rx_ready(unsigned ch) const { return !chan_[ch].rx.empty(); }
+    bool rx_enabled(unsigned ch) const { return (chan_[ch].wr[3] & 0x01) != 0; }
     void set_tx_sink(TxSink sink) { tx_sink_ = std::move(sink); }
     void set_irq_callback(IrqCallback cb) { irq_cb_ = std::move(cb); }
     bool irq() const { return irq_; }

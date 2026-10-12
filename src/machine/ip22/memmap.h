@@ -27,7 +27,7 @@ constexpr u32 kMcSize = 0x00020000;
 constexpr u32 kHpc3 = 0x1FB80000;             // HPC3 #0: DMA, SCSI, ethernet, PBUS
 constexpr u32 kHpc3Size = 0x00080000;
 // Within HPC3 space:
-constexpr u32 kHpc3Wd33c93 = 0x1FBC4000;      // SCSI controller
+constexpr u32 kHpc3Wd33c93 = 0x1FBC0000;      // WD33C93 SCSI controller (SASR +3, data +7)
 constexpr u32 kHpc3Seeq = 0x1FBD4000;         // Seeq 8003 ethernet
 constexpr u32 kHpc3Hal2 = 0x1FBD8000;         // HAL2 audio
 constexpr u32 kHpc3Ioc2 = 0x1FBD9800;         // IOC2: Z85230 serial, 8042 kbd/mouse, INT3, sysid

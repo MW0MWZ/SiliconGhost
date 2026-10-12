@@ -2,6 +2,7 @@
 #include "machine/ip22/indy.h"
 
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <stdexcept>
 
@@ -36,7 +37,7 @@ Indy::Indy(const IndyConfig& config)
       prom_(std::make_unique<u8[]>(kPromMaxSize)),
       cpu_(bus_, cpu_options(config)),
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
-      hpc3_(ioc_),
+      hpc3_(ioc_, scheduler_, config.cpu_hz),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
       newport_(scheduler_, config.cpu_hz, Newport::Options{}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
@@ -57,6 +58,7 @@ Indy::Indy(const IndyConfig& config)
     // IP2..IP5; the MC bus error interrupt drives IP6.
     ioc_.set_cpu_line_callback([this](unsigned line, bool level) { cpu_.set_int_line(line, level); });
     mc_.set_irq_callback([this](bool level) { cpu_.set_int_line(4, level); });
+    mc_.set_dma_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0McDma, level); });
     newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
     mc_.set_reset_callback([this] {
         reset_pending_ = true;
@@ -66,6 +68,11 @@ Indy::Indy(const IndyConfig& config)
         powered_off_ = true;
         cpu_.request_stop();
     });
+    // The RTC starts at the host's wall-clock time and then follows guest time.
+    {
+        const double wall = static_cast<double>(std::time(nullptr));
+        hpc3_.rtc().set_time_source([this, wall] { return wall + static_cast<double>(cpu_.cycles()) / config_.cpu_hz; });
+    }
     ioc_.scc().set_tx_sink([this](unsigned channel, u8 byte) {
         if (serial_out_) serial_out_(channel, byte);
     });
@@ -135,18 +142,19 @@ void Indy::serial_input(unsigned channel, u8 byte) {
 }
 
 // Feed queued input at most one byte per channel per millisecond of guest
-// time, and only into an empty receive FIFO, so pasted text is not lost.
+// time, and only into an enabled receiver with an empty FIFO, so typed-ahead
+// and pasted text is not lost.
 void Indy::pump_serial_input() {
     {
         std::lock_guard<std::mutex> lock(serial_mutex_);
         bool fed[2] = {false, false};
         for (auto it = serial_in_.begin(); it != serial_in_.end();) {
             const unsigned ch = it->first & 1;
-            if (!fed[ch] && !ioc_.scc().rx_ready(ch)) {
+            if (!fed[ch] && ioc_.scc().rx_enabled(ch) && !ioc_.scc().rx_ready(ch)) {
                 ioc_.scc().receive(ch, it->second);
                 fed[ch] = true;
                 it = serial_in_.erase(it);
-            } else if (fed[ch] || ioc_.scc().rx_ready(ch)) {
+            } else {
                 fed[ch] = true;  // keep per-channel order
                 ++it;
             }

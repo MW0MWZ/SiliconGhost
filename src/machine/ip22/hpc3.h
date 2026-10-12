@@ -3,14 +3,15 @@
 // SCSI and Ethernet DMA channels, interrupt status, the serial EEPROM, the
 // PBUS device windows (IOC2 on channel 6) and the DS1386 RTC/NVRAM.
 //
-// DMA engines, the WD33C93 SCSI controller and the Seeq Ethernet controller
-// are register storage for now.
+// The SCSI channel 0 controller (WD33C93) is modelled; the DMA engines and
+// the Seeq Ethernet controller are register storage for now.
 #pragma once
 
 #include <unordered_map>
 
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
+#include "devices/wd33c93.h"
 #include "machine/ip22/ioc2.h"
 #include "mem/bus.h"
 
@@ -18,7 +19,7 @@ namespace sg::ip22 {
 
 class Hpc3 final : public Device {
 public:
-    explicit Hpc3(Ioc2& ioc);
+    Hpc3(Ioc2& ioc, Scheduler& scheduler, double cpu_hz);
 
     void reset();
     const char* name() const override { return "hpc3"; }
@@ -27,6 +28,7 @@ public:
 
     Ds1386& rtc() { return rtc_; }
     Eeprom93Cxx& eeprom() { return eeprom_; }
+    Wd33c93& scsi0() { return scsi0_; }
 
 private:
     // Byte-wide devices on 4-byte strides: returns the byte-register index
@@ -39,6 +41,7 @@ private:
     Ioc2& ioc_;
     Ds1386 rtc_;
     Eeprom93Cxx eeprom_;
+    Wd33c93 scsi0_;
     u32 eeprom_reg_ = 0;
     std::unordered_map<u32, u32> regs_;  // registers without behaviour yet
 };

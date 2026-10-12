@@ -7,6 +7,7 @@
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
 #include "devices/pit8254.h"
+#include "devices/wd33c93.h"
 #include "devices/z85230.h"
 #include "test.h"
 
@@ -71,8 +72,17 @@ TEST(pit_readback_status) {
 
 TEST(ds1386_time_freeze_and_set) {
     Ds1386 rtc;
-    std::time_t host = 1700000000;  // 2023-11-14 22:13:20 UTC (a Tuesday)
+    double host = 1700000000;  // 2023-11-14 22:13:20 UTC (a Tuesday)
     rtc.set_time_source([&] { return host; });
+    rtc.write(Ds1386::kRegCommand, 0x00);  // re-base the clock onto this source
+    rtc.write(0xA, 0x23);
+    rtc.write(0x9, 0x11);
+    rtc.write(0x8, 0x14);
+    rtc.write(0x4, 0x22);
+    rtc.write(0x2, 0x13);
+    rtc.write(0x1, 0x20);
+    rtc.write(0x0, 0x00);
+    rtc.write(Ds1386::kRegCommand, 0x80);
     CHECK_EQ(rtc.read(0x1), 0x20);  // seconds BCD
     CHECK_EQ(rtc.read(0x2), 0x13);
     CHECK_EQ(rtc.read(0x4), 0x22);
@@ -94,6 +104,14 @@ TEST(ds1386_time_freeze_and_set) {
     CHECK_EQ(rtc.read(0xA), 0x00);
     CHECK_EQ(rtc.read(0x9) & 0x1F, 0x01);
     CHECK_EQ(rtc.read(0x1), 0x05);
+
+    // Partial writes with TE set: an invalid intermediate date is kept verbatim.
+    rtc.write(0x9, 0x00);
+    CHECK_EQ(rtc.read(0x9) & 0x1F, 0x00);
+    rtc.write(0x9, 0x02);
+    CHECK_EQ(rtc.read(0x9) & 0x1F, 0x02);
+    host += 0.25;
+    CHECK_EQ(rtc.read(0x0), 0x25);  // hundredths tick
 
     rtc.write(0x100, 0x5A);  // NVRAM
     CHECK_EQ(rtc.read(0x100), 0x5A);
@@ -168,4 +186,36 @@ TEST(scc_transmit_and_interrupts) {
     CHECK_EQ(scc.read_data(0), 'x');
     CHECK(!irq);
     CHECK(out == "h");
+}
+
+TEST(wd33c93_reset_and_selection_timeout) {
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);  // 150 MHz
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.write_address(0x00);
+    wd.write_data(0x08 | 7);  // own ID 7, advanced features
+    wd.write_address(0x02);
+    wd.write_data(0x20);      // selection timeout period
+    wd.write_address(0x18);
+    wd.write_data(0x00);      // RESET
+    CHECK(wd.read_aux_status() & 0x10);
+    clk.advance_to(100000);
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x01);  // reset with advanced features
+    CHECK(!irq);
+    wd.write_address(0x15);
+    wd.write_data(3);        // destination ID
+    wd.write_address(0x18);
+    wd.write_data(0x07);     // SELECT without ATN
+    CHECK(wd.read_aux_status() & 0x20);
+    clk.advance_to(100000 + 150000 * 20);  // ~13 ms timeout at 20 MHz
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x42);  // selection timeout
+    wd.write_address(0x18);
+    wd.write_data(0x04);  // DISCONNECT while not connected: no interrupt
+    clk.advance_to(100000 + 150000 * 40);
+    CHECK(!irq);
 }

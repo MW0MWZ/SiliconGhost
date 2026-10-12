@@ -19,6 +19,7 @@ constexpr u32 kEeromSi = 1u << 4;
 
 // MEMCFG half-word fields
 constexpr u32 kBankValid = 1u << 13;
+constexpr u32 kBankSubbanks = 1u << 14;
 
 // Main memory may only be decoded into the low and high system memory windows.
 constexpr u32 kLowWindow = 0x08000000, kLowWindowEnd = 0x18000000;
@@ -30,12 +31,22 @@ constexpr u32 kGioSpaceStart = 0x1F000000, kGioSpaceEnd = 0x1FA00000;
 }  // namespace
 
 Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz)
-    : bus_(bus), scheduler_(scheduler), ram_(ram), cycles_per_sysclk_(cpu_hz / sysclk_hz) {
+    : bus_(bus),
+      scheduler_(scheduler),
+      ram_(ram),
+      cycles_per_sysclk_(cpu_hz / sysclk_hz),
+      dma_timer_(scheduler, [this] { finish_dma(); }) {
     // Split installed memory into decodable banks, largest first.
-    u64 remaining = ram_size;
-    for (u64 size = u64{128} << 20; size >= (u64{4} << 20) && bank_sizes_.size() < 4;) {
+    u64 remaining = ram_size, offset = 0;
+    for (u64 size = u64{128} << 20; size >= (u64{4} << 20) && banks_.size() < 4;) {
         if (remaining >= size) {
-            bank_sizes_.push_back(size);
+            const bool double_sided = size == (u64{128} << 20) || size == (u64{32} << 20) || size == (u64{8} << 20);
+            Bank b;
+            b.offset = offset;
+            b.subbanks = double_sided ? 2 : 1;
+            b.subbank_size = size / b.subbanks;
+            banks_.push_back(b);
+            offset += size;
             remaining -= size;
         } else {
             size >>= 1;
@@ -64,6 +75,12 @@ void Mc::reset() {
     user_semaphores_.fill(0);
     rpss_base_ = 0;
     rpss_cycle_base_ = scheduler_.now();
+    dma_timer_.cancel();
+    dma_mem_addr_ = dma_size_ = dma_stride_ = dma_gio_addr_ = dma_mode_ = dma_count_ = 0;
+    dma_run_ = dma_ctl_ = dma_cause_ = 0;
+    dma_tlb_hi_.fill(0);
+    dma_tlb_lo_.fill(0);
+    if (dma_irq_cb_) dma_irq_cb_(false);
     remap_memory();
     update_irq();
 }
@@ -127,7 +144,18 @@ u32 Mc::read_reg(u32 reg) {
             return v;
         }
         case kRpssCounter: return rpss_counter();
-        case kDmaRun: return 0;
+        case kDmaCause: return dma_cause_;
+        case kDmaCtl: return dma_ctl_;
+        case kDmaMemAdr:
+        case kDmaMemAdrD: return dma_mem_addr_;
+        case kDmaSize: return dma_size_;
+        case kDmaStride: return dma_stride_;
+        case kDmaGioAdr:
+        case kDmaGioAdrS: return dma_gio_addr_;
+        case kDmaMode: return dma_mode_;
+        case kDmaCount: return dma_count_;
+        case kDmaStart: return 0;
+        case kDmaRun: return dma_run_;
         default: {
             const auto it = regs_.find(reg);
             if (it == regs_.end()) {
@@ -151,6 +179,39 @@ void Mc::write_reg(u32 reg, u32 value) {
                 SG_LOG(Info, "mc", "system reset requested");
                 if (reset_cb_) reset_cb_();
             }
+            return;
+        case kDmaCause:
+            dma_cause_ = value;
+            if (dma_cause_ == 0 && dma_irq_cb_) dma_irq_cb_(false);
+            return;
+        case kDmaCtl: dma_ctl_ = value; return;
+        case kDmaMemAdr:
+        case kDmaMemAdrD: dma_mem_addr_ = value; return;
+        case kDmaSize:
+            dma_size_ = value;
+            dma_count_ = (dma_count_ & 0xFFFF0000u) | (value & 0xFFFF);
+            return;
+        case kDmaStride:
+            dma_stride_ = value;
+            dma_count_ = (dma_count_ & 0x0000FFFFu) | (value & 0x03FF0000u);
+            return;
+        case kDmaGioAdr: dma_gio_addr_ = value; return;
+        case kDmaGioAdrS:
+            dma_gio_addr_ = value;
+            start_dma();
+            return;
+        case kDmaMode: dma_mode_ = value; return;
+        case kDmaCount: dma_count_ = value; return;
+        case kDmaStart:
+            if (value & 1) start_dma();
+            return;
+        case kDmaMemAdrDS:
+            dma_gio_addr_ = value;
+            dma_size_ = 0x0001000C;
+            dma_stride_ = 0x00010000;
+            dma_count_ = 0x0001000C;
+            dma_mode_ = 0x00000028;
+            start_dma();
             return;
         case kSysId:
         case kRefCtr:
@@ -180,6 +241,11 @@ void Mc::write_reg(u32 reg, u32 value) {
             return;
         case kSysSemaphore: sys_semaphore_ = value; return;
         default:
+            if (reg >= kDmaTlbHi0 && reg < kDmaTlbHi0 + 0x40 && ((reg - kDmaTlbHi0) & 7) == 0) {
+                const unsigned i = (reg - kDmaTlbHi0) >> 4;
+                ((reg - kDmaTlbHi0) & 8 ? dma_tlb_lo_ : dma_tlb_hi_)[i] = value;
+                return;
+            }
             if (!regs_.count(reg)) SG_LOG(Debug, "mc", "write to unknown register +%05x = %08x", reg, value);
             regs_[reg] = value;
             return;
@@ -203,14 +269,11 @@ void Mc::remap_memory() {
     mapped_.clear();
     bus_.unmap(0, kLowAliasSize);
 
-    u64 bank_offset = 0;
     for (unsigned bank = 0; bank < 4; ++bank) {
         const u32 memcfg = regs_[bank < 2 ? kMemCfg0 : kMemCfg1];
         const u32 field = (bank & 1) ? (memcfg & 0xFFFF) : (memcfg >> 16);
-        const u64 installed = bank < bank_sizes_.size() ? bank_sizes_[bank] : 0;
-        u8* const host = ram_ + bank_offset;
-        bank_offset += installed;
-        if (!(field & kBankValid) || installed == 0) continue;
+        const Bank fitted = bank < banks_.size() ? banks_[bank] : Bank{};
+        if (!(field & kBankValid)) continue;
 
         const u32 base = (field & 0xFF) << 22;
         const u64 size = static_cast<u64>(((field >> 8) & 0x1F) + 1) << 22;
@@ -221,15 +284,28 @@ void Mc::remap_memory() {
                    base, static_cast<unsigned long long>(size >> 20));
             continue;
         }
-        // A bank configured larger than the SIMMs fitted mirrors them; smaller
-        // shows only the configured part.
-        for (u64 off = 0; off < size; off += installed) {
-            const u64 chunk = std::min(installed, size - off);
-            bus_.map_ram(static_cast<u32>(base + off), chunk, host);
-            mapped_.emplace_back(static_cast<u32>(base + off), chunk);
+        // The configured range is split into one or two sub-banks (BNK). A
+        // sub-bank with SIMMs repeats them when configured larger (unused
+        // address lines); a sub-bank without SIMMs is decoded but undriven.
+        const unsigned configured_subbanks = (field & kBankSubbanks) ? 2 : 1;
+        const u64 part = size / configured_subbanks;
+        for (unsigned s = 0; s < configured_subbanks; ++s) {
+            const u64 part_base = base + s * part;
+            if (s >= fitted.subbanks) {
+                bus_.map_device(static_cast<u32>(part_base), part, &empty_bank_);
+                mapped_.emplace_back(static_cast<u32>(part_base), part);
+                continue;
+            }
+            u8* const host = ram_ + fitted.offset + s * fitted.subbank_size;
+            for (u64 off = 0; off < part; off += fitted.subbank_size) {
+                const u64 chunk = std::min(fitted.subbank_size, part - off);
+                bus_.map_ram(static_cast<u32>(part_base + off), chunk, host);
+                mapped_.emplace_back(static_cast<u32>(part_base + off), chunk);
+            }
         }
-        SG_LOG(Debug, "mc", "bank %u: %llu MiB at %08x (%llu MiB fitted)", bank,
-               static_cast<unsigned long long>(size >> 20), base, static_cast<unsigned long long>(installed >> 20));
+        SG_LOG(Debug, "mc", "bank %u: %llu MiB at %08x as %u sub-bank(s); fitted %u x %llu MiB", bank,
+               static_cast<unsigned long long>(size >> 20), base, configured_subbanks, fitted.subbanks,
+               static_cast<unsigned long long>(fitted.subbank_size >> 20));
     }
     // The first 512 KiB of whatever is decoded at 0x08000000 also appear at 0.
     if (u8* low = bus_.host_write_ptr(kLowWindow)) bus_.map_ram(0, kLowAliasSize, low);
@@ -260,6 +336,88 @@ void Mc::update_irq() {
     if (!pending && irq_) {
         irq_ = false;
         if (irq_cb_) irq_cb_(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual DMA: moves rectangular memory areas to or from a GIO64 address, or
+// fills memory with a constant. Memory addresses go through a 4-entry TLB of
+// 4 MiB segments whose PTEs live in main memory; addresses no entry covers
+// are used as physical addresses (the boot PROM clears memory this way).
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr u32 kDmaModeToHost = 1u << 1;
+constexpr u32 kDmaModeFill = 1u << 3;
+constexpr u32 kDmaModeIncrement = 1u << 4;
+constexpr u32 kDmaRunActive = 1u << 6;
+constexpr u32 kDmaRunDone = 1u << 3;
+constexpr u32 kDmaCtlIntEnable = 1u << 4;
+constexpr u32 kDmaCauseDone = 1u << 3;
+}  // namespace
+
+u32 Mc::dma_translate(u32 vaddr) {
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!dma_tlb_hi_[i] && !dma_tlb_lo_[i]) continue;
+        if ((vaddr & 0xFFC00000u) != (dma_tlb_hi_[i] & 0xFFC00000u)) continue;
+        u32 pte = 0;
+        bus_.read<u32>(((dma_tlb_lo_[i] & 0x003FFFC0u) << 6) + (((vaddr >> 12) & 0x3FF) << 2), pte);
+        return ((pte & 0x03FFFFC0u) << 6) + (vaddr & 0xFFF);
+    }
+    return vaddr;
+}
+
+// The transfer is timed as one 64-bit word per system clock and its effect
+// is applied when it completes.
+void Mc::start_dma() {
+    dma_run_ = (dma_run_ & ~kDmaRunDone) | kDmaRunActive;
+    const u64 lines = dma_size_ >> 16, width = dma_size_ & 0xFFFF, zoom = std::max<u64>(1, (dma_stride_ >> 16) & 0x3FF);
+    const u64 words = std::max<u64>(1, lines * zoom * width / 8);
+    dma_timer_.schedule_in(static_cast<u64>(static_cast<double>(words) * cycles_per_sysclk_) + 1);
+}
+
+void Mc::finish_dma() {
+    const u32 lines = dma_size_ >> 16;
+    const u32 width = dma_size_ & 0xFFFF;
+    const u32 zoom = (dma_stride_ >> 16) & 0x3FF;
+    const s32 stride = static_cast<s16>(dma_stride_);
+    const bool to_host = dma_mode_ & kDmaModeToHost, fill = dma_mode_ & kDmaModeFill;
+    const s32 step = (dma_mode_ & kDmaModeIncrement) ? 1 : -1;
+    u32 addr = dma_mem_addr_;
+    u64 gio = dma_gio_addr_;
+    for (u32 line = 0; line < lines; ++line) {
+        for (u32 z = 0; z < std::max(zoom, 1u); ++z) {
+            u32 a = addr;
+            if (fill && to_host) {
+                for (u32 n = 0; n < width; n += 4, a += static_cast<u32>(4 * step))
+                    bus_.write<u32>(dma_translate(a), dma_gio_addr_);
+            } else if (to_host) {
+                for (u32 n = 0; n < width; n += 8, gio += 8) {
+                    u64 data = 0;
+                    bus_.read<u64>(gio, data);
+                    for (u32 b = 0; b < 8 && n + b < width; ++b, a += static_cast<u32>(step))
+                        bus_.write<u8>(dma_translate(a), static_cast<u8>(data >> (56 - 8 * b)));
+                }
+            } else {
+                for (u32 n = 0; n < width; n += 8, gio += 8) {
+                    u64 data = 0;
+                    for (u32 b = 0; b < 8 && n + b < width; ++b, a += static_cast<u32>(step)) {
+                        u8 v = 0;
+                        bus_.read<u8>(dma_translate(a), v);
+                        data |= u64{v} << (56 - 8 * b);
+                    }
+                    bus_.write<u64>(gio, data);
+                }
+            }
+            if (z + 1 == std::max(zoom, 1u)) addr = a;
+        }
+        addr += static_cast<u32>(stride);
+    }
+    dma_mem_addr_ = addr;
+    dma_run_ = (dma_run_ & ~kDmaRunActive) | kDmaRunDone;
+    if (dma_ctl_ & kDmaCtlIntEnable) {
+        dma_cause_ |= kDmaCauseDone;
+        if (dma_irq_cb_) dma_irq_cb_(true);
     }
 }
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "devices/ds1386.h"
 
+#include <ctime>
+
 namespace sg {
 
 namespace {
@@ -31,16 +33,25 @@ void civil_from_days(s64 z, s64& y, unsigned& m, unsigned& d) {
     y += m <= 2;
 }
 
+bool valid_bcd(u8 v, unsigned max) { return (v & 0x0F) <= 9 && (v >> 4) <= 9 && from_bcd(v) <= max; }
+
 }  // namespace
 
 Ds1386::Ds1386(unsigned size_bytes) : mem_(size_bytes, 0) {
-    time_source_ = [] { return std::time(nullptr); };
+    source_ = [] { return static_cast<double>(std::time(nullptr)); };
     mem_[kRegCommand] = 0x80;  // TE set: clock registers track time
+    load_registers();
 }
 
-void Ds1386::snapshot() {
-    const s64 t = static_cast<s64>(time_source_()) + offset_;
-    s64 days = t / 86400, secs = t % 86400;
+void Ds1386::set_time_source(std::function<double()> source) {
+    const double t = now();
+    source_ = std::move(source);
+    offset_ = t - source_();
+}
+
+void Ds1386::load_registers() {
+    const double t = now();
+    s64 days = static_cast<s64>(t) / 86400, secs = static_cast<s64>(t) % 86400;
     if (secs < 0) {
         secs += 86400;
         --days;
@@ -50,13 +61,13 @@ void Ds1386::snapshot() {
     civil_from_days(days, year, month, day);
     const unsigned hour = static_cast<unsigned>(secs / 3600), minute = static_cast<unsigned>(secs / 60 % 60);
     const unsigned second = static_cast<unsigned>(secs % 60);
+    const unsigned hundredths = static_cast<unsigned>((t - static_cast<double>(static_cast<s64>(t))) * 100) % 100;
     const unsigned dow = static_cast<unsigned>(((days % 7) + 7 + 4) % 7) + 1;  // 1970-01-01 was a Thursday; 1 = Sunday
 
-    mem_[0x0] = 0;
+    mem_[0x0] = to_bcd(hundredths);
     mem_[0x1] = to_bcd(second);
     mem_[0x2] = to_bcd(minute);
-    // Preserve the 12/24 mode bit; 24-hour format is what IRIX/PROM use.
-    if (mem_[0x4] & 0x40) {
+    if (mem_[0x4] & 0x40) {  // 12-hour mode
         const unsigned h12 = hour % 12 == 0 ? 12 : hour % 12;
         mem_[0x4] = static_cast<u8>(0x40 | (hour >= 12 ? 0x20 : 0) | to_bcd(h12));
     } else {
@@ -68,24 +79,39 @@ void Ds1386::snapshot() {
     mem_[0xA] = to_bcd(static_cast<unsigned>(year % 100));
 }
 
-void Ds1386::commit() {
+bool Ds1386::registers_valid(s64& seconds) const {
+    const u8 sec = mem_[0x1] & 0x7F, min = mem_[0x2] & 0x7F, date = mem_[0x8] & 0x3F, mon = mem_[0x9] & 0x1F;
+    const u8 yr = mem_[0xA];
+    if (!valid_bcd(sec, 59) || !valid_bcd(min, 59) || !valid_bcd(date, 31) || !valid_bcd(mon, 12) ||
+        !valid_bcd(yr, 99) || from_bcd(date) == 0 || from_bcd(mon) == 0)
+        return false;
     unsigned hour;
     if (mem_[0x4] & 0x40) {
-        hour = from_bcd(mem_[0x4] & 0x1F) % 12 + ((mem_[0x4] & 0x20) ? 12 : 0);
+        const u8 h = mem_[0x4] & 0x1F;
+        if (!valid_bcd(h, 12) || from_bcd(h) == 0) return false;
+        hour = from_bcd(h) % 12 + ((mem_[0x4] & 0x20) ? 12 : 0);
     } else {
-        hour = from_bcd(mem_[0x4] & 0x3F);
+        const u8 h = mem_[0x4] & 0x3F;
+        if (!valid_bcd(h, 23)) return false;
+        hour = from_bcd(h);
     }
-    // Two-digit year: 70..99 -> 19xx, 00..69 -> 20xx (IRIX's convention).
-    const unsigned yy = from_bcd(mem_[0xA]);
+    // Two-digit year: 70..99 -> 19xx, 00..69 -> 20xx.
+    const unsigned yy = from_bcd(yr);
     const s64 year = yy >= 70 ? 1900 + yy : 2000 + yy;
-    const s64 days = days_from_civil(year, from_bcd(mem_[0x9] & 0x1F), from_bcd(mem_[0x8] & 0x3F));
-    const s64 guest = days * 86400 + hour * 3600 + from_bcd(mem_[0x2] & 0x7F) * 60 + from_bcd(mem_[0x1] & 0x7F);
-    offset_ = guest - static_cast<s64>(time_source_());
+    const s64 days = days_from_civil(year, from_bcd(mon), from_bcd(date));
+    seconds = days * 86400 + hour * 3600 + from_bcd(min) * 60 + from_bcd(sec);
+    return true;
+}
+
+void Ds1386::commit() {
+    s64 t;
+    valid_ = registers_valid(t);
+    if (valid_) offset_ = static_cast<double>(t) + from_bcd(mem_[0x0] & 0xFF) / 100.0 - source_();
 }
 
 u8 Ds1386::read(unsigned index) {
     if (index >= mem_.size()) return 0xFF;
-    if (index < kNumClockRegs && index != kRegCommand && !frozen_) snapshot();
+    if (index < kNumClockRegs && index != kRegCommand && !frozen_ && valid_) load_registers();
     return mem_[index];
 }
 
@@ -94,20 +120,20 @@ void Ds1386::write(unsigned index, u8 value) {
     if (index == kRegCommand) {
         const bool te = value & 0x80;
         if (!te && !frozen_) {
-            snapshot();
+            if (valid_) load_registers();
             frozen_ = true;
         } else if (te && frozen_) {
-            commit();
             frozen_ = false;
+            commit();
         }
         mem_[index] = value;
         return;
     }
-    if (index < kNumClockRegs && !frozen_) {
-        // Writes with TE=1 still land; apply them immediately.
-        snapshot();
+    if (index < kNumClockRegs) {
+        // Writes land verbatim; the clock takes them up once they form a valid time.
+        if (!frozen_ && valid_) load_registers();
         mem_[index] = value;
-        commit();
+        if (!frozen_) commit();
         return;
     }
     mem_[index] = value;

@@ -17,6 +17,10 @@ constexpr u32 kBeStat = 0x30010;
 
 constexpr u32 kIocWindow = 0x59800;  // PBUS PIO channel 6
 constexpr u32 kIocWindowEnd = kIocWindow + 0x400;
+constexpr u32 kScsi0Window = 0x40000;  // WD33C93: SASR at word 0, data at word 1
+constexpr u32 kScsi0WindowEnd = 0x48000;
+constexpr u32 kScsi0Ctrl = 0x11004;
+constexpr u32 kScsiCtrlReset = 1u << 6;
 constexpr u32 kRtcWindow = 0x60000;
 constexpr u32 kRtcWindowEnd = 0x68000;
 
@@ -28,12 +32,16 @@ constexpr u32 kEepromDataIn = 1u << 4;   // EEPROM -> CPU
 
 }  // namespace
 
-Hpc3::Hpc3(Ioc2& ioc) : ioc_(ioc) { reset(); }
+Hpc3::Hpc3(Ioc2& ioc, Scheduler& scheduler, double cpu_hz) : ioc_(ioc), scsi0_(scheduler, cpu_hz / 1000.0) {
+    scsi0_.set_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0Scsi0, level); });
+    reset();
+}
 
 void Hpc3::reset() {
     regs_.clear();
     eeprom_reg_ = 0;
     eeprom_.set_lines(false, false, false);
+    scsi0_.reset();
 }
 
 int Hpc3::byte_index(u32 offset, unsigned size, u32 window_base) {
@@ -44,6 +52,12 @@ int Hpc3::byte_index(u32 offset, unsigned size, u32 window_base) {
 }
 
 bool Hpc3::read(u32 offset, unsigned size, u64& value) {
+    if (offset >= kScsi0Window && offset < kScsi0WindowEnd) {
+        const u32 o = size == 8 ? offset + 4 : offset;
+        const int idx = byte_index(o, size == 8 ? 4 : size, kScsi0Window);
+        value = idx < 0 ? 0 : (idx & 1) ? scsi0_.read_data() : scsi0_.read_aux_status();
+        return true;
+    }
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
@@ -71,6 +85,15 @@ bool Hpc3::read(u32 offset, unsigned size, u64& value) {
 }
 
 bool Hpc3::write(u32 offset, unsigned size, u64 value) {
+    if (offset >= kScsi0Window && offset < kScsi0WindowEnd) {
+        const u32 o = size == 8 ? offset + 4 : offset;
+        const int idx = byte_index(o, size == 8 ? 4 : size, kScsi0Window);
+        if (idx >= 0) {
+            if (idx & 1) scsi0_.write_data(static_cast<u8>(value));
+            else scsi0_.write_address(static_cast<u8>(value));
+        }
+        return true;
+    }
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
@@ -121,6 +144,10 @@ void Hpc3::write_word(u32 offset, u32 value) {
             eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut);
             return;
         case kGioMisc: regs_[offset] = value & 3; return;
+        case kScsi0Ctrl:
+            if (value & kScsiCtrlReset) scsi0_.reset();
+            regs_[offset] = value & ~kScsiCtrlReset;
+            return;
         case kIntStat0:
         case kIntStat1:
         case kBeStat: return;

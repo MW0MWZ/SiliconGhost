@@ -117,8 +117,8 @@ before device models depend on them):
 | `0800_0000–17FF_FFFF`, `2000_0000–2FFF_FFFF` | Main memory (16–256 MiB), decoded from MC MEMCFG bank registers | done |
 | `1F00_0000–1F3F_FFFF` | GIO64 graphics slot: Newport XL8, REX3 registers at `1F0F_0000` | done for PROM-level graphics (see below) |
 | `1F40_0000`, `1F60_0000` | GIO expansion slots 0/1 | empty (bus error) |
-| `1FA0_0000–1FA1_FFFF` | MC: control, SYSID, MEMCFG, error latches, RPSS, semaphores | done (virtual DMA: storage only) |
-| `1FB8_0000–1FBF_FFFF` | HPC3: DMA channels, EEPROM, PBUS. IOC2/INT3/8254/Z85230/8042 at `1FBD_9800`, DS1386 at `1FBE_0000` | IOC2, INT3, timers, serial, keyboard controller, EEPROM, RTC/NVRAM done; DMA, SCSI, Ethernet, audio: storage only |
+| `1FA0_0000–1FA1_FFFF` | MC: control, SYSID, MEMCFG (SIMM banks and sub-banks), error latches, RPSS, semaphores, virtual DMA | done |
+| `1FB8_0000–1FBF_FFFF` | HPC3: DMA channels, EEPROM, PBUS. IOC2/INT3/8254/Z85230/8042 at `1FBD_9800`, DS1386 at `1FBE_0000` | IOC2, INT3, timers, serial, keyboard controller, EEPROM, RTC/NVRAM, WD33C93 (at `1FBC_0000`) done; DMA, Ethernet, audio: storage only |
 | `1FC0_0000–1FC7_FFFF` | Boot PROM (512 KiB) | done |
 
 Planned device models, in the order the PROM needs them:
@@ -186,9 +186,9 @@ possible") throttles at frame boundaries.
 |---|---|---|
 | **M0** | Scaffold: bus, R4000 integer interpreter, TLB, tests, CLI | ✅ |
 | **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
-| **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | Implemented; boot with a real PROM pending |
-| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | Implemented (XL8, keyboard); mouse pending |
-| **M4** | WD33C93A SCSI + disk/CD images | IRIX 5.3/6.5 boots from disk image; install from CD |
+| **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | ✅ PROM 5.3 boots to the System Maintenance Menu on the serial console |
+| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu with keyboard input; mouse pending |
+| **M4** | WD33C93 SCSI (controller done; targets, DMA and disk/CD images next) | IRIX 5.3/6.5 boots from disk image; install from CD |
 | **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |
 | **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | |

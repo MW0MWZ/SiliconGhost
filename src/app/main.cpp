@@ -42,6 +42,7 @@ void usage(const char* argv0) {
                  "  --cpu-mhz N      R4400 pipeline clock (default 150)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only)\n"
                  "  --headless       no display window\n"
+                 "  --screenshot F   on exit, save the display as a binary PPM image\n"
                  "  --max N          stop after N cycles (default: run until Ctrl-C)\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
@@ -103,7 +104,7 @@ bool load_file(const std::string& path, std::vector<sg::u8>& data) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string prom, nvram;
+    std::string prom, nvram, screenshot;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
     bool trace = false, headless = false;
@@ -120,6 +121,7 @@ int main(int argc, char** argv) {
         };
         if (!std::strcmp(a, "--prom")) prom = next();
         else if (!std::strcmp(a, "--nvram")) nvram = next();
+        else if (!std::strcmp(a, "--screenshot")) screenshot = next();
         else if (!std::strcmp(a, "--ram")) config.ram_mb = static_cast<unsigned>(std::strtoul(next(), nullptr, 0));
         else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);
@@ -190,6 +192,20 @@ int main(int argc, char** argv) {
         if (machine.powered_off()) std::fprintf(stderr, "\n[powered off]\n");
         dump_state(cpu);
 
+        if (!screenshot.empty()) {
+            std::vector<sg::u32> pixels;
+            unsigned w = 0, h = 0;
+            if (machine.newport() && machine.newport()->render(pixels, w, h)) {
+                std::ofstream f(screenshot, std::ios::binary);
+                f << "P6\n" << w << " " << h << "\n255\n";
+                for (sg::u32 p : pixels) {
+                    const char rgb[3] = {static_cast<char>(p >> 16), static_cast<char>(p >> 8), static_cast<char>(p)};
+                    f.write(rgb, 3);
+                }
+            } else {
+                std::fprintf(stderr, "screenshot: no video signal\n");
+            }
+        }
         if (!nvram.empty()) {
             std::ofstream f(nvram, std::ios::binary);
             const auto& mem = machine.rtc().memory();

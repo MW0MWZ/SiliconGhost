@@ -37,6 +37,7 @@ add_library(sg_emu STATIC
   src/devices/eeprom93cxx.cpp
   src/devices/kbc8042.cpp
   src/devices/pit8254.cpp
+  src/devices/wd33c93.cpp
   src/devices/z85230.cpp
   src/machine/ip22/hpc3.cpp
   src/machine/ip22/indy.cpp

@@ -80,6 +80,17 @@ TEST(ip22_mc_memory_banks) {
     // Configure 128 MiB over 64 MiB of SIMMs: the upper half mirrors the lower.
     t.w32(kMcMemCfg0, (0x2000u | 0x1F00u | 0x20u) << 16);
     CHECK_EQ(t.r32(0x0C000010), 0xDEADBEEFu);
+    // Two sub-banks configured over single-sided SIMMs: the second half is undriven.
+    t.w32(kMcMemCfg0, (0x4000u | 0x2000u | 0x1F00u | 0x20u) << 16);
+    t.w32(0x0C000010, 0x12345678);
+    CHECK_EQ(t.r32(0x0C000010), 0u);
+    CHECK_EQ(t.r32(0x08000010), 0xDEADBEEFu);
+    // Bank 1 has no SIMMs: configuring it decodes the range without bus errors.
+    t.w32(kMcCpuErrorStat, 0);
+    t.w32(kMcMemCfg0, ((0x2000u | 0x1F00u | 0x20u) << 16) | 0x2000u | 0x1F00u | 0x80u);
+    CHECK(t.m.bus().write<u32>(0x20000000, 0x11111111));
+    CHECK_EQ(t.r32(0x20000000), 0u);
+    CHECK_EQ(t.r32(kMcCpuErrorStat), 0u);
     // Invalidate: memory disappears.
     t.w32(kMcMemCfg0, 0);
     CHECK(!t.m.bus().read<u32>(0x08000010, v));
