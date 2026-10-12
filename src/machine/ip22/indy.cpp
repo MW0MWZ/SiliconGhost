@@ -38,6 +38,7 @@ Indy::Indy(const IndyConfig& config)
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
       hpc3_(ioc_),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
+      newport_(scheduler_, config.cpu_hz, Newport::Options{}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
     std::memset(ram_.get(), 0, checked_ram_bytes(config));
     std::memset(prom_.get(), 0xFF, kPromMaxSize);
@@ -47,6 +48,7 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_ram(kProm, kPromMaxSize, prom_.get(), /*writable=*/false);
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
+    if (config_.graphics) bus_.map_device(kNewportRex3, 0x10000, &newport_);
     bus_.set_error_handler([this](u64 paddr, unsigned size, bool is_write) {
         mc_.report_bus_error(paddr, size, is_write);
     });
@@ -55,6 +57,7 @@ Indy::Indy(const IndyConfig& config)
     // IP2..IP5; the MC bus error interrupt drives IP6.
     ioc_.set_cpu_line_callback([this](unsigned line, bool level) { cpu_.set_int_line(line, level); });
     mc_.set_irq_callback([this](bool level) { cpu_.set_int_line(4, level); });
+    newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
     mc_.set_reset_callback([this] {
         reset_pending_ = true;
         cpu_.request_stop();
@@ -102,6 +105,7 @@ void Indy::reset() {
     mc_.reset();
     ioc_.reset();
     hpc3_.reset();
+    newport_.reset();
     cpu_.reset();
     for (unsigned line = 0; line < 5; ++line) cpu_.set_int_line(line, false);
     serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
@@ -118,8 +122,7 @@ u64 Indy::run(u64 cycles) {
             SG_LOG(Info, "indy", "system reset");
             reset();
         }
-        const u64 next = scheduler_.next_event();
-        cpu_.run_until(next < end ? next : end);
+        cpu_.run_until(end, scheduler_.next_event_ptr());
         scheduler_.run_due(cpu_.cycles());
         if (cpu_.stop_requested() && !reset_pending_) break;
     }

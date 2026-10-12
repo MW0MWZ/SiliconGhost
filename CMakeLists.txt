@@ -42,6 +42,7 @@ add_library(sg_emu STATIC
   src/machine/ip22/indy.cpp
   src/machine/ip22/ioc2.cpp
   src/machine/ip22/mc.cpp
+  src/machine/ip22/newport.cpp
 )
 target_include_directories(sg_emu PUBLIC src)
 target_link_libraries(sg_emu PRIVATE sg_warnings)
@@ -56,6 +57,18 @@ endif()
 add_executable(siliconghost src/app/main.cpp)
 target_link_libraries(siliconghost PRIVATE sg_emu sg_warnings)
 
+option(SG_WITH_SDL3 "Build the SDL3 display front end" ON)
+if(SG_WITH_SDL3)
+  find_package(SDL3 CONFIG QUIET)
+  if(SDL3_FOUND)
+    target_sources(siliconghost PRIVATE src/app/display_sdl.cpp)
+    target_compile_definitions(siliconghost PRIVATE SG_HAVE_SDL3=1)
+    target_link_libraries(siliconghost PRIVATE SDL3::SDL3)
+  else()
+    message(STATUS "SDL3 not found: building without a display window")
+  endif()
+endif()
+
 if(SG_BUILD_TESTS)
   enable_testing()
   add_executable(sg_tests
@@ -65,6 +78,7 @@ if(SG_BUILD_TESTS)
     tests/device_tests.cpp
     tests/fpu_cache_tests.cpp
     tests/ip22_tests.cpp
+    tests/newport_tests.cpp
   )
   target_link_libraries(sg_tests PRIVATE sg_emu sg_warnings)
   add_test(NAME sg_tests COMMAND sg_tests)

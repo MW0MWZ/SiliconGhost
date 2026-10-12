@@ -33,6 +33,7 @@ void Kbc8042::reset() {
     last_was_command_ = false;
     pending_ = Pending::None;
     kbd_arg_command_ = mouse_arg_command_ = 0;
+    scan_set_ = 2;
     update_irq();
 }
 
@@ -121,12 +122,18 @@ void Kbc8042::write_data(u8 value) {
 
 void Kbc8042::keyboard_command(u8 value) {
     if (kbd_arg_command_) {  // argument of a previous command
+        const u8 command = kbd_arg_command_;
         kbd_arg_command_ = 0;
         push(kAck, false);
+        if (command == 0xF0) {
+            if (value == 0) push(static_cast<u8>(scan_set_), false);  // query
+            else if (value <= 3) scan_set_ = value;
+        }
         return;
     }
     switch (value) {
         case 0xFF:  // reset
+            scan_set_ = 2;
             push(kAck, false);
             push(kSelfTestPassed, false);
             break;

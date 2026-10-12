@@ -126,8 +126,9 @@ public:
     void step();
     // Executes up to `max_instructions`; returns the number executed.
     u64 run(u64 max_instructions);
-    // Executes until the cycle counter reaches `cycle` or a stop is requested.
-    void run_until(u64 cycle);
+    // Executes until the cycle counter reaches `cycle` (or `*deadline`, which
+    // may move earlier while running) or a stop is requested.
+    void run_until(u64 cycle, const u64* deadline = nullptr);
     bool stop_requested() const { return stop_.load(std::memory_order_relaxed); }
     void clear_stop() { stop_.store(false, std::memory_order_relaxed); }
     void request_stop() { stop_.store(true, std::memory_order_relaxed); }

@@ -120,11 +120,13 @@ u64 R4000::run(u64 max_instructions) {
     return n;
 }
 
-void R4000::run_until(u64 cycle) {
-    while (cycles_ < cycle) {
-        const u64 chunk_end = (cycle - cycles_ > 4096) ? cycles_ + 4096 : cycle;
-        while (cycles_ < chunk_end) step();
-        if (stop_.load(std::memory_order_relaxed)) break;
+void R4000::run_until(u64 cycle, const u64* deadline) {
+    static constexpr u64 kNever = ~u64{0};
+    const u64* const limit = deadline ? deadline : &kNever;
+    u64 n = 0;
+    while (cycles_ < cycle && cycles_ < *limit) {
+        step();
+        if ((++n & 4095) == 0 && stop_.load(std::memory_order_relaxed)) break;
     }
 }
 

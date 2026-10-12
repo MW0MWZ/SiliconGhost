@@ -14,6 +14,10 @@
 #include "cpu/r4000/disasm.h"
 #include "machine/ip22/indy.h"
 
+#if defined(SG_HAVE_SDL3)
+#include "app/display_sdl.h"
+#endif
+
 #if !defined(_WIN32)
 #include <termios.h>
 #include <unistd.h>
@@ -36,6 +40,8 @@ void usage(const char* argv0) {
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved on exit\n"
                  "  --ram MB         memory size, 16..256 (default 64)\n"
                  "  --cpu-mhz N      R4400 pipeline clock (default 150)\n"
+                 "  --no-graphics    leave the GFX slot empty (serial console only)\n"
+                 "  --headless       no display window\n"
                  "  --max N          stop after N cycles (default: run until Ctrl-C)\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
@@ -100,7 +106,7 @@ int main(int argc, char** argv) {
     std::string prom, nvram;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false;
+    bool trace = false, headless = false;
     sg::log::set_level(sg::log::Level::Warn);
 
     for (int i = 1; i < argc; ++i) {
@@ -118,6 +124,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
+        else if (!std::strcmp(a, "--headless")) headless = true;
+        else if (!std::strcmp(a, "--no-graphics")) config.graphics = false;
         else if (!std::strcmp(a, "--log")) {
             const std::string l = next();
             using sg::log::Level;
@@ -170,7 +178,13 @@ int main(int argc, char** argv) {
                 machine.run(1);
             }
         } else {
+#if defined(SG_HAVE_SDL3)
+            const bool windowed = !headless && config.graphics && max_cycles == ~0ull;
+            if (!windowed || !sg::app::run_with_display(machine, g_interrupted)) machine.run(max_cycles);
+#else
+            (void)headless;
             machine.run(max_cycles);
+#endif
         }
         g_machine = nullptr;
         if (machine.powered_off()) std::fprintf(stderr, "\n[powered off]\n");

@@ -24,6 +24,8 @@ public:
     void write_command(u8 value);
 
     void key_input(u8 scancode);
+    // Scan code set the keyboard was told to use (2 after reset, 3 if selected).
+    unsigned scan_set() const { return scan_set_; }
     void mouse_input(u8 byte);
     void set_irq_callback(IrqCallback cb) { irq_cb_ = std::move(cb); }
     bool irq() const { return irq_; }
@@ -42,6 +44,7 @@ private:
     bool last_was_command_ = false;
     Pending pending_ = Pending::None;
     u8 kbd_arg_command_ = 0;    // keyboard command awaiting its argument byte
+    unsigned scan_set_ = 2;
     u8 mouse_arg_command_ = 0;  // mouse command awaiting its argument byte
     bool irq_ = false;
     IrqCallback irq_cb_;

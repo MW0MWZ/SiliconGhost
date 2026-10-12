@@ -13,6 +13,7 @@
 #include "machine/ip22/hpc3.h"
 #include "machine/ip22/ioc2.h"
 #include "machine/ip22/mc.h"
+#include "machine/ip22/newport.h"
 #include "mem/bus.h"
 
 namespace sg::ip22 {
@@ -22,6 +23,7 @@ struct IndyConfig {
     double cpu_hz = 150.0e6;    // pipeline clock
     double sysclk_hz = 50.0e6;  // SysAD bus clock
     u32 prid = 0x00000450;      // R4400 revision 5.0
+    bool graphics = true;       // Newport XL8 in the GFX slot
 };
 
 class Indy {
@@ -40,6 +42,7 @@ public:
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+    double cycles_per_second() const { return config_.cpu_hz; }
 
     void set_serial_output(SerialOutput out) { serial_out_ = std::move(out); }
     // Thread-safe: queue a received byte for a serial channel.
@@ -51,6 +54,7 @@ public:
     Ds1386& rtc() { return hpc3_.rtc(); }
     Ioc2& ioc() { return ioc_; }
     Mc& mc() { return mc_; }
+    Newport* newport() { return config_.graphics ? &newport_ : nullptr; }
 
 private:
     void pump_serial_input();
@@ -64,6 +68,7 @@ private:
     Ioc2 ioc_;
     Hpc3 hpc3_;
     Mc mc_;
+    Newport newport_;
     Timer serial_timer_;
 
     SerialOutput serial_out_;

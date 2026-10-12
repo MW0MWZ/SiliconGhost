@@ -115,7 +115,7 @@ before device models depend on them):
 |---|---|---|
 | `0000_0000–0007_FFFF` | Low-memory alias of first 512 KiB of RAM | done |
 | `0800_0000–17FF_FFFF`, `2000_0000–2FFF_FFFF` | Main memory (16–256 MiB), decoded from MC MEMCFG bank registers | done |
-| `1F00_0000–1F3F_FFFF` | GIO64 graphics slot. REX3 at `1F0F_0000` | not yet (slot reads as empty) |
+| `1F00_0000–1F3F_FFFF` | GIO64 graphics slot: Newport XL8, REX3 registers at `1F0F_0000` | done for PROM-level graphics (see below) |
 | `1F40_0000`, `1F60_0000` | GIO expansion slots 0/1 | empty (bus error) |
 | `1FA0_0000–1FA1_FFFF` | MC: control, SYSID, MEMCFG, error latches, RPSS, semaphores | done (virtual DMA: storage only) |
 | `1FB8_0000–1FBF_FFFF` | HPC3: DMA channels, EEPROM, PBUS. IOC2/INT3/8254/Z85230/8042 at `1FBD_9800`, DS1386 at `1FBE_0000` | IOC2, INT3, timers, serial, keyboard controller, EEPROM, RTC/NVRAM done; DMA, SCSI, Ethernet, audio: storage only |
@@ -140,17 +140,27 @@ Planned device models, in the order the PROM needs them:
 ## Graphics: Newport / REX3
 
 Newport is a fixed-function 2D raster engine (lines, spans, blocks, patterns,
-logic ops, Z is not present), driven by REX3 register writes. Plan:
+logic ops; no Z buffer) driven by REX3 register writes, with display control
+bus (DCB) slaves for video timing and colour.
 
-* Model the frame buffer (1280×1024, 8-bit or 24-bit RGB configurations; XL8
-  first) as host memory **owned by the emulation core**.
-* Implement REX3 draw commands on the CPU first, with bulk fast paths for
-  block fills and screen-to-screen copies (which dominate X11 under IRIX).
-* Display: VC2 timing + XMAP9/CMAP translate the frame buffer to RGBA once per
-  host frame (dirty-rectangle tracked), uploaded as an SDL3 texture. CMAP
-  lookups move to a fragment shader if profiling says so.
-* Software emulation of a 2D engine at 1280×1024 is far cheaper than
-  emulating the CPU, so a GPU REX3 is not planned unless measured necessary.
+Implemented:
+
+* REX3 register file with the +0x800 "GO" aliases, identification probe,
+  STATUS/USTATUS with the vertical-retrace interrupt (INT3 LOCAL1 bit 7).
+* Drawing: span and block fills with stop-on-X/Y continuation, fast clear,
+  Z/line-stipple patterns (transparent and opaque), host pixel writes and
+  packed reads through HOSTRW, screen-to-screen copy, integer Bresenham lines,
+  Gouraud shading and dithering, all 16 logic ops, write masks, screen masks
+  0-4, window offset, RGB/CI, pop-up, overlay and CID planes.
+* DCB with byte-lane transfers to VC2 (registers, 32K x 16 RAM, timing-table
+  walk, 32x32x2 and 64x64x1 cursors, DID tables), XMAP9 (mode table), both
+  CMAPs (palette, revision and monitor sense) and the Bt445 gamma tables.
+* Scan-out: DID -> XMAP9 mode -> CI or RGB through CMAP -> gamma, with
+  TOPSCAN hardware scrolling; presented in an SDL3 window at 60 Hz.
+
+Still to do (needed by IRIX rather than the PROM): blending, CID-plane
+clipping, colour compare, fractional and antialiased lines, YFLIP/XYOFFSET,
+XL24 24-bit planes and the MC graphics DMA engine.
 
 ## Timing and scheduling
 
@@ -176,8 +186,8 @@ possible") throttles at frame boundaries.
 |---|---|---|
 | **M0** | Scaffold: bus, R4000 integer interpreter, TLB, tests, CLI | ✅ |
 | **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
-| **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | PROM prints to serial console and reaches the command monitor |
-| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | graphical PROM menu displays and accepts input |
+| **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | Implemented; boot with a real PROM pending |
+| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | Implemented (XL8, keyboard); mouse pending |
 | **M4** | WD33C93A SCSI + disk/CD images | IRIX 5.3/6.5 boots from disk image; install from CD |
 | **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |

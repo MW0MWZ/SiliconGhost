@@ -45,8 +45,11 @@ public:
     void set_clock(std::function<u64()> now) { now_ = std::move(now); }
     u64 now() const { return now_ ? now_() : 0; }
 
-    // Cycle of the earliest pending event, or kNever.
-    u64 next_event() const { return queue_.empty() ? kNever : queue_.front()->when_; }
+    // Cycle of the earliest pending event, or kNever. The pointer form stays
+    // current as events are added or removed, so a running CPU can stop as
+    // soon as a device schedules something earlier.
+    u64 next_event() const { return next_; }
+    const u64* next_event_ptr() const { return &next_; }
 
     // Fire every event due at or before `now`, in time order. Callbacks may
     // (re)schedule timers, including themselves.
@@ -58,7 +61,10 @@ private:
     void remove(Timer* t);
 
     std::function<u64()> now_;
+    void update_next() { next_ = queue_.empty() ? kNever : queue_.front()->when_; }
+
     std::vector<Timer*> queue_;  // sorted by when_; device count is small, so insertion sort is fine
+    u64 next_ = kNever;
 };
 
 }  // namespace sg

@@ -214,3 +214,21 @@ TEST(ip22_hpc3_eeprom_read) {
     put(false, false, false);
     CHECK_EQ(v, 0xFFFFu);  // erased part
 }
+
+TEST(ip22_events_scheduled_by_running_code_fire_on_time) {
+    // A PROM that sends one character: the transmit completion event is
+    // scheduled while the CPU runs and must not wait for later events.
+    using namespace test::as;
+    Indy m{IndyConfig{}};
+    std::string out;
+    m.set_serial_output([&](unsigned, u8 b) { out.push_back(static_cast<char>(b)); });
+    const u32 prog[] = {LUI(t0, 0xBFBD), ORI(t0, t0, 0x9833), ADDIU(t1, zero, 5), I(0x28, t0, t1, 0),
+                        ADDIU(t1, zero, 0x68), I(0x28, t0, t1, 0), ADDIU(t1, zero, 'X'), I(0x28, t0, t1, 4),
+                        BEQ(zero, zero, -1), NOP};
+    std::vector<u8> prom(sizeof(prog));
+    for (std::size_t i = 0; i < std::size(prog); ++i) store_be<u32>(&prom[i * 4], prog[i]);
+    m.load_prom_image(prom.data(), prom.size());
+    m.reset();
+    m.run(20000);
+    CHECK(out == "X");
+}
