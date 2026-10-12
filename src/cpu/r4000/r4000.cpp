@@ -105,6 +105,14 @@ u64 R4000::run(u64 max_instructions) {
     return n;
 }
 
+void R4000::run_until(u64 cycle) {
+    while (cycles_ < cycle) {
+        const u64 chunk_end = (cycle - cycles_ > 4096) ? cycles_ + 4096 : cycle;
+        while (cycles_ < chunk_end) step();
+        if (stop_.load(std::memory_order_relaxed)) break;
+    }
+}
+
 void R4000::set_int_line(unsigned line, bool asserted) {
     if (line > 4) return;
     const u32 bit = 1u << (10 + line);

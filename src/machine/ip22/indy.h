@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "core/scheduler.h"
 #include "cpu/r4000/r4000.h"
 #include "mem/bus.h"
 
@@ -24,14 +25,17 @@ public:
     bool load_prom(const std::string& path, std::string& error);
 
     void reset();
-    u64 run(u64 instructions) { return cpu_.run(instructions); }
+    // Runs the CPU for up to `cycles`, dispatching device events on time.
+    u64 run(u64 cycles);
 
     mips::R4000& cpu() { return cpu_; }
     Bus& bus() { return bus_; }
+    Scheduler& scheduler() { return scheduler_; }
 
 private:
     IndyConfig config_;
     Bus bus_;
+    Scheduler scheduler_;
     std::unique_ptr<u8[]> ram_;
     std::unique_ptr<u8[]> prom_;
     std::vector<std::unique_ptr<Device>> devices_;

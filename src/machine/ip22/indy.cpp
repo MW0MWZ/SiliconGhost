@@ -34,6 +34,8 @@ Indy::Indy(const IndyConfig& config) : config_(config), cpu_(bus_) {
     add_stub("hpc3", kHpc3, kHpc3Size);
     add_stub("newport", kNewportRex3, 0x10000);
 
+    scheduler_.set_clock([this] { return cpu_.cycles(); });
+
     reset();
 }
 
@@ -61,5 +63,17 @@ bool Indy::load_prom(const std::string& path, std::string& error) {
 }
 
 void Indy::reset() { cpu_.reset(); }
+
+u64 Indy::run(u64 cycles) {
+    const u64 start = cpu_.cycles();
+    const u64 end = (cycles > ~u64{0} - start) ? ~u64{0} : start + cycles;
+    cpu_.clear_stop();
+    while (cpu_.cycles() < end && !cpu_.stop_requested()) {
+        const u64 next = scheduler_.next_event();
+        cpu_.run_until(next < end ? next : end);
+        scheduler_.run_due(cpu_.cycles());
+    }
+    return cpu_.cycles() - start;
+}
 
 }  // namespace sg::ip22

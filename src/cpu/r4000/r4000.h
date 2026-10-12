@@ -124,6 +124,10 @@ public:
     void step();
     // Executes up to `max_instructions`; returns the number executed.
     u64 run(u64 max_instructions);
+    // Executes until the cycle counter reaches `cycle` or a stop is requested.
+    void run_until(u64 cycle);
+    bool stop_requested() const { return stop_.load(std::memory_order_relaxed); }
+    void clear_stop() { stop_.store(false, std::memory_order_relaxed); }
     void request_stop() { stop_.store(true, std::memory_order_relaxed); }
 
     // External interrupt lines Int0..Int4 drive Cause.IP2..IP6 (IP7 is the timer).

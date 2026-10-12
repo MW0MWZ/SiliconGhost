@@ -69,3 +69,28 @@ TEST(disasm_common_forms) {
     CHECK(disassemble(BNE(a0, a1, -1), 0xFFFFFFFFBFC00010ull) == "bne a0, a1, 0xbfc00010");
     CHECK(disassemble(ERET, 0) == "eret");
 }
+
+#include "core/scheduler.h"
+
+TEST(scheduler_orders_and_reschedules) {
+    u64 now = 0;
+    Scheduler s;
+    s.set_clock([&] { return now; });
+    std::vector<int> fired;
+    Timer a(s, [&] { fired.push_back(1); });
+    Timer b(s, [&] { fired.push_back(2); });
+    Timer periodic(s, [&] {
+        fired.push_back(3);
+        periodic.schedule_in(100);
+    });
+    a.schedule_at(50);
+    b.schedule_at(20);
+    periodic.schedule_at(30);
+    CHECK_EQ(s.next_event(), 20ull);
+    now = 60;
+    s.run_due(now);
+    CHECK(fired == (std::vector<int>{2, 3, 1}));
+    CHECK_EQ(s.next_event(), 160ull);  // periodic rescheduled relative to the clock
+    periodic.cancel();
+    CHECK_EQ(s.next_event(), Scheduler::kNever);
+}
