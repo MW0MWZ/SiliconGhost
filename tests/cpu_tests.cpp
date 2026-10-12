@@ -321,7 +321,7 @@ TEST(cpu_bev_vectors_and_reset_state) {
     CHECK_EQ(cpu.pc, R4000::kResetVector);
     CHECK(cpu.cp0_read(cop0::Status) & sr::BEV);
     CHECK(cpu.cp0_read(cop0::Status) & sr::ERL);
-    CHECK_EQ(cpu.cp0_read(cop0::PRId), 0x460ull);
+    CHECK_EQ(cpu.cp0_read(cop0::PRId), 0x450ull);
     // Fetch from an unmapped PROM address -> instruction bus error via BEV vector.
     cpu.step();
     CHECK_EQ(cpu.pc, 0xFFFFFFFFBFC00380ull);

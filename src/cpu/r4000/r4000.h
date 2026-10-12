@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <vector>
 
 #include "core/types.h"
 
@@ -107,14 +108,15 @@ public:
     static constexpr unsigned kTlbEntries = 48;
     static constexpr u64 kResetVector = 0xFFFFFFFFBFC00000ull;
 
-    // R4400SC, big-endian, 16 KiB I/D primary caches with 32-byte lines,
-    // secondary cache present, kseg0 cacheable-noncoherent.
-    static constexpr u32 kDefaultConfig = (1u << 28) | (1u << 22) | (1u << 15) | (2u << 9) |
-                                          (2u << 6) | (1u << 5) | (1u << 4) | 3u;
+    // R4400SC as fitted to the Indy: SysClock = PClock/3, 128-byte secondary
+    // lines, big-endian, 16 KiB primary caches (I: 32-byte lines, D: 16-byte),
+    // kseg0 cacheable-noncoherent. SC (bit 17) is derived from scache_bytes.
+    static constexpr u32 kDefaultConfig = 0x10C084A3u;
 
     struct Options {
-        u32 prid = 0x00000460;  // R4400 rev 6.0
+        u32 prid = 0x00000450;          // R4400 rev 5.0 (150 MHz Indy)
         u32 config = kDefaultConfig;
+        u32 scache_bytes = 1u << 20;    // 0 = no secondary cache (R4x00PC)
     };
 
     explicit R4000(Bus& bus) : R4000(bus, Options{}) {}
@@ -178,9 +180,32 @@ private:
     void execute_regimm(u32 inst);
     void execute_cop0(u32 inst);
     void execute_cop1(u32 inst);
-    void branch(bool taken, u64 target);
-    void branch_likely(bool taken, u64 target);
-    void jump(u64 target);
+    void execute_cache(u32 inst);
+
+    // FPU (fpu.cpp)
+    template <typename F>
+    void fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd);
+    void fp_convert_from_int(unsigned fmt, unsigned func, unsigned fs, unsigned fd);
+    bool fp_commit(u32 cause);  // updates FCR31; false if an FPE was raised
+    void fp_unimplemented();
+    void fp_check_ctc1_trap();
+    void branch(bool taken, u64 target) {
+        next_delay_ = true;
+        if (taken) npc_ = target;
+    }
+    void branch_likely(bool taken, u64 target) {
+        if (taken) {
+            next_delay_ = true;
+            npc_ = target;
+        } else {  // nullify the delay slot
+            pc = npc_;
+            npc_ = pc + 4;
+        }
+    }
+    void jump(u64 target) {
+        next_delay_ = true;
+        npc_ = target;
+    }
 
     // Exceptions
     void raise(Exc code, bool tlb_refill = false, bool xtlb = false, unsigned ce = 0);
@@ -252,7 +277,13 @@ private:
     u64 entrylo0_ = 0, entrylo1_ = 0, context_ = 0, xcontext_ = 0, badvaddr_ = 0;
     u64 entryhi_ = 0, epc_ = 0, errorepc_ = 0;
     bool llbit_ = false;
+    u64 random_base_ = 0;
     std::array<TlbEntry, kTlbEntries> tlb_{};
+
+    // Cache tag arrays (no data is cached; tags exist for CACHE-instruction
+    // diagnostics and size probing).
+    std::vector<u32> itag_, dtag_, stag_;
+    std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
 
     FastEntry fast_[kNumModes][2][kFastEntries];
 };

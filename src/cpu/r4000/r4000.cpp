@@ -26,12 +26,17 @@ constexpr u32 kStatusWriteMask = 0xFE77FFFFu;
 constexpr u32 kCauseWriteMask = 0x00000300u;  // IP1:IP0 (software interrupts)
 constexpr u32 kCauseBD = 0x80000000u;
 constexpr u32 kCauseIP7 = 1u << 15;
-constexpr u32 kFcr31WriteMask = 0x0183FFFFu;
-constexpr u32 kFpuImplementation = 0x00000500u;  // R4000/R4400 integrated FPU
+constexpr u32 kConfigWriteMask = 0x3Fu;  // IB, DB, CU, K0
+constexpr u32 kConfigNoScache = 1u << 17;
+constexpr u32 kStatusCH = 1u << 18;
 
 constexpr u64 k32BitCompatBase = 0xFFFFFFFF80000000ull;
 constexpr u64 kKseg2Base = 0xFFFFFFFFC0000000ull;
 constexpr u64 kXuseg = u64{1} << 40;  // R4000 implements 40 virtual address bits
+// How long (in cycles) a secondary tag written with Index Store Tag is reported
+// back verbatim by Index Load Tag; see execute_cache().
+constexpr u64 kScacheTagWindow = 10'000'000;
+constexpr u64 kNeverStored = ~u64{0};
 
 inline unsigned f_rs(u32 i) { return (i >> 21) & 31; }
 inline unsigned f_rt(u32 i) { return (i >> 16) & 31; }
@@ -52,14 +57,24 @@ void R4000::reset() {
 
     status_ = sr::BEV | sr::ERL;
     cause_ = 0;
-    config_ = opts_.config;
+    config_ = opts_.scache_bytes ? (opts_.config & ~kConfigNoScache) : (opts_.config | kConfigNoScache);
     prid_ = opts_.prid;
     index_ = wired_ = compare_ = pagemask_ = count_offset_ = 0;
     watchlo_ = watchhi_ = ecc_ = cacheerr_ = taglo_ = taghi_ = lladdr_ = 0;
     entrylo0_ = entrylo1_ = context_ = xcontext_ = badvaddr_ = 0;
     entryhi_ = epc_ = errorepc_ = 0;
     llbit_ = false;
+    random_base_ = 0;
     tlb_.fill(TlbEntry{});
+
+    // Tag arrays sized for the smallest line size the Config register allows.
+    const u32 icache = 1u << (12 + ((config_ >> 9) & 7));
+    const u32 dcache = 1u << (12 + ((config_ >> 6) & 7));
+    itag_.assign(icache / 16, 0);
+    dtag_.assign(dcache / 16, 0);
+    const u32 sline = 16u << ((config_ >> 22) & 3);
+    stag_.assign(opts_.scache_bytes / sline, 0);
+    stag_stored_at_.assign(stag_.size(), kNeverStored);
 
     cycles_ = 0;
     in_delay_ = false;
@@ -417,30 +432,6 @@ bool R4000::merge_store(u64 vaddr, T value, T keep_mask) {
 }
 
 // ---------------------------------------------------------------------------
-// Control flow
-// ---------------------------------------------------------------------------
-
-SG_FORCEINLINE void R4000::branch(bool taken, u64 target) {
-    next_delay_ = true;
-    if (taken) npc_ = target;
-}
-
-SG_FORCEINLINE void R4000::branch_likely(bool taken, u64 target) {
-    if (taken) {
-        next_delay_ = true;
-        npc_ = target;
-    } else {  // nullify the delay slot
-        pc = npc_;
-        npc_ = pc + 4;
-    }
-}
-
-SG_FORCEINLINE void R4000::jump(u64 target) {
-    next_delay_ = true;
-    npc_ = target;
-}
-
-// ---------------------------------------------------------------------------
 // Instruction execution
 // ---------------------------------------------------------------------------
 
@@ -610,15 +601,7 @@ void R4000::execute(u32 inst) {
             merge_store<u32>(va, static_cast<u32>(r[rt]) << sh, ~(0xFFFFFFFFu << sh));
             break;
         }
-        case 0x2F:  // CACHE
-            if (!cop0_usable()) {
-                raise(Exc::CpU);
-                return;
-            }
-            // Caches are not modelled yet; the PROM's cache sizing/diagnostics
-            // will need Index Load/Store Tag behaviour (milestone M1).
-            SG_LOG(Trace, "cpu", "CACHE op %u @ %016llx", rt, static_cast<unsigned long long>(r[rs] + simm));
-            break;
+        case 0x2F: execute_cache(inst); break;  // CACHE
         case 0x30: {  // LL
             const u64 va = r[rs] + simm;
             u32 v;
@@ -995,7 +978,7 @@ void R4000::execute_cop0(u32 inst) {
 u32 R4000::random() const {
     if (wired_ >= kTlbEntries) return kTlbEntries - 1;
     const u32 range = kTlbEntries - wired_;
-    return (kTlbEntries - 1) - static_cast<u32>(cycles_ % range);
+    return (kTlbEntries - 1) - static_cast<u32>((cycles_ - random_base_) % range);
 }
 
 u64 R4000::cp0_read(unsigned reg) const {
@@ -1037,7 +1020,10 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         case cop0::EntryLo1: entrylo1_ = v & kEntryLoMask; break;
         case cop0::Context: context_ = (v & ~0x7FFFFFull) | (context_ & 0x7FFFF0ull); break;
         case cop0::PageMask: pagemask_ = v32 & kPageMaskMask; break;
-        case cop0::Wired: wired_ = v32 & 0x3F; break;
+        case cop0::Wired:
+            wired_ = v32 & 0x3F;
+            random_base_ = cycles_;  // Random restarts at 47
+            break;
         case cop0::Count:
             count_offset_ = v32 - static_cast<u32>(cycles_ >> 1);
             reschedule_timer();
@@ -1063,7 +1049,7 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         }
         case cop0::Cause: cause_ = (cause_ & ~kCauseWriteMask) | (v32 & kCauseWriteMask); break;
         case cop0::EPC: epc_ = v; break;
-        case cop0::Config: config_ = (config_ & ~0xFu) | (v32 & 0xFu); break;
+        case cop0::Config: config_ = (config_ & ~kConfigWriteMask) | (v32 & kConfigWriteMask); break;
         case cop0::LLAddr: lladdr_ = v32; break;
         case cop0::WatchLo: watchlo_ = v32; break;
         case cop0::WatchHi: watchhi_ = v32; break;
@@ -1140,34 +1126,108 @@ void R4000::fpr_write64(unsigned n, u64 v) {
     else fpr[n & ~1u] = v;
 }
 
-void R4000::execute_cop1(u32 inst) {
-    if (!(status_ & sr::CU1)) {
-        raise(Exc::CpU, false, false, 1);
+// ---------------------------------------------------------------------------
+// CACHE instruction. Cache contents are not modelled (all accesses go to
+// memory, so the system is always coherent); only the tag arrays exist, so
+// that tag diagnostics and cache-size probing see real hardware behaviour.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Primary TagLo: PTagLo (paddr 35:12) in 31:8, PState in 7:6.
+constexpr u32 kPStateMask = 0xC0u;
+// Secondary TagLo: STagLo (paddr 35:17) in 31:13, SState 12:10, VIndex 9:7, ECC 6:0.
+constexpr u32 kSStateMask = 0x1C00u;
+constexpr u32 kSStateCleanExclusive = 4u << 10;
+constexpr u32 kSStateDirtyExclusive = 5u << 10;
+
+u32 primary_tag(u64 paddr, u32 state) { return static_cast<u32>(((paddr >> 12) & 0xFFFFFF) << 8) | (state << 6); }
+u32 secondary_tag(u64 paddr, u32 state_bits, u64 vaddr) {
+    return static_cast<u32>(((paddr >> 17) & 0x7FFFF) << 13) | state_bits | static_cast<u32>(((vaddr >> 12) & 7) << 7);
+}
+bool primary_hit(u32 tag, u64 paddr) { return (tag & kPStateMask) && (tag >> 8) == ((paddr >> 12) & 0xFFFFFF); }
+bool secondary_hit(u32 tag, u64 paddr) { return (tag & kSStateMask) && (tag >> 13) == ((paddr >> 17) & 0x7FFFF); }
+}  // namespace
+
+void R4000::execute_cache(u32 inst) {
+    if (!cop0_usable()) {
+        raise(Exc::CpU);
         return;
     }
-    const unsigned rt = f_rt(inst), fs = f_rd(inst);
-    switch (f_rs(inst)) {
-        case 0x00: gpr[rt] = sext32(fpr_read32(fs)); return;  // MFC1
-        case 0x01:                                            // DMFC1
-            SG_REQUIRE_64BIT();
-            gpr[rt] = fpr_read64(fs);
-            return;
-        case 0x02:  // CFC1
-            gpr[rt] = sext32(fs == 0 ? (kFpuImplementation | (prid_ & 0xFF)) : fs == 31 ? fcr31 : 0);
-            return;
-        case 0x04: fpr_write32(fs, static_cast<u32>(gpr[rt])); return;  // MTC1
-        case 0x05:                                                     // DMTC1
-            SG_REQUIRE_64BIT();
-            fpr_write64(fs, gpr[rt]);
-            return;
-        case 0x06:  // CTC1
-            if (fs == 31) fcr31 = static_cast<u32>(gpr[rt]) & kFcr31WriteMask;
-            return;
+    const unsigned op = f_rt(inst);
+    const u64 vaddr = gpr[f_rs(inst)] + f_simm(inst);
+    u64 paddr;
+    if (!translate<true>(vaddr, Access::Load, paddr)) return;
+
+    const unsigned cache = op & 3, operation = op >> 2;
+    if (cache >= 2 && stag_.empty()) return;  // no secondary cache: undefined, ignore
+
+    // Primary caches are virtually indexed, the secondary physically.
+    const u32 iline = 16u << ((config_ >> 5) & 1), dline = 16u << ((config_ >> 4) & 1);
+    const u32 icache = 1u << (12 + ((config_ >> 9) & 7)), dcache = 1u << (12 + ((config_ >> 6) & 7));
+    const u32 sline = 16u << ((config_ >> 22) & 3);
+    u32* tag;
+    unsigned sindex = 0;
+    switch (cache) {
+        case 0: tag = &itag_[(vaddr & (icache - 1)) / iline]; break;
+        case 1: tag = &dtag_[(vaddr & (dcache - 1)) / dline]; break;
         default:
-            SG_LOG(Warn, "fpu", "unimplemented FPU op %08x @ %016llx", inst,
-                   static_cast<unsigned long long>(cur_pc_));
-            raise(Exc::RI);
-            return;
+            sindex = static_cast<unsigned>((paddr / sline) % stag_.size());
+            tag = &stag_[sindex];
+            break;
+    }
+    const bool secondary = cache >= 2;
+    const bool hit = secondary ? secondary_hit(*tag, paddr) : primary_hit(*tag, paddr);
+    auto set_ch = [this](bool h) { status_ = h ? (status_ | kStatusCH) : (status_ & ~kStatusCH); };
+
+    switch (operation) {
+        case 0:  // Index Invalidate / Index Writeback Invalidate
+            *tag &= secondary ? ~kSStateMask : ~kPStateMask;
+            break;
+        case 1:  // Index Load Tag
+            if (secondary && !(*tag & kSStateMask) &&
+                (stag_stored_at_[sindex] == kNeverStored || cycles_ - stag_stored_at_[sindex] > kScacheTagWindow)) {
+                // Lines not written through Index Store Tag recently are reported
+                // as holding the probed address, as if a cached access had filled
+                // them. Size probes (store a zero tag at the base, then look for
+                // the index that wraps back to it) depend on this.
+                taglo_ = secondary_tag(paddr, kSStateCleanExclusive, vaddr);
+            } else {
+                taglo_ = *tag;
+            }
+            taghi_ = 0;
+            ecc_ = 0;
+            break;
+        case 2:  // Index Store Tag
+            if (secondary) {
+                *tag = (taglo_ & 0xFFFFFC00u) | static_cast<u32>(((vaddr >> 12) & 7) << 7);
+                stag_stored_at_[sindex] = cycles_;
+            } else {
+                *tag = taglo_ & 0xFFFFFFC0u;
+            }
+            break;
+        case 3:  // Create Dirty Exclusive (D, SD)
+            if (cache == 1) *tag = primary_tag(paddr, 3);
+            else if (cache == 3) *tag = secondary_tag(paddr, kSStateDirtyExclusive, vaddr);
+            break;
+        case 4:  // Hit Invalidate
+            if (hit) *tag &= secondary ? ~kSStateMask : ~kPStateMask;
+            if (secondary) set_ch(hit);
+            break;
+        case 5:  // Fill I / Hit Writeback Invalidate D, SD
+            if (cache == 0) {
+                *tag = primary_tag(paddr, 1);
+            } else if (hit) {
+                *tag &= secondary ? ~kSStateMask : ~kPStateMask;
+            }
+            if (secondary) set_ch(hit);
+            break;
+        case 6:  // Hit Writeback: data is never held, nothing to write
+            if (secondary) set_ch(hit);
+            break;
+        case 7:  // Hit Set Virtual (SI, SD)
+            if (secondary && hit) *tag = (*tag & ~0x380u) | static_cast<u32>(((vaddr >> 12) & 7) << 7);
+            if (secondary) set_ch(hit);
+            break;
     }
 }
 

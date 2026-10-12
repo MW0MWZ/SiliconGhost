@@ -32,6 +32,7 @@ add_library(sg_emu STATIC
   src/mem/bus.cpp
   src/cpu/r4000/r4000.cpp
   src/cpu/r4000/disasm.cpp
+  src/cpu/r4000/fpu.cpp
   src/devices/ds1386.cpp
   src/devices/eeprom93cxx.cpp
   src/devices/pit8254.cpp
@@ -41,6 +42,13 @@ add_library(sg_emu STATIC
 )
 target_include_directories(sg_emu PUBLIC src)
 target_link_libraries(sg_emu PRIVATE sg_warnings)
+
+# The FPU relies on the host rounding mode and exception flags.
+if(MSVC)
+  set_source_files_properties(src/cpu/r4000/fpu.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
+else()
+  set_source_files_properties(src/cpu/r4000/fpu.cpp PROPERTIES COMPILE_OPTIONS "-frounding-math;-ffp-contract=off")
+endif()
 
 add_executable(siliconghost src/app/main.cpp)
 target_link_libraries(siliconghost PRIVATE sg_emu sg_warnings)
@@ -52,6 +60,7 @@ if(SG_BUILD_TESTS)
     tests/cpu_tests.cpp
     tests/misc_tests.cpp
     tests/device_tests.cpp
+    tests/fpu_cache_tests.cpp
   )
   target_link_libraries(sg_tests PRIVATE sg_emu sg_warnings)
   add_test(NAME sg_tests COMMAND sg_tests)
