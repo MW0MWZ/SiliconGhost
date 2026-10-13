@@ -94,8 +94,13 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    `MAP_JIT` + `pthread_jit_write_protect_np`; on Linux/Windows, dual-mapped
    W^X code buffers. Self-modifying code is handled by write-protecting
    translated physical pages.
-4. **Idle detection:** IRIX's idle loop and the PROM's polling loops skip ahead
-   to the next scheduled event, so host CPU use stays low.
+4. **Idle detection:** a short loop that comes back to its head with
+   identical registers, having done nothing but RAM loads (no stores, device
+   access, exceptions, CP0 or FPU side effects), is a spin: it is
+   fast-forwarded in whole iterations to just before the next timer or
+   device event, so the guest sees exactly the state it would have reached.
+   IRIX's `idle` loop qualifies; loops polling device registers (the PROM's
+   console wait) do not yet.
 
 ## Physical bus
 
@@ -164,11 +169,24 @@ XL24 24-bit planes and the MC graphics DMA engine.
 
 ## Timing and scheduling
 
-The CPU is the master clock (`cycles`). Devices register events on a single
-scheduler (min-heap keyed by CPU cycle). The run loop executes until the next
-event, then dispatches it. This replaces per-instruction polling and is what
-the JIT will exit to. Wall-clock pacing (for 100% speed rather than "as fast as
-possible") throttles at frame boundaries.
+The CPU's cycle counter is the master clock: Count/Compare, the 8254, the RTC
+and every device delay derive from it, so guest clocks always agree with each
+other. Devices register events on a single scheduler keyed by cycle. The run
+loop executes until the next event, then dispatches it. This replaces
+per-instruction polling and is what the JIT will exit to. The counter keeps
+running through resets.
+
+The counter has fractional precision, so the guest time charged per
+instruction need not be one cycle. A pacer relates guest time to the host
+clock after every 1 ms slice (`--timing`):
+
+* `realtime` (default): guest time follows the wall clock. The CPU runs as
+  many instructions as the host can, and the charge per instruction adapts
+  (1/64 to 16 cycles), so a fast host looks like a faster R4400 while a guest
+  second remains a second.
+* `cycle`: one cycle per instruction, reproducible from run to run; waits
+  when ahead of the wall clock and lags when the host is too slow.
+* `max`: no waiting, one cycle per instruction (the default with `--max`).
 
 ## Front end and host integration
 

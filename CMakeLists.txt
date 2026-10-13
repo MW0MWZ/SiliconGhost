@@ -28,6 +28,7 @@ endif()
 
 add_library(sg_emu STATIC
   src/core/log.cpp
+  src/core/pacer.cpp
   src/core/scheduler.cpp
   src/mem/bus.cpp
   src/cpu/r4000/r4000.cpp

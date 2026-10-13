@@ -4,13 +4,15 @@
 
 #include <csignal>
 
+#include "core/pacer.h"
 #include "machine/ip22/indy.h"
 
 namespace sg::app {
 
-// Runs the machine in real time with a window until it is closed, the
-// machine powers off, or `stop` becomes set. Returns false if SDL could not
-// be initialised.
-bool run_with_display(ip22::Indy& machine, volatile std::sig_atomic_t& stop);
+// Runs the machine with a window, paced by `pacer`, until the window is
+// closed, the machine powers off, or `stop` becomes set. The display is
+// refreshed at 60 Hz of host time. Returns false if SDL could not be
+// initialised.
+bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop);
 
 }  // namespace sg::app

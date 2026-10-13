@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // SiliconGhost command-line front end. The Indy's serial ports are connected
 // to the terminal; a graphical front end comes with Newport support.
+#include <algorithm>
 #include <array>
 #include <csignal>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "core/pacer.h"
 #include "cpu/r4000/disasm.h"
 #include "machine/ip22/indy.h"
 
@@ -48,10 +50,30 @@ void usage(const char* argv0) {
                  "  --headless       no display window\n"
                  "  --screenshot F   on exit, save the display as a binary PPM image\n"
                  "  --max N          stop after N cycles (default: run until Ctrl-C)\n"
+                 "  --timing MODE    realtime: guest clocks follow the host clock and the CPU runs as\n"
+                 "                             fast as the host allows (default)\n"
+                 "                   cycle:    one cycle per instruction, reproducible; waits when ahead\n"
+                 "                   max:      no waiting; guest time runs ahead (default with --max)\n"
+                 "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "Both serial ports are connected to this terminal; Ctrl-C quits.\n",
                  argv0);
+}
+
+// Runs in 1 ms slices of guest time, letting the pacer relate them to the
+// host clock after each.
+void run_headless(sg::ip22::Indy& machine, sg::Pacer& pacer, unsigned long long max_cycles) {
+    auto& cpu = machine.cpu();
+    const sg::u64 slice = static_cast<sg::u64>(machine.cycles_per_second() / 1000);
+    const sg::u64 start = cpu.cycles();
+    pacer.update(cpu.cycles(), cpu.instructions());
+    while (!g_interrupted && !machine.powered_off()) {
+        const sg::u64 done = cpu.cycles() - start;
+        if (done >= max_cycles) break;
+        machine.run(std::min<sg::u64>(slice, max_cycles - done));
+        cpu.set_cycles_per_instruction(pacer.update(cpu.cycles(), cpu.instructions()));
+    }
 }
 
 void dump_state(sg::mips::R4000& cpu) {
@@ -111,7 +133,8 @@ int main(int argc, char** argv) {
     std::string prom, nvram, screenshot;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false, headless = false;
+    bool trace = false, headless = false, idle_skip = true;
+    const char* timing = nullptr;
     sg::log::set_level(sg::log::Level::Warn);
 
     for (int i = 1; i < argc; ++i) {
@@ -143,6 +166,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
+        else if (!std::strcmp(a, "--timing")) timing = next();
+        else if (!std::strcmp(a, "--no-idle-skip")) idle_skip = false;
         else if (!std::strcmp(a, "--no-graphics")) config.graphics = false;
         else if (!std::strcmp(a, "--log")) {
             const std::string l = next();
@@ -157,6 +182,16 @@ int main(int argc, char** argv) {
     if (prom.empty()) {
         usage(argv[0]);
         return 2;
+    }
+    sg::Pacer::Mode timing_mode = max_cycles != ~0ull ? sg::Pacer::Mode::Max : sg::Pacer::Mode::Realtime;
+    if (timing) {
+        if (!std::strcmp(timing, "realtime")) timing_mode = sg::Pacer::Mode::Realtime;
+        else if (!std::strcmp(timing, "cycle")) timing_mode = sg::Pacer::Mode::Cycle;
+        else if (!std::strcmp(timing, "max")) timing_mode = sg::Pacer::Mode::Max;
+        else {
+            std::fprintf(stderr, "error: --timing expects realtime, cycle or max\n");
+            return 2;
+        }
     }
 
     try {
@@ -189,6 +224,8 @@ int main(int argc, char** argv) {
         }).detach();
 
         auto& cpu = machine.cpu();
+        cpu.set_idle_skip(idle_skip && !trace);
+        sg::Pacer pacer(timing_mode, machine.cycles_per_second());
         if (trace) {
             for (unsigned long long n = 0; n < max_cycles && !g_interrupted && !machine.powered_off(); ++n) {
                 sg::u32 inst = 0;
@@ -200,10 +237,11 @@ int main(int argc, char** argv) {
         } else {
 #if defined(SG_HAVE_SDL3)
             const bool windowed = !headless && config.graphics && max_cycles == ~0ull;
-            if (!windowed || !sg::app::run_with_display(machine, g_interrupted)) machine.run(max_cycles);
+            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted))
+                run_headless(machine, pacer, max_cycles);
 #else
             (void)headless;
-            machine.run(max_cycles);
+            run_headless(machine, pacer, max_cycles);
 #endif
         }
         g_machine = nullptr;

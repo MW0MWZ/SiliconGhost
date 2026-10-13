@@ -3,6 +3,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "core/log.h"
@@ -89,7 +90,7 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
 
 }  // namespace
 
-bool run_with_display(ip22::Indy& machine, volatile std::sig_atomic_t& stop) {
+bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SG_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -106,19 +107,25 @@ bool run_with_display(ip22::Indy& machine, volatile std::sig_atomic_t& stop) {
     unsigned tex_w = 0, tex_h = 0;
     std::vector<u32> pixels;
 
-    const u64 frame_cycles = static_cast<u64>(machine.cycles_per_second() / 60);
-    const u64 start_ns = SDL_GetTicksNS();
-    u64 frames = 0;
+    constexpr u64 kFrameNs = 1000000000ull / 60;
+    const u64 slice = static_cast<u64>(machine.cycles_per_second() / 1000);  // 1 ms of guest time
+    auto& cpu = machine.cpu();
+    pacer.update(cpu.cycles(), cpu.instructions());
+    u64 next_frame_ns = SDL_GetTicksNS();
 
     while (!stop && !machine.powered_off()) {
+        machine.run(slice);
+        cpu.set_cycles_per_instruction(pacer.update(cpu.cycles(), cpu.instructions()));
+        const u64 now_ns = SDL_GetTicksNS();
+        if (now_ns < next_frame_ns) continue;
+        next_frame_ns = std::max(next_frame_ns + kFrameNs, now_ns);
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) stop = 1;
             else if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
                 send_key(machine, ev.key.scancode, ev.type == SDL_EVENT_KEY_DOWN);
         }
-        machine.run(frame_cycles);
-        ++frames;
 
         unsigned w = 0, h = 0;
         const bool signal = machine.newport() && machine.newport()->render(pixels, w, h);
@@ -138,11 +145,6 @@ bool run_with_display(ip22::Indy& machine, volatile std::sig_atomic_t& stop) {
         SDL_RenderClear(renderer);
         if (signal && texture) SDL_RenderTexture(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
-
-        // Pace to real time: one emulated frame per 1/60 s.
-        const u64 target_ns = start_ns + frames * 1000000000ull / 60;
-        const u64 now_ns = SDL_GetTicksNS();
-        if (now_ns < target_ns) SDL_DelayNS(target_ns - now_ns);
     }
 
     if (texture) SDL_DestroyTexture(texture);
