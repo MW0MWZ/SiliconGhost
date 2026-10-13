@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // R4000 interpreter tests: hand-assembled programs run from kseg0 in kernel mode.
+#include <array>
+#include <cstddef>
 #include <initializer_list>
+#include <iterator>
 #include <tuple>
 #include <vector>
 
@@ -575,4 +578,153 @@ TEST(cpu_bus_remap_drops_cached_host_pointers) {
     t.cpu.step();
     CHECK_EQ(t.cpu.gpr[t1], 0x11111111u);
     CHECK_EQ(t.cpu.gpr[t2], 0x22222222u);
+}
+
+namespace {
+
+// Final state of a run, for comparing the block cache with step().
+struct CpuState {
+    std::array<u64, 32> gpr{};
+    u64 hi = 0, lo = 0, pc = 0, cycles = 0, epc = 0, cause = 0;
+    std::vector<u8> data;
+    bool operator==(const CpuState&) const = default;
+};
+
+CpuState capture(Rig& t, u64 data_paddr, std::size_t data_size) {
+    CpuState s;
+    s.gpr = t.cpu.gpr;
+    s.hi = t.cpu.hi;
+    s.lo = t.cpu.lo;
+    s.pc = t.cpu.pc;
+    s.cycles = t.cpu.cycles();
+    s.epc = t.cpu.cp0_read(cop0::EPC);
+    s.cause = t.cpu.cp0_read(cop0::Cause);
+    s.data.assign(t.ram.begin() + static_cast<std::ptrdiff_t>(data_paddr),
+                  t.ram.begin() + static_cast<std::ptrdiff_t>(data_paddr + data_size));
+    return s;
+}
+
+// A random straight-line program with forward branches, using every
+// instruction the block cache decodes ahead (and a few it does not).
+std::vector<u32> random_program(u32 seed, unsigned length) {
+    u64 x = seed * 0x9E3779B97F4A7C15ull + 1;
+    auto rnd = [&](u32 n) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        return static_cast<u32>(x % n);
+    };
+    auto reg = [&] { return rnd(32); };
+    auto dst = [&] {  // never s0 (the data pointer)
+        unsigned r;
+        do r = rnd(32);
+        while (r == s0);
+        return r;
+    };
+    static constexpr unsigned kRFuncts[] = {0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x12, 0x18, 0x19,
+                                            0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2F,
+                                            0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B};
+    static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19};
+    static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F, 0x22, 0x26};
+    static constexpr unsigned kBranches[] = {0x04, 0x05, 0x06, 0x07, 0x14, 0x15};
+
+    std::vector<u32> prog;
+    while (prog.size() + 2 < length) {
+        const unsigned room = length - 2 - static_cast<unsigned>(prog.size());
+        switch (rnd(8)) {
+            case 0:
+            case 1:
+            case 2: {
+                const unsigned f = kRFuncts[rnd(std::size(kRFuncts))];
+                prog.push_back(R(f, reg(), reg(), dst(), rnd(32)));
+                break;
+            }
+            case 3:
+            case 4: prog.push_back(I(kImmOps[rnd(std::size(kImmOps))], reg(), dst(), static_cast<s32>(rnd(65536)) - 32768)); break;
+            case 5: {  // aligned for every size, within the data area
+                const unsigned op = kLoadStore[rnd(std::size(kLoadStore))];
+                prog.push_back(I(op, s0, dst(), static_cast<s32>(rnd(128) * 8 + rnd(2) * (op == 0x22 || op == 0x26 ? 3 : 0))));
+                break;
+            }
+            case 6: {  // forward branch or jump; the delay slot is a plain instruction
+                if (room < 12) break;
+                const s32 off = static_cast<s32>(1 + rnd(8));
+                if (rnd(4) == 0) {
+                    const u64 target = kCode + 4 * (prog.size() + 1 + static_cast<unsigned>(off));
+                    prog.push_back((0x02u << 26) | static_cast<u32>((target >> 2) & 0x03FFFFFF));
+                } else if (rnd(3) == 0) {
+                    prog.push_back(I(0x01, reg(), rnd(2), off));  // BLTZ/BGEZ
+                } else {
+                    prog.push_back(I(kBranches[rnd(std::size(kBranches))], reg(), reg(), off));
+                }
+                prog.push_back(I(0x09, reg(), dst(), static_cast<s32>(rnd(256))));
+                break;
+            }
+            default: prog.push_back(rnd(2) ? NOP : I(0x0D, reg(), dst(), static_cast<s32>(rnd(65536)))); break;
+        }
+    }
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    return prog;
+}
+
+}  // namespace
+
+TEST(cpu_block_cache_matches_interpreter_on_random_programs) {
+    constexpr u64 kData = 0x10000;
+    for (u32 seed = 1; seed <= 200; ++seed) {
+        const std::vector<u32> prog = random_program(seed, 600);
+        auto run = [&](bool blocks) {
+            Rig t;
+            t.cpu.set_block_cache(blocks);
+            t.cpu.set_idle_skip(false);
+            u64 x = seed;
+            for (unsigned i = 1; i < 32; ++i) {
+                x = x * 6364136223846793005ull + 1442695040888963407ull;
+                t.cpu.gpr[i] = (i & 1) ? sext32(x >> 17) : x;
+            }
+            t.cpu.gpr[s0] = 0xFFFFFFFF80000000ull + kData;
+            for (u64 a = 0; a < 0x800; a += 4) t.w32(kData + a, static_cast<u32>(a * 0x01010101u ^ seed));
+            u64 paddr = 0x1000;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);  // exceptions (overflow) end up here
+            t.cpu.run_until(3000);
+            return capture(t, kData, 0x800);
+        };
+        const CpuState reference = run(false);
+        if (!(run(true) == reference)) {
+            CHECK_EQ(seed, 0u);  // report the failing seed
+            break;
+        }
+    }
+}
+
+TEST(cpu_linked_blocks_match_interpreter_with_timer_interrupts) {
+    auto run = [](bool blocks) {
+        Rig t;
+        t.cpu.set_block_cache(blocks);
+        t.cpu.set_idle_skip(false);
+        // Main loop: re-arm Compare every 8 iterations; t3 counts interrupts.
+        t.load({
+            ADDIU(t2, zero, 3000),
+            ADDIU(t0, t0, 1),                       // 1004: loop
+            ANDI(t1, t0, 7),
+            BNE(t1, zero, 4), NOP,
+            MFC0(t4, cop0::Count), ADDIU(t4, t4, 37), MTC0(t4, cop0::Compare), NOP,
+            BNE(t0, t2, -9), NOP,                    // 1024 -> 1004
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.load({ADDIU(t3, t3, 1), MFC0(k0, cop0::Count), ADDIU(k0, k0, 500), MTC0(k0, cop0::Compare), ERET}, 0x180);
+        t.cpu.cp0_write(cop0::Compare, 100);
+        t.cpu.cp0_write(cop0::Status, sr::IE | (0x80u << 8));
+        t.cpu.run_until(40000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(false);
+    CHECK(run(true) == reference);
+    CHECK(reference.gpr[t3] > 10u);
+    CHECK_EQ(reference.gpr[t0], 3000u);
 }

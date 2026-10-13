@@ -217,13 +217,25 @@ private:
     // Execution
     void step_inline();
 
-    // Decoded blocks
+    // Decoded blocks. Each instruction is decoded once, into a handler and
+    // its register fields; uncommon instructions use a handler that runs
+    // execute() on the raw word.
     static constexpr unsigned kBlockBits = 14;
     static constexpr unsigned kMaxBlockLength = 32;
+    static constexpr unsigned kMaxLinkedBlocks = 1024;  // per run_block() call
+    struct Op;
+    using Handler = void (*)(R4000&, const Op&);
+    struct Op {
+        Handler fn;
+        u32 inst;
+        u8 rs, rt, rd, sa;
+    };
+    struct Ops;  // the handlers
+    static Handler decode(u32 inst);
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 count = 0;
-        u32 words[kMaxBlockLength];
+        Op ops[kMaxBlockLength];
     };
     static unsigned block_index(const u8* host) {
         return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);

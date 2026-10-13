@@ -6,6 +6,7 @@
 #include "cpu/r4000/r4000.h"
 
 #include <climits>
+#include <type_traits>
 
 #include "core/int128.h"
 #include "core/log.h"
@@ -192,14 +193,15 @@ void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
     b.count = 0;
     const u32 room = (0x1000 - page_offset) / 4;  // instructions left in the page
     const u32 max = std::min<u32>(room, kMaxBlockLength);
+    auto add = [&](u32 w) {
+        b.ops[b.count++] = Op{decode(w), w, static_cast<u8>(f_rs(w)), static_cast<u8>(f_rt(w)),
+                              static_cast<u8>(f_rd(w)), static_cast<u8>(f_sa(w))};
+    };
     while (b.count < max) {
         const u32 w = load_be<u32>(host + 4 * b.count);
-        b.words[b.count++] = w;
+        add(w);
         if (is_branch(w)) {
-            if (b.count < max) {
-                b.words[b.count] = load_be<u32>(host + 4 * b.count);
-                ++b.count;
-            }
+            if (b.count < max) add(load_be<u32>(host + 4 * b.count));
             break;
         }
         if (ends_block(w)) break;
@@ -221,26 +223,27 @@ void R4000::flush_blocks() {
     for (Block& b : blocks_) b.host = nullptr;
 }
 
-// Runs one block from pc, with exactly the per-instruction semantics of
-// step(); it returns as soon as control leaves the straight line (branch,
-// exception, interrupt), the block's memory is written, an idle loop is
-// confirmed, or the run limit is reached.
+// Runs blocks from pc, with exactly the per-instruction semantics of
+// step(). A block is left when control leaves the straight line (branch,
+// exception, interrupt) or its memory is written; execution then carries on
+// directly with the block at the new pc while that is in the same virtual
+// page, translated the same way (blocks are linked within a page). It
+// returns when control leaves the page, an idle loop is confirmed, or the
+// run limit is reached.
 //
 // The per-instruction checks of step() are only needed where their outcome
 // can change: the run limit and the Compare timer are turned into one time
 // below which neither can trigger, and interrupt lines only change when the
-// timer fires, a device is accessed or CP0 is written (which ends a block).
+// timer fires, a device is accessed or CP0 is written.
 void R4000::run_block(u64 cycle, const u64* limit) {
-    const FastEntry& fe = fast_[mode_][static_cast<unsigned>(Access::Fetch)][(pc >> 12) & (kFastEntries - 1)];
-    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != (pc >> 12) || fe.host == nullptr)) {
+    const unsigned mode = mode_;
+    const u64 vpage = pc >> 12;
+    const FastEntry& fe = fast_[mode][static_cast<unsigned>(Access::Fetch)][vpage & (kFastEntries - 1)];
+    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != vpage || fe.host == nullptr)) {
         step_inline();  // delay slot on a new page, misaligned or untranslated pc, uncached fetch
         return;
     }
-    const u32 offset = static_cast<u32>(pc & 0xFFF);
-    const u8* const host = fe.host + offset;
-    Block& b = blocks_[block_index(host)];
-    if (b.host != host) build_block(b, host, offset);
-    block_invalidated_ = false;
+    const u8* const page = fe.host;
 
     // Below `safe` an instruction neither reaches the run limit nor fires
     // the timer; recomputed after anything that could move either.
@@ -251,36 +254,52 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     };
     u64 safe = safe_time();
     bool check_irq = true;
-    for (u32 i = 0; i < b.count; ++i) {
-        if (SG_UNLIKELY(time_fp_ >= safe)) {
-            if (i && !(cycles() < cycle && cycles() < *limit)) return;
-            time_fp_ += weight_;
-            if (time_fp_ >= timer_event_fp_) timer_fire();
-            check_irq = true;
-            safe = safe_time();
-        } else {
-            time_fp_ += weight_;
-        }
-        cur_pc_ = pc;
-        in_delay_ = next_delay_;
-        next_delay_ = false;
-        if (SG_UNLIKELY(check_irq)) {
-            check_irq = false;
-            if (interrupt_pending()) {
-                raise(Exc::Int);
-                return;
+    bool first = true;  // the caller has checked the run limit for the first instruction
+    for (unsigned linked = 0; linked < kMaxLinkedBlocks; ++linked) {
+        const u32 offset = static_cast<u32>(pc & 0xFFF);
+        const u8* const host = page + offset;
+        Block& b = blocks_[block_index(host)];
+        if (b.host != host) build_block(b, host, offset);
+        block_invalidated_ = false;
+
+        for (u32 i = 0; i < b.count; ++i) {
+            if (SG_UNLIKELY(time_fp_ >= safe)) {
+                if (!first && !(cycles() < cycle && cycles() < *limit)) return;
+                time_fp_ += weight_;
+                if (time_fp_ >= timer_event_fp_) timer_fire();
+                check_irq = true;
+                safe = safe_time();
+            } else {
+                time_fp_ += weight_;
             }
+            first = false;
+            cur_pc_ = pc;
+            in_delay_ = next_delay_;
+            next_delay_ = false;
+            if (SG_UNLIKELY(check_irq)) {
+                check_irq = false;
+                if (interrupt_pending()) {
+                    raise(Exc::Int);
+                    break;
+                }
+            }
+            pc = npc_;
+            npc_ += 4;
+            io_ = false;
+            const Op& op = b.ops[i];
+            op.fn(*this, op);
+            gpr[0] = 0;
+            if (SG_UNLIKELY(io_)) {  // a device or CP0 may have raised an interrupt or moved an event
+                check_irq = true;
+                safe = safe_time();
+            }
+            if (pc != cur_pc_ + 4 || block_invalidated_ || idle_ready_) break;
         }
-        pc = npc_;
-        npc_ += 4;
-        io_ = false;
-        execute(b.words[i]);
-        gpr[0] = 0;
-        if (pc != cur_pc_ + 4 || block_invalidated_ || idle_ready_) return;
-        if (SG_UNLIKELY(io_)) {  // a device may have raised an interrupt or scheduled an event
-            check_irq = true;
-            safe = safe_time();
-        }
+
+        // Link to the block at the new pc if nothing it relies on changed.
+        if (idle_ready_ || next_delay_ || (pc >> 12) != vpage || (pc & 3) || mode_ != mode || fe.tag != vpage ||
+            fe.host != page)
+            return;
     }
 }
 
@@ -1234,6 +1253,214 @@ void R4000::execute_regimm(u32 inst) {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-decoded handlers
+// ---------------------------------------------------------------------------
+
+// The most frequent instructions, with the same semantics as execute(); the
+// rest go through execute() itself.
+struct R4000::Ops {
+    static u64 simm(const Op& o) { return sext16(o.inst); }
+    static u64 zimm(const Op& o) { return o.inst & 0xFFFF; }
+    static u64 btarget(const R4000& c, const Op& o) { return c.cur_pc_ + 4 + (simm(o) << 2); }
+    static bool require64(R4000& c) {
+        if (SG_LIKELY(c.ops64_enabled())) return true;
+        c.raise(Exc::RI);
+        return false;
+    }
+
+    static void other(R4000& c, const Op& o) { c.execute(o.inst); }
+    static void nop(R4000&, const Op&) {}
+
+    // Immediate ALU
+    static void addiu(R4000& c, const Op& o) {
+        c.gpr[o.rt] = sext32(static_cast<u32>(c.gpr[o.rs]) + static_cast<u32>(simm(o)));
+    }
+    static void daddiu(R4000& c, const Op& o) {
+        if (require64(c)) c.gpr[o.rt] = c.gpr[o.rs] + simm(o);
+    }
+    static void slti(R4000& c, const Op& o) { c.gpr[o.rt] = static_cast<s64>(c.gpr[o.rs]) < static_cast<s64>(simm(o)); }
+    static void sltiu(R4000& c, const Op& o) { c.gpr[o.rt] = c.gpr[o.rs] < simm(o); }
+    static void andi(R4000& c, const Op& o) { c.gpr[o.rt] = c.gpr[o.rs] & zimm(o); }
+    static void ori(R4000& c, const Op& o) { c.gpr[o.rt] = c.gpr[o.rs] | zimm(o); }
+    static void xori(R4000& c, const Op& o) { c.gpr[o.rt] = c.gpr[o.rs] ^ zimm(o); }
+    static void lui(R4000& c, const Op& o) { c.gpr[o.rt] = sext32(zimm(o) << 16); }
+
+    // Loads and stores
+    template <typename T, bool kSigned, bool k64 = false>
+    static void load(R4000& c, const Op& o) {
+        if (k64 && !require64(c)) return;
+        T v;
+        if (!c.load<T>(c.effective_address(c.gpr[o.rs], simm(o)), v)) return;
+        if constexpr (kSigned) c.gpr[o.rt] = static_cast<u64>(static_cast<s64>(static_cast<std::make_signed_t<T>>(v)));
+        else c.gpr[o.rt] = v;
+    }
+    template <typename T, bool k64 = false>
+    static void store(R4000& c, const Op& o) {
+        if (k64 && !require64(c)) return;
+        c.store<T>(c.effective_address(c.gpr[o.rs], simm(o)), static_cast<T>(c.gpr[o.rt]));
+    }
+
+    // Branches and jumps
+    static void beq(R4000& c, const Op& o) { c.branch(c.gpr[o.rs] == c.gpr[o.rt], btarget(c, o)); }
+    static void bne(R4000& c, const Op& o) { c.branch(c.gpr[o.rs] != c.gpr[o.rt], btarget(c, o)); }
+    static void blez(R4000& c, const Op& o) { c.branch(static_cast<s64>(c.gpr[o.rs]) <= 0, btarget(c, o)); }
+    static void bgtz(R4000& c, const Op& o) { c.branch(static_cast<s64>(c.gpr[o.rs]) > 0, btarget(c, o)); }
+    static void bltz(R4000& c, const Op& o) { c.branch(static_cast<s64>(c.gpr[o.rs]) < 0, btarget(c, o)); }
+    static void bgez(R4000& c, const Op& o) { c.branch(static_cast<s64>(c.gpr[o.rs]) >= 0, btarget(c, o)); }
+    static void beql(R4000& c, const Op& o) { c.branch_likely(c.gpr[o.rs] == c.gpr[o.rt], btarget(c, o)); }
+    static void bnel(R4000& c, const Op& o) { c.branch_likely(c.gpr[o.rs] != c.gpr[o.rt], btarget(c, o)); }
+    static u64 jtarget(const R4000& c, const Op& o) {
+        return ((c.cur_pc_ + 4) & ~0x0FFFFFFFull) | (u64{o.inst & 0x03FFFFFF} << 2);
+    }
+    static void j(R4000& c, const Op& o) {
+        const u64 target = jtarget(c, o);
+        c.jump(target);
+        if (target <= c.cur_pc_) c.backward_branch(target);
+    }
+    static void jal(R4000& c, const Op& o) {
+        c.gpr[31] = c.cur_pc_ + 8;
+        c.jump(jtarget(c, o));
+    }
+    static void jr(R4000& c, const Op& o) { c.jump(c.gpr[o.rs]); }
+    static void jalr(R4000& c, const Op& o) {
+        const u64 target = c.gpr[o.rs];
+        c.gpr[o.rd] = c.cur_pc_ + 8;
+        c.jump(target);
+    }
+
+    // Register ALU
+    static void sll(R4000& c, const Op& o) { c.gpr[o.rd] = sext32(static_cast<u32>(c.gpr[o.rt]) << o.sa); }
+    static void srl(R4000& c, const Op& o) { c.gpr[o.rd] = sext32(static_cast<u32>(c.gpr[o.rt]) >> o.sa); }
+    static void sra(R4000& c, const Op& o) {
+        c.gpr[o.rd] = sext32(static_cast<u32>(static_cast<s32>(c.gpr[o.rt]) >> o.sa));
+    }
+    static void sllv(R4000& c, const Op& o) {
+        c.gpr[o.rd] = sext32(static_cast<u32>(c.gpr[o.rt]) << (c.gpr[o.rs] & 31));
+    }
+    static void srlv(R4000& c, const Op& o) {
+        c.gpr[o.rd] = sext32(static_cast<u32>(c.gpr[o.rt]) >> (c.gpr[o.rs] & 31));
+    }
+    static void srav(R4000& c, const Op& o) {
+        c.gpr[o.rd] = sext32(static_cast<u32>(static_cast<s32>(c.gpr[o.rt]) >> (c.gpr[o.rs] & 31)));
+    }
+    static void mfhi(R4000& c, const Op& o) { c.gpr[o.rd] = c.hi; }
+    static void mflo(R4000& c, const Op& o) { c.gpr[o.rd] = c.lo; }
+    static void mult(R4000& c, const Op& o) {
+        const s64 p = s64{static_cast<s32>(c.gpr[o.rs])} * s64{static_cast<s32>(c.gpr[o.rt])};
+        c.lo = sext32(static_cast<u64>(p));
+        c.hi = sext32(static_cast<u64>(p) >> 32);
+    }
+    static void multu(R4000& c, const Op& o) {
+        const u64 p = u64{static_cast<u32>(c.gpr[o.rs])} * u64{static_cast<u32>(c.gpr[o.rt])};
+        c.lo = sext32(p);
+        c.hi = sext32(p >> 32);
+    }
+    static void addu(R4000& c, const Op& o) {
+        c.gpr[o.rd] = sext32(static_cast<u32>(c.gpr[o.rs]) + static_cast<u32>(c.gpr[o.rt]));
+    }
+    static void subu(R4000& c, const Op& o) {
+        c.gpr[o.rd] = sext32(static_cast<u32>(c.gpr[o.rs]) - static_cast<u32>(c.gpr[o.rt]));
+    }
+    static void and_(R4000& c, const Op& o) { c.gpr[o.rd] = c.gpr[o.rs] & c.gpr[o.rt]; }
+    static void or_(R4000& c, const Op& o) { c.gpr[o.rd] = c.gpr[o.rs] | c.gpr[o.rt]; }
+    static void xor_(R4000& c, const Op& o) { c.gpr[o.rd] = c.gpr[o.rs] ^ c.gpr[o.rt]; }
+    static void nor(R4000& c, const Op& o) { c.gpr[o.rd] = ~(c.gpr[o.rs] | c.gpr[o.rt]); }
+    static void slt(R4000& c, const Op& o) {
+        c.gpr[o.rd] = static_cast<s64>(c.gpr[o.rs]) < static_cast<s64>(c.gpr[o.rt]);
+    }
+    static void sltu(R4000& c, const Op& o) { c.gpr[o.rd] = c.gpr[o.rs] < c.gpr[o.rt]; }
+    static void daddu(R4000& c, const Op& o) {
+        if (require64(c)) c.gpr[o.rd] = c.gpr[o.rs] + c.gpr[o.rt];
+    }
+    static void dsubu(R4000& c, const Op& o) {
+        if (require64(c)) c.gpr[o.rd] = c.gpr[o.rs] - c.gpr[o.rt];
+    }
+    template <unsigned kExtra>
+    static void dsll(R4000& c, const Op& o) {
+        if (require64(c)) c.gpr[o.rd] = c.gpr[o.rt] << (o.sa + kExtra);
+    }
+    template <unsigned kExtra>
+    static void dsrl(R4000& c, const Op& o) {
+        if (require64(c)) c.gpr[o.rd] = c.gpr[o.rt] >> (o.sa + kExtra);
+    }
+    template <unsigned kExtra>
+    static void dsra(R4000& c, const Op& o) {
+        if (require64(c)) c.gpr[o.rd] = static_cast<u64>(static_cast<s64>(c.gpr[o.rt]) >> (o.sa + kExtra));
+    }
+};
+
+R4000::Handler R4000::decode(u32 w) {
+    switch (w >> 26) {
+        case 0x00:
+            switch (w & 63) {
+                case 0x00: return w == 0 ? Ops::nop : Ops::sll;
+                case 0x02: return Ops::srl;
+                case 0x03: return Ops::sra;
+                case 0x04: return Ops::sllv;
+                case 0x06: return Ops::srlv;
+                case 0x07: return Ops::srav;
+                case 0x08: return Ops::jr;
+                case 0x09: return Ops::jalr;
+                case 0x10: return Ops::mfhi;
+                case 0x12: return Ops::mflo;
+                case 0x18: return Ops::mult;
+                case 0x19: return Ops::multu;
+                case 0x21: return Ops::addu;
+                case 0x23: return Ops::subu;
+                case 0x24: return Ops::and_;
+                case 0x25: return Ops::or_;
+                case 0x26: return Ops::xor_;
+                case 0x27: return Ops::nor;
+                case 0x2A: return Ops::slt;
+                case 0x2B: return Ops::sltu;
+                case 0x2D: return Ops::daddu;
+                case 0x2F: return Ops::dsubu;
+                case 0x38: return Ops::dsll<0>;
+                case 0x3A: return Ops::dsrl<0>;
+                case 0x3B: return Ops::dsra<0>;
+                case 0x3C: return Ops::dsll<32>;
+                case 0x3E: return Ops::dsrl<32>;
+                case 0x3F: return Ops::dsra<32>;
+                default: return Ops::other;
+            }
+        case 0x01:
+            switch (f_rt(w)) {
+                case 0x00: return Ops::bltz;
+                case 0x01: return Ops::bgez;
+                default: return Ops::other;
+            }
+        case 0x02: return Ops::j;
+        case 0x03: return Ops::jal;
+        case 0x04: return Ops::beq;
+        case 0x05: return Ops::bne;
+        case 0x06: return Ops::blez;
+        case 0x07: return Ops::bgtz;
+        case 0x09: return Ops::addiu;
+        case 0x0A: return Ops::slti;
+        case 0x0B: return Ops::sltiu;
+        case 0x0C: return Ops::andi;
+        case 0x0D: return Ops::ori;
+        case 0x0E: return Ops::xori;
+        case 0x0F: return Ops::lui;
+        case 0x14: return Ops::beql;
+        case 0x15: return Ops::bnel;
+        case 0x19: return Ops::daddiu;
+        case 0x20: return Ops::load<u8, true>;
+        case 0x21: return Ops::load<u16, true>;
+        case 0x23: return Ops::load<u32, true>;
+        case 0x24: return Ops::load<u8, false>;
+        case 0x25: return Ops::load<u16, false>;
+        case 0x27: return Ops::load<u32, false, true>;  // LWU
+        case 0x28: return Ops::store<u8>;
+        case 0x29: return Ops::store<u16>;
+        case 0x2B: return Ops::store<u32>;
+        case 0x37: return Ops::load<u64, false, true>;  // LD
+        case 0x3F: return Ops::store<u64, true>;        // SD
+        default: return Ops::other;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // COP0
 // ---------------------------------------------------------------------------
 
@@ -1246,6 +1473,7 @@ void R4000::execute_cop0(u32 inst) {
     // Reading a constant register (PRId, Config, Status...) is pure; Count
     // and Random change with time, and everything else alters CP0 state.
     if (f_rs(inst) > 0x01 || rd == cop0::Count || rd == cop0::Random) touch();
+    if (f_rs(inst) > 0x01) io_ = true;  // interrupt enables, Compare or translation may change
     switch (f_rs(inst)) {
         case 0x00: gpr[rt] = sext32(cp0_read(rd)); break;  // MFC0
         case 0x01:                                          // DMFC0

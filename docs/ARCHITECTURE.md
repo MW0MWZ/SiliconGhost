@@ -99,7 +99,11 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    them. A per-4 KiB "holds cached code" flag on the bus makes CPU stores and
    device DMA (`Bus::write_block`) drop affected blocks, so self-modifying
    code and freshly loaded programs behave exactly as with the interpreter.
-   Next steps: pre-decoded handlers, then translation to host code on the
+   Each instruction is decoded once into a handler and its register fields;
+   uncommon instructions fall back to the interpreter's `execute()`. Blocks
+   are linked within a 4 KiB page: when a block ends, execution continues
+   directly with the block at the new pc while the mode and the page's
+   translation are unchanged. Next step: translation to host code on the
    same block structure.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
