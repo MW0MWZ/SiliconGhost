@@ -58,6 +58,7 @@ void usage(const char* argv0) {
                  "                   max:      no waiting; guest time runs ahead (default with --max)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
+                 "  --no-jit         run decoded blocks without translating them to host code\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "Both serial ports are connected to this terminal; Ctrl-C quits.\n",
@@ -180,7 +181,7 @@ int main(int argc, char** argv) {
     std::string prom, nvram, screenshot;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false, headless = false, idle_skip = true, block_cache = true;
+    bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true;
     const char* timing = nullptr;
     sg::log::set_level(sg::log::Level::Warn);
 
@@ -216,6 +217,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--timing")) timing = next();
         else if (!std::strcmp(a, "--no-idle-skip")) idle_skip = false;
         else if (!std::strcmp(a, "--no-block-cache")) block_cache = false;
+        else if (!std::strcmp(a, "--no-jit")) jit = false;
         else if (!std::strcmp(a, "--no-graphics")) config.graphics = false;
         else if (!std::strcmp(a, "--log")) {
             const std::string l = next();
@@ -268,6 +270,7 @@ int main(int argc, char** argv) {
         auto& cpu = machine.cpu();
         cpu.set_idle_skip(idle_skip && !trace);
         cpu.set_block_cache(block_cache);
+        cpu.set_jit(jit);
         sg::Pacer pacer(timing_mode, machine.cycles_per_second());
         if (trace) {
             for (unsigned long long n = 0; n < max_cycles && !g_interrupted && !machine.powered_off(); ++n) {

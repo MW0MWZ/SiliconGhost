@@ -615,10 +615,10 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
         return static_cast<u32>(x % n);
     };
     auto reg = [&] { return rnd(32); };
-    auto dst = [&] {  // never s0 (the data pointer)
+    auto dst = [&] {  // never s0 (the data pointer) or s1 (the loop counter)
         unsigned r;
         do r = rnd(32);
-        while (r == s0);
+        while (r == s0 || r == s1);
         return r;
     };
     static constexpr unsigned kRFuncts[] = {0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x12, 0x18, 0x19,
@@ -628,9 +628,10 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
     static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F, 0x22, 0x26};
     static constexpr unsigned kBranches[] = {0x04, 0x05, 0x06, 0x07, 0x14, 0x15};
 
-    std::vector<u32> prog;
-    while (prog.size() + 2 < length) {
-        const unsigned room = length - 2 - static_cast<unsigned>(prog.size());
+    // The body runs several times, so that its blocks become hot.
+    std::vector<u32> prog{ADDIU(s1, zero, 12)};
+    while (prog.size() + 5 < length) {
+        const unsigned room = length - 5 - static_cast<unsigned>(prog.size());
         switch (rnd(8)) {
             case 0:
             case 1:
@@ -641,9 +642,10 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
             }
             case 3:
             case 4: prog.push_back(I(kImmOps[rnd(std::size(kImmOps))], reg(), dst(), static_cast<s32>(rnd(65536)) - 32768)); break;
-            case 5: {  // aligned for every size, within the data area
+            case 5: {  // within the data area; rarely misaligned (an address error)
                 const unsigned op = kLoadStore[rnd(std::size(kLoadStore))];
-                prog.push_back(I(op, s0, dst(), static_cast<s32>(rnd(128) * 8 + rnd(2) * (op == 0x22 || op == 0x26 ? 3 : 0))));
+                const s32 skew = (op == 0x22 || op == 0x26) ? static_cast<s32>(rnd(4)) : rnd(150) == 0 ? 1 : 0;
+                prog.push_back(I(op, s0, dst(), static_cast<s32>(rnd(128) * 8) + skew));
                 break;
             }
             case 6: {  // forward branch or jump; the delay slot is a plain instruction
@@ -663,6 +665,9 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
             default: prog.push_back(rnd(2) ? NOP : I(0x0D, reg(), dst(), static_cast<s32>(rnd(65536)))); break;
         }
     }
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, 1 - static_cast<s32>(prog.size() + 1)));
+    prog.push_back(NOP);
     prog.push_back(BEQ(zero, zero, -1));
     prog.push_back(NOP);
     return prog;
@@ -670,13 +675,20 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
 
 }  // namespace
 
-TEST(cpu_block_cache_matches_interpreter_on_random_programs) {
+enum class Engine { Interpreter, Blocks, Jit };
+
+void use_engine(Rig& t, Engine engine) {
+    t.cpu.set_block_cache(engine != Engine::Interpreter);
+    t.cpu.set_jit(engine == Engine::Jit);
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) {
     constexpr u64 kData = 0x10000;
     for (u32 seed = 1; seed <= 200; ++seed) {
         const std::vector<u32> prog = random_program(seed, 600);
-        auto run = [&](bool blocks) {
+        auto run = [&](Engine engine) {
             Rig t;
-            t.cpu.set_block_cache(blocks);
+            use_engine(t, engine);
             t.cpu.set_idle_skip(false);
             u64 x = seed;
             for (unsigned i = 1; i < 32; ++i) {
@@ -690,22 +702,22 @@ TEST(cpu_block_cache_matches_interpreter_on_random_programs) {
                 t.w32(paddr, w);
                 paddr += 4;
             }
-            t.load({BEQ(zero, zero, -1), NOP}, 0x180);  // exceptions (overflow) end up here
-            t.cpu.run_until(3000);
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);  // exceptions end up here
+            t.cpu.run_until(20000);
             return capture(t, kData, 0x800);
         };
-        const CpuState reference = run(false);
-        if (!(run(true) == reference)) {
+        const CpuState reference = run(Engine::Interpreter);
+        if (!(run(Engine::Blocks) == reference) || !(run(Engine::Jit) == reference)) {
             CHECK_EQ(seed, 0u);  // report the failing seed
             break;
         }
     }
 }
 
-TEST(cpu_linked_blocks_match_interpreter_with_timer_interrupts) {
-    auto run = [](bool blocks) {
+TEST(cpu_linked_blocks_and_jit_match_interpreter_with_timer_interrupts) {
+    auto run = [](Engine engine) {
         Rig t;
-        t.cpu.set_block_cache(blocks);
+        use_engine(t, engine);
         t.cpu.set_idle_skip(false);
         // Main loop: re-arm Compare every 8 iterations; t3 counts interrupts.
         t.load({
@@ -723,8 +735,59 @@ TEST(cpu_linked_blocks_match_interpreter_with_timer_interrupts) {
         t.cpu.run_until(40000);
         return capture(t, 0, 0);
     };
-    const CpuState reference = run(false);
-    CHECK(run(true) == reference);
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
     CHECK(reference.gpr[t3] > 10u);
     CHECK_EQ(reference.gpr[t0], 3000u);
+}
+
+TEST(cpu_jit_drops_translated_code_when_it_is_overwritten) {
+    for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        // A hot loop adds t4 to t2; after 50 passes it patches its own add
+        // into "addiu t2, t2, 100" and keeps going until t0 reaches 80.
+        t.cpu.gpr[t5] = ADDIU(t2, t2, 100);
+        t.cpu.gpr[t6] = 0xFFFFFFFF80001008ull;
+        t.cpu.gpr[t4] = 1;
+        t.load({
+            ADDIU(t1, zero, 50), ADDIU(t3, zero, 80),
+            ADDU(t2, t2, t4),          // 1008: patched
+            ADDIU(t0, t0, 1),
+            BNE(t0, t1, 2), NOP,       // 1010
+            SW(t5, 0, t6), NOP,        // 1018: once, at t0 == 50
+            BNE(t0, t3, -7), NOP,      // 1020 -> 1008
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.cpu.run_until(5000);
+        CHECK_EQ(t.cpu.gpr[t0], 80u);
+        CHECK_EQ(t.cpu.gpr[t2], 50u + 30u * 100u);
+    }
+}
+
+TEST(cpu_jit_self_loop_takes_interrupts_where_the_interpreter_does) {
+    auto run = [](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.load({
+            ADDIU(t1, zero, 5000),
+            ADDIU(t0, t0, 1),     // 1004: a block that branches to itself
+            ADDU(t2, t2, t0),
+            BNE(t0, t1, -3), NOP,
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.load({ADDIU(t3, t3, 1), MFC0(k0, cop0::Count), ADDIU(k0, k0, 150), MTC0(k0, cop0::Compare), ERET}, 0x180);
+        t.cpu.cp0_write(cop0::Compare, 77);
+        t.cpu.cp0_write(cop0::Status, sr::IE | (0x80u << 8));
+        t.cpu.run_until(30000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK(reference.gpr[t3] > 20u);
+    CHECK_EQ(reference.gpr[t0], 5000u);
 }

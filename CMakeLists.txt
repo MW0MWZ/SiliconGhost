@@ -30,10 +30,12 @@ add_library(sg_emu STATIC
   src/core/log.cpp
   src/core/pacer.cpp
   src/core/scheduler.cpp
+  src/jit/exec_buffer.cpp
   src/mem/bus.cpp
   src/cpu/r4000/r4000.cpp
   src/cpu/r4000/disasm.cpp
   src/cpu/r4000/fpu.cpp
+  src/cpu/r4000/jit_x64.cpp
   src/devices/ds1386.cpp
   src/devices/eeprom93cxx.cpp
   src/devices/kbc8042.cpp

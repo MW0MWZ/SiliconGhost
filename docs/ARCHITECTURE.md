@@ -103,8 +103,21 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    uncommon instructions fall back to the interpreter's `execute()`. Blocks
    are linked within a 4 KiB page: when a block ends, execution continues
    directly with the block at the new pc while the mode and the page's
-   translation are unchanged. Next step: translation to host code on the
-   same block structure.
+   translation are unchanged.
+5. **x86-64 recompiler (first stage, in place):** a block that has run eight
+   times is translated into one host function (`src/cpu/r4000/jit_x64.cpp`,
+   with a small encoder in `src/jit/`). Register operations and RAM loads
+   and stores are emitted inline, the latter with the soft-TLB lookup;
+   misses, MMIO, unaligned addresses and pages holding translated code take
+   the handler path. Other instructions call their handlers with the same
+   bookkeeping as the block loop, and the function returns early wherever
+   the block loop would stop, so the two always agree. A block that branches
+   back to itself loops inside the function while the next pass fits before
+   the next timer or run-limit check. Generated code lives in a buffer
+   mapped twice (writable, executable); when it fills, all translations are
+   dropped. `--no-jit` turns the recompiler off. Next: branches and jumps
+   inline, direct links between translated blocks, keeping guest registers
+   in host registers, then an AArch64 back end.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
    with the same registers and stored the same values to the same RAM

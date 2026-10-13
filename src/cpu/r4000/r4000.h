@@ -9,12 +9,16 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "core/types.h"
 
 namespace sg {
 class Bus;
+namespace jit {
+class ExecBuffer;
+}
 }
 
 namespace sg::mips {
@@ -122,6 +126,7 @@ public:
 
     explicit R4000(Bus& bus) : R4000(bus, Options{}) {}
     R4000(Bus& bus, const Options& options);
+    ~R4000();
 
     void reset();
     void step();
@@ -178,6 +183,9 @@ public:
         block_cache_ = enabled;
         flush_blocks();
     }
+    // Dynamic recompiler: hot blocks are translated to host code (x86-64;
+    // elsewhere this is a no-op). Results are identical to step().
+    void set_jit(bool enabled);
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
     u64 change_epoch() const { return change_epoch_; }
@@ -234,12 +242,23 @@ private:
     // `plain`: a register-only operation that cannot raise an exception and
     // reads neither the pc nor the time, so it runs without bookkeeping.
     static Handler decode(u32 inst, bool& plain);
+    // Translated block: runs the block from its start, returns the number
+    // of instructions completed (see jit_x64.cpp).
+    using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 time_fp);
+    static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 count = 0;
         u32 plain = 0;             // bit i: ops[i] is plain (never a delay slot)
+        u32 runs = 0;
+        JitFn code = nullptr;
+        bool jit_addr64 = false;  // addressing mode the code was translated for
         Op ops[kMaxBlockLength];
     };
+    static bool is_branch_word(u32 w);
+    bool jit_compile(Block& b);  // false if the code buffer is full
+    static bool jit_compile_supported();
+    void jit_flush();
     static unsigned block_index(const u8* host) {
         return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
     }
@@ -351,6 +370,8 @@ private:
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
     std::vector<Block> blocks_;
+    std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
+    u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
     u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 
