@@ -164,6 +164,25 @@ TEST(cpu_misaligned_load_raises_adel) {
     CHECK_EQ(t.cpu.cp0_read(cop0::BadVAddr), 0xFFFFFFFF80002001ull);
 }
 
+TEST(cpu_32bit_addressing_wraps_effective_address) {
+    Rig t;
+    t.w32(0x2010, 0xCAFEF00D);
+    t.cpu.gpr[t0] = 0x000000007FFFFFF0ull;  // base + offset crosses 2 GiB
+    t.load({LW(t1, 0x2020, t0)});
+    t.steps(1);
+    CHECK_EQ(t.cpu.gpr[t1], 0xFFFFFFFFCAFEF00Dull);  // read from kseg0 0x80002010
+    CHECK_EQ(t.cpu.pc, kCode + 4);
+}
+
+TEST(cpu_64bit_addressing_does_not_wrap) {
+    Rig t;
+    t.cpu.cp0_write(cop0::Status, sr::KX);
+    t.cpu.gpr[t0] = 0x000000007FFFFFF0ull;
+    t.load({LW(t1, 0x2020, t0)});
+    t.steps(1);
+    CHECK_EQ(t.cpu.pc, kRefillVector + 0x80);  // xkuseg 0x80002010: XTLB refill
+}
+
 TEST(cpu_kseg0_kseg1_alias) {
     Rig t;
     t.cpu.gpr[t0] = 0xFFFFFFFF80002000ull;

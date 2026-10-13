@@ -155,6 +155,8 @@ void R4000::reschedule_timer() {
 // ---------------------------------------------------------------------------
 
 void R4000::raise(Exc code, bool tlb_refill, bool xtlb, unsigned ce) {
+    if (exception_hook) [[unlikely]]
+        exception_hook(static_cast<unsigned>(code), cur_pc_, status_);
     const bool exl = (status_ & sr::EXL) != 0;
     if (!exl) {
         epc_ = in_delay_ ? cur_pc_ - 4 : cur_pc_;
@@ -197,6 +199,11 @@ void R4000::update_mode() {
             case 1: mode_ = kSupervisor; break;
             default: mode_ = kUser; break;
         }
+    }
+    switch (mode_) {
+        case kUser: addr64_ = (status_ & sr::UX) != 0; break;
+        case kSupervisor: addr64_ = (status_ & sr::SX) != 0; break;
+        default: addr64_ = (status_ & sr::KX) != 0; break;
     }
 }
 
@@ -507,7 +514,7 @@ void R4000::execute(u32 inst) {
             break;
         case 0x1A: {  // LDL
             SG_REQUIRE_64BIT();
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (va & 7);
             u64 d;
             if (!load_containing<u64>(va, d)) return;
@@ -516,7 +523,7 @@ void R4000::execute(u32 inst) {
         }
         case 0x1B: {  // LDR
             SG_REQUIRE_64BIT();
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (7 - (va & 7));
             u64 d;
             if (!load_containing<u64>(va, d)) return;
@@ -525,16 +532,16 @@ void R4000::execute(u32 inst) {
         }
         case 0x20: {  // LB
             u8 v;
-            if (load<u8>(r[rs] + simm, v)) r[rt] = sext8(v);
+            if (load<u8>(effective_address(r[rs], simm), v)) r[rt] = sext8(v);
             break;
         }
         case 0x21: {  // LH
             u16 v;
-            if (load<u16>(r[rs] + simm, v)) r[rt] = sext16(v);
+            if (load<u16>(effective_address(r[rs], simm), v)) r[rt] = sext16(v);
             break;
         }
         case 0x22: {  // LWL
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (va & 3);
             u32 w;
             if (!load_containing<u32>(va, w)) return;
@@ -544,21 +551,21 @@ void R4000::execute(u32 inst) {
         }
         case 0x23: {  // LW
             u32 v;
-            if (load<u32>(r[rs] + simm, v)) r[rt] = sext32(v);
+            if (load<u32>(effective_address(r[rs], simm), v)) r[rt] = sext32(v);
             break;
         }
         case 0x24: {  // LBU
             u8 v;
-            if (load<u8>(r[rs] + simm, v)) r[rt] = v;
+            if (load<u8>(effective_address(r[rs], simm), v)) r[rt] = v;
             break;
         }
         case 0x25: {  // LHU
             u16 v;
-            if (load<u16>(r[rs] + simm, v)) r[rt] = v;
+            if (load<u16>(effective_address(r[rs], simm), v)) r[rt] = v;
             break;
         }
         case 0x26: {  // LWR
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned b = va & 3;
             const unsigned sh = 8 * (3 - b);
             u32 w;
@@ -571,41 +578,41 @@ void R4000::execute(u32 inst) {
         case 0x27: {  // LWU
             SG_REQUIRE_64BIT();
             u32 v;
-            if (load<u32>(r[rs] + simm, v)) r[rt] = v;
+            if (load<u32>(effective_address(r[rs], simm), v)) r[rt] = v;
             break;
         }
-        case 0x28: store<u8>(r[rs] + simm, static_cast<u8>(r[rt])); break;    // SB
-        case 0x29: store<u16>(r[rs] + simm, static_cast<u16>(r[rt])); break;  // SH
+        case 0x28: store<u8>(effective_address(r[rs], simm), static_cast<u8>(r[rt])); break;    // SB
+        case 0x29: store<u16>(effective_address(r[rs], simm), static_cast<u16>(r[rt])); break;  // SH
         case 0x2A: {                                                           // SWL
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (va & 3);
             merge_store<u32>(va, static_cast<u32>(r[rt]) >> sh, ~(0xFFFFFFFFu >> sh));
             break;
         }
-        case 0x2B: store<u32>(r[rs] + simm, static_cast<u32>(r[rt])); break;  // SW
+        case 0x2B: store<u32>(effective_address(r[rs], simm), static_cast<u32>(r[rt])); break;  // SW
         case 0x2C: {                                                           // SDL
             SG_REQUIRE_64BIT();
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (va & 7);
             merge_store<u64>(va, r[rt] >> sh, ~(~u64{0} >> sh));
             break;
         }
         case 0x2D: {  // SDR
             SG_REQUIRE_64BIT();
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (7 - (va & 7));
             merge_store<u64>(va, r[rt] << sh, ~(~u64{0} << sh));
             break;
         }
         case 0x2E: {  // SWR
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             const unsigned sh = 8 * (3 - (va & 3));
             merge_store<u32>(va, static_cast<u32>(r[rt]) << sh, ~(0xFFFFFFFFu << sh));
             break;
         }
         case 0x2F: execute_cache(inst); break;  // CACHE
         case 0x30: {  // LL
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             u32 v;
             if (!load<u32>(va, v)) return;
             u64 paddr = 0;
@@ -617,7 +624,7 @@ void R4000::execute(u32 inst) {
         }
         case 0x34: {  // LLD
             SG_REQUIRE_64BIT();
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             u64 v;
             if (!load<u64>(va, v)) return;
             u64 paddr = 0;
@@ -630,12 +637,12 @@ void R4000::execute(u32 inst) {
         case 0x37: {  // LD
             SG_REQUIRE_64BIT();
             u64 v;
-            if (load<u64>(r[rs] + simm, v)) r[rt] = v;
+            if (load<u64>(effective_address(r[rs], simm), v)) r[rt] = v;
             break;
         }
         case 0x38:  // SC
             if (llbit_) {
-                if (!store<u32>(r[rs] + simm, static_cast<u32>(r[rt]))) return;
+                if (!store<u32>(effective_address(r[rs], simm), static_cast<u32>(r[rt]))) return;
                 r[rt] = 1;
             } else {
                 r[rt] = 0;
@@ -644,7 +651,7 @@ void R4000::execute(u32 inst) {
         case 0x3C:  // SCD
             SG_REQUIRE_64BIT();
             if (llbit_) {
-                if (!store<u64>(r[rs] + simm, r[rt])) return;
+                if (!store<u64>(effective_address(r[rs], simm), r[rt])) return;
                 r[rt] = 1;
             } else {
                 r[rt] = 0;
@@ -652,7 +659,7 @@ void R4000::execute(u32 inst) {
             break;
         case 0x3F:  // SD
             SG_REQUIRE_64BIT();
-            store<u64>(r[rs] + simm, r[rt]);
+            store<u64>(effective_address(r[rs], simm), r[rt]);
             break;
 
         // FPU loads/stores
@@ -665,7 +672,7 @@ void R4000::execute(u32 inst) {
                 raise(Exc::CpU, false, false, 1);
                 return;
             }
-            const u64 va = r[rs] + simm;
+            const u64 va = effective_address(r[rs], simm);
             switch (inst >> 26) {
                 case 0x31: {
                     u32 v;
@@ -1156,7 +1163,7 @@ void R4000::execute_cache(u32 inst) {
         return;
     }
     const unsigned op = f_rt(inst);
-    const u64 vaddr = gpr[f_rs(inst)] + f_simm(inst);
+    const u64 vaddr = effective_address(gpr[f_rs(inst)], f_simm(inst));
     u64 paddr;
     if (!translate<true>(vaddr, Access::Load, paddr)) return;
 

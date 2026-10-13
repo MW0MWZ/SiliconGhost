@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <vector>
 
 #include "core/types.h"
@@ -148,6 +149,10 @@ public:
     const TlbEntry& tlb_entry(unsigned i) const { return tlb_[i]; }
     u64 cycles() const { return cycles_; }
 
+    // Debugger hook, called as each exception is taken: (ExcCode, faulting PC,
+    // Status before the exception).
+    std::function<void(unsigned code, u64 pc, u64 status)> exception_hook;
+
     // Side-effect-free translation and read, for debuggers and tracing.
     bool debug_translate(u64 vaddr, u64& paddr) const;
     bool debug_read32(u64 vaddr, u32& value) const;
@@ -229,6 +234,12 @@ private:
     void flush_fast_tlb();
     void update_mode();
     bool ops64_enabled() const;
+    // Load/store address: a full 64-bit sum with 64-bit addressing, otherwise
+    // the 32-bit sum sign-extended (32-bit binaries rely on the wrap).
+    u64 effective_address(u64 base, u64 offset) const {
+        const u64 a = base + offset;
+        return addr64_ ? a : static_cast<u64>(static_cast<s64>(static_cast<s32>(a)));
+    }
     bool cop0_usable() const { return mode_ == kKernel || mode_ == kKernelErl || (status_ & sr::CU0); }
 
     // Memory access (return false if an exception was raised)
@@ -270,6 +281,7 @@ private:
     u64 cycles_ = 0;
     u64 timer_event_ = ~u64{0};
     unsigned mode_ = kKernelErl;
+    bool addr64_ = false;  // 64-bit addressing in the current mode (KX/SX/UX)
 
     // COP0
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
