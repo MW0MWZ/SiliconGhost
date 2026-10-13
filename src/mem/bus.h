@@ -24,6 +24,16 @@ public:
     // Return false to signal a bus error to the requester.
     virtual bool read(u32 offset, unsigned size, u64& value) = 0;
     virtual bool write(u32 offset, unsigned size, u64 value) = 0;
+
+    // True if reading this register has no side effects and its value can
+    // only change through a scheduled event, a write, or input delivered
+    // between run slices. The CPU's idle detection may then treat a loop
+    // polling it as a spin. Conservative default: no.
+    virtual bool read_is_pure(u32 offset, unsigned size) const {
+        (void)offset;
+        (void)size;
+        return false;
+    }
 };
 
 class Bus {
@@ -51,6 +61,12 @@ public:
     // up to the handler (on IP22 the MC raises an interrupt).
     using ErrorHandler = std::function<void(u64 paddr, unsigned size, bool is_write)>;
     void set_error_handler(ErrorHandler handler) { error_handler_ = std::move(handler); }
+
+    // See Device::read_is_pure. RAM and ROM reads are always pure.
+    bool read_is_pure(u64 paddr, unsigned size) const;
+
+    // Debugger hook: every device (MMIO) read, after it completes.
+    std::function<void(u64 paddr, unsigned size, u64 value)> device_read_hook;
 
     template <typename T>
     SG_FORCEINLINE bool read(u64 paddr, T& out) {

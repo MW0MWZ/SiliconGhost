@@ -419,3 +419,70 @@ TEST(cpu_fractional_cycles_per_instruction) {
     CHECK_EQ(t.cpu.instructions(), 4000u);
     CHECK_EQ(t.cpu.cp0_read(cop0::Count), 500u);  // Count follows guest cycles, not instructions
 }
+
+namespace {
+// A device register whose value never changes; `pure` says whether reading
+// it is declared side-effect free.
+struct StatusDevice final : Device {
+    bool pure;
+    unsigned reads = 0;
+    explicit StatusDevice(bool p) : pure(p) {}
+    const char* name() const override { return "status"; }
+    bool read(u32, unsigned, u64& v) override {
+        ++reads;
+        v = 0x80;
+        return true;
+    }
+    bool write(u32, unsigned, u64) override { return true; }
+    bool read_is_pure(u32, unsigned) const override { return pure; }
+};
+
+// The PROM's console wait in miniature: poll a status register, store two
+// different values to the same stack slot (as calls at the same depth do),
+// count down a delay, repeat.
+void load_poll_program(Rig& t, StatusDevice& dev) {
+    t.bus.map_device(0x1F000000, Bus::kPageSize, &dev);
+    t.cpu.gpr[t0] = 0xFFFFFFFFBF000000ull;  // kseg1: the device
+    t.cpu.gpr[sp] = 0xFFFFFFFF80003000ull;
+    t.cpu.gpr[s0] = 0x1234;
+    t.cpu.gpr[s1] = 0x5678;
+    t.load({
+        LW(t1, 0, t0),             // 1000: poll
+        SW(s0, 0, sp),             // 1004: the slot changes within a pass...
+        SW(s1, 0, sp),             // 1008: ...but ends each pass the same
+        ADDIU(t4, zero, 20),       // 100c: delay count
+        ADDIU(t4, t4, -1),         // 1010: delay loop
+        BNE(t4, zero, -2), NOP,    // 1014
+        BEQ(zero, zero, -8), NOP,  // 101c: back to the poll
+    });
+    t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+    t.cpu.cp0_write(cop0::Compare, 50000);
+    t.cpu.cp0_write(cop0::Status, sr::IE | (1u << 15));
+}
+}  // namespace
+
+TEST(cpu_idle_skip_nested_poll_loop_with_pure_device_read) {
+    Rig fast, slow;
+    StatusDevice dev_fast(true), dev_slow(true);
+    load_poll_program(fast, dev_fast);
+    load_poll_program(slow, dev_slow);
+    slow.cpu.set_idle_skip(false);
+    fast.cpu.run_until(150000);
+    slow.cpu.run_until(150000);
+    CHECK_EQ(fast.cpu.cycles(), slow.cpu.cycles());
+    CHECK_EQ(fast.cpu.pc, slow.cpu.pc);
+    CHECK_EQ(fast.cpu.cp0_read(cop0::EPC), slow.cpu.cp0_read(cop0::EPC));
+    CHECK_EQ(fast.cpu.cp0_read(cop0::Cause), slow.cpu.cp0_read(cop0::Cause));
+    CHECK_EQ(fast.cpu.gpr[t4], slow.cpu.gpr[t4]);
+    CHECK(fast.cpu.idle_skipped_cycles() > 140000);
+    CHECK(dev_fast.reads < dev_slow.reads / 100);
+}
+
+TEST(cpu_idle_skip_never_skips_impure_device_reads) {
+    Rig t;
+    StatusDevice dev(false);
+    load_poll_program(t, dev);
+    t.cpu.run_until(40000);
+    CHECK_EQ(t.cpu.idle_skipped_cycles(), 0u);
+    CHECK_EQ(t.cpu.instructions(), 40000u);
+}

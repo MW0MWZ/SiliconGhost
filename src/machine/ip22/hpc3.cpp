@@ -161,6 +161,15 @@ bool Hpc3::read(u32 offset, unsigned size, u64& value) {
     return true;
 }
 
+bool Hpc3::read_is_pure(u32 offset, unsigned size) const {
+    if (offset >= kIocWindow && offset < kIocWindowEnd) {
+        const u32 o = size == 8 ? offset + 4 : offset;
+        const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
+        return idx < 0 || ioc_.read_is_pure(static_cast<unsigned>(idx));
+    }
+    return false;
+}
+
 bool Hpc3::write(u32 offset, unsigned size, u64 value) {
     if (offset >= kScsi0Window && offset < kScsi0WindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;

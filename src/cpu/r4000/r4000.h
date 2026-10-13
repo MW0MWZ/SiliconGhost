@@ -161,12 +161,17 @@ public:
     void set_cycles_per_instruction(double cpi);
     double cycles_per_instruction() const { return static_cast<double>(weight_) / (1u << kCycleFracBits); }
 
-    // Idle skipping: a short loop that repeats with identical registers and
-    // touches nothing but RAM loads is fast-forwarded, in whole iterations,
-    // to the next timer or device event. The guest state is the same as if
-    // every iteration had run.
+    // Idle skipping: a loop is a spin when two consecutive iterations (visits
+    // to the same backward branch) end with the same registers and have
+    // stored the same values to the same RAM locations, with no other side
+    // effect (device access other than pure reads, exceptions, CP0/FPU
+    // state). The machine state is then identical at every visit, so the loop
+    // is fast-forwarded in whole iterations to the next timer or device
+    // event; the guest ends up exactly where it would have by spinning.
     void set_idle_skip(bool enabled) { idle_skip_ = enabled; }
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
+    // Debugger view: bumped by every side effect that rules out idle skipping.
+    u64 change_epoch() const { return change_epoch_; }
 
     // Debugger hook, called as each exception is taken: (ExcCode, faulting PC,
     // Status before the exception).
@@ -219,14 +224,14 @@ private:
         next_delay_ = true;
         if (taken) {
             npc_ = target;
-            if (target <= cur_pc_) loop_watch_ = target;  // candidate loop head
+            if (target <= cur_pc_) backward_branch(target);
         }
     }
     void branch_likely(bool taken, u64 target) {
         if (taken) {
             next_delay_ = true;
             npc_ = target;
-            if (target <= cur_pc_) loop_watch_ = target;
+            if (target <= cur_pc_) backward_branch(target);
         } else {  // nullify the delay slot
             pc = npc_;
             npc_ = pc + 4;
@@ -289,9 +294,8 @@ private:
     u32 count() const { return static_cast<u32>(count_offset_ + static_cast<u32>(cycles() >> 1)); }
 
     // Idle detection
-    void loop_head_reached();
     void skip_idle(u64 limit_cycle);
-    void touch() { loop_dirty_ = true; }  // a side effect that rules out idle skipping
+    void touch() { ++change_epoch_; }  // a side effect that rules out idle skipping
 
     // FPU register file views (FR=0: 16 64-bit regs as 32 32-bit halves)
     u32 fpr_read32(unsigned n) const;
@@ -313,16 +317,54 @@ private:
     u64 instret_base_ = 0, instret_time_fp_ = 0, instret_skip_fp_ = 0;  // instructions() at the last re-base
     u64 timer_event_fp_ = ~u64{0};             // Count == Compare, in time_fp_ units
 
+    // Loops are tracked per backward branch (nested loops each get an entry),
+    // in a small direct-mapped table.
+    // Every RAM store is logged (address and size) in a ring; an iteration's
+    // stores are the entries made since its loop's previous visit.
+    static constexpr unsigned kStoreLogBits = 7;
+    struct StoreRec {
+        const u8* host = nullptr;
+        unsigned size = 0;
+        u64 value = 0;  // at the end of the iteration (snapshots only)
+    };
+    struct LoopEntry {
+        u64 branch_pc = ~u64{0};
+        u64 time_fp = 0;    // time of the previous visit
+        u64 epoch = 0;      // change_epoch_ at the previous visit
+        u64 weight_epoch = 0;
+        u64 store_pos = 0;  // store_count_ at the previous visit
+        u64 period_fp = 0;  // length of the iteration the snapshot belongs to
+        unsigned cooldown = 0;
+        bool have_snapshot = false;
+        std::array<u64, 34> regs{};  // GPRs, HI, LO
+        unsigned nstores = 0;
+        std::array<StoreRec, 1u << kStoreLogBits> stores{};
+    };
+    void log_store(const u8* host, unsigned size) {
+        store_log_[store_count_ & ((1u << kStoreLogBits) - 1)] = {host, size, 0};
+        ++store_count_;
+    }
+    bool snapshot_matches(const LoopEntry& e, u64 period, unsigned nstores) const;
+    void take_snapshot(LoopEntry& e, u64 period, unsigned nstores);
+    void backward_branch(u64 target) {
+        // Loops known to make progress are left alone for a while, cheaply.
+        LoopEntry& e = loops_[(cur_pc_ >> 2) & ((1u << kLoopTableBits) - 1)];
+        if (e.branch_pc == cur_pc_ && e.cooldown) {
+            if (--e.cooldown == 0) e.branch_pc = ~u64{0};  // start afresh afterwards
+            return;
+        }
+        loop_visit(e, target);
+    }
+    void loop_visit(LoopEntry& e, u64 target);
+    static constexpr unsigned kLoopTableBits = 4;
     bool idle_skip_ = true;
-    u64 loop_watch_ = ~u64{0};      // target of the last backward branch
-    u64 loop_head_ = ~u64{0};       // loop head being examined
-    u64 loop_time_fp_ = 0;          // time at the previous visit
-    u64 loop_period_fp_ = 0;        // length of one iteration
-    bool loop_dirty_ = false;       // side effect since the previous visit
-    bool loop_have_snapshot_ = false;
-    bool idle_ready_ = false;       // confirmed spin: skip once the head instruction ran
-    unsigned loop_cooldown_ = 0;
-    std::array<u64, 34> loop_regs_{};  // GPRs, HI, LO at the previous visit
+    u64 change_epoch_ = 0;  // bumped by every side effect
+    u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
+    u64 store_count_ = 0;
+    std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
+    std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    bool idle_ready_ = false;  // confirmed spin: skip once the branch has executed
+    u64 idle_period_fp_ = 0;
     u64 idle_skipped_fp_ = 0;
     unsigned mode_ = kKernelErl;
     bool addr64_ = false;  // 64-bit addressing in the current mode (KX/SX/UX)

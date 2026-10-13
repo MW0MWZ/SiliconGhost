@@ -25,6 +25,8 @@ public:
 
     void reset();
     u8 read_control(unsigned ch);
+    // Reading the control port is side-effect free only for RR0 (pointer 0).
+    bool control_read_is_pure(unsigned ch) const { return chan_[ch].pointer == 0; }
     void write_control(unsigned ch, u8 value);
     u8 read_data(unsigned ch);
     void write_data(unsigned ch, u8 value);

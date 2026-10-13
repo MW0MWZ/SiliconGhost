@@ -136,6 +136,35 @@ u8 Ioc2::read(unsigned index) {
     }
 }
 
+// Status and configuration registers are plain state; data ports (which
+// consume input) and the 8254 counters (which move with time) are not.
+bool Ioc2::read_is_pure(unsigned index) const {
+    if (index < pport_.size()) return true;
+    switch (index) {
+        case kSccBCtrl: return scc_.control_read_is_pure(1);
+        case kSccACtrl: return scc_.control_read_is_pure(0);
+        case kKbdCmd:
+        case kGcSel:
+        case kGenCtrl:
+        case kRead:
+        case kPanel:
+        case kSysId:
+        case kDmaSel:
+        case kReset:
+        case kWrite:
+        case kL0Status:
+        case kL0Mask:
+        case kL1Status:
+        case kL1Mask:
+        case kMapStatus:
+        case kMapMask0:
+        case kMapMask1:
+        case kMapPol:
+        case kErrStat: return true;
+        default: return false;
+    }
+}
+
 void Ioc2::write(unsigned index, u8 value) {
     if (index < pport_.size()) {
         pport_[index] = value;

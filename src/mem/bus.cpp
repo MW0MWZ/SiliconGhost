@@ -47,10 +47,21 @@ u8* Bus::host_write_ptr(u64 paddr) const {
     return (p.host && p.writable) ? p.host + (paddr & kPageMask) : nullptr;
 }
 
+bool Bus::read_is_pure(u64 paddr, unsigned size) const {
+    if ((paddr >> 32) != 0) return false;
+    const Page& p = pages_[paddr >> kPageShift];
+    if (p.host) return true;
+    return p.device && p.device->read_is_pure(static_cast<u32>(paddr) - p.device_base, size);
+}
+
 bool Bus::read_slow(u64 paddr, unsigned size, u64& out) {
     if ((paddr >> 32) == 0) {
         const Page& p = pages_[paddr >> kPageShift];
-        if (p.device && p.device->read(static_cast<u32>(paddr) - p.device_base, size, out)) return true;
+        if (p.device && p.device->read(static_cast<u32>(paddr) - p.device_base, size, out)) {
+            if (device_read_hook) [[unlikely]]
+                device_read_hook(paddr, size, out);
+            return true;
+        }
     }
     SG_LOG(Debug, "bus", "bus error: read%u @ %09llx", size * 8, static_cast<unsigned long long>(paddr));
     if (error_handler_) error_handler_(paddr, size, false);

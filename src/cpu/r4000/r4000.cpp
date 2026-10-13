@@ -79,8 +79,8 @@ void R4000::reset() {
 
     // The cycle counter is the machine's master clock and keeps running
     // through a reset (Count's value after reset is undefined anyway).
-    loop_watch_ = loop_head_ = ~u64{0};
-    loop_have_snapshot_ = idle_ready_ = false;
+    loops_.fill(LoopEntry{});
+    idle_ready_ = false;
     in_delay_ = false;
     update_mode();
     flush_fast_tlb();
@@ -95,7 +95,6 @@ void R4000::reset() {
 SG_FORCEINLINE void R4000::step_inline() {
     time_fp_ += weight_;
     if (SG_UNLIKELY(time_fp_ >= timer_event_fp_)) timer_fire();
-    if (SG_UNLIKELY(pc == loop_watch_) && !next_delay_) loop_head_reached();
 
     cur_pc_ = pc;
     in_delay_ = next_delay_;
@@ -149,6 +148,7 @@ void R4000::set_cycles_per_instruction(double cpi) {
     instret_time_fp_ = time_fp_;
     instret_skip_fp_ = idle_skipped_fp_;
     weight_ = weight;
+    ++weight_epoch_;  // iteration lengths measured in guest time are no longer comparable
 }
 
 // ---------------------------------------------------------------------------
@@ -156,42 +156,77 @@ void R4000::set_cycles_per_instruction(double cpi) {
 // ---------------------------------------------------------------------------
 
 namespace {
-constexpr u64 kMaxIdleLoopInstructions = 64;
-constexpr unsigned kIdleCooldown = 256;  // visits to ignore after a loop proved not idle
+constexpr u64 kMaxIdleLoopInstructions = 4096;
+constexpr unsigned kIdleCooldown = 1024;  // visits to ignore after a loop proved not idle
 }  // namespace
 
-// Called on arriving at the target of a taken backward branch. A loop is a
-// spin when, between two visits, nothing but RAM loads happened (no stores,
-// device access, exceptions or CP0/FPU side effects) and the integer
-// registers came back identical: every further iteration is then the same
-// until an interrupt or device event changes something.
-void R4000::loop_head_reached() {
+namespace {
+u64 read_host(const u8* p, unsigned size) {
+    switch (size) {
+        case 1: return *p;
+        case 2: return load_be<u16>(p);
+        case 4: return load_be<u32>(p);
+        default: return load_be<u64>(p);
+    }
+}
+}  // namespace
+
+// The previous iteration's registers, stores (locations and the values they
+// were left holding) and length, compared with the iteration just finished.
+bool R4000::snapshot_matches(const LoopEntry& e, u64 period, unsigned nstores) const {
+    if (!e.have_snapshot || period != e.period_fp || nstores != e.nstores || e.regs[32] != hi || e.regs[33] != lo ||
+        !std::equal(gpr.begin(), gpr.end(), e.regs.begin()))
+        return false;
+    constexpr u64 mask = (1u << kStoreLogBits) - 1;
+    for (unsigned i = 0; i < nstores; ++i) {
+        const StoreRec& now = store_log_[(store_count_ - nstores + i) & mask];
+        const StoreRec& then = e.stores[i];
+        if (now.host != then.host || now.size != then.size || read_host(now.host, now.size) != then.value) return false;
+    }
+    return true;
+}
+
+void R4000::take_snapshot(LoopEntry& e, u64 period, unsigned nstores) {
+    std::copy(gpr.begin(), gpr.end(), e.regs.begin());
+    e.regs[32] = hi;
+    e.regs[33] = lo;
+    constexpr u64 mask = (1u << kStoreLogBits) - 1;
+    for (unsigned i = 0; i < nstores; ++i) {
+        StoreRec r = store_log_[(store_count_ - nstores + i) & mask];
+        r.value = read_host(r.host, r.size);
+        e.stores[i] = r;
+    }
+    e.nstores = nstores;
+    e.period_fp = period;
+    e.have_snapshot = true;
+}
+
+// Called when a branch to an earlier address is taken; see set_idle_skip().
+void R4000::loop_visit(LoopEntry& e, u64 target) {
+    (void)target;
     if (!idle_skip_) return;
-    const u64 period = time_fp_ - loop_time_fp_;
-    const bool same = pc == loop_head_ && !loop_dirty_ && period <= kMaxIdleLoopInstructions * weight_;
-    loop_dirty_ = false;
-    loop_time_fp_ = time_fp_;
+    const u64 period = time_fp_ - e.time_fp;
+    const u64 stores = store_count_ - e.store_pos;
+    const bool same = e.branch_pc == cur_pc_ && e.epoch == change_epoch_ && e.weight_epoch == weight_epoch_ &&
+                      period <= kMaxIdleLoopInstructions * weight_ && stores <= (1u << kStoreLogBits);
+    e.time_fp = time_fp_;
+    e.epoch = change_epoch_;
+    e.weight_epoch = weight_epoch_;
+    e.store_pos = store_count_;
     if (!same) {
-        loop_head_ = pc;
-        loop_have_snapshot_ = false;
-        loop_cooldown_ = 0;
+        e.branch_pc = cur_pc_;
+        e.have_snapshot = false;
+        e.cooldown = 0;
         return;
     }
-    if (loop_cooldown_) {
-        --loop_cooldown_;
-        return;
-    }
-    if (loop_have_snapshot_ && period == loop_period_fp_ && loop_regs_[32] == hi && loop_regs_[33] == lo &&
-        std::equal(gpr.begin(), gpr.end(), loop_regs_.begin())) {
+    const unsigned n = static_cast<unsigned>(stores);
+    if (snapshot_matches(e, period, n)) {
+        idle_period_fp_ = period;
         idle_ready_ = true;
         return;
     }
-    if (loop_have_snapshot_) loop_cooldown_ = kIdleCooldown;  // a loop, but one that makes progress
-    std::copy(gpr.begin(), gpr.end(), loop_regs_.begin());
-    loop_regs_[32] = hi;
-    loop_regs_[33] = lo;
-    loop_period_fp_ = period;
-    loop_have_snapshot_ = true;
+    if (e.have_snapshot) e.cooldown = kIdleCooldown;  // a loop, but one that makes progress
+    take_snapshot(e, period, n);
 }
 
 // Fast-forwards whole iterations of a confirmed spin loop, stopping strictly
@@ -199,14 +234,14 @@ void R4000::loop_head_reached() {
 // device event or the end of the run slice), so that event is taken by the
 // same instruction it would have been without skipping.
 void R4000::skip_idle(u64 limit_cycle) {
-    if (loop_period_fp_ == 0 || interrupt_pending()) return;
+    if (idle_period_fp_ == 0 || interrupt_pending()) return;
     const u64 limit_fp = std::min(limit_cycle << kCycleFracBits, timer_event_fp_);
     if (limit_fp <= time_fp_ + 1) return;
-    const u64 iterations = (limit_fp - 1 - time_fp_) / loop_period_fp_;
+    const u64 iterations = (limit_fp - 1 - time_fp_) / idle_period_fp_;
     if (iterations == 0) return;
-    const u64 advance = iterations * loop_period_fp_;
+    const u64 advance = iterations * idle_period_fp_;
     time_fp_ += advance;
-    loop_time_fp_ += advance;
+    for (LoopEntry& e : loops_) e.time_fp += advance;  // keep visit times consistent
     idle_skipped_fp_ += advance;
 }
 
@@ -433,7 +468,7 @@ bool R4000::debug_read32(u64 vaddr, u32& value) const {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::phys_read(u64 paddr, T& out, Access acc) {
-    touch();  // device registers may change between reads
+    if (acc != Access::Load || !bus_.read_is_pure(paddr, sizeof(T))) touch();
     if (SG_LIKELY(bus_.read<T>(paddr, out))) return true;
     raise(acc == Access::Fetch ? Exc::IBE : Exc::DBE);
     return false;
@@ -480,7 +515,6 @@ SG_FORCEINLINE bool R4000::load(u64 vaddr, T& out) {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::store(u64 vaddr, T value) {
-    touch();
     if (SG_UNLIKELY(vaddr & (sizeof(T) - 1))) {
         address_error(vaddr, Access::Store);
         return false;
@@ -489,7 +523,9 @@ SG_FORCEINLINE bool R4000::store(u64 vaddr, T value) {
     u64 paddr;
     if (SG_UNLIKELY(!lookup<Access::Store>(vaddr, host, paddr))) return false;
     if (SG_LIKELY(host != nullptr)) {
-        store_be<T>(host + (vaddr & 0xFFF), value);
+        u8* const p = host + (vaddr & 0xFFF);
+        log_store(p, sizeof(T));
+        store_be<T>(p, value);
         return true;
     }
     return phys_write<T>(paddr, value);
@@ -544,7 +580,12 @@ void R4000::execute(u32 inst) {
     switch (inst >> 26) {
         case 0x00: execute_special(inst); break;
         case 0x01: execute_regimm(inst); break;
-        case 0x02: jump(((cur_pc_ + 4) & ~0x0FFFFFFFull) | (u64{inst & 0x03FFFFFF} << 2)); break;  // J
+        case 0x02: {  // J
+            const u64 target = ((cur_pc_ + 4) & ~0x0FFFFFFFull) | (u64{inst & 0x03FFFFFF} << 2);
+            jump(target);
+            if (target <= cur_pc_) backward_branch(target);
+            break;
+        }
         case 0x03:                                                                              // JAL
             r[31] = cur_pc_ + 8;
             jump(((cur_pc_ + 4) & ~0x0FFFFFFFull) | (u64{inst & 0x03FFFFFF} << 2));

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 namespace sg {
@@ -76,7 +77,10 @@ double Pacer::update(u64 guest_cycles, u64 instructions) {
         // second per wall second, plus a little extra while catching up.
         double cpi = hz_ / rate_;
         if (lag > 0) cpi *= 1.0 + std::min(lag / 0.1, 1.0);
-        cpi_ = std::clamp(cpi, kMinCpi, kMaxCpi);
+        cpi = std::clamp(cpi, kMinCpi, kMaxCpi);
+        // Small corrections are not worth making: a stable charge keeps
+        // iteration lengths comparable for idle detection.
+        if (std::abs(cpi - cpi_) > 0.02 * cpi_) cpi_ = cpi;
     } else {
         cpi_ = 1.0;
     }

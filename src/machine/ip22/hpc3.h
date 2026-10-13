@@ -26,6 +26,7 @@ public:
     const char* name() const override { return "hpc3"; }
     bool read(u32 offset, unsigned size, u64& value) override;
     bool write(u32 offset, unsigned size, u64 value) override;
+    bool read_is_pure(u32 offset, unsigned size) const override;
 
     Ds1386& rtc() { return rtc_; }
     Eeprom93Cxx& eeprom() { return eeprom_; }
