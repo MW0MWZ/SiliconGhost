@@ -64,7 +64,8 @@ void R4000::reset() {
     entrylo0_ = entrylo1_ = context_ = xcontext_ = badvaddr_ = 0;
     entryhi_ = epc_ = errorepc_ = 0;
     llbit_ = false;
-    random_base_ = 0;
+    random_base_ = cycles();                               // Random restarts at 47
+    count_offset_ = 0u - static_cast<u32>(cycles() >> 1);  // Count restarts at 0
     tlb_.fill(TlbEntry{});
 
     // Tag arrays sized for the smallest line size the Config register allows.
@@ -76,7 +77,10 @@ void R4000::reset() {
     stag_.assign(opts_.scache_bytes / sline, 0);
     stag_stored_at_.assign(stag_.size(), kNeverStored);
 
-    cycles_ = 0;
+    // The cycle counter is the machine's master clock and keeps running
+    // through a reset (Count's value after reset is undefined anyway).
+    loop_watch_ = loop_head_ = ~u64{0};
+    loop_have_snapshot_ = idle_ready_ = false;
     in_delay_ = false;
     update_mode();
     flush_fast_tlb();
@@ -88,9 +92,10 @@ void R4000::reset() {
 // Main loop
 // ---------------------------------------------------------------------------
 
-void R4000::step() {
-    ++cycles_;
-    if (SG_UNLIKELY(cycles_ >= timer_event_)) timer_fire();
+SG_FORCEINLINE void R4000::step_inline() {
+    time_fp_ += weight_;
+    if (SG_UNLIKELY(time_fp_ >= timer_event_fp_)) timer_fire();
+    if (SG_UNLIKELY(pc == loop_watch_) && !next_delay_) loop_head_reached();
 
     cur_pc_ = pc;
     in_delay_ = next_delay_;
@@ -109,6 +114,8 @@ void R4000::step() {
     gpr[0] = 0;
 }
 
+void R4000::step() { step_inline(); }
+
 u64 R4000::run(u64 max_instructions) {
     stop_.store(false, std::memory_order_relaxed);
     u64 n = 0;
@@ -124,10 +131,83 @@ void R4000::run_until(u64 cycle, const u64* deadline) {
     static constexpr u64 kNever = ~u64{0};
     const u64* const limit = deadline ? deadline : &kNever;
     u64 n = 0;
-    while (cycles_ < cycle && cycles_ < *limit) {
-        step();
+    while (cycles() < cycle && cycles() < *limit) {
+        step_inline();
+        if (SG_UNLIKELY(idle_ready_)) {
+            idle_ready_ = false;
+            skip_idle(std::min(cycle, *limit));
+        }
         if ((++n & 4095) == 0 && stop_.load(std::memory_order_relaxed)) break;
     }
+}
+
+void R4000::set_cycles_per_instruction(double cpi) {
+    const double w = cpi * (1u << kCycleFracBits);
+    const u64 weight = w < 1 ? 1 : static_cast<u64>(w + 0.5);
+    if (weight == weight_) return;
+    instret_base_ = instructions();
+    instret_time_fp_ = time_fp_;
+    instret_skip_fp_ = idle_skipped_fp_;
+    weight_ = weight;
+}
+
+// ---------------------------------------------------------------------------
+// Idle detection
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr u64 kMaxIdleLoopInstructions = 64;
+constexpr unsigned kIdleCooldown = 256;  // visits to ignore after a loop proved not idle
+}  // namespace
+
+// Called on arriving at the target of a taken backward branch. A loop is a
+// spin when, between two visits, nothing but RAM loads happened (no stores,
+// device access, exceptions or CP0/FPU side effects) and the integer
+// registers came back identical: every further iteration is then the same
+// until an interrupt or device event changes something.
+void R4000::loop_head_reached() {
+    if (!idle_skip_) return;
+    const u64 period = time_fp_ - loop_time_fp_;
+    const bool same = pc == loop_head_ && !loop_dirty_ && period <= kMaxIdleLoopInstructions * weight_;
+    loop_dirty_ = false;
+    loop_time_fp_ = time_fp_;
+    if (!same) {
+        loop_head_ = pc;
+        loop_have_snapshot_ = false;
+        loop_cooldown_ = 0;
+        return;
+    }
+    if (loop_cooldown_) {
+        --loop_cooldown_;
+        return;
+    }
+    if (loop_have_snapshot_ && period == loop_period_fp_ && loop_regs_[32] == hi && loop_regs_[33] == lo &&
+        std::equal(gpr.begin(), gpr.end(), loop_regs_.begin())) {
+        idle_ready_ = true;
+        return;
+    }
+    if (loop_have_snapshot_) loop_cooldown_ = kIdleCooldown;  // a loop, but one that makes progress
+    std::copy(gpr.begin(), gpr.end(), loop_regs_.begin());
+    loop_regs_[32] = hi;
+    loop_regs_[33] = lo;
+    loop_period_fp_ = period;
+    loop_have_snapshot_ = true;
+}
+
+// Fast-forwards whole iterations of a confirmed spin loop, stopping strictly
+// before the next event (the Compare timer, or `limit_cycle`: the next
+// device event or the end of the run slice), so that event is taken by the
+// same instruction it would have been without skipping.
+void R4000::skip_idle(u64 limit_cycle) {
+    if (loop_period_fp_ == 0 || interrupt_pending()) return;
+    const u64 limit_fp = std::min(limit_cycle << kCycleFracBits, timer_event_fp_);
+    if (limit_fp <= time_fp_ + 1) return;
+    const u64 iterations = (limit_fp - 1 - time_fp_) / loop_period_fp_;
+    if (iterations == 0) return;
+    const u64 advance = iterations * loop_period_fp_;
+    time_fp_ += advance;
+    loop_time_fp_ += advance;
+    idle_skipped_fp_ += advance;
 }
 
 void R4000::set_int_line(unsigned line, bool asserted) {
@@ -144,10 +224,10 @@ void R4000::timer_fire() {
 // Count increments every other pipeline cycle; compute the cycle at which it
 // next equals Compare so the hot loop only has to do one comparison.
 void R4000::reschedule_timer() {
-    const u64 now_half = cycles_ >> 1;
+    const u64 now_half = cycles() >> 1;
     const u32 k = compare_ - count();
     const u64 delta = k ? k : (u64{1} << 32);
-    timer_event_ = (now_half + delta) << 1;
+    timer_event_fp_ = ((now_half + delta) << 1) << kCycleFracBits;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +235,7 @@ void R4000::reschedule_timer() {
 // ---------------------------------------------------------------------------
 
 void R4000::raise(Exc code, bool tlb_refill, bool xtlb, unsigned ce) {
+    touch();
     if (exception_hook) [[unlikely]]
         exception_hook(static_cast<unsigned>(code), cur_pc_, status_);
     const bool exl = (status_ & sr::EXL) != 0;
@@ -352,6 +433,7 @@ bool R4000::debug_read32(u64 vaddr, u32& value) const {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::phys_read(u64 paddr, T& out, Access acc) {
+    touch();  // device registers may change between reads
     if (SG_LIKELY(bus_.read<T>(paddr, out))) return true;
     raise(acc == Access::Fetch ? Exc::IBE : Exc::DBE);
     return false;
@@ -359,6 +441,7 @@ SG_FORCEINLINE bool R4000::phys_read(u64 paddr, T& out, Access acc) {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::phys_write(u64 paddr, T value) {
+    touch();
     if (SG_LIKELY(bus_.write<T>(paddr, value))) return true;
     raise(Exc::DBE);
     return false;
@@ -397,6 +480,7 @@ SG_FORCEINLINE bool R4000::load(u64 vaddr, T& out) {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::store(u64 vaddr, T value) {
+    touch();
     if (SG_UNLIKELY(vaddr & (sizeof(T) - 1))) {
         address_error(vaddr, Access::Store);
         return false;
@@ -426,6 +510,7 @@ bool R4000::load_containing(u64 vaddr, T& out) {
 
 template <typename T>
 bool R4000::merge_store(u64 vaddr, T value, T keep_mask) {
+    touch();
     u8* host;
     u64 paddr;
     if (!lookup<Access::Store>(vaddr, host, paddr)) return false;
@@ -668,6 +753,7 @@ void R4000::execute(u32 inst) {
         case 0x39:  // SWC1
         case 0x3D:  // SDC1
         {
+            touch();  // FPU registers are not part of the idle-loop comparison
             if (!(status_ & sr::CU1)) {
                 raise(Exc::CpU, false, false, 1);
                 return;
@@ -946,6 +1032,9 @@ void R4000::execute_cop0(u32 inst) {
         return;
     }
     const unsigned rt = f_rt(inst), rd = f_rd(inst);
+    // Reading a constant register (PRId, Config, Status...) is pure; Count
+    // and Random change with time, and everything else alters CP0 state.
+    if (f_rs(inst) > 0x01 || rd == cop0::Count || rd == cop0::Random) touch();
     switch (f_rs(inst)) {
         case 0x00: gpr[rt] = sext32(cp0_read(rd)); break;  // MFC0
         case 0x01:                                          // DMFC0
@@ -987,7 +1076,7 @@ void R4000::execute_cop0(u32 inst) {
 u32 R4000::random() const {
     if (wired_ >= kTlbEntries) return kTlbEntries - 1;
     const u32 range = kTlbEntries - wired_;
-    return (kTlbEntries - 1) - static_cast<u32>((cycles_ - random_base_) % range);
+    return (kTlbEntries - 1) - static_cast<u32>((cycles() - random_base_) % range);
 }
 
 u64 R4000::cp0_read(unsigned reg) const {
@@ -1031,10 +1120,10 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         case cop0::PageMask: pagemask_ = v32 & kPageMaskMask; break;
         case cop0::Wired:
             wired_ = v32 & 0x3F;
-            random_base_ = cycles_;  // Random restarts at 47
+            random_base_ = cycles();  // Random restarts at 47
             break;
         case cop0::Count:
-            count_offset_ = v32 - static_cast<u32>(cycles_ >> 1);
+            count_offset_ = v32 - static_cast<u32>(cycles() >> 1);
             reschedule_timer();
             break;
         case cop0::EntryHi: {
@@ -1158,6 +1247,7 @@ bool secondary_hit(u32 tag, u64 paddr) { return (tag & kSStateMask) && (tag >> 1
 }  // namespace
 
 void R4000::execute_cache(u32 inst) {
+    touch();
     if (!cop0_usable()) {
         raise(Exc::CpU);
         return;
@@ -1194,7 +1284,7 @@ void R4000::execute_cache(u32 inst) {
             break;
         case 1:  // Index Load Tag
             if (secondary && !(*tag & kSStateMask) &&
-                (stag_stored_at_[sindex] == kNeverStored || cycles_ - stag_stored_at_[sindex] > kScacheTagWindow)) {
+                (stag_stored_at_[sindex] == kNeverStored || cycles() - stag_stored_at_[sindex] > kScacheTagWindow)) {
                 // Lines not written through Index Store Tag recently are reported
                 // as holding the probed address, as if a cached access had filled
                 // them. Size probes (store a zero tag at the base, then look for
@@ -1209,7 +1299,7 @@ void R4000::execute_cache(u32 inst) {
         case 2:  // Index Store Tag
             if (secondary) {
                 *tag = (taglo_ & 0xFFFFFC00u) | static_cast<u32>(((vaddr >> 12) & 7) << 7);
-                stag_stored_at_[sindex] = cycles_;
+                stag_stored_at_[sindex] = cycles();
             } else {
                 *tag = taglo_ & 0xFFFFFFC0u;
             }

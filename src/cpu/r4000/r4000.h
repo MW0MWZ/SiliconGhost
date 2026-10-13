@@ -147,7 +147,26 @@ public:
     u64 cp0_read(unsigned reg) const;
     void cp0_write(unsigned reg, u64 value);
     const TlbEntry& tlb_entry(unsigned i) const { return tlb_[i]; }
-    u64 cycles() const { return cycles_; }
+    u64 cycles() const { return time_fp_ >> kCycleFracBits; }
+    // Instructions executed (idle-skipped spin iterations are not counted).
+    // Derived from guest time, since the charge per instruction only changes
+    // through set_cycles_per_instruction().
+    u64 instructions() const {
+        return instret_base_ + (time_fp_ - instret_time_fp_ - (idle_skipped_fp_ - instret_skip_fp_)) / weight_;
+    }
+
+    // Guest time charged per instruction, in cycles (default 1). Fractional
+    // values model a faster CPU against unchanged guest clocks; every timer,
+    // including Count/Compare, follows the cycle counter.
+    void set_cycles_per_instruction(double cpi);
+    double cycles_per_instruction() const { return static_cast<double>(weight_) / (1u << kCycleFracBits); }
+
+    // Idle skipping: a short loop that repeats with identical registers and
+    // touches nothing but RAM loads is fast-forwarded, in whole iterations,
+    // to the next timer or device event. The guest state is the same as if
+    // every iteration had run.
+    void set_idle_skip(bool enabled) { idle_skip_ = enabled; }
+    u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
 
     // Debugger hook, called as each exception is taken: (ExcCode, faulting PC,
     // Status before the exception).
@@ -181,6 +200,7 @@ private:
     static constexpr unsigned kFastEntries = 1u << kFastBits;
 
     // Execution
+    void step_inline();
     void execute(u32 inst);
     void execute_special(u32 inst);
     void execute_regimm(u32 inst);
@@ -197,12 +217,16 @@ private:
     void fp_check_ctc1_trap();
     void branch(bool taken, u64 target) {
         next_delay_ = true;
-        if (taken) npc_ = target;
+        if (taken) {
+            npc_ = target;
+            if (target <= cur_pc_) loop_watch_ = target;  // candidate loop head
+        }
     }
     void branch_likely(bool taken, u64 target) {
         if (taken) {
             next_delay_ = true;
             npc_ = target;
+            if (target <= cur_pc_) loop_watch_ = target;
         } else {  // nullify the delay slot
             pc = npc_;
             npc_ = pc + 4;
@@ -262,7 +286,12 @@ private:
     void tlb_read();
     void tlb_probe();
     u32 random() const;
-    u32 count() const { return static_cast<u32>(count_offset_ + static_cast<u32>(cycles_ >> 1)); }
+    u32 count() const { return static_cast<u32>(count_offset_ + static_cast<u32>(cycles() >> 1)); }
+
+    // Idle detection
+    void loop_head_reached();
+    void skip_idle(u64 limit_cycle);
+    void touch() { loop_dirty_ = true; }  // a side effect that rules out idle skipping
 
     // FPU register file views (FR=0: 16 64-bit regs as 32 32-bit halves)
     u32 fpr_read32(unsigned n) const;
@@ -278,8 +307,23 @@ private:
     u64 cur_pc_ = 0;
     bool in_delay_ = false;
     bool next_delay_ = false;
-    u64 cycles_ = 0;
-    u64 timer_event_ = ~u64{0};
+    static constexpr unsigned kCycleFracBits = 10;
+    u64 time_fp_ = 0;                          // cycle counter, kCycleFracBits fractional bits
+    u64 weight_ = u64{1} << kCycleFracBits;    // charged per instruction
+    u64 instret_base_ = 0, instret_time_fp_ = 0, instret_skip_fp_ = 0;  // instructions() at the last re-base
+    u64 timer_event_fp_ = ~u64{0};             // Count == Compare, in time_fp_ units
+
+    bool idle_skip_ = true;
+    u64 loop_watch_ = ~u64{0};      // target of the last backward branch
+    u64 loop_head_ = ~u64{0};       // loop head being examined
+    u64 loop_time_fp_ = 0;          // time at the previous visit
+    u64 loop_period_fp_ = 0;        // length of one iteration
+    bool loop_dirty_ = false;       // side effect since the previous visit
+    bool loop_have_snapshot_ = false;
+    bool idle_ready_ = false;       // confirmed spin: skip once the head instruction ran
+    unsigned loop_cooldown_ = 0;
+    std::array<u64, 34> loop_regs_{};  // GPRs, HI, LO at the previous visit
+    u64 idle_skipped_fp_ = 0;
     unsigned mode_ = kKernelErl;
     bool addr64_ = false;  // 64-bit addressing in the current mode (KX/SX/UX)
 

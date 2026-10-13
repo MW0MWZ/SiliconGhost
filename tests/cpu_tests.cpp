@@ -346,3 +346,76 @@ TEST(cpu_bev_vectors_and_reset_state) {
     CHECK_EQ(cpu.pc, 0xFFFFFFFFBFC00380ull);
     CHECK_EQ((cpu.cp0_read(cop0::Cause) >> 2) & 31, static_cast<u64>(Exc::IBE));
 }
+
+namespace {
+// Polls a RAM word that stays zero until the Compare interrupt (IP7) fires;
+// the exception vector then spins too.
+void load_spin_program(Rig& t) {
+    t.cpu.gpr[t0] = 0xFFFFFFFF80002000ull;
+    t.load({LW(t1, 0, t0), BEQ(t1, zero, -2), NOP});
+    t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+    t.cpu.cp0_write(cop0::Compare, 50000);  // Count == Compare at cycle 100000
+    t.cpu.cp0_write(cop0::Status, sr::IE | (1u << 15));
+}
+}  // namespace
+
+TEST(cpu_idle_skip_is_exact) {
+    Rig fast, slow;
+    load_spin_program(fast);
+    load_spin_program(slow);
+    slow.cpu.set_idle_skip(false);
+    fast.cpu.run_until(150000);
+    slow.cpu.run_until(150000);
+    CHECK_EQ(fast.cpu.cycles(), slow.cpu.cycles());
+    CHECK_EQ(fast.cpu.pc, slow.cpu.pc);
+    CHECK_EQ(fast.cpu.cp0_read(cop0::EPC), slow.cpu.cp0_read(cop0::EPC));
+    CHECK_EQ(fast.cpu.cp0_read(cop0::Cause), slow.cpu.cp0_read(cop0::Cause));
+    CHECK_EQ(fast.cpu.cp0_read(cop0::Count), slow.cpu.cp0_read(cop0::Count));
+    CHECK_EQ(fast.cpu.cp0_read(cop0::Random), slow.cpu.cp0_read(cop0::Random));
+    CHECK(fast.cpu.cp0_read(cop0::EPC) == kCode || fast.cpu.cp0_read(cop0::EPC) == kCode + 4 ||
+          fast.cpu.cp0_read(cop0::EPC) == kCode + 8);
+    CHECK(fast.cpu.idle_skipped_cycles() > 140000);
+    CHECK(fast.cpu.instructions() < 1000);
+    CHECK_EQ(slow.cpu.idle_skipped_cycles(), 0u);
+}
+
+TEST(cpu_idle_skip_ignores_loops_that_progress_or_store) {
+    // Count t2 up to 1000, storing it each time, then spin.
+    auto storing = [](Rig& t) {
+        t.cpu.gpr[t0] = 0xFFFFFFFF80002000ull;
+        t.cpu.gpr[t3] = 1000;
+        t.load({ADDIU(t2, t2, 1), SW(t2, 0, t0), BNE(t2, t3, -3), NOP, BEQ(zero, zero, -1), NOP});
+    };
+    Rig a, b;
+    storing(a);
+    storing(b);
+    b.cpu.set_idle_skip(false);
+    a.cpu.run_until(3999);  // still counting
+    b.cpu.run_until(3999);
+    CHECK_EQ(a.cpu.instructions(), 3999u);
+    CHECK_EQ(a.cpu.gpr[t2], b.cpu.gpr[t2]);
+    a.cpu.run_until(100000);  // finished; the final spin is skipped
+    b.cpu.run_until(100000);
+    CHECK_EQ(a.cpu.gpr[t2], 1000u);
+    CHECK_EQ(a.r32(0x2000), 1000u);
+    CHECK_EQ(a.cpu.pc, b.cpu.pc);
+    CHECK(a.cpu.instructions() < 4100);
+
+    Rig u;  // a counting loop without stores makes progress: never skipped
+    u.load({ADDIU(t2, t2, 1), BNE(t2, t3, -2), NOP, BEQ(zero, zero, -1), NOP});
+    u.cpu.gpr[t3] = 5000;
+    u.cpu.run_until(10002);
+    CHECK_EQ(u.cpu.gpr[t2], 3334u);
+    CHECK_EQ(u.cpu.instructions(), 10002u);
+}
+
+TEST(cpu_fractional_cycles_per_instruction) {
+    Rig t;
+    t.load({BEQ(zero, zero, -1), NOP});
+    t.cpu.set_idle_skip(false);
+    t.cpu.set_cycles_per_instruction(0.25);
+    t.cpu.run_until(1000);
+    CHECK_EQ(t.cpu.cycles(), 1000u);
+    CHECK_EQ(t.cpu.instructions(), 4000u);
+    CHECK_EQ(t.cpu.cp0_read(cop0::Count), 500u);  // Count follows guest cycles, not instructions
+}

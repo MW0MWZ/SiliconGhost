@@ -368,6 +368,7 @@ void R4000::fp_convert_from_int(unsigned fmt, unsigned func, unsigned fs, unsign
 }
 
 void R4000::execute_cop1(u32 inst) {
+    touch();  // FPU state is not part of the idle-loop comparison
     if (!(status_ & sr::CU1)) {
         raise(Exc::CpU, false, false, 1);
         return;
