@@ -24,10 +24,18 @@ public:
     void write(unsigned index, u8 value);
 
     std::vector<u8>& memory() { return mem_; }  // whole array, for NVRAM persistence
+    // After restoring memory(): the clock carries on from the time source
+    // (a real battery-backed clock kept running while the machine was off),
+    // replacing whatever clock registers were saved.
+    void power_on();
     // Seconds since the Unix epoch (UTC), fractional; must not go backwards.
     void set_time_source(std::function<double()> source);
+    // The year register holds years since `base` (0: the calendar year's
+    // last two digits). IRIX on the IP22 counts from 1940.
+    void set_year_base(int base) { year_base_ = base; }
 
 private:
+    int year_base_ = 0;
     double now() const { return source_() + offset_; }
     void load_registers();  // clock registers <- current time
     bool registers_valid(s64& seconds) const;

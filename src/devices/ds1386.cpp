@@ -49,6 +49,14 @@ void Ds1386::set_time_source(std::function<double()> source) {
     offset_ = t - source_();
 }
 
+void Ds1386::power_on() {
+    offset_ = 0;
+    frozen_ = false;
+    valid_ = true;
+    mem_[kRegCommand] |= 0x80;  // TE
+    load_registers();
+}
+
 void Ds1386::load_registers() {
     const double t = now();
     s64 days = static_cast<s64>(t) / 86400, secs = static_cast<s64>(t) % 86400;
@@ -76,7 +84,7 @@ void Ds1386::load_registers() {
     mem_[0x6] = static_cast<u8>(dow);
     mem_[0x8] = to_bcd(day);
     mem_[0x9] = static_cast<u8>((mem_[0x9] & 0xC0) | to_bcd(month));
-    mem_[0xA] = to_bcd(static_cast<unsigned>(year % 100));
+    mem_[0xA] = to_bcd(static_cast<unsigned>(((year - year_base_) % 100 + 100) % 100));
 }
 
 bool Ds1386::registers_valid(s64& seconds) const {
@@ -95,9 +103,9 @@ bool Ds1386::registers_valid(s64& seconds) const {
         if (!valid_bcd(h, 23)) return false;
         hour = from_bcd(h);
     }
-    // Two-digit year: 70..99 -> 19xx, 00..69 -> 20xx.
+    // Two-digit year; with the calendar base, 70..99 -> 19xx, 00..69 -> 20xx.
     const unsigned yy = from_bcd(yr);
-    const s64 year = yy >= 70 ? 1900 + yy : 2000 + yy;
+    const s64 year = year_base_ ? year_base_ + yy : (yy >= 70 ? 1900 + yy : 2000 + yy);
     const s64 days = days_from_civil(year, from_bcd(mon), from_bcd(date));
     seconds = days * 86400 + hour * 3600 + from_bcd(min) * 60 + from_bcd(sec);
     return true;

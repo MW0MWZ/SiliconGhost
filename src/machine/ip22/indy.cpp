@@ -84,6 +84,7 @@ Indy::Indy(const IndyConfig& config)
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
         const double wall = static_cast<double>(std::time(nullptr));
+        hpc3_.rtc().set_year_base(1940);  // IRIX counts RTC years from 1940 (and keeps UTC)
         hpc3_.rtc().set_time_source([this, wall] { return wall + static_cast<double>(cpu_.cycles()) / config_.cpu_hz; });
     }
     ioc_.scc().set_tx_sink([this](unsigned channel, u8 byte) {

@@ -29,7 +29,7 @@ namespace {
 sg::ip22::Indy* g_machine = nullptr;
 volatile std::sig_atomic_t g_interrupted = 0;
 
-void on_sigint(int) {
+void on_stop_signal(int) {
     g_interrupted = 1;
     if (g_machine) g_machine->cpu().request_stop();
 }
@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
         }
         if (!nvram.empty() && !load_file(nvram, machine.rtc().memory()))
             std::fprintf(stderr, "note: %s not found, starting with empty NVRAM\n", nvram.c_str());
+        machine.rtc().power_on();  // the clock follows the host's (UTC)
 
         machine.set_serial_output([](unsigned, sg::u8 byte) {
             std::fputc(byte, stdout);
@@ -175,7 +176,8 @@ int main(int argc, char** argv) {
         });
         machine.reset();
         g_machine = &machine;
-        std::signal(SIGINT, on_sigint);
+        std::signal(SIGINT, on_stop_signal);
+        std::signal(SIGTERM, on_stop_signal);  // stop cleanly (NVRAM is saved) when asked to terminate
 
         RawTerminal terminal;
         std::thread([&machine] {

@@ -523,3 +523,36 @@ TEST(wd33c93_manual_phases_command_status_message) {
     CHECK_EQ(status(), 0x85);  // target released the bus
     std::filesystem::remove(path);
 }
+
+TEST(ds1386_year_counted_from_a_base) {
+    Ds1386 rtc;
+    rtc.set_year_base(1940);  // IRIX on the IP22
+    double host = 1700000000;
+    rtc.set_time_source([&] { return host; });
+    rtc.write(Ds1386::kRegCommand, 0x00);
+    rtc.write(0xA, 0x83);  // 1940 + 83 = 2023
+    rtc.write(0x9, 0x11);
+    rtc.write(0x8, 0x14);
+    rtc.write(0x4, 0x12);
+    rtc.write(0x2, 0x00);
+    rtc.write(0x1, 0x00);
+    rtc.write(Ds1386::kRegCommand, 0x80);
+    host += 86400;
+    CHECK_EQ(rtc.read(0x8), 0x15);
+    CHECK_EQ(rtc.read(0x6), 4);     // 2023-11-15 was a Wednesday (1 = Sunday)
+    CHECK_EQ(rtc.read(0xA), 0x83);  // still counted from 1940
+}
+
+TEST(ds1386_power_on_discards_saved_clock_registers) {
+    Ds1386 rtc;
+    rtc.set_year_base(1940);
+    double host = 1700000000;  // 2023-11-14 22:13:20 UTC
+    rtc.set_time_source([&] { return host; });
+    rtc.memory()[0xA] = 0x56;  // a saved image from another time (1996)
+    rtc.memory()[Ds1386::kRegCommand] = 0x00;
+    rtc.power_on();
+    rtc.write(Ds1386::kRegCommand, 0x00);  // freeze and resume as the PROM does
+    rtc.write(Ds1386::kRegCommand, 0x80);
+    CHECK_EQ(rtc.read(0xA), 0x83);  // 2023
+    CHECK_EQ(rtc.read(0x4), 0x22);
+}

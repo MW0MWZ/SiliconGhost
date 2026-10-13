@@ -176,7 +176,11 @@ possible") throttles at frame boundaries.
   tests and CI.
 * Disks: raw SCSI disk and CD-ROM images of 512-byte blocks (`--disk`,
   `--cdrom`). IRIX CDs are not ISO 9660: they carry an SGI volume header and
-  EFS file system, so a raw dump of the disc is used as-is. Later: sparse or
+  EFS file system, so a raw dump of the disc is used as-is. A new disk is a
+  blank (sparse) file, labelled as on real hardware with `fx` from the CD:
+  `boot -f dksc(0,4,8)sashARCS dksc(0,4,7)stand/fx.ARCS --x`, then
+  `repartition/rootdrive` and `label/sync`. "Install System Software" then
+  copies the miniroot to the swap partition and runs `inst`. Later:
   copy-on-write disk images.
 * Networking: Seeq 8003 behind a host backend (TAP on Linux, user-mode slirp
   everywhere).
@@ -190,7 +194,7 @@ possible") throttles at frame boundaries.
 | **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
 | **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | ✅ PROM 5.3 boots to the System Maintenance Menu on the serial console |
 | **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu with keyboard input; mouse pending |
-| **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | PROM boots `sash` from IRIX CD media ✅; IRIX kernel next |
+| **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | ✅ IRIX 5.3 installs from its CD and boots multi-user from disk (serial console) |
 | **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |
 | **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | |
