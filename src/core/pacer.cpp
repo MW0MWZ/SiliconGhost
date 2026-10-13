@@ -51,12 +51,15 @@ double Pacer::update(u64 guest_cycles, u64 instructions) {
     if (guest_cycles < epoch_cycles_) rebase(now, guest_cycles);  // clock replaced (not expected)
 
     // Host speed while busy: instructions per second of host time spent
-    // running (waits excluded).
-    const u64 ran = instructions - last_instructions_;
-    const u64 busy_ns = now - last_ns_;
-    if (mode_ == Mode::Realtime && ran >= kMinSample && busy_ns > 0) {
-        const double sample = static_cast<double>(ran) * 1e9 / static_cast<double>(busy_ns);
+    // running (waits excluded). Short slices are pooled until they are long
+    // enough to measure; otherwise a high charge per instruction (few
+    // instructions per slice) could never be measured down again.
+    sample_ran_ += instructions - last_instructions_;
+    sample_busy_ns_ += now - last_ns_;
+    if (mode_ == Mode::Realtime && sample_ran_ >= kMinSample && sample_busy_ns_ > 0) {
+        const double sample = static_cast<double>(sample_ran_) * 1e9 / static_cast<double>(sample_busy_ns_);
         rate_ = rate_ > 0 ? 0.8 * rate_ + 0.2 * sample : sample;
+        sample_ran_ = sample_busy_ns_ = 0;
     }
 
     const double wall = static_cast<double>(now - epoch_ns_) * 1e-9;

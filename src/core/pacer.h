@@ -54,6 +54,7 @@ private:
     u64 epoch_ns_ = 0, epoch_cycles_ = 0;
     u64 last_ns_ = 0, last_instructions_ = 0;  // end of the previous update, after any wait
     double rate_ = 0;                          // measured host speed, instructions per second
+    u64 sample_ran_ = 0, sample_busy_ns_ = 0;  // slices pooled until they make a sample
     double cpi_ = 1.0;
 };
 

@@ -139,6 +139,29 @@ TEST(pacer_realtime_locks_guest_time_to_the_wall_clock) {
     CHECK(guest > wall - 0.01 && guest < wall + 0.01);
 }
 
+TEST(pacer_realtime_recovers_from_a_stall) {
+    FakeHost host;
+    const double hz = 175e6, host_ips = 350e6;
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    p.update(0, 0);
+    // 1 ms of guest time took 200 ms of host time (the host was busy
+    // elsewhere): the charge per instruction goes to its maximum.
+    u64 cycles = 175000, instructions = 175000;
+    host.now += 200000000;
+    double cpi = p.update(cycles, instructions);
+    CHECK(cpi > 15);
+    // Back to full speed, in 1 ms slices of guest time, each now holding
+    // fewer instructions than one measurement needs.
+    for (int slice = 0; slice < 3000; ++slice) {
+        const u64 n = static_cast<u64>(175000 / cpi);
+        instructions += n;
+        cycles += 175000;
+        host.now += static_cast<u64>(static_cast<double>(n) / host_ips * 1e9);
+        cpi = p.update(cycles, instructions);
+    }
+    CHECK(cpi > 0.45 && cpi < 0.55);
+}
+
 TEST(pacer_max_mode_never_waits) {
     FakeHost host;
     Pacer p(Pacer::Mode::Max, 100e6, host.clock());
