@@ -94,6 +94,13 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    `MAP_JIT` + `pthread_jit_write_protect_np`; on Linux/Windows, dual-mapped
    W^X code buffers. Self-modifying code is handled by write-protecting
    translated physical pages.
+4. **Decoded-block cache (in place):** straight-line runs are fetched and
+   translated once and cached by host address, so physical aliases share
+   them. A per-4 KiB "holds cached code" flag on the bus makes CPU stores and
+   device DMA (`Bus::write_block`) drop affected blocks, so self-modifying
+   code and freshly loaded programs behave exactly as with the interpreter.
+   Next steps: pre-decoded handlers, then translation to host code on the
+   same block structure.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
    with the same registers and stored the same values to the same RAM

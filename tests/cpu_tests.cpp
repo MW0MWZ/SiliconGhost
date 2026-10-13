@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // R4000 interpreter tests: hand-assembled programs run from kseg0 in kernel mode.
 #include <initializer_list>
+#include <tuple>
 #include <vector>
 
 #include "core/endian.h"
@@ -485,4 +486,93 @@ TEST(cpu_idle_skip_never_skips_impure_device_reads) {
     t.cpu.run_until(40000);
     CHECK_EQ(t.cpu.idle_skipped_cycles(), 0u);
     CHECK_EQ(t.cpu.instructions(), 40000u);
+}
+
+TEST(cpu_block_cache_sees_code_written_inside_the_running_block) {
+    for (bool blocks : {false, true}) {
+        Rig t;
+        t.cpu.set_block_cache(blocks);
+        t.cpu.set_idle_skip(false);
+        t.w32(0x2000, ADDIU(t2, zero, 42));  // the replacement instruction
+        t.load({
+            LUI(t0, 0x8000), ORI(t0, t0, 0x1018),
+            LUI(t3, 0x8000), LW(t1, 0x2000, t3),   // 1008, 100c
+            SW(t1, 0, t0),                         // 1010: overwrite 0x1018
+            NOP,                                   // 1014
+            ADDIU(t2, zero, 7),                    // 1018: replaced before it runs
+            BEQ(zero, zero, -1), NOP,              // 101c
+        });
+        t.cpu.run_until(20);
+        CHECK_EQ(t.cpu.gpr[t2], 42u);
+    }
+}
+
+TEST(cpu_block_cache_drops_code_overwritten_later_and_by_dma) {
+    Rig t;
+    t.cpu.set_idle_skip(false);
+    t.load({ADDIU(t2, zero, 1), BEQ(zero, zero, -1), NOP});
+    t.cpu.run_until(10);
+    CHECK_EQ(t.cpu.gpr[t2], 1u);
+    // Overwritten by the CPU (from elsewhere), then run again
+    t.cpu.gpr[t0] = kCode;
+    t.load({SW(t1, 0, t0), BEQ(zero, zero, -1), NOP}, 0x3000);
+    t.cpu.gpr[t1] = ADDIU(t2, zero, 2);
+    t.cpu.set_pc(0xFFFFFFFF80003000ull);
+    t.cpu.run_until(20);
+    t.cpu.set_pc(kCode);
+    t.cpu.run_until(30);
+    CHECK_EQ(t.cpu.gpr[t2], 2u);
+    // Overwritten by DMA
+    u8 word[4];
+    store_be<u32>(word, ADDIU(t2, zero, 3));
+    CHECK(t.bus.write_block(0x1000, word, 4));
+    t.cpu.set_pc(kCode);
+    t.cpu.run_until(40);
+    CHECK_EQ(t.cpu.gpr[t2], 3u);
+}
+
+TEST(cpu_block_cache_matches_interpreter_on_exception_in_delay_slot) {
+    auto run = [](bool blocks) {
+        Rig t;
+        t.cpu.set_block_cache(blocks);
+        t.cpu.set_idle_skip(false);
+        t.cpu.gpr[t0] = 0xFFFFFFFF80002001ull;  // misaligned
+        t.load({ADDIU(t1, zero, 5), BNE(t1, zero, 4), LW(t2, 0, t0), NOP, NOP, NOP, NOP});
+        t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+        t.cpu.run_until(50);
+        return std::make_tuple(t.cpu.pc, t.cpu.cp0_read(cop0::EPC), t.cpu.cp0_read(cop0::Cause), t.cpu.cycles(),
+                               t.cpu.gpr[t1]);
+    };
+    CHECK(run(false) == run(true));
+    CHECK_EQ(std::get<1>(run(true)), kCode + 4);  // EPC at the branch, BD set
+    CHECK(std::get<2>(run(true)) >> 31);
+}
+
+TEST(cpu_tlb_rewrite_takes_effect_for_cached_translation) {
+    Rig t;
+    setup_tlb(t, true);
+    t.w32(0x200010, 0x11111111);
+    t.w32(0x300010, 0x22222222);
+    // Read through the mapping (now in the soft TLB), remap the same entry
+    // to PA 0x300000 and read again.
+    t.load({TLBWI, LUI(t0, 0x0040), LW(t1, 0x10, t0), TLBWI, LW(t2, 0x10, t0), NOP});
+    t.steps(3);
+    t.cpu.cp0_write(cop0::EntryLo0, (0x300u << 6) | (3u << 3) | 4u | 2u);
+    t.steps(2);
+    CHECK_EQ(t.cpu.gpr[t1], 0x11111111u);
+    CHECK_EQ(t.cpu.gpr[t2], 0x22222222u);
+}
+
+TEST(cpu_bus_remap_drops_cached_host_pointers) {
+    Rig t;
+    std::vector<u8> other(Bus::kPageSize);
+    store_be<u32>(&other[0x2010], 0x22222222);
+    t.w32(0x22010, 0x11111111);
+    t.cpu.gpr[t0] = 0xFFFFFFFF80022000ull;  // data in the second 64 KiB bus page
+    t.load({LW(t1, 0x10, t0), LW(t2, 0x10, t0), NOP});
+    t.cpu.step();  // translation of 0x80002000 now cached
+    t.bus.map_ram(0x20000, Bus::kPageSize, other.data());  // the memory controller remaps
+    t.cpu.step();
+    CHECK_EQ(t.cpu.gpr[t1], 0x11111111u);
+    CHECK_EQ(t.cpu.gpr[t2], 0x22222222u);
 }

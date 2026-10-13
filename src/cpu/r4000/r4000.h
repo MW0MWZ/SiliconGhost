@@ -169,6 +169,15 @@ public:
     // is fast-forwarded in whole iterations to the next timer or device
     // event; the guest ends up exactly where it would have by spinning.
     void set_idle_skip(bool enabled) { idle_skip_ = enabled; }
+
+    // Decoded-block cache: run_until() executes straight-line runs of
+    // instructions fetched (and translated) once per block instead of once
+    // per instruction. Results are identical to step(); blocks are dropped
+    // when their memory is written, by the CPU or by DMA.
+    void set_block_cache(bool enabled) {
+        block_cache_ = enabled;
+        flush_blocks();
+    }
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
     u64 change_epoch() const { return change_epoch_; }
@@ -200,12 +209,29 @@ private:
         u64 tag = ~u64{0};  // vaddr >> 12
         u8* host = nullptr; // host pointer to the 4 KiB page, or nullptr for MMIO
         u64 ppage = 0;      // physical page address
+        u8* code = nullptr; // the page's code flag (host pages only; see Bus::code_flag)
     };
-    static constexpr unsigned kFastBits = 8;
+    static constexpr unsigned kFastBits = 10;
     static constexpr unsigned kFastEntries = 1u << kFastBits;
 
     // Execution
     void step_inline();
+
+    // Decoded blocks
+    static constexpr unsigned kBlockBits = 14;
+    static constexpr unsigned kMaxBlockLength = 32;
+    struct Block {
+        const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
+        u32 count = 0;
+        u32 words[kMaxBlockLength];
+    };
+    static unsigned block_index(const u8* host) {
+        return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
+    }
+    void run_block(u64 cycle, const u64* limit);
+    void build_block(Block& b, const u8* host, u32 page_offset);
+    void invalidate_code_page(const u8* page);
+    void flush_blocks();
     void execute(u32 inst);
     void execute_special(u32 inst);
     void execute_regimm(u32 inst);
@@ -261,6 +287,7 @@ private:
     template <Access A>
     bool lookup(u64 vaddr, u8*& host, u64& paddr);
     void flush_fast_tlb();
+    void flush_fast_tlb_entry(const TlbEntry& e);
     void update_mode();
     bool ops64_enabled() const;
     // Load/store address: a full 64-bit sum with 64-bit addressing, otherwise
@@ -305,6 +332,11 @@ private:
 
     Bus& bus_;
     Options opts_;
+    bool block_cache_ = true;
+    bool block_invalidated_ = false;  // the running block's memory was written
+    bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
+    std::vector<Block> blocks_;
+    u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 
     u64 npc_ = 0;
@@ -384,7 +416,9 @@ private:
     std::vector<u32> itag_, dtag_, stag_;
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
 
-    FastEntry fast_[kNumModes][2][kFastEntries];
+    // Separate tables for fetch, load and store (indexed by Access), so code
+    // and data pages that share low address bits do not evict each other.
+    FastEntry fast_[kNumModes][3][kFastEntries];
 };
 
 }  // namespace sg::mips

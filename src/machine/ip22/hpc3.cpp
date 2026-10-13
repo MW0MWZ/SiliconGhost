@@ -95,8 +95,8 @@ u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
             const u32 addr = d.cbp + done;
             const u32 chunk = std::min<u32>(n - done, static_cast<u32>(Bus::kPageSize - (addr & Bus::kPageMask)));
             if (src) {
-                if (u8* host = bus_.host_write_ptr(addr)) std::memcpy(host, src + moved + done, chunk);
-                else for (u32 i = 0; i < chunk; ++i) bus_.write<u8>(addr + i, src[moved + done + i]);
+                if (!bus_.write_block(addr, src + moved + done, chunk))  // also drops cached code it overwrites
+                    for (u32 i = 0; i < chunk; ++i) bus_.write<u8>(addr + i, src[moved + done + i]);
             } else {
                 if (const u8* host = bus_.host_read_ptr(addr)) std::memcpy(dst + moved + done, host, chunk);
                 else for (u32 i = 0; i < chunk; ++i) bus_.read<u8>(addr + i, dst[moved + done + i]);

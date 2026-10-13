@@ -47,7 +47,11 @@ inline u64 f_zimm(u32 i) { return i & 0xFFFF; }
 
 }  // namespace
 
-R4000::R4000(Bus& bus, const Options& options) : bus_(bus), opts_(options) { reset(); }
+R4000::R4000(Bus& bus, const Options& options) : bus_(bus), opts_(options), blocks_(1u << kBlockBits) {
+    bus_.set_code_write_handler([this](const u8* page) { invalidate_code_page(page); });
+    bus_.set_remap_handler([this] { flush_fast_tlb(); });  // cached host pointers are stale
+    reset();
+}
 
 void R4000::reset() {
     gpr.fill(0);
@@ -131,12 +135,152 @@ void R4000::run_until(u64 cycle, const u64* deadline) {
     const u64* const limit = deadline ? deadline : &kNever;
     u64 n = 0;
     while (cycles() < cycle && cycles() < *limit) {
-        step_inline();
+        if (SG_LIKELY(block_cache_)) run_block(cycle, limit);
+        else step_inline();
         if (SG_UNLIKELY(idle_ready_)) {
             idle_ready_ = false;
             skip_idle(std::min(cycle, *limit));
         }
         if ((++n & 4095) == 0 && stop_.load(std::memory_order_relaxed)) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoded blocks
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Control transfers: the block ends after the delay slot.
+bool is_branch(u32 w) {
+    const unsigned op = w >> 26;
+    switch (op) {
+        case 0x00: return (w & 0x3E) == 0x08;  // JR, JALR
+        case 0x01: return ((w >> 16) & 0x0C) == 0x00;  // BLTZ/BGEZ(L)(AL)
+        case 0x02:
+        case 0x03:
+        case 0x04:
+        case 0x05:
+        case 0x06:
+        case 0x07:
+        case 0x14:
+        case 0x15:
+        case 0x16:
+        case 0x17: return true;
+        case 0x10:
+        case 0x11:
+        case 0x12:
+        case 0x13: return ((w >> 21) & 0x1F) == 0x08;  // BCz
+        default: return false;
+    }
+}
+
+// Instructions after which fetch translation or the code itself may differ:
+// all of CP0 (MTC0, ERET, TLB writes...) and CACHE.
+bool ends_block(u32 w) {
+    const unsigned op = w >> 26;
+    return (op == 0x10 && ((w >> 21) & 0x1F) != 0x08) || op == 0x2F;
+}
+
+}  // namespace
+
+// Decodes a straight-line run from `host` up to (and including) a control
+// transfer and its delay slot, a block-ending instruction, the end of the
+// 4 KiB page, or the length limit.
+void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
+    b.host = host;
+    b.count = 0;
+    const u32 room = (0x1000 - page_offset) / 4;  // instructions left in the page
+    const u32 max = std::min<u32>(room, kMaxBlockLength);
+    while (b.count < max) {
+        const u32 w = load_be<u32>(host + 4 * b.count);
+        b.words[b.count++] = w;
+        if (is_branch(w)) {
+            if (b.count < max) {
+                b.words[b.count] = load_be<u32>(host + 4 * b.count);
+                ++b.count;
+            }
+            break;
+        }
+        if (ends_block(w)) break;
+    }
+    if (u8* flag = bus_.code_flag(host)) *flag = 1;  // writes to this page now drop its blocks
+}
+
+// `page` is the host address of a 4 KiB page that was written.
+void R4000::invalidate_code_page(const u8* page) {
+    if (u8* flag = bus_.code_flag(page)) *flag = 0;
+    for (u32 off = 0; off < 0x1000; off += 4) {
+        Block& b = blocks_[block_index(page + off)];
+        if (b.host >= page && b.host < page + 0x1000) b.host = nullptr;
+    }
+    block_invalidated_ = true;
+}
+
+void R4000::flush_blocks() {
+    for (Block& b : blocks_) b.host = nullptr;
+}
+
+// Runs one block from pc, with exactly the per-instruction semantics of
+// step(); it returns as soon as control leaves the straight line (branch,
+// exception, interrupt), the block's memory is written, an idle loop is
+// confirmed, or the run limit is reached.
+//
+// The per-instruction checks of step() are only needed where their outcome
+// can change: the run limit and the Compare timer are turned into one time
+// below which neither can trigger, and interrupt lines only change when the
+// timer fires, a device is accessed or CP0 is written (which ends a block).
+void R4000::run_block(u64 cycle, const u64* limit) {
+    const FastEntry& fe = fast_[mode_][static_cast<unsigned>(Access::Fetch)][(pc >> 12) & (kFastEntries - 1)];
+    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != (pc >> 12) || fe.host == nullptr)) {
+        step_inline();  // delay slot on a new page, misaligned or untranslated pc, uncached fetch
+        return;
+    }
+    const u32 offset = static_cast<u32>(pc & 0xFFF);
+    const u8* const host = fe.host + offset;
+    Block& b = blocks_[block_index(host)];
+    if (b.host != host) build_block(b, host, offset);
+    block_invalidated_ = false;
+
+    // Below `safe` an instruction neither reaches the run limit nor fires
+    // the timer; recomputed after anything that could move either.
+    auto safe_time = [&] {
+        const u64 stop = std::min(cycle, *limit) << kCycleFracBits;
+        const u64 timer = timer_event_fp_ > weight_ ? timer_event_fp_ - weight_ : 0;
+        return std::min(stop, timer);
+    };
+    u64 safe = safe_time();
+    bool check_irq = true;
+    for (u32 i = 0; i < b.count; ++i) {
+        if (SG_UNLIKELY(time_fp_ >= safe)) {
+            if (i && !(cycles() < cycle && cycles() < *limit)) return;
+            time_fp_ += weight_;
+            if (time_fp_ >= timer_event_fp_) timer_fire();
+            check_irq = true;
+            safe = safe_time();
+        } else {
+            time_fp_ += weight_;
+        }
+        cur_pc_ = pc;
+        in_delay_ = next_delay_;
+        next_delay_ = false;
+        if (SG_UNLIKELY(check_irq)) {
+            check_irq = false;
+            if (interrupt_pending()) {
+                raise(Exc::Int);
+                return;
+            }
+        }
+        pc = npc_;
+        npc_ += 4;
+        io_ = false;
+        execute(b.words[i]);
+        gpr[0] = 0;
+        if (pc != cur_pc_ + 4 || block_invalidated_ || idle_ready_) return;
+        if (SG_UNLIKELY(io_)) {  // a device may have raised an interrupt or scheduled an event
+            check_irq = true;
+            safe = safe_time();
+        }
     }
 }
 
@@ -337,6 +481,25 @@ void R4000::flush_fast_tlb() {
             for (auto& e : table) e = FastEntry{};
 }
 
+// Drops the soft-TLB slots a TLB entry's pages can occupy (in every mode).
+// Slots are indexed by the low bits of the 4 KiB page number, which the
+// entry determines whatever the upper address bits are; anything else
+// sharing those slots is merely re-translated.
+void R4000::flush_fast_tlb_entry(const TlbEntry& e) {
+    const u64 span = (e.mask | 0x1FFF) + 1;  // both pages of the pair
+    const u64 pages = span >> 12;
+    if (pages >= kFastEntries) {
+        flush_fast_tlb();
+        return;
+    }
+    const u64 first = (e.hi >> 12) & ~(pages - 1);
+    for (u64 p = 0; p < pages; ++p) {
+        const unsigned slot = static_cast<unsigned>((first + p) & (kFastEntries - 1));
+        for (auto& mode : fast_)
+            for (auto& table : mode) table[slot] = FastEntry{};
+    }
+}
+
 template <bool kRaise>
 bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
     switch (mode_) {
@@ -428,10 +591,12 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     const u64 ppage = paddr & ~u64{0xFFF};
     const bool is_store = acc == Access::Store;
     host = is_store ? bus_.host_write_ptr(ppage) : bus_.host_read_ptr(ppage);
-    FastEntry& e = fast_[mode_][is_store][(vaddr >> 12) & (kFastEntries - 1)];
+    FastEntry& e = fast_[mode_][static_cast<unsigned>(acc)][(vaddr >> 12) & (kFastEntries - 1)];
     e.tag = vaddr >> 12;
     e.host = host;
     e.ppage = ppage;
+    e.code = host ? bus_.code_flag(host) : nullptr;
+    if (is_store) store_code_ = e.code;
     return true;
 }
 
@@ -439,10 +604,11 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
 // and `paddr` the full physical address.
 template <R4000::Access A>
 SG_FORCEINLINE bool R4000::lookup(u64 vaddr, u8*& host, u64& paddr) {
-    const FastEntry& e = fast_[mode_][A == Access::Store][(vaddr >> 12) & (kFastEntries - 1)];
+    const FastEntry& e = fast_[mode_][static_cast<unsigned>(A)][(vaddr >> 12) & (kFastEntries - 1)];
     if (SG_LIKELY(e.tag == (vaddr >> 12))) {
         host = e.host;
         paddr = e.ppage | (vaddr & 0xFFF);
+        if constexpr (A == Access::Store) store_code_ = e.code;
         return true;
     }
     return lookup_slow(vaddr, A, host, paddr);
@@ -468,6 +634,7 @@ bool R4000::debug_read32(u64 vaddr, u32& value) const {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::phys_read(u64 paddr, T& out, Access acc) {
+    io_ = true;
     if (acc != Access::Load || !bus_.read_is_pure(paddr, sizeof(T))) touch();
     if (SG_LIKELY(bus_.read<T>(paddr, out))) return true;
     raise(acc == Access::Fetch ? Exc::IBE : Exc::DBE);
@@ -476,6 +643,7 @@ SG_FORCEINLINE bool R4000::phys_read(u64 paddr, T& out, Access acc) {
 
 template <typename T>
 SG_FORCEINLINE bool R4000::phys_write(u64 paddr, T value) {
+    io_ = true;
     touch();
     if (SG_LIKELY(bus_.write<T>(paddr, value))) return true;
     raise(Exc::DBE);
@@ -526,6 +694,7 @@ SG_FORCEINLINE bool R4000::store(u64 vaddr, T value) {
         u8* const p = host + (vaddr & 0xFFF);
         log_store(p, sizeof(T));
         store_be<T>(p, value);
+        if (SG_UNLIKELY(*store_code_)) invalidate_code_page(host);  // decoded code lives here
         return true;
     }
     return phys_write<T>(paddr, value);
@@ -554,6 +723,7 @@ bool R4000::merge_store(u64 vaddr, T value, T keep_mask) {
     if (host) {
         u8* p = host + (vaddr & 0xFFF & ~align);
         store_be<T>(p, static_cast<T>((load_be<T>(p) & keep_mask) | value));
+        if (SG_UNLIKELY(*store_code_)) invalidate_code_page(host);
         return true;
     }
     T old;
@@ -1208,12 +1378,13 @@ void R4000::tlb_write(unsigned index) {
         return;
     }
     TlbEntry& e = tlb_[index];
+    flush_fast_tlb_entry(e);  // the mapping being replaced
     e.mask = pagemask_;
     e.hi = entryhi_ & ~u64{pagemask_};
     e.lo[0] = entrylo0_ & ~u64{1};
     e.lo[1] = entrylo1_ & ~u64{1};
     e.global = (entrylo0_ & entrylo1_ & 1) != 0;
-    flush_fast_tlb();
+    flush_fast_tlb_entry(e);  // and any slot the new one could shadow
 }
 
 void R4000::tlb_read() {

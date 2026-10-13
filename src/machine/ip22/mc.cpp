@@ -36,6 +36,7 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
       ram_(ram),
       cycles_per_sysclk_(cpu_hz / sysclk_hz),
       dma_timer_(scheduler, [this] { finish_dma(); }) {
+    bus_.add_host_region(ram, ram_size);  // however the banks get mapped, it is one memory
     // Split installed memory into decodable banks, largest first.
     u64 remaining = ram_size, offset = 0;
     for (u64 size = u64{128} << 20; size >= (u64{4} << 20) && banks_.size() < 4;) {
