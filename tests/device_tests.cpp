@@ -291,3 +291,235 @@ TEST(wd33c93_select_and_transfer_dma) {
     CHECK_EQ(wd.read_data(), 0x16);  // select-and-transfer complete
     std::filesystem::remove(path);
 }
+
+TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {
+    const std::string path = make_image(8);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x01, 0x80);
+    wd_write(wd, 0x15, 1);
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 2, 0, 0, 4, 0};  // READ(10) blocks 2-5
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    auto start = [&](u32 count) {
+        wd_write(wd, 0x12, static_cast<u8>(count >> 16));
+        wd_write(wd, 0x13, static_cast<u8>(count >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(count));
+        wd_write(wd, 0x18, 0x09);
+    };
+    start(1024);  // host DMA only covers half the data
+    clk.advance_to(150000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 1024u);
+    wd.write_address(0x10);
+    CHECK_EQ(wd.read_data(), 0x46);  // paused: transfer count exhausted
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x49);  // unexpected phase: target still in DATA IN
+    CHECK(!irq);
+    start(1024);  // reload and continue
+    clk.advance_to(300000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 2048u);
+    if (memory.size() == 2048) {
+        CHECK_EQ(memory[0], 2);
+        CHECK_EQ(memory[1024], 4);
+        CHECK_EQ(memory[2047], 5);
+    }
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x16);
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_select_with_atn_reports_selection_then_message_out) {
+    const std::string path = make_image(1);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);  // SELECT WITH ATN
+    clk.advance_to(150000);
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x11);  // selected
+    CHECK(irq);                      // target requests MESSAGE OUT
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    CHECK(!irq);
+    wd_write(wd, 0x18, 0x04);  // DISCONNECT: no interrupt
+    clk.advance_to(300000);
+    CHECK(!irq);
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_sync_negotiation_then_command) {
+    const std::string path = make_image(4);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, static_cast<u8>(n >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    wd_write(wd, 0x01, 0x80);  // DMA mode: message phases still use the data register
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);  // SELECT WITH ATN
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);  // MESSAGE OUT requested
+    count(6);
+    wd_write(wd, 0x18, 0x20);  // TRANSFER INFO, polled
+    for (u8 b : {u8{0xC0}, u8{0x01}, u8{0x03}, u8{0x01}, u8{0x32}, u8{0x0C}}) {
+        CHECK(wd.read_aux_status() & 0x01);  // DBR
+        wd_write(wd, 0x19, b);               // IDENTIFY + SDTR
+    }
+    CHECK_EQ(status(), 0x1F);  // done; target requests MESSAGE IN
+    std::vector<u8> reply;
+    for (;;) {
+        count(1);
+        wd_write(wd, 0x18, 0x20);
+        CHECK(wd.read_aux_status() & 0x01);
+        wd.write_address(0x19);
+        reply.push_back(wd.read_data());
+        CHECK_EQ(status(), 0x20);  // paused with ACK asserted
+        wd_write(wd, 0x18, 0x03);  // NEGATE ACK
+        const u8 next = status();
+        if (next != 0x8F) {
+            CHECK_EQ(next, 0x8A);  // COMMAND phase next
+            break;
+        }
+        if (reply.size() > 8) break;
+    }
+    CHECK_EQ(reply.size(), 5u);
+    if (reply.size() == 5) CHECK_EQ(reply[4], 0x00);  // asynchronous: offset 0
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0};
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    count(512);
+    wd_write(wd, 0x18, 0x08);  // SELECT-WITH-ATN-AND-TRANSFER continues the connection
+    CHECK_EQ(status(), 0x16);
+    CHECK_EQ(memory.size(), 512u);
+    if (!memory.empty()) CHECK_EQ(memory[0], 3);
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_message_in_whole_message_holds_ack_on_last_byte) {
+    const std::string path = make_image(1);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, 0);
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    count(6);
+    wd_write(wd, 0x18, 0x20);
+    for (u8 b : {u8{0x80}, u8{0x01}, u8{0x03}, u8{0x01}, u8{0x32}, u8{0x0A}}) wd_write(wd, 0x19, b);
+    CHECK_EQ(status(), 0x1F);
+    count(5);
+    wd_write(wd, 0x18, 0x20);  // whole SDTR reply in one Transfer Info
+    std::vector<u8> reply;
+    for (int i = 0; i < 5 && (wd.read_aux_status() & 0x01); ++i) {
+        wd.write_address(0x19);
+        reply.push_back(wd.read_data());
+    }
+    CHECK_EQ(reply.size(), 5u);
+    if (reply.size() == 5) {
+        CHECK_EQ(reply[0], 0x01);
+        CHECK_EQ(reply[3], 0x32);  // period echoed
+    }
+    CHECK_EQ(status(), 0x20);  // ACK held on the last byte
+    wd_write(wd, 0x18, 0x03);
+    CHECK_EQ(status(), 0x8A);  // then COMMAND
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_manual_phases_command_status_message) {
+    const std::string path = make_image(2);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, static_cast<u8>(n >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    auto read_byte = [&]() {
+        wd.write_address(0x19);
+        return wd.read_data();
+    };
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    wd_write(wd, 0x19, 0x80);  // IDENTIFY only
+    CHECK_EQ(status(), 0x1A);  // COMMAND next
+    count(6);
+    wd_write(wd, 0x18, 0x20);
+    for (u8 b : {u8{0x08}, u8{0}, u8{0}, u8{1}, u8{1}, u8{0}}) wd_write(wd, 0x19, b);  // READ(6) block 1
+    CHECK_EQ(status(), 0x19);  // DATA IN next
+    count(512);
+    wd_write(wd, 0x18, 0x20);  // polled data
+    std::vector<u8> data;
+    while (wd.read_aux_status() & 0x01) data.push_back(read_byte());
+    CHECK_EQ(data.size(), 512u);
+    if (!data.empty()) CHECK_EQ(data[0], 1);
+    CHECK_EQ(status(), 0x1B);  // STATUS next
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    CHECK_EQ(read_byte(), 0x00);  // GOOD
+    CHECK_EQ(status(), 0x1F);     // MESSAGE IN next
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    CHECK_EQ(read_byte(), 0x00);  // COMMAND COMPLETE
+    CHECK_EQ(status(), 0x20);
+    wd_write(wd, 0x18, 0x03);
+    CHECK_EQ(status(), 0x85);  // target released the bus
+    std::filesystem::remove(path);
+}
