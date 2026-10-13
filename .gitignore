@@ -2,9 +2,17 @@ build*/
 .cache/
 compile_commands.json
 *.o
-# User-supplied firmware and media are never committed
+# User-supplied firmware, media and disk images are never committed
 roms/
+iso/
+disks/
 *.bin
 *.img
 *.iso
 *.chd
+*.raw
+*.hdd
+*.dsk
+*.vhd
+*.qcow2
+*.nvram

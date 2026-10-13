@@ -22,6 +22,7 @@ constexpr u32 kIocWindow = 0x59800;  // PBUS PIO channel 6
 constexpr u32 kIocWindowEnd = kIocWindow + 0x400;
 constexpr u32 kScsi0Window = 0x40000;  // WD33C93: SASR at word 0, data at word 1
 constexpr u32 kScsi0WindowEnd = 0x48000;
+constexpr u32 kScsi1WindowEnd = 0x50000;  // second WD33C93 port: not connected on the Indy
 constexpr u32 kScsi0Cbp = 0x10000;
 constexpr u32 kScsi0Ndbp = 0x10004;
 constexpr u32 kScsi0Bc = 0x11000;
@@ -110,6 +111,7 @@ u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
             update_dma_irq();
         }
     }
+    if (moved < length) SG_LOG(Debug, "hpc3", "SCSI DMA chain ended after %u of %u bytes", moved, length);
     return moved;
 }
 
@@ -127,6 +129,10 @@ bool Hpc3::read(u32 offset, unsigned size, u64& value) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kScsi0Window);
         value = idx < 0 ? 0 : (idx & 1) ? scsi0_.read_data() : scsi0_.read_aux_status();
+        return true;
+    }
+    if (offset >= kScsi0WindowEnd && offset < kScsi1WindowEnd) {  // no chip: reads float low
+        value = 0;
         return true;
     }
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
@@ -165,6 +171,7 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
         }
         return true;
     }
+    if (offset >= kScsi0WindowEnd && offset < kScsi1WindowEnd) return true;
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);

@@ -2,10 +2,12 @@
 // SGI Indy (IP22) machine: owns the bus, memory, CPU and devices.
 #pragma once
 
+#include <array>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "core/scheduler.h"
@@ -26,6 +28,9 @@ struct IndyConfig {
     bool graphics = true;       // Newport XL8 in the GFX slot
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
     std::string cdrom_image;    // SCSI CD-ROM (ID 4), raw 512-byte blocks (IRIX media layout)
+    // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
+    // use a default when the NVRAM has none (IRIX requires one).
+    std::optional<std::array<u8, 6>> mac;
 };
 
 class Indy {
@@ -59,7 +64,10 @@ public:
     Newport* newport() { return config_.graphics ? &newport_ : nullptr; }
 
 private:
+    static constexpr unsigned kNvramBase = 0x40;   // NVRAM byte 0 within the DS1386
+    static constexpr unsigned kNvramEaddr = 250;   // Ethernet address, 6 bytes
     void pump_serial_input();
+    void apply_ethernet_address();
 
     IndyConfig config_;
     Scheduler scheduler_;

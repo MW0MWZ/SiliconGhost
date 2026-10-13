@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // SiliconGhost command-line front end. The Indy's serial ports are connected
 // to the terminal; a graphical front end comes with Newport support.
+#include <array>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +41,7 @@ void usage(const char* argv0) {
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved on exit\n"
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media\n"
+                 "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n"
                  "  --ram MB         memory size, 16..256 (default 64)\n"
                  "  --cpu-mhz N      R4400 pipeline clock (default 150)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only)\n"
@@ -126,6 +128,16 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--screenshot")) screenshot = next();
         else if (!std::strcmp(a, "--disk")) config.disk_image = next();
         else if (!std::strcmp(a, "--cdrom")) config.cdrom_image = next();
+        else if (!std::strcmp(a, "--mac")) {
+            std::array<sg::u8, 6> mac{};
+            unsigned b[6];
+            if (std::sscanf(next(), "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+                std::fprintf(stderr, "error: --mac expects xx:xx:xx:xx:xx:xx\n");
+                return 2;
+            }
+            for (unsigned k = 0; k < 6; ++k) mac[k] = static_cast<sg::u8>(b[k]);
+            config.mac = mac;
+        }
         else if (!std::strcmp(a, "--ram")) config.ram_mb = static_cast<unsigned>(std::strtoul(next(), nullptr, 0));
         else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);

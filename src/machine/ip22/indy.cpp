@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "machine/ip22/indy.h"
 
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -120,7 +121,18 @@ void Indy::load_prom_image(const u8* data, std::size_t size) {
     std::memcpy(prom_.get(), data, size < kPromMaxSize ? size : kPromMaxSize);
 }
 
+// The factory programs each Indy's Ethernet address into NVRAM bytes 250-255.
+void Indy::apply_ethernet_address() {
+    static constexpr std::array<u8, 6> kDefaultMac = {0x08, 0x00, 0x69, 0x0C, 0x5E, 0x01};  // SGI OUI
+    u8* nv = &rtc().memory()[kNvramBase + kNvramEaddr];
+    const bool blank = std::all_of(nv, nv + 6, [](u8 b) { return b == 0x00; }) ||
+                       std::all_of(nv, nv + 6, [](u8 b) { return b == 0xFF; });
+    if (config_.mac) std::copy(config_.mac->begin(), config_.mac->end(), nv);
+    else if (blank) std::copy(kDefaultMac.begin(), kDefaultMac.end(), nv);
+}
+
 void Indy::reset() {
+    apply_ethernet_address();
     mc_.reset();
     ioc_.reset();
     hpc3_.reset();
