@@ -44,12 +44,14 @@ Ds1386::Ds1386(unsigned size_bytes) : mem_(size_bytes, 0) {
 }
 
 void Ds1386::set_time_source(std::function<double()> source) {
+    loaded_centis_ = kNotLoaded;
     const double t = now();
     source_ = std::move(source);
     offset_ = t - source_();
 }
 
 void Ds1386::power_on() {
+    loaded_centis_ = kNotLoaded;
     offset_ = 0;
     frozen_ = false;
     valid_ = true;
@@ -59,6 +61,11 @@ void Ds1386::power_on() {
 
 void Ds1386::load_registers() {
     const double t = now();
+    // Software polls the clock constantly; only re-derive the registers when
+    // the time they show (to the hundredth) has moved on.
+    const s64 centis = static_cast<s64>(t * 100);
+    if (centis == loaded_centis_) return;
+    loaded_centis_ = centis;
     s64 days = static_cast<s64>(t) / 86400, secs = static_cast<s64>(t) % 86400;
     if (secs < 0) {
         secs += 86400;
@@ -112,6 +119,7 @@ bool Ds1386::registers_valid(s64& seconds) const {
 }
 
 void Ds1386::commit() {
+    loaded_centis_ = kNotLoaded;
     s64 t;
     valid_ = registers_valid(t);
     if (valid_) offset_ = static_cast<double>(t) + from_bcd(mem_[0x0] & 0xFF) / 100.0 - source_();
@@ -125,6 +133,7 @@ u8 Ds1386::read(unsigned index) {
 
 void Ds1386::write(unsigned index, u8 value) {
     if (index >= mem_.size()) return;
+    if (index < kNumClockRegs) loaded_centis_ = kNotLoaded;  // registers no longer show the loaded time
     if (index == kRegCommand) {
         const bool te = value & 0x80;
         if (!te && !frozen_) {
