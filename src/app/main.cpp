@@ -3,6 +3,7 @@
 // to the terminal; a graphical front end comes with Newport support.
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #endif
 
 #if !defined(_WIN32)
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -121,6 +123,50 @@ private:
     bool active_ = false;
 };
 
+// Feeds terminal input to both serial ports. On POSIX the reader polls, so
+// it can be stopped and joined before the machine goes away (a thread left
+// blocked reading stdin would also hold up the C library's cleanup at exit).
+class TerminalInput {
+public:
+    explicit TerminalInput(sg::ip22::Indy& machine)
+        : thread_([this, &machine] {
+#if !defined(_WIN32)
+              while (!stop_.load(std::memory_order_relaxed)) {
+                  pollfd p{STDIN_FILENO, POLLIN, 0};
+                  if (poll(&p, 1, 100) <= 0) continue;
+                  sg::u8 buf[256];
+                  const ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+                  if (n <= 0) break;  // end of input
+                  for (ssize_t i = 0; i < n; ++i) {
+                      machine.serial_input(0, buf[i]);
+                      machine.serial_input(1, buf[i]);
+                  }
+              }
+#else
+              int c;
+              while ((c = std::getchar()) != EOF) {  // detached: must not touch *this
+                  machine.serial_input(0, static_cast<sg::u8>(c));
+                  machine.serial_input(1, static_cast<sg::u8>(c));
+              }
+#endif
+          }) {
+    }
+    ~TerminalInput() {
+        stop_.store(true, std::memory_order_relaxed);
+#if !defined(_WIN32)
+        thread_.join();
+#else
+        thread_.detach();  // a blocked console read cannot be interrupted portably
+#endif
+    }
+    TerminalInput(const TerminalInput&) = delete;
+    TerminalInput& operator=(const TerminalInput&) = delete;
+
+private:
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
+
 bool load_file(const std::string& path, std::vector<sg::u8>& data) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -217,13 +263,7 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, on_stop_signal);  // stop cleanly (NVRAM is saved) when asked to terminate
 
         RawTerminal terminal;
-        std::thread([&machine] {
-            int c;
-            while ((c = std::getchar()) != EOF) {
-                machine.serial_input(0, static_cast<sg::u8>(c));
-                machine.serial_input(1, static_cast<sg::u8>(c));
-            }
-        }).detach();
+        TerminalInput input(machine);
 
         auto& cpu = machine.cpu();
         cpu.set_idle_skip(idle_skip && !trace);
