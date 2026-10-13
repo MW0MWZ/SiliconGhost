@@ -202,6 +202,28 @@ TEST(ip22_nvram_and_rtc) {
     CHECK(month >= 0x01 && month <= 0x12);
 }
 
+TEST(ip22_nvram_default_ethernet_address) {
+    IndyRig t;
+    t.m.reset();
+    const u8* nv = &t.m.rtc().memory()[0x40 + 250];
+    CHECK_EQ(nv[0], 0x08);
+    CHECK_EQ(nv[1], 0x00);
+    CHECK_EQ(nv[2], 0x69);
+    t.m.rtc().memory()[0x40 + 255] = 0x77;  // an address already in NVRAM is kept
+    t.m.reset();
+    CHECK_EQ(nv[5], 0x77);
+}
+
+TEST(ip22_second_scsi_port_unconnected) {
+    IndyRig t;
+    const u32 scsi1 = 0x1FBC8000;
+    t.w8(scsi1 + 3, 0x00);  // SASR = own ID
+    t.w8(scsi1 + 7, 0x07);
+    t.w8(scsi1 + 3, 0x00);
+    CHECK_EQ(t.r8(scsi1 + 7), 0x00);  // nothing answers: no controller
+    CHECK_EQ(t.r8(scsi1 + 3), 0x00);
+}
+
 TEST(ip22_hpc3_eeprom_read) {
     IndyRig t;
     t.m.reset();

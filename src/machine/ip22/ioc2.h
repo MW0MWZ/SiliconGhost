@@ -32,6 +32,7 @@ public:
     void reset();
 
     u8 read(unsigned index);  // index = register byte offset / 4
+    bool read_is_pure(unsigned index) const;
     void write(unsigned index, u8 value);
 
     void set_local0(unsigned bit, bool level) { set_bit(local0_raw_, bit, level); }

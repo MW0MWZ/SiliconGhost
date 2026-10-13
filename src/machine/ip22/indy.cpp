@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "machine/ip22/indy.h"
 
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -37,7 +38,7 @@ Indy::Indy(const IndyConfig& config)
       prom_(std::make_unique<u8[]>(kPromMaxSize)),
       cpu_(bus_, cpu_options(config)),
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
-      hpc3_(ioc_, scheduler_, config.cpu_hz),
+      hpc3_(bus_, ioc_, scheduler_, config.cpu_hz),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
       newport_(scheduler_, config.cpu_hz, Newport::Options{}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
@@ -68,9 +69,22 @@ Indy::Indy(const IndyConfig& config)
         powered_off_ = true;
         cpu_.request_stop();
     });
+    // SCSI devices on the built-in bus: disk at ID 1, CD-ROM at ID 4 (SGI's usual IDs).
+    auto attach = [this](std::unique_ptr<ScsiDisk>& slot, ScsiDisk::Kind kind, const std::string& path, unsigned id) {
+        if (path.empty()) return;
+        slot = std::make_unique<ScsiDisk>(kind, path);
+        if (!slot->ok()) throw std::runtime_error("cannot open " + path);
+        hpc3_.scsi0().attach(id, slot.get());
+        SG_LOG(Info, "indy", "SCSI ID %u: %s (%llu blocks)", id, path.c_str(),
+               static_cast<unsigned long long>(slot->blocks()));
+    };
+    attach(disk_, ScsiDisk::Kind::Disk, config_.disk_image, 1);
+    attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_image, 4);
+
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
         const double wall = static_cast<double>(std::time(nullptr));
+        hpc3_.rtc().set_year_base(1940);  // IRIX counts RTC years from 1940 (and keeps UTC)
         hpc3_.rtc().set_time_source([this, wall] { return wall + static_cast<double>(cpu_.cycles()) / config_.cpu_hz; });
     }
     ioc_.scc().set_tx_sink([this](unsigned channel, u8 byte) {
@@ -108,7 +122,18 @@ void Indy::load_prom_image(const u8* data, std::size_t size) {
     std::memcpy(prom_.get(), data, size < kPromMaxSize ? size : kPromMaxSize);
 }
 
+// The factory programs each Indy's Ethernet address into NVRAM bytes 250-255.
+void Indy::apply_ethernet_address() {
+    static constexpr std::array<u8, 6> kDefaultMac = {0x08, 0x00, 0x69, 0x0C, 0x5E, 0x01};  // SGI OUI
+    u8* nv = &rtc().memory()[kNvramBase + kNvramEaddr];
+    const bool blank = std::all_of(nv, nv + 6, [](u8 b) { return b == 0x00; }) ||
+                       std::all_of(nv, nv + 6, [](u8 b) { return b == 0xFF; });
+    if (config_.mac) std::copy(config_.mac->begin(), config_.mac->end(), nv);
+    else if (blank) std::copy(kDefaultMac.begin(), kDefaultMac.end(), nv);
+}
+
 void Indy::reset() {
+    apply_ethernet_address();
     mc_.reset();
     ioc_.reset();
     hpc3_.reset();

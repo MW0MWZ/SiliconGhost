@@ -3,8 +3,9 @@
 // SCSI and Ethernet DMA channels, interrupt status, the serial EEPROM, the
 // PBUS device windows (IOC2 on channel 6) and the DS1386 RTC/NVRAM.
 //
-// The SCSI channel 0 controller (WD33C93) is modelled; the DMA engines and
-// the Seeq Ethernet controller are register storage for now.
+// SCSI channel 0 (WD33C93 plus its DMA channel) is modelled; the PBUS and
+// Ethernet DMA engines and the Seeq Ethernet controller are register storage
+// for now.
 #pragma once
 
 #include <unordered_map>
@@ -19,12 +20,13 @@ namespace sg::ip22 {
 
 class Hpc3 final : public Device {
 public:
-    Hpc3(Ioc2& ioc, Scheduler& scheduler, double cpu_hz);
+    Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz);
 
     void reset();
     const char* name() const override { return "hpc3"; }
     bool read(u32 offset, unsigned size, u64& value) override;
     bool write(u32 offset, unsigned size, u64 value) override;
+    bool read_is_pure(u32 offset, unsigned size) const override;
 
     Ds1386& rtc() { return rtc_; }
     Eeprom93Cxx& eeprom() { return eeprom_; }
@@ -38,7 +40,16 @@ private:
     u32 read_word(u32 offset);
     void write_word(u32 offset, u32 value);
 
+    // SCSI channel 0 DMA: walks descriptor chains {buffer, count/flags, next}.
+    u32 scsi_dma(const u8* src, u8* dst, u32 length);
+    void update_dma_irq();
+
+    Bus& bus_;
     Ioc2& ioc_;
+    struct ScsiDma {
+        u32 ndbp = 0, cbp = 0, bc = 0, flags = 0, ctrl = 0;
+        bool active = false, loaded = false, irq = false;
+    } scsi_dma_;
     Ds1386 rtc_;
     Eeprom93Cxx eeprom_;
     Wd33c93 scsi0_;

@@ -94,88 +94,75 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    `MAP_JIT` + `pthread_jit_write_protect_np`; on Linux/Windows, dual-mapped
    W^X code buffers. Self-modifying code is handled by write-protecting
    translated physical pages.
-4. **Idle detection:** IRIX's idle loop and the PROM's polling loops skip ahead
-   to the next scheduled event, so host CPU use stays low.
-
-## Physical bus
-
-`Bus` is a flat array of 65,536 entries (64 KiB pages over 4 GiB). Each entry
-points at host memory (RAM/ROM, with a writable flag) or at a `Device` plus
-its base. Aligned accesses never cross a page, so the fast path is one table
-lookup. Devices see offsets relative to their mapping and already-resolved
-integers. Physical addresses ≥ 4 GiB are bus errors (IP22 never uses them).
-
-## IP22 (Indy) hardware model
-
-Physical map (see `src/machine/ip22/memmap.h`; addresses marked VERIFY there
-must be checked against Linux `arch/mips/sgi-ip22`, NetBSD `sgimips` and MAME
-before device models depend on them):
-
-| Range | Device | Status |
-|---|---|---|
-| `0000_0000–0007_FFFF` | Low-memory alias of first 512 KiB of RAM | done |
-| `0800_0000–17FF_FFFF`, `2000_0000–2FFF_FFFF` | Main memory (16–256 MiB), decoded from MC MEMCFG bank registers | done |
-| `1F00_0000–1F3F_FFFF` | GIO64 graphics slot: Newport XL8, REX3 registers at `1F0F_0000` | done for PROM-level graphics (see below) |
-| `1F40_0000`, `1F60_0000` | GIO expansion slots 0/1 | empty (bus error) |
-| `1FA0_0000–1FA1_FFFF` | MC: control, SYSID, MEMCFG (SIMM banks and sub-banks), error latches, RPSS, semaphores, virtual DMA | done |
-| `1FB8_0000–1FBF_FFFF` | HPC3: DMA channels, EEPROM, PBUS. IOC2/INT3/8254/Z85230/8042 at `1FBD_9800`, DS1386 at `1FBE_0000` | IOC2, INT3, timers, serial, keyboard controller, EEPROM, RTC/NVRAM, WD33C93 (at `1FBC_0000`) done; DMA, Ethernet, audio: storage only |
-| `1FC0_0000–1FC7_FFFF` | Boot PROM (512 KiB) | done |
-
-Planned device models, in the order the PROM needs them:
-
-* **MC**: CPUCTRL0/1, SYSID, MEMCFG0/1 (bank decode drives `Bus` RAM mapping),
-  RPSS counter, refresh, GIO/CPU error address/status (bus-error interrupt
-  policy for unmapped writes), virtual DMA engine.
-* **HPC3**: PBUS PIO/DMA channels, SCSI DMA (with **WD33C93A**), Ethernet DMA
-  (with **Seeq 8003**), EEPROM serial interface (NVRAM/serial number), interrupt
-  routing.
-* **IOC2/INT3**: local interrupt status/mask → CPU Int0..Int4, 8254 PIT
-  (timers 0/1 drive IP4/IP5 on IP22), **Z85230** SCC (serial console, the first
-  thing we want working), **8042** keyboard/mouse.
-* **DS1386** RTC + NVRAM (PROM environment variables).
-* **HAL2** audio (late).
-* **Newport**: REX3 (drawing engine), VC2 (video timing, cursor), XMAP9
-  (pixel modes), CMAP (colour maps), RB2 (frame buffer), plus Bt445 RAMDAC.
-
-## Graphics: Newport / REX3
-
-Newport is a fixed-function 2D raster engine (lines, spans, blocks, patterns,
-logic ops; no Z buffer) driven by REX3 register writes, with display control
-bus (DCB) slaves for video timing and colour.
-
-Implemented:
-
-* REX3 register file with the +0x800 "GO" aliases, identification probe,
-  STATUS/USTATUS with the vertical-retrace interrupt (INT3 LOCAL1 bit 7).
-* Drawing: span and block fills with stop-on-X/Y continuation, fast clear,
-  Z/line-stipple patterns (transparent and opaque), host pixel writes and
-  packed reads through HOSTRW, screen-to-screen copy, integer Bresenham lines,
-  Gouraud shading and dithering, all 16 logic ops, write masks, screen masks
-  0-4, window offset, RGB/CI, pop-up, overlay and CID planes.
-* DCB with byte-lane transfers to VC2 (registers, 32K x 16 RAM, timing-table
-  walk, 32x32x2 and 64x64x1 cursors, DID tables), XMAP9 (mode table), both
-  CMAPs (palette, revision and monitor sense) and the Bt445 gamma tables.
-* Scan-out: DID -> XMAP9 mode -> CI or RGB through CMAP -> gamma, with
-  TOPSCAN hardware scrolling; presented in an SDL3 window at 60 Hz.
-
-Still to do (needed by IRIX rather than the PROM): blending, CID-plane
-clipping, colour compare, fractional and antialiased lines, YFLIP/XYOFFSET,
-XL24 24-bit planes and the MC graphics DMA engine.
+4. **Decoded-block cache (in place):** straight-line runs are fetched and
+   translated once and cached by host address, so physical aliases share
+   them. A per-4 KiB "holds cached code" flag on the bus makes CPU stores and
+   device DMA (`Bus::write_block`) drop affected blocks, so self-modifying
+   code and freshly loaded programs behave exactly as with the interpreter.
+   Each instruction is decoded once into a handler and its register fields;
+   uncommon instructions fall back to the interpreter's `execute()`. Blocks
+   are linked within a 4 KiB page: when a block ends, execution continues
+   directly with the block at the new pc while the mode and the page's
+   translation are unchanged.
+5. **x86-64 recompiler (first stage, in place):** a block that has run eight
+   times is translated into one host function (`src/cpu/r4000/jit_x64.cpp`,
+   with a small encoder in `src/jit/`). Register operations and RAM loads
+   and stores are emitted inline, the latter with the soft-TLB lookup;
+   misses, MMIO, unaligned addresses and pages holding translated code take
+   the handler path. Other instructions call their handlers with the same
+   bookkeeping as the block loop, and the function returns early wherever
+   the block loop would stop, so the two always agree. A block that branches
+   back to itself loops inside the function while the next pass fits before
+   the next timer or run-limit check. Generated code lives in a buffer
+   mapped twice (writable, executable); when it fills, all translations are
+   dropped. `--no-jit` turns the recompiler off. Next: branches and jumps
+   inline, direct links between translated blocks, keeping guest registers
+   in host registers, then an AArch64 back end.
+4. **Idle detection:** loops are tracked per backward branch (so nested
+   loops are seen too). A loop is a spin when two consecutive iterations end
+   with the same registers and stored the same values to the same RAM
+   locations, with no other side effect: no device access except reads that
+   devices declare pure (status registers that only change at scheduled
+   events), no exceptions, CP0 or FPU state changes. Machine state is then
+   identical at every visit, so the loop is fast-forwarded in whole
+   iterations to just before the next timer or device event, and the guest
+   ends up exactly where it would have by spinning. IRIX's idle loop
+   qualifies. The PROM's console wait does not: it increments a poll counter
+   every pass, so its state never repeats.
 
 ## Timing and scheduling
 
-The CPU is the master clock (`cycles`). Devices register events on a single
-scheduler (min-heap keyed by CPU cycle). The run loop executes until the next
-event, then dispatches it. This replaces per-instruction polling and is what
-the JIT will exit to. Wall-clock pacing (for 100% speed rather than "as fast as
-possible") throttles at frame boundaries.
+The CPU's cycle counter is the master clock: Count/Compare, the 8254, the RTC
+and every device delay derive from it, so guest clocks always agree with each
+other. Devices register events on a single scheduler keyed by cycle. The run
+loop executes until the next event, then dispatches it. This replaces
+per-instruction polling and is what the JIT will exit to. The counter keeps
+running through resets.
+
+The counter has fractional precision, so the guest time charged per
+instruction need not be one cycle. A pacer relates guest time to the host
+clock after every 1 ms slice (`--timing`):
+
+* `realtime` (default): guest time follows the wall clock. The CPU runs as
+  many instructions as the host can, and the charge per instruction adapts
+  (1/64 to 16 cycles), so a fast host looks like a faster R4400 while a guest
+  second remains a second.
+* `cycle`: one cycle per instruction, reproducible from run to run; waits
+  when ahead of the wall clock and lags when the host is too slow.
+* `max`: no waiting, one cycle per instruction (the default with `--max`).
 
 ## Front end and host integration
 
 * **SDL3** for window, input, audio and timing (M3). The headless CLI stays for
   tests and CI.
-* Disks: raw SCSI disk/CD images (`.img`, `.iso`); later CHD or qcow2-style
-  sparse images.
+* Disks: raw SCSI disk and CD-ROM images of 512-byte blocks (`--disk`,
+  `--cdrom`). IRIX CDs are not ISO 9660: they carry an SGI volume header and
+  EFS file system, so a raw dump of the disc is used as-is. A new disk is a
+  blank (sparse) file, labelled as on real hardware with `fx` from the CD:
+  `boot -f dksc(0,4,8)sashARCS dksc(0,4,7)stand/fx.ARCS --x`, then
+  `repartition/rootdrive` and `label/sync`. "Install System Software" then
+  copies the miniroot to the swap partition and runs `inst`. Later:
+  copy-on-write disk images.
 * Networking: Seeq 8003 behind a host backend (TAP on Linux, user-mode slirp
   everywhere).
 * Config: TOML machine profiles (RAM size, PROM path, disks, display size).
@@ -188,7 +175,7 @@ possible") throttles at frame boundaries.
 | **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
 | **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | ✅ PROM 5.3 boots to the System Maintenance Menu on the serial console |
 | **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu with keyboard input; mouse pending |
-| **M4** | WD33C93 SCSI (controller done; targets, DMA and disk/CD images next) | IRIX 5.3/6.5 boots from disk image; install from CD |
+| **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | ✅ IRIX 5.3 installs from its CD and boots multi-user from disk (serial console) |
 | **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |
 | **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | |

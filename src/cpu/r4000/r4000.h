@@ -8,12 +8,17 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <vector>
 
 #include "core/types.h"
 
 namespace sg {
 class Bus;
+namespace jit {
+class ExecBuffer;
+}
 }
 
 namespace sg::mips {
@@ -121,6 +126,7 @@ public:
 
     explicit R4000(Bus& bus) : R4000(bus, Options{}) {}
     R4000(Bus& bus, const Options& options);
+    ~R4000();
 
     void reset();
     void step();
@@ -146,7 +152,47 @@ public:
     u64 cp0_read(unsigned reg) const;
     void cp0_write(unsigned reg, u64 value);
     const TlbEntry& tlb_entry(unsigned i) const { return tlb_[i]; }
-    u64 cycles() const { return cycles_; }
+    u64 cycles() const { return time_fp_ >> kCycleFracBits; }
+    // Instructions executed (idle-skipped spin iterations are not counted).
+    // Derived from guest time, since the charge per instruction only changes
+    // through set_cycles_per_instruction().
+    u64 instructions() const {
+        return instret_base_ + (time_fp_ - instret_time_fp_ - (idle_skipped_fp_ - instret_skip_fp_)) / weight_;
+    }
+
+    // Guest time charged per instruction, in cycles (default 1). Fractional
+    // values model a faster CPU against unchanged guest clocks; every timer,
+    // including Count/Compare, follows the cycle counter.
+    void set_cycles_per_instruction(double cpi);
+    double cycles_per_instruction() const { return static_cast<double>(weight_) / (1u << kCycleFracBits); }
+
+    // Idle skipping: a loop is a spin when two consecutive iterations (visits
+    // to the same backward branch) end with the same registers and have
+    // stored the same values to the same RAM locations, with no other side
+    // effect (device access other than pure reads, exceptions, CP0/FPU
+    // state). The machine state is then identical at every visit, so the loop
+    // is fast-forwarded in whole iterations to the next timer or device
+    // event; the guest ends up exactly where it would have by spinning.
+    void set_idle_skip(bool enabled) { idle_skip_ = enabled; }
+
+    // Decoded-block cache: run_until() executes straight-line runs of
+    // instructions fetched (and translated) once per block instead of once
+    // per instruction. Results are identical to step(); blocks are dropped
+    // when their memory is written, by the CPU or by DMA.
+    void set_block_cache(bool enabled) {
+        block_cache_ = enabled;
+        flush_blocks();
+    }
+    // Dynamic recompiler: hot blocks are translated to host code (x86-64;
+    // elsewhere this is a no-op). Results are identical to step().
+    void set_jit(bool enabled);
+    u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
+    // Debugger view: bumped by every side effect that rules out idle skipping.
+    u64 change_epoch() const { return change_epoch_; }
+
+    // Debugger hook, called as each exception is taken: (ExcCode, faulting PC,
+    // Status before the exception).
+    std::function<void(unsigned code, u64 pc, u64 status)> exception_hook;
 
     // Side-effect-free translation and read, for debuggers and tracing.
     bool debug_translate(u64 vaddr, u64& paddr) const;
@@ -171,11 +217,55 @@ private:
         u64 tag = ~u64{0};  // vaddr >> 12
         u8* host = nullptr; // host pointer to the 4 KiB page, or nullptr for MMIO
         u64 ppage = 0;      // physical page address
+        u8* code = nullptr; // the page's code flag (host pages only; see Bus::code_flag)
     };
-    static constexpr unsigned kFastBits = 8;
+    static constexpr unsigned kFastBits = 10;
     static constexpr unsigned kFastEntries = 1u << kFastBits;
 
     // Execution
+    void step_inline();
+
+    // Decoded blocks. Each instruction is decoded once, into a handler and
+    // its register fields; uncommon instructions use a handler that runs
+    // execute() on the raw word.
+    static constexpr unsigned kBlockBits = 14;
+    static constexpr unsigned kMaxBlockLength = 32;
+    static constexpr unsigned kMaxLinkedBlocks = 1024;  // per run_block() call
+    struct Op;
+    using Handler = void (*)(R4000&, const Op&);
+    struct Op {
+        Handler fn;
+        u32 inst;
+        u8 rs, rt, rd, sa;
+    };
+    struct Ops;  // the handlers
+    // `plain`: a register-only operation that cannot raise an exception and
+    // reads neither the pc nor the time, so it runs without bookkeeping.
+    static Handler decode(u32 inst, bool& plain);
+    // Translated block: runs the block from its start, returns the number
+    // of instructions completed (see jit_x64.cpp).
+    using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 time_fp);
+    static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
+    struct Block {
+        const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
+        u32 count = 0;
+        u32 plain = 0;             // bit i: ops[i] is plain (never a delay slot)
+        u32 runs = 0;
+        JitFn code = nullptr;
+        bool jit_addr64 = false;  // addressing mode the code was translated for
+        Op ops[kMaxBlockLength];
+    };
+    static bool is_branch_word(u32 w);
+    bool jit_compile(Block& b);  // false if the code buffer is full
+    static bool jit_compile_supported();
+    void jit_flush();
+    static unsigned block_index(const u8* host) {
+        return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
+    }
+    void run_block(u64 cycle, const u64* limit);
+    void build_block(Block& b, const u8* host, u32 page_offset);
+    void invalidate_code_page(const u8* page);
+    void flush_blocks();
     void execute(u32 inst);
     void execute_special(u32 inst);
     void execute_regimm(u32 inst);
@@ -192,12 +282,16 @@ private:
     void fp_check_ctc1_trap();
     void branch(bool taken, u64 target) {
         next_delay_ = true;
-        if (taken) npc_ = target;
+        if (taken) {
+            npc_ = target;
+            if (target <= cur_pc_) backward_branch(target);
+        }
     }
     void branch_likely(bool taken, u64 target) {
         if (taken) {
             next_delay_ = true;
             npc_ = target;
+            if (target <= cur_pc_) backward_branch(target);
         } else {  // nullify the delay slot
             pc = npc_;
             npc_ = pc + 4;
@@ -227,8 +321,15 @@ private:
     template <Access A>
     bool lookup(u64 vaddr, u8*& host, u64& paddr);
     void flush_fast_tlb();
+    void flush_fast_tlb_entry(const TlbEntry& e);
     void update_mode();
     bool ops64_enabled() const;
+    // Load/store address: a full 64-bit sum with 64-bit addressing, otherwise
+    // the 32-bit sum sign-extended (32-bit binaries rely on the wrap).
+    u64 effective_address(u64 base, u64 offset) const {
+        const u64 a = base + offset;
+        return addr64_ ? a : static_cast<u64>(static_cast<s64>(static_cast<s32>(a)));
+    }
     bool cop0_usable() const { return mode_ == kKernel || mode_ == kKernelErl || (status_ & sr::CU0); }
 
     // Memory access (return false if an exception was raised)
@@ -251,7 +352,11 @@ private:
     void tlb_read();
     void tlb_probe();
     u32 random() const;
-    u32 count() const { return static_cast<u32>(count_offset_ + static_cast<u32>(cycles_ >> 1)); }
+    u32 count() const { return static_cast<u32>(count_offset_ + static_cast<u32>(cycles() >> 1)); }
+
+    // Idle detection
+    void skip_idle(u64 limit_cycle);
+    void touch() { ++change_epoch_; }  // a side effect that rules out idle skipping
 
     // FPU register file views (FR=0: 16 64-bit regs as 32 32-bit halves)
     u32 fpr_read32(unsigned n) const;
@@ -261,15 +366,76 @@ private:
 
     Bus& bus_;
     Options opts_;
+    bool block_cache_ = true;
+    bool block_invalidated_ = false;  // the running block's memory was written
+    bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
+    std::vector<Block> blocks_;
+    std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
+    u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
+    u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 
     u64 npc_ = 0;
     u64 cur_pc_ = 0;
     bool in_delay_ = false;
     bool next_delay_ = false;
-    u64 cycles_ = 0;
-    u64 timer_event_ = ~u64{0};
+    static constexpr unsigned kCycleFracBits = 10;
+    u64 time_fp_ = 0;                          // cycle counter, kCycleFracBits fractional bits
+    u64 weight_ = u64{1} << kCycleFracBits;    // charged per instruction
+    u64 instret_base_ = 0, instret_time_fp_ = 0, instret_skip_fp_ = 0;  // instructions() at the last re-base
+    u64 timer_event_fp_ = ~u64{0};             // Count == Compare, in time_fp_ units
+
+    // Loops are tracked per backward branch (nested loops each get an entry),
+    // in a small direct-mapped table.
+    // Every RAM store is logged (address and size) in a ring; an iteration's
+    // stores are the entries made since its loop's previous visit.
+    static constexpr unsigned kStoreLogBits = 7;
+    struct StoreRec {
+        const u8* host = nullptr;
+        unsigned size = 0;
+        u64 value = 0;  // at the end of the iteration (snapshots only)
+    };
+    struct LoopEntry {
+        u64 branch_pc = ~u64{0};
+        u64 time_fp = 0;    // time of the previous visit
+        u64 epoch = 0;      // change_epoch_ at the previous visit
+        u64 weight_epoch = 0;
+        u64 store_pos = 0;  // store_count_ at the previous visit
+        u64 period_fp = 0;  // length of the iteration the snapshot belongs to
+        unsigned cooldown = 0;
+        bool have_snapshot = false;
+        std::array<u64, 34> regs{};  // GPRs, HI, LO
+        unsigned nstores = 0;
+        std::array<StoreRec, 1u << kStoreLogBits> stores{};
+    };
+    void log_store(const u8* host, unsigned size) {
+        store_log_[store_count_ & ((1u << kStoreLogBits) - 1)] = {host, size, 0};
+        ++store_count_;
+    }
+    bool snapshot_matches(const LoopEntry& e, u64 period, unsigned nstores) const;
+    void take_snapshot(LoopEntry& e, u64 period, unsigned nstores);
+    void backward_branch(u64 target) {
+        // Loops known to make progress are left alone for a while, cheaply.
+        LoopEntry& e = loops_[(cur_pc_ >> 2) & ((1u << kLoopTableBits) - 1)];
+        if (e.branch_pc == cur_pc_ && e.cooldown) {
+            if (--e.cooldown == 0) e.branch_pc = ~u64{0};  // start afresh afterwards
+            return;
+        }
+        loop_visit(e, target);
+    }
+    void loop_visit(LoopEntry& e, u64 target);
+    static constexpr unsigned kLoopTableBits = 4;
+    bool idle_skip_ = true;
+    u64 change_epoch_ = 0;  // bumped by every side effect
+    u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
+    u64 store_count_ = 0;
+    std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
+    std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    bool idle_ready_ = false;  // confirmed spin: skip once the branch has executed
+    u64 idle_period_fp_ = 0;
+    u64 idle_skipped_fp_ = 0;
     unsigned mode_ = kKernelErl;
+    bool addr64_ = false;  // 64-bit addressing in the current mode (KX/SX/UX)
 
     // COP0
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
@@ -286,7 +452,9 @@ private:
     std::vector<u32> itag_, dtag_, stag_;
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
 
-    FastEntry fast_[kNumModes][2][kFastEntries];
+    // Separate tables for fetch, load and store (indexed by Access), so code
+    // and data pages that share low address bits do not evict each other.
+    FastEntry fast_[kNumModes][3][kFastEntries];
 };
 
 }  // namespace sg::mips

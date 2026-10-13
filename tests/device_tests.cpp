@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Tests for the generic peripheral chips (PIT, RTC, EEPROM, SCC).
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -7,6 +9,7 @@
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
 #include "devices/pit8254.h"
+#include "devices/scsi_disk.h"
 #include "devices/wd33c93.h"
 #include "devices/z85230.h"
 #include "test.h"
@@ -218,4 +221,338 @@ TEST(wd33c93_reset_and_selection_timeout) {
     wd.write_data(0x04);  // DISCONNECT while not connected: no interrupt
     clk.advance_to(100000 + 150000 * 40);
     CHECK(!irq);
+}
+
+namespace {
+std::string make_image(unsigned blocks) {
+    const std::string path = (std::filesystem::temp_directory_path() / "sg_scsi_test.img").string();
+    std::ofstream f(path, std::ios::binary);
+    for (unsigned b = 0; b < blocks; ++b) {
+        std::vector<char> block(512, static_cast<char>(b));
+        f.write(block.data(), 512);
+    }
+    return path;
+}
+void wd_write(Wd33c93& wd, u8 reg, u8 v) {
+    wd.write_address(reg);
+    wd.write_data(v);
+}
+}  // namespace
+
+TEST(scsi_cdrom_inquiry_capacity_read) {
+    const std::string path = make_image(16);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, path);
+    CHECK(cd.ok());
+    const u8 inquiry[6] = {0x12, 0, 0, 0, 36, 0};
+    auto r = cd.command(inquiry, 6);
+    CHECK_EQ(r.data_in.size(), 36u);
+    CHECK_EQ(r.data_in[0], 0x05);  // CD-ROM
+    const u8 capacity[10] = {0x25};
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[3], 15);    // last LBA
+    CHECK_EQ(r.data_in[6], 0x02);  // 512-byte blocks
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 2, 0};
+    r = cd.command(read10, 10);
+    CHECK_EQ(r.data_in.size(), 1024u);
+    CHECK_EQ(r.data_in[0], 3);
+    CHECK_EQ(r.data_in[600], 4);
+    const u8 write10[10] = {0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    r = cd.command(write10, 10);
+    CHECK_EQ(r.status, 0x02);  // write-protected medium
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_select_and_transfer_dma) {
+    const std::string path = make_image(8);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x01, 0x80);  // control: DMA mode
+    wd_write(wd, 0x15, 1);     // destination ID
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 5, 0, 0, 1, 0};  // READ(10) block 5
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    wd_write(wd, 0x12, 0);
+    wd_write(wd, 0x13, 0x02);
+    wd_write(wd, 0x14, 0x00);  // transfer count 512
+    wd_write(wd, 0x18, 0x09);  // SELECT-AND-TRANSFER
+    clk.advance_to(150000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 512u);
+    if (!memory.empty()) CHECK_EQ(memory[0], 5);
+    wd.write_address(0x0F);
+    CHECK_EQ(wd.read_data(), 0x00);  // target status GOOD
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x16);  // select-and-transfer complete
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {
+    const std::string path = make_image(8);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x01, 0x80);
+    wd_write(wd, 0x15, 1);
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 2, 0, 0, 4, 0};  // READ(10) blocks 2-5
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    auto start = [&](u32 count) {
+        wd_write(wd, 0x12, static_cast<u8>(count >> 16));
+        wd_write(wd, 0x13, static_cast<u8>(count >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(count));
+        wd_write(wd, 0x18, 0x09);
+    };
+    start(1024);  // host DMA only covers half the data
+    clk.advance_to(150000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 1024u);
+    wd.write_address(0x10);
+    CHECK_EQ(wd.read_data(), 0x46);  // paused: transfer count exhausted
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x49);  // unexpected phase: target still in DATA IN
+    CHECK(!irq);
+    start(1024);  // reload and continue
+    clk.advance_to(300000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 2048u);
+    if (memory.size() == 2048) {
+        CHECK_EQ(memory[0], 2);
+        CHECK_EQ(memory[1024], 4);
+        CHECK_EQ(memory[2047], 5);
+    }
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x16);
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_select_with_atn_reports_selection_then_message_out) {
+    const std::string path = make_image(1);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);  // SELECT WITH ATN
+    clk.advance_to(150000);
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x11);  // selected
+    CHECK(irq);                      // target requests MESSAGE OUT
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    CHECK(!irq);
+    wd_write(wd, 0x18, 0x04);  // DISCONNECT: no interrupt
+    clk.advance_to(300000);
+    CHECK(!irq);
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_sync_negotiation_then_command) {
+    const std::string path = make_image(4);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, static_cast<u8>(n >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    wd_write(wd, 0x01, 0x80);  // DMA mode: message phases still use the data register
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);  // SELECT WITH ATN
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);  // MESSAGE OUT requested
+    count(6);
+    wd_write(wd, 0x18, 0x20);  // TRANSFER INFO, polled
+    for (u8 b : {u8{0xC0}, u8{0x01}, u8{0x03}, u8{0x01}, u8{0x32}, u8{0x0C}}) {
+        CHECK(wd.read_aux_status() & 0x01);  // DBR
+        wd_write(wd, 0x19, b);               // IDENTIFY + SDTR
+    }
+    CHECK_EQ(status(), 0x1F);  // done; target requests MESSAGE IN
+    std::vector<u8> reply;
+    for (;;) {
+        count(1);
+        wd_write(wd, 0x18, 0x20);
+        CHECK(wd.read_aux_status() & 0x01);
+        wd.write_address(0x19);
+        reply.push_back(wd.read_data());
+        CHECK_EQ(status(), 0x20);  // paused with ACK asserted
+        wd_write(wd, 0x18, 0x03);  // NEGATE ACK
+        const u8 next = status();
+        if (next != 0x8F) {
+            CHECK_EQ(next, 0x8A);  // COMMAND phase next
+            break;
+        }
+        if (reply.size() > 8) break;
+    }
+    CHECK_EQ(reply.size(), 5u);
+    if (reply.size() == 5) CHECK_EQ(reply[4], 0x00);  // asynchronous: offset 0
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0};
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    count(512);
+    wd_write(wd, 0x18, 0x08);  // SELECT-WITH-ATN-AND-TRANSFER continues the connection
+    CHECK_EQ(status(), 0x16);
+    CHECK_EQ(memory.size(), 512u);
+    if (!memory.empty()) CHECK_EQ(memory[0], 3);
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_message_in_whole_message_holds_ack_on_last_byte) {
+    const std::string path = make_image(1);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, 0);
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    count(6);
+    wd_write(wd, 0x18, 0x20);
+    for (u8 b : {u8{0x80}, u8{0x01}, u8{0x03}, u8{0x01}, u8{0x32}, u8{0x0A}}) wd_write(wd, 0x19, b);
+    CHECK_EQ(status(), 0x1F);
+    count(5);
+    wd_write(wd, 0x18, 0x20);  // whole SDTR reply in one Transfer Info
+    std::vector<u8> reply;
+    for (int i = 0; i < 5 && (wd.read_aux_status() & 0x01); ++i) {
+        wd.write_address(0x19);
+        reply.push_back(wd.read_data());
+    }
+    CHECK_EQ(reply.size(), 5u);
+    if (reply.size() == 5) {
+        CHECK_EQ(reply[0], 0x01);
+        CHECK_EQ(reply[3], 0x32);  // period echoed
+    }
+    CHECK_EQ(status(), 0x20);  // ACK held on the last byte
+    wd_write(wd, 0x18, 0x03);
+    CHECK_EQ(status(), 0x8A);  // then COMMAND
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_manual_phases_command_status_message) {
+    const std::string path = make_image(2);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, static_cast<u8>(n >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    auto read_byte = [&]() {
+        wd.write_address(0x19);
+        return wd.read_data();
+    };
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    wd_write(wd, 0x19, 0x80);  // IDENTIFY only
+    CHECK_EQ(status(), 0x1A);  // COMMAND next
+    count(6);
+    wd_write(wd, 0x18, 0x20);
+    for (u8 b : {u8{0x08}, u8{0}, u8{0}, u8{1}, u8{1}, u8{0}}) wd_write(wd, 0x19, b);  // READ(6) block 1
+    CHECK_EQ(status(), 0x19);  // DATA IN next
+    count(512);
+    wd_write(wd, 0x18, 0x20);  // polled data
+    std::vector<u8> data;
+    while (wd.read_aux_status() & 0x01) data.push_back(read_byte());
+    CHECK_EQ(data.size(), 512u);
+    if (!data.empty()) CHECK_EQ(data[0], 1);
+    CHECK_EQ(status(), 0x1B);  // STATUS next
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    CHECK_EQ(read_byte(), 0x00);  // GOOD
+    CHECK_EQ(status(), 0x1F);     // MESSAGE IN next
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    CHECK_EQ(read_byte(), 0x00);  // COMMAND COMPLETE
+    CHECK_EQ(status(), 0x20);
+    wd_write(wd, 0x18, 0x03);
+    CHECK_EQ(status(), 0x85);  // target released the bus
+    std::filesystem::remove(path);
+}
+
+TEST(ds1386_year_counted_from_a_base) {
+    Ds1386 rtc;
+    rtc.set_year_base(1940);  // IRIX on the IP22
+    double host = 1700000000;
+    rtc.set_time_source([&] { return host; });
+    rtc.write(Ds1386::kRegCommand, 0x00);
+    rtc.write(0xA, 0x83);  // 1940 + 83 = 2023
+    rtc.write(0x9, 0x11);
+    rtc.write(0x8, 0x14);
+    rtc.write(0x4, 0x12);
+    rtc.write(0x2, 0x00);
+    rtc.write(0x1, 0x00);
+    rtc.write(Ds1386::kRegCommand, 0x80);
+    host += 86400;
+    CHECK_EQ(rtc.read(0x8), 0x15);
+    CHECK_EQ(rtc.read(0x6), 4);     // 2023-11-15 was a Wednesday (1 = Sunday)
+    CHECK_EQ(rtc.read(0xA), 0x83);  // still counted from 1940
+}
+
+TEST(ds1386_power_on_discards_saved_clock_registers) {
+    Ds1386 rtc;
+    rtc.set_year_base(1940);
+    double host = 1700000000;  // 2023-11-14 22:13:20 UTC
+    rtc.set_time_source([&] { return host; });
+    rtc.memory()[0xA] = 0x56;  // a saved image from another time (1996)
+    rtc.memory()[Ds1386::kRegCommand] = 0x00;
+    rtc.power_on();
+    rtc.write(Ds1386::kRegCommand, 0x00);  // freeze and resume as the PROM does
+    rtc.write(Ds1386::kRegCommand, 0x80);
+    CHECK_EQ(rtc.read(0xA), 0x83);  // 2023
+    CHECK_EQ(rtc.read(0x4), 0x22);
 }

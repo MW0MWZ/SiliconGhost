@@ -6,6 +6,7 @@
 // changes an offset and never touches the host.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <vector>
 
@@ -24,10 +25,21 @@ public:
     void write(unsigned index, u8 value);
 
     std::vector<u8>& memory() { return mem_; }  // whole array, for NVRAM persistence
+    // After restoring memory(): the clock carries on from the time source
+    // (a real battery-backed clock kept running while the machine was off),
+    // replacing whatever clock registers were saved.
+    void power_on();
     // Seconds since the Unix epoch (UTC), fractional; must not go backwards.
     void set_time_source(std::function<double()> source);
+    // The year register holds years since `base` (0: the calendar year's
+    // last two digits). IRIX on the IP22 counts from 1940.
+    void set_year_base(int base) {
+        year_base_ = base;
+        loaded_centis_ = kNotLoaded;
+    }
 
 private:
+    int year_base_ = 0;
     double now() const { return source_() + offset_; }
     void load_registers();  // clock registers <- current time
     bool registers_valid(s64& seconds) const;
@@ -36,6 +48,8 @@ private:
     std::vector<u8> mem_;
     std::function<double()> source_;
     double offset_ = 0;   // guest time - source time, seconds
+    static constexpr s64 kNotLoaded = INT64_MIN;
+    s64 loaded_centis_ = kNotLoaded;  // time (1/100 s) the clock registers were last loaded with
     bool frozen_ = false; // TE = 0: registers hold a snapshot
     bool valid_ = true;   // registers describe a real date/time
 };

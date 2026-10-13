@@ -5,20 +5,32 @@
 // registers, which is then accessed through the data port (SCMD); reading
 // SASR returns the auxiliary status. Targets attach through ScsiTarget; with
 // no target at an ID, selection times out exactly as on a real bus.
+// Select-and-Transfer runs the whole command, data and status sequence (and
+// pauses, connected, if the transfer count runs out mid-data); Select plus
+// Transfer Info walks the bus phases one at a time, including the message
+// phases. Data moves through the host DMA channel, or the data register in
+// polled mode; command, status and message bytes always use the register.
 #pragma once
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include "core/scheduler.h"
 #include "core/types.h"
+#include "devices/scsi_disk.h"
 
 namespace sg {
 
 class Wd33c93 {
 public:
     using IrqCallback = std::function<void(bool asserted)>;
+    // DMA hooks: move up to `length` bytes to or from host memory; return the
+    // number actually moved.
+    using DmaToMemory = std::function<u32(const u8* data, u32 length)>;
+    using DmaFromMemory = std::function<u32(u8* data, u32 length)>;
 
     // `cycles_per_ms`: CPU cycles per millisecond, for command timing.
     Wd33c93(Scheduler& scheduler, double cycles_per_ms);
@@ -30,10 +42,15 @@ public:
     void write_data(u8 value);
 
     void set_irq_callback(IrqCallback cb) { irq_cb_ = std::move(cb); }
+    void set_dma(DmaToMemory to_memory, DmaFromMemory from_memory) {
+        dma_to_memory_ = std::move(to_memory);
+        dma_from_memory_ = std::move(from_memory);
+    }
+    void attach(unsigned id, ScsiTarget* target) { targets_[id & 7] = target; }
     bool irq() const { return (aux_status_ & kAuxInt) != 0; }
 
 private:
-    static constexpr u8 kAuxInt = 0x80, kAuxLci = 0x40, kAuxBusy = 0x20, kAuxCip = 0x10;
+    static constexpr u8 kAuxInt = 0x80, kAuxLci = 0x40, kAuxBusy = 0x20, kAuxCip = 0x10, kAuxDbr = 0x01;
 
     enum Reg : unsigned {
         kOwnId = 0x00, kControl = 0x01, kTimeout = 0x02, kTargetLun = 0x0F, kCommandPhase = 0x10,
@@ -43,7 +60,30 @@ private:
 
     void command(u8 cmd);
     void complete(u8 status);  // finish the current command with an interrupt
+    void finish_in(u8 status, double ms);
+    u32 transfer_count() const;
+    void set_transfer_count(u32 count);
+    bool dma_mode() const { return (regs_[kControl] & 0xE0) != 0; }
     void advance_address();
+
+    // Bus and target side
+    void select(ScsiTarget& target, bool atn);
+    void release_bus();
+    void issue_command(const u8* cdb, unsigned length);
+    void end_data();
+    bool receive_messages(const std::vector<u8>& m);
+    void selection_timeout();
+
+    void select_and_transfer();
+    void sat_complete(u32 moved);
+    u32 dma_data();
+    void start_polled_data(bool sat);
+    void polled_data_done();
+
+    void transfer_info();
+    void end_pio_out();
+    void pio_in_taken();
+    void negate_ack();
 
     Scheduler& scheduler_;
     double cycles_per_ms_;
@@ -51,8 +91,27 @@ private:
     u8 address_ = 0;
     u8 aux_status_ = 0;
     u8 pending_status_ = 0;
+    u8 queued_status_ = 0;  // interrupt status delivered after the current one is read
     std::unique_ptr<Timer> timer_;
     IrqCallback irq_cb_;
+    DmaToMemory dma_to_memory_;
+    DmaFromMemory dma_from_memory_;
+    std::array<ScsiTarget*, 8> targets_{};
+
+    // Connection state
+    ScsiTarget* target_ = nullptr;  // connected target, if any
+    u8 bus_phase_ = 0;              // phase the target is requesting
+    u8 cdb_[12] = {};
+    u8 target_status_ = 0;
+    bool command_done_ = false;     // status sent; COMMAND COMPLETE follows
+    std::vector<u8> buffer_;        // data phase bytes
+    std::size_t buffer_pos_ = 0;
+    std::size_t polled_end_ = 0;    // end of the current polled data chunk
+    bool polled_sat_ = false;       // polled chunk belongs to Select-and-Transfer
+    bool data_out_ = false;
+    std::vector<u8> pio_;           // command / status / message bytes of a Transfer Info
+    std::size_t pio_pos_ = 0;
+    std::deque<u8> msg_in_;         // message bytes the target has to send
 };
 
 }  // namespace sg

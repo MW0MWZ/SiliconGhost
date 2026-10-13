@@ -70,6 +70,7 @@ TEST(disasm_common_forms) {
     CHECK(disassemble(ERET, 0) == "eret");
 }
 
+#include "core/pacer.h"
 #include "core/scheduler.h"
 
 TEST(scheduler_orders_and_reschedules) {
@@ -93,4 +94,79 @@ TEST(scheduler_orders_and_reschedules) {
     CHECK_EQ(s.next_event(), 160ull);  // periodic rescheduled relative to the clock
     periodic.cancel();
     CHECK_EQ(s.next_event(), Scheduler::kNever);
+}
+
+namespace {
+struct FakeHost {
+    u64 now = 1000000000;
+    u64 slept = 0;
+    Pacer::HostClock clock() {
+        return {[this] { return now; }, [this](u64 ns) { now += ns; slept += ns; }};
+    }
+};
+}  // namespace
+
+TEST(pacer_cycle_mode_waits_when_ahead) {
+    FakeHost host;
+    Pacer p(Pacer::Mode::Cycle, 100e6, host.clock());
+    p.update(0, 0);
+    host.now += 2000000;               // 2 ms of host time ran 5 ms of guest time (idle skipping)
+    CHECK_EQ(p.update(500000, 1000), 1.0);
+    CHECK_EQ(host.slept, 3000000u);    // waits for the wall clock to catch up
+    host.now += 10000000;              // a slow stretch: the guest falls behind and is not waited for
+    p.update(1000000, 2000);
+    CHECK_EQ(host.slept, 3000000u);
+}
+
+TEST(pacer_realtime_locks_guest_time_to_the_wall_clock) {
+    FakeHost host;
+    const double hz = 175e6;
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    u64 cycles = 0, instructions = 0;
+    double cpi = p.update(0, 0);
+    const double host_ips = 350e6;  // the host runs twice as many instructions as a real R4400 would cycles
+    double guest_cycles = 0;
+    for (int slice = 0; slice < 2000; ++slice) {  // 1 ms slices of host time, fully busy
+        const u64 n = static_cast<u64>(host_ips / 1000);
+        instructions += n;
+        guest_cycles += static_cast<double>(n) * cpi;
+        cycles = static_cast<u64>(guest_cycles);
+        host.now += 1000000;
+        cpi = p.update(cycles, instructions);
+    }
+    CHECK(cpi > 0.49 && cpi < 0.51);  // each instruction worth half a cycle: a CPU twice as fast
+    const double wall = 2.0, guest = static_cast<double>(cycles) / hz;
+    CHECK(guest > wall - 0.01 && guest < wall + 0.01);
+}
+
+TEST(pacer_realtime_recovers_from_a_stall) {
+    FakeHost host;
+    const double hz = 175e6, host_ips = 350e6;
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    p.update(0, 0);
+    // 1 ms of guest time took 200 ms of host time (the host was busy
+    // elsewhere): the charge per instruction goes to its maximum.
+    u64 cycles = 175000, instructions = 175000;
+    host.now += 200000000;
+    double cpi = p.update(cycles, instructions);
+    CHECK(cpi > 15);
+    // Back to full speed, in 1 ms slices of guest time, each now holding
+    // fewer instructions than one measurement needs.
+    for (int slice = 0; slice < 3000; ++slice) {
+        const u64 n = static_cast<u64>(175000 / cpi);
+        instructions += n;
+        cycles += 175000;
+        host.now += static_cast<u64>(static_cast<double>(n) / host_ips * 1e9);
+        cpi = p.update(cycles, instructions);
+    }
+    CHECK(cpi > 0.45 && cpi < 0.55);
+}
+
+TEST(pacer_max_mode_never_waits) {
+    FakeHost host;
+    Pacer p(Pacer::Mode::Max, 100e6, host.clock());
+    p.update(0, 0);
+    host.now += 1000;
+    CHECK_EQ(p.update(100000000, 1000), 1.0);
+    CHECK_EQ(host.slept, 0u);
 }

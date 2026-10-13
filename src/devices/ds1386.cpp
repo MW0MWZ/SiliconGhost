@@ -44,13 +44,28 @@ Ds1386::Ds1386(unsigned size_bytes) : mem_(size_bytes, 0) {
 }
 
 void Ds1386::set_time_source(std::function<double()> source) {
+    loaded_centis_ = kNotLoaded;
     const double t = now();
     source_ = std::move(source);
     offset_ = t - source_();
 }
 
+void Ds1386::power_on() {
+    loaded_centis_ = kNotLoaded;
+    offset_ = 0;
+    frozen_ = false;
+    valid_ = true;
+    mem_[kRegCommand] |= 0x80;  // TE
+    load_registers();
+}
+
 void Ds1386::load_registers() {
     const double t = now();
+    // Software polls the clock constantly; only re-derive the registers when
+    // the time they show (to the hundredth) has moved on.
+    const s64 centis = static_cast<s64>(t * 100);
+    if (centis == loaded_centis_) return;
+    loaded_centis_ = centis;
     s64 days = static_cast<s64>(t) / 86400, secs = static_cast<s64>(t) % 86400;
     if (secs < 0) {
         secs += 86400;
@@ -76,7 +91,7 @@ void Ds1386::load_registers() {
     mem_[0x6] = static_cast<u8>(dow);
     mem_[0x8] = to_bcd(day);
     mem_[0x9] = static_cast<u8>((mem_[0x9] & 0xC0) | to_bcd(month));
-    mem_[0xA] = to_bcd(static_cast<unsigned>(year % 100));
+    mem_[0xA] = to_bcd(static_cast<unsigned>(((year - year_base_) % 100 + 100) % 100));
 }
 
 bool Ds1386::registers_valid(s64& seconds) const {
@@ -95,15 +110,16 @@ bool Ds1386::registers_valid(s64& seconds) const {
         if (!valid_bcd(h, 23)) return false;
         hour = from_bcd(h);
     }
-    // Two-digit year: 70..99 -> 19xx, 00..69 -> 20xx.
+    // Two-digit year; with the calendar base, 70..99 -> 19xx, 00..69 -> 20xx.
     const unsigned yy = from_bcd(yr);
-    const s64 year = yy >= 70 ? 1900 + yy : 2000 + yy;
+    const s64 year = year_base_ ? year_base_ + yy : (yy >= 70 ? 1900 + yy : 2000 + yy);
     const s64 days = days_from_civil(year, from_bcd(mon), from_bcd(date));
     seconds = days * 86400 + hour * 3600 + from_bcd(min) * 60 + from_bcd(sec);
     return true;
 }
 
 void Ds1386::commit() {
+    loaded_centis_ = kNotLoaded;
     s64 t;
     valid_ = registers_valid(t);
     if (valid_) offset_ = static_cast<double>(t) + from_bcd(mem_[0x0] & 0xFF) / 100.0 - source_();
@@ -117,6 +133,7 @@ u8 Ds1386::read(unsigned index) {
 
 void Ds1386::write(unsigned index, u8 value) {
     if (index >= mem_.size()) return;
+    if (index < kNumClockRegs) loaded_centis_ = kNotLoaded;  // registers no longer show the loaded time
     if (index == kRegCommand) {
         const bool te = value & 0x80;
         if (!te && !frozen_) {
