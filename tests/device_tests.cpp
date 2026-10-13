@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Tests for the generic peripheral chips (PIT, RTC, EEPROM, SCC).
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -7,6 +9,7 @@
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
 #include "devices/pit8254.h"
+#include "devices/scsi_disk.h"
 #include "devices/wd33c93.h"
 #include "devices/z85230.h"
 #include "test.h"
@@ -218,4 +221,73 @@ TEST(wd33c93_reset_and_selection_timeout) {
     wd.write_data(0x04);  // DISCONNECT while not connected: no interrupt
     clk.advance_to(100000 + 150000 * 40);
     CHECK(!irq);
+}
+
+namespace {
+std::string make_image(unsigned blocks) {
+    const std::string path = (std::filesystem::temp_directory_path() / "sg_scsi_test.img").string();
+    std::ofstream f(path, std::ios::binary);
+    for (unsigned b = 0; b < blocks; ++b) {
+        std::vector<char> block(512, static_cast<char>(b));
+        f.write(block.data(), 512);
+    }
+    return path;
+}
+void wd_write(Wd33c93& wd, u8 reg, u8 v) {
+    wd.write_address(reg);
+    wd.write_data(v);
+}
+}  // namespace
+
+TEST(scsi_cdrom_inquiry_capacity_read) {
+    const std::string path = make_image(16);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, path);
+    CHECK(cd.ok());
+    const u8 inquiry[6] = {0x12, 0, 0, 0, 36, 0};
+    auto r = cd.command(inquiry, 6);
+    CHECK_EQ(r.data_in.size(), 36u);
+    CHECK_EQ(r.data_in[0], 0x05);  // CD-ROM
+    const u8 capacity[10] = {0x25};
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[3], 15);    // last LBA
+    CHECK_EQ(r.data_in[6], 0x02);  // 512-byte blocks
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 2, 0};
+    r = cd.command(read10, 10);
+    CHECK_EQ(r.data_in.size(), 1024u);
+    CHECK_EQ(r.data_in[0], 3);
+    CHECK_EQ(r.data_in[600], 4);
+    const u8 write10[10] = {0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    r = cd.command(write10, 10);
+    CHECK_EQ(r.status, 0x02);  // write-protected medium
+    std::filesystem::remove(path);
+}
+
+TEST(wd33c93_select_and_transfer_dma) {
+    const std::string path = make_image(8);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x01, 0x80);  // control: DMA mode
+    wd_write(wd, 0x15, 1);     // destination ID
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 5, 0, 0, 1, 0};  // READ(10) block 5
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    wd_write(wd, 0x12, 0);
+    wd_write(wd, 0x13, 0x02);
+    wd_write(wd, 0x14, 0x00);  // transfer count 512
+    wd_write(wd, 0x18, 0x09);  // SELECT-AND-TRANSFER
+    clk.advance_to(150000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 512u);
+    if (!memory.empty()) CHECK_EQ(memory[0], 5);
+    wd.write_address(0x0F);
+    CHECK_EQ(wd.read_data(), 0x00);  // target status GOOD
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x16);  // select-and-transfer complete
+    std::filesystem::remove(path);
 }

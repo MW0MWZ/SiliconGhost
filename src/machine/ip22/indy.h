@@ -24,6 +24,8 @@ struct IndyConfig {
     double sysclk_hz = 50.0e6;  // SysAD bus clock
     u32 prid = 0x00000450;      // R4400 revision 5.0
     bool graphics = true;       // Newport XL8 in the GFX slot
+    std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
+    std::string cdrom_image;    // SCSI CD-ROM (ID 4), raw 512-byte blocks (IRIX media layout)
 };
 
 class Indy {
@@ -70,6 +72,7 @@ private:
     Mc mc_;
     Newport newport_;
     Timer serial_timer_;
+    std::unique_ptr<ScsiDisk> disk_, cdrom_;
 
     SerialOutput serial_out_;
     std::mutex serial_mutex_;

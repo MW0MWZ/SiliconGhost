@@ -38,6 +38,8 @@ void usage(const char* argv0) {
                  "usage: %s --prom FILE [options]\n"
                  "  --prom FILE      IP22 boot PROM image (raw, big-endian)\n"
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved on exit\n"
+                 "  --disk FILE      SCSI disk image (ID 1)\n"
+                 "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media\n"
                  "  --ram MB         memory size, 16..256 (default 64)\n"
                  "  --cpu-mhz N      R4400 pipeline clock (default 150)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only)\n"
@@ -122,6 +124,8 @@ int main(int argc, char** argv) {
         if (!std::strcmp(a, "--prom")) prom = next();
         else if (!std::strcmp(a, "--nvram")) nvram = next();
         else if (!std::strcmp(a, "--screenshot")) screenshot = next();
+        else if (!std::strcmp(a, "--disk")) config.disk_image = next();
+        else if (!std::strcmp(a, "--cdrom")) config.cdrom_image = next();
         else if (!std::strcmp(a, "--ram")) config.ram_mb = static_cast<unsigned>(std::strtoul(next(), nullptr, 0));
         else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);

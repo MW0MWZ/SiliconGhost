@@ -37,7 +37,7 @@ Indy::Indy(const IndyConfig& config)
       prom_(std::make_unique<u8[]>(kPromMaxSize)),
       cpu_(bus_, cpu_options(config)),
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
-      hpc3_(ioc_, scheduler_, config.cpu_hz),
+      hpc3_(bus_, ioc_, scheduler_, config.cpu_hz),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
       newport_(scheduler_, config.cpu_hz, Newport::Options{}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
@@ -68,6 +68,18 @@ Indy::Indy(const IndyConfig& config)
         powered_off_ = true;
         cpu_.request_stop();
     });
+    // SCSI devices on the built-in bus: disk at ID 1, CD-ROM at ID 4 (SGI's usual IDs).
+    auto attach = [this](std::unique_ptr<ScsiDisk>& slot, ScsiDisk::Kind kind, const std::string& path, unsigned id) {
+        if (path.empty()) return;
+        slot = std::make_unique<ScsiDisk>(kind, path);
+        if (!slot->ok()) throw std::runtime_error("cannot open " + path);
+        hpc3_.scsi0().attach(id, slot.get());
+        SG_LOG(Info, "indy", "SCSI ID %u: %s (%llu blocks)", id, path.c_str(),
+               static_cast<unsigned long long>(slot->blocks()));
+    };
+    attach(disk_, ScsiDisk::Kind::Disk, config_.disk_image, 1);
+    attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_image, 4);
+
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
         const double wall = static_cast<double>(std::time(nullptr));
