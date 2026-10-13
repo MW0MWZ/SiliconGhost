@@ -193,15 +193,19 @@ void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
     b.count = 0;
     const u32 room = (0x1000 - page_offset) / 4;  // instructions left in the page
     const u32 max = std::min<u32>(room, kMaxBlockLength);
-    auto add = [&](u32 w) {
-        b.ops[b.count++] = Op{decode(w), w, static_cast<u8>(f_rs(w)), static_cast<u8>(f_rt(w)),
-                              static_cast<u8>(f_rd(w)), static_cast<u8>(f_sa(w))};
+    b.plain = 0;
+    auto add = [&](u32 w, bool delay_slot) {
+        bool plain;
+        const Handler fn = decode(w, plain);
+        if (plain && !delay_slot) b.plain |= 1u << b.count;
+        b.ops[b.count++] = Op{fn, w, static_cast<u8>(f_rs(w)), static_cast<u8>(f_rt(w)), static_cast<u8>(f_rd(w)),
+                              static_cast<u8>(f_sa(w))};
     };
     while (b.count < max) {
         const u32 w = load_be<u32>(host + 4 * b.count);
-        add(w);
+        add(w, false);
         if (is_branch(w)) {
-            if (b.count < max) add(load_be<u32>(host + 4 * b.count));
+            if (b.count < max) add(load_be<u32>(host + 4 * b.count), true);
             break;
         }
         if (ends_block(w)) break;
@@ -262,38 +266,70 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         if (b.host != host) build_block(b, host, offset);
         block_invalidated_ = false;
 
-        for (u32 i = 0; i < b.count; ++i) {
-            if (SG_UNLIKELY(time_fp_ >= safe)) {
-                if (!first && !(cycles() < cycle && cycles() < *limit)) return;
-                time_fp_ += weight_;
+        // Plain operations only advance the time (kept in `t`), so pc, npc_
+        // and the delay-slot state are brought up to date (`synced`) just
+        // before anything that can observe them, and when the block is left.
+        u64 ipc = pc;  // address of ops[i]
+        u64 t = time_fp_;
+        bool synced = true;
+        u32 i = 0;
+        for (; i < b.count; ++i, ipc += 4) {
+            if (SG_UNLIKELY(t >= safe)) {
+                time_fp_ = t;
+                if (!first && !(cycles() < cycle && cycles() < *limit)) {
+                    if (!synced) set_pc(ipc);
+                    return;
+                }
+                time_fp_ = t += weight_;
                 if (time_fp_ >= timer_event_fp_) timer_fire();
                 check_irq = true;
                 safe = safe_time();
             } else {
-                time_fp_ += weight_;
+                t += weight_;
             }
             first = false;
-            cur_pc_ = pc;
-            in_delay_ = next_delay_;
-            next_delay_ = false;
             if (SG_UNLIKELY(check_irq)) {
                 check_irq = false;
                 if (interrupt_pending()) {
+                    time_fp_ = t;
+                    cur_pc_ = ipc;
+                    in_delay_ = next_delay_;
+                    next_delay_ = false;
                     raise(Exc::Int);
                     break;
                 }
             }
-            pc = npc_;
-            npc_ += 4;
-            io_ = false;
             const Op& op = b.ops[i];
+            if ((b.plain >> i) & 1) {
+                op.fn(*this, op);
+                synced = false;
+                continue;
+            }
+            time_fp_ = t;
+            cur_pc_ = ipc;
+            in_delay_ = next_delay_;
+            next_delay_ = false;
+            if (in_delay_) {
+                pc = npc_;
+                npc_ += 4;
+            } else {
+                pc = ipc + 4;
+                npc_ = ipc + 8;
+            }
+            io_ = false;
             op.fn(*this, op);
             gpr[0] = 0;
+            t = time_fp_;
+            synced = true;
             if (SG_UNLIKELY(io_)) {  // a device or CP0 may have raised an interrupt or moved an event
                 check_irq = true;
                 safe = safe_time();
             }
-            if (pc != cur_pc_ + 4 || block_invalidated_ || idle_ready_) break;
+            if (pc != ipc + 4 || block_invalidated_ || idle_ready_) break;
+        }
+        if (i == b.count) {  // ran off the end of the block
+            time_fp_ = t;
+            if (!synced) set_pc(ipc);
         }
 
         // Link to the block at the new pc if nothing it relies on changed.
@@ -1389,30 +1425,36 @@ struct R4000::Ops {
     }
 };
 
-R4000::Handler R4000::decode(u32 w) {
+R4000::Handler R4000::decode(u32 w, bool& plain) {
+    plain = false;
+    // Plain register operations; one that writes r0 does nothing at all.
+    auto pure = [&](Handler fn, unsigned dest) -> Handler {
+        plain = true;
+        return dest ? fn : Ops::nop;
+    };
     switch (w >> 26) {
         case 0x00:
             switch (w & 63) {
-                case 0x00: return w == 0 ? Ops::nop : Ops::sll;
-                case 0x02: return Ops::srl;
-                case 0x03: return Ops::sra;
-                case 0x04: return Ops::sllv;
-                case 0x06: return Ops::srlv;
-                case 0x07: return Ops::srav;
+                case 0x00: return pure(Ops::sll, f_rd(w));
+                case 0x02: return pure(Ops::srl, f_rd(w));
+                case 0x03: return pure(Ops::sra, f_rd(w));
+                case 0x04: return pure(Ops::sllv, f_rd(w));
+                case 0x06: return pure(Ops::srlv, f_rd(w));
+                case 0x07: return pure(Ops::srav, f_rd(w));
                 case 0x08: return Ops::jr;
                 case 0x09: return Ops::jalr;
-                case 0x10: return Ops::mfhi;
-                case 0x12: return Ops::mflo;
-                case 0x18: return Ops::mult;
-                case 0x19: return Ops::multu;
-                case 0x21: return Ops::addu;
-                case 0x23: return Ops::subu;
-                case 0x24: return Ops::and_;
-                case 0x25: return Ops::or_;
-                case 0x26: return Ops::xor_;
-                case 0x27: return Ops::nor;
-                case 0x2A: return Ops::slt;
-                case 0x2B: return Ops::sltu;
+                case 0x10: return pure(Ops::mfhi, f_rd(w));
+                case 0x12: return pure(Ops::mflo, f_rd(w));
+                case 0x18: return pure(Ops::mult, 1);
+                case 0x19: return pure(Ops::multu, 1);
+                case 0x21: return pure(Ops::addu, f_rd(w));
+                case 0x23: return pure(Ops::subu, f_rd(w));
+                case 0x24: return pure(Ops::and_, f_rd(w));
+                case 0x25: return pure(Ops::or_, f_rd(w));
+                case 0x26: return pure(Ops::xor_, f_rd(w));
+                case 0x27: return pure(Ops::nor, f_rd(w));
+                case 0x2A: return pure(Ops::slt, f_rd(w));
+                case 0x2B: return pure(Ops::sltu, f_rd(w));
                 case 0x2D: return Ops::daddu;
                 case 0x2F: return Ops::dsubu;
                 case 0x38: return Ops::dsll<0>;
@@ -1435,13 +1477,13 @@ R4000::Handler R4000::decode(u32 w) {
         case 0x05: return Ops::bne;
         case 0x06: return Ops::blez;
         case 0x07: return Ops::bgtz;
-        case 0x09: return Ops::addiu;
-        case 0x0A: return Ops::slti;
-        case 0x0B: return Ops::sltiu;
-        case 0x0C: return Ops::andi;
-        case 0x0D: return Ops::ori;
-        case 0x0E: return Ops::xori;
-        case 0x0F: return Ops::lui;
+        case 0x09: return pure(Ops::addiu, f_rt(w));
+        case 0x0A: return pure(Ops::slti, f_rt(w));
+        case 0x0B: return pure(Ops::sltiu, f_rt(w));
+        case 0x0C: return pure(Ops::andi, f_rt(w));
+        case 0x0D: return pure(Ops::ori, f_rt(w));
+        case 0x0E: return pure(Ops::xori, f_rt(w));
+        case 0x0F: return pure(Ops::lui, f_rt(w));
         case 0x14: return Ops::beql;
         case 0x15: return Ops::bnel;
         case 0x19: return Ops::daddiu;

@@ -231,10 +231,13 @@ private:
         u8 rs, rt, rd, sa;
     };
     struct Ops;  // the handlers
-    static Handler decode(u32 inst);
+    // `plain`: a register-only operation that cannot raise an exception and
+    // reads neither the pc nor the time, so it runs without bookkeeping.
+    static Handler decode(u32 inst, bool& plain);
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 count = 0;
+        u32 plain = 0;             // bit i: ops[i] is plain (never a delay slot)
         Op ops[kMaxBlockLength];
     };
     static unsigned block_index(const u8* host) {
