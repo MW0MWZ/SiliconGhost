@@ -14,7 +14,9 @@ namespace {
 constexpr u8 kGood = 0x00;
 constexpr u8 kCheckCondition = 0x02;
 
-constexpr u8 kSenseNone = 0x0, kSenseMediumError = 0x3, kSenseIllegalRequest = 0x5, kSenseDataProtect = 0x7;
+constexpr u8 kSenseNone = 0x0, kSenseNotReady = 0x2, kSenseMediumError = 0x3, kSenseIllegalRequest = 0x5;
+constexpr u8 kSenseUnitAttention = 0x6, kSenseDataProtect = 0x7;
+constexpr u8 kAscMediumChanged = 0x28, kAscMediumNotPresent = 0x3A;
 constexpr u8 kAscInvalidOpcode = 0x20, kAscLbaOutOfRange = 0x21, kAscWriteProtected = 0x27;
 constexpr u8 kAscUnrecoveredRead = 0x11;
 
@@ -33,7 +35,13 @@ void put_padded(u8* p, const char* s, std::size_t n) {
 
 }  // namespace
 
-ScsiDisk::ScsiDisk(Kind kind, const std::string& path) : kind_(kind), read_only_(kind == Kind::CdRom) {
+ScsiDisk::ScsiDisk(Kind kind, const std::string& path) : kind_(kind), read_only_(kind == Kind::CdRom) { open(path); }
+
+bool ScsiDisk::open(const std::string& path) {
+    if (file_.is_open()) file_.close();
+    file_.clear();
+    blocks_ = 0;
+    read_only_ = kind_ == Kind::CdRom;
     file_.open(path, std::ios::binary | std::ios::in | (read_only_ ? std::ios::openmode{} : std::ios::out));
     if (!file_.is_open() && !read_only_) {  // fall back to read-only access
         file_.open(path, std::ios::binary | std::ios::in);
@@ -43,6 +51,12 @@ ScsiDisk::ScsiDisk(Kind kind, const std::string& path) : kind_(kind), read_only_
         file_.seekg(0, std::ios::end);
         blocks_ = static_cast<u64>(file_.tellg()) / kBlockSize;
     }
+    return file_.is_open();
+}
+
+bool ScsiDisk::change_medium(const std::string& path) {
+    unit_attention_ = true;
+    return open(path);
 }
 
 ScsiTarget::Result ScsiDisk::check_condition(u8 key, u8 asc, u8 ascq) {
@@ -125,6 +139,13 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
     Result r;
     const u8 op = cdb[0];
     if ((cdb[1] >> 5) != 0 && op != 0x03 && op != 0x12) return check_condition(kSenseIllegalRequest, 0x25);  // LUN
+    if (op != 0x03 && op != 0x12) {
+        if (unit_attention_) {
+            unit_attention_ = false;
+            return check_condition(kSenseUnitAttention, kAscMediumChanged);
+        }
+        if (!file_.is_open() && op != 0x1B && op != 0x1E) return check_condition(kSenseNotReady, kAscMediumNotPresent);
+    }
     switch (op) {
         case 0x00:  // TEST UNIT READY
         case 0x01:  // REZERO UNIT
@@ -132,11 +153,17 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
         case 0x2B:  // SEEK(10)
         case 0x16:  // RESERVE
         case 0x17:  // RELEASE
-        case 0x1B:  // START STOP UNIT
         case 0x1D:  // SEND DIAGNOSTIC
         case 0x1E:  // PREVENT ALLOW MEDIUM REMOVAL
         case 0x2F:  // VERIFY(10)
         case 0x35:  // SYNCHRONIZE CACHE
+            break;
+        case 0x1B:                                                   // START STOP UNIT
+            if (kind_ == Kind::CdRom && (cdb[4] & 0x03) == 0x02) {  // LoEj, stop: eject
+                file_.close();
+                blocks_ = 0;
+                if (eject_cb_) eject_cb_();
+            }
             break;
         case 0x04:  // FORMAT UNIT
             if (read_only_) return check_condition(kSenseDataProtect, kAscWriteProtected);

@@ -367,7 +367,13 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
             if (ev.type == SDL_EVENT_QUIT) stop = 1;
             else if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) redraw = true;
             if (mouse.handle(ev)) continue;
-            else if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
+            // Ctrl+Alt+E: put the next CD-ROM disc in the drive.
+            if ((ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) && ev.key.scancode == SDL_SCANCODE_E &&
+                (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_ALT)) {
+                if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) machine.request_next_disc();
+                continue;
+            }
+            if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
                 send_key(machine, ev.key.scancode, ev.type == SDL_EVENT_KEY_DOWN);
         }
         mouse.flush();

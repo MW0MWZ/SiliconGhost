@@ -130,7 +130,7 @@ Main options (run `siliconghost` with no arguments for the full list):
 |---|---|
 | `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
 | `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
-| `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image |
+| `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
 | `--ram MB` | memory size, 16 to 256 (default 64) |
 | `--cpu-mhz N` | CPU clock (default 150) |
 | `--no-graphics`, `--headless` | serial console only / no display window |
@@ -156,6 +156,9 @@ why it could not open a window.
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G
   (Ctrl+Option+G on a Mac), or switching to another window, releases it.
   All three buttons work.
+- **CD-ROM:** with several `--cdrom` discs, ejecting from the guest
+  (`eject` in IRIX) puts the next one in; Ctrl+Alt+E in the window, or
+  `kill -USR1` to the emulator, does the same.
 - **Keyboard:** keys are sent by position as a PS/2 keyboard would send
   them, including the numeric keypad and the UK keys `#~` and `\|`; IRIX's
   keyboard layout setting decides what they produce.

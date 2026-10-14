@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/scheduler.h"
 #include "cpu/r4000/r4000.h"
@@ -28,7 +29,9 @@ struct IndyConfig {
     u32 prid = 0x00000450;      // R4400 revision 5.0
     bool graphics = true;       // Newport XL8 in the GFX slot
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
-    std::string cdrom_image;    // SCSI CD-ROM (ID 4), raw 512-byte blocks (IRIX media layout)
+    // SCSI CD-ROM (ID 4) discs, raw 512-byte blocks (IRIX media layout). The
+    // first is in the drive at power-on; ejecting moves on to the next.
+    std::vector<std::string> cdrom_images;
     // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
     // use a default when the NVRAM has none (IRIX requires one).
     std::optional<std::array<u8, 6>> mac;
@@ -50,6 +53,10 @@ public:
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+
+    // Thread-safe: put the next CD-ROM disc in the drive (after the last,
+    // the first again), as if the operator had swapped it.
+    void request_next_disc();
     double cycles_per_second() const { return config_.cpu_hz; }
 
     void set_serial_output(SerialOutput out) { serial_out_ = std::move(out); }
@@ -73,6 +80,7 @@ private:
     static constexpr unsigned kNvramEaddr = 250;   // Ethernet address, 6 bytes
     void pump_serial_input();
     void apply_ethernet_address();
+    void next_disc();
 
     // The graphics slot as the board decodes it: REX3 at +0xF0000, and the
     // rest of the slot answering (reads as zero) rather than timing out, so
@@ -107,6 +115,8 @@ private:
     std::mutex serial_mutex_;
     std::deque<std::pair<unsigned, u8>> serial_in_;
     std::atomic<bool> serial_pending_{false};  // input queued: run() starts the pump
+    std::size_t disc_ = 0;                   // index into config_.cdrom_images
+    std::atomic<bool> disc_change_{false};  // host asked for the next disc
     bool reset_pending_ = false;
     bool powered_off_ = false;
 };

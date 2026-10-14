@@ -79,7 +79,12 @@ Indy::Indy(const IndyConfig& config)
                static_cast<unsigned long long>(slot->blocks()));
     };
     attach(disk_, ScsiDisk::Kind::Disk, config_.disk_image, 1);
-    attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_image, 4);
+    if (!config_.cdrom_images.empty()) {
+        for (const auto& path : config_.cdrom_images)
+            if (!std::ifstream(path, std::ios::binary)) throw std::runtime_error("cannot open " + path);
+        attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_images.front(), 4);
+        cdrom_->set_eject_callback([this] { next_disc(); });
+    }
 
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
@@ -95,6 +100,21 @@ Indy::Indy(const IndyConfig& config)
 }
 
 Indy::~Indy() = default;
+
+void Indy::request_next_disc() {
+    disc_change_.store(true, std::memory_order_release);
+    cpu_.request_stop();
+}
+
+void Indy::next_disc() {
+    if (!cdrom_) return;
+    disc_ = (disc_ + 1) % config_.cdrom_images.size();
+    const std::string& path = config_.cdrom_images[disc_];
+    if (cdrom_->change_medium(path))
+        SG_LOG(Info, "indy", "CD-ROM: %s (%llu blocks)", path.c_str(), static_cast<unsigned long long>(cdrom_->blocks()));
+    else
+        SG_LOG(Warn, "indy", "CD-ROM: cannot open %s, drive empty", path.c_str());
+}
 
 bool Indy::load_prom(const std::string& path, std::string& error) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -154,6 +174,7 @@ u64 Indy::run(u64 cycles) {
             SG_LOG(Info, "indy", "system reset");
             reset();
         }
+        if (disc_change_.exchange(false, std::memory_order_acq_rel)) next_disc();
         // Host input (serial bytes, Ethernet frames) is taken in by timers
         // that run only while there is some.
         if (serial_pending_.load(std::memory_order_acquire) && !serial_timer_.active()) serial_timer_.schedule_in(1);

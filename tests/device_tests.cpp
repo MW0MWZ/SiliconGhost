@@ -293,6 +293,40 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     CHECK_EQ(r.status, 0x02);  // write-protected medium
 }
 
+TEST(scsi_cdrom_eject_changes_disc_with_unit_attention) {
+    const TempImage first(16), second(32);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, first.path);
+    int ejects = 0;
+    cd.set_eject_callback([&] {
+        ++ejects;
+        CHECK(cd.change_medium(second.path));
+    });
+    const u8 eject[6] = {0x1B, 0, 0, 0, 0x02, 0};  // LoEj, stop
+    auto r = cd.command(eject, 6);
+    CHECK_EQ(r.status, 0x00);
+    CHECK_EQ(ejects, 1);
+    const u8 tur[6] = {0x00};
+    r = cd.command(tur, 6);
+    CHECK_EQ(r.status, 0x02);  // check condition: medium may have changed
+    const u8 sense[6] = {0x03, 0, 0, 0, 18, 0};
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x06);
+    CHECK_EQ(r.data_in[12], 0x28);
+    r = cd.command(tur, 6);
+    CHECK_EQ(r.status, 0x00);
+    const u8 capacity[10] = {0x25};
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[3], 31);  // the new disc
+    // Ejected with nothing put back: not ready, medium not present.
+    cd.set_eject_callback({});
+    cd.command(eject, 6);
+    r = cd.command(tur, 6);
+    CHECK_EQ(r.status, 0x02);
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x02);
+    CHECK_EQ(r.data_in[12], 0x3A);
+}
+
 TEST(wd33c93_select_and_transfer_dma) {
     const TempImage image(8);
     const std::string& path = image.path;

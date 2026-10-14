@@ -43,13 +43,21 @@ void on_stop_signal(int) {
     if (g_machine) g_machine->cpu().request_stop();
 }
 
+#if defined(SIGUSR1)
+void on_disc_signal(int) {
+    if (g_machine) g_machine->request_next_disc();
+}
+#endif
+
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --prom FILE [options]\n"
                  "  --prom FILE      IP22 boot PROM image (raw, big-endian)\n"
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved when it changes\n"
                  "  --disk FILE      SCSI disk image (ID 1)\n"
-                 "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media\n"
+                 "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media; give it\n"
+                 "                   more than once for a set of discs: ejecting one inserts the next\n"
+                 "                   (as do Ctrl+Alt+E in the window and SIGUSR1)\n"
                  "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n"
                  "  --net MODE       user:     NAT through the host, no privileges needed (the default;\n"
                  "                             the guest is 10.0.2.15, the host and gateway 10.0.2.2,\n"
@@ -259,7 +267,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--nvram")) nvram = next();
         else if (!std::strcmp(a, "--screenshot")) screenshot = next();
         else if (!std::strcmp(a, "--disk")) config.disk_image = next();
-        else if (!std::strcmp(a, "--cdrom")) config.cdrom_image = next();
+        else if (!std::strcmp(a, "--cdrom")) config.cdrom_images.push_back(next());
         else if (!std::strcmp(a, "--mac")) {
             std::array<sg::u8, 6> mac{};
             unsigned b[6];
@@ -359,6 +367,9 @@ int main(int argc, char** argv) {
         g_machine = &machine;
         std::signal(SIGINT, on_stop_signal);
         std::signal(SIGTERM, on_stop_signal);  // stop cleanly (NVRAM is saved) when asked to terminate
+#if defined(SIGUSR1)
+        std::signal(SIGUSR1, on_disc_signal);  // next CD-ROM disc
+#endif
 
         RawTerminal terminal;
         TerminalInput input(machine);
