@@ -14,18 +14,18 @@ machine. Linux is the primary host; macOS and Windows are planned.
 
 SiliconGhost is under active development. What works today:
 
-- **Boot PROM:** the IP24 PROM (5.3) passes its power-on tests and reaches
-  the System Maintenance Menu, on the serial console or on the Newport
-  graphics console with the PS/2 keyboard.
+- **Boot PROM:** the IP24 PROM (5.3) passes its power-on tests, plays the
+  start-up chime and reaches the System Maintenance Menu, on the serial
+  console or on the Newport graphics console.
 - **IRIX 5.3:** installs from its CD onto a blank disk image (labelled with
   `fx`, as on real hardware) and boots multi-user, on the serial console or
   to the graphical login and the IRIX desktop (4Dwm, Toolchest, winterm) on
   Newport, with the PS/2 keyboard and mouse. IRIS GL programs run, such as
   the flight simulator and the atlantis and ideas demos.
-- **Audio:** the HAL2 plays through the host's sound output, from the PROM's
-  start-up chime to IRIX's sounds.
-- **Networking:** the Ethernet port works, through user-mode NAT on the host
-  (no privileges needed) or a Linux TAP interface.
+- **Audio:** what the machine plays goes to the host's sound output.
+- **Networking:** the Ethernet port works (ping, telnet, file transfers),
+  through user-mode NAT on the host (no privileges needed) or a Linux TAP
+  interface.
 - **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
   TLB, exceptions, 32/64-bit addressing and cache tag operations.
 - **Speed:** hot code is translated to x86-64 machine code, and idle loops
@@ -33,7 +33,7 @@ SiliconGhost is under active development. What works today:
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
   host core.
 
-Not there yet: audio input and 24-bit graphics. See [Roadmap](#roadmap).
+See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 
 ## Emulated hardware
 
@@ -46,7 +46,7 @@ Not there yet: audio input and 24-bit graphics. See [Roadmap](#roadmap).
 | Serial | Zilog 85230 SCC (two ports) | working |
 | Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved on exit |
 | SCSI | WD33C93 with disk and CD-ROM targets | working |
-| Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | PROM console and the IRIX desktop work |
+| Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit board) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
 | Audio | HAL2 | output works; inputs record silence |
@@ -94,7 +94,19 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 
-In the display window, click to capture the mouse; Ctrl+Alt+G releases it.
+### The display window
+
+Without `--headless`, the Newport screen appears in a window that can be
+resized; it plays the machine's sound too.
+
+- **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G (or
+  switching to another window) releases it. All three buttons work.
+- **Keyboard:** keys are sent by position as a PS/2 keyboard would send
+  them, including the numeric keypad and the UK keys `#~` and `\|`; IRIX's
+  keyboard layout setting decides what they produce.
+- **Console:** with the NVRAM's `console` set to `g` (the PROM's default on
+  a machine with graphics), the PROM and IRIX use the screen; set it to `d`
+  from the Command Monitor (`setenv console d`) to use the serial port.
 
 ### Installing IRIX on a new disk
 
@@ -168,9 +180,20 @@ with performance layers on top that must give exactly the same results:
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the details.
 
+## Known limitations
+
+- Only the 8-bit Newport (XL8) is emulated. Blending and antialiased lines
+  are drawn without the effect, which most of the desktop and the demos tried
+  so far do not use.
+- Audio input (microphone, line in, digital in) records silence.
+- IRIX 5.3 is the system tested so far; 6.5 has not been tried.
+- The recompiler is x86-64 only; on other hosts the (slower) block cache
+  and interpreter run everything. Linux is the only host built and tested.
+- The NVRAM is written back only when the emulator exits.
+
 ## Roadmap
 
-- Audio input; Newport 24-bit boards and the remaining raster operations
+- Newport 24-bit boards (XL24) and the remaining raster operations; audio input
 - IRIX 6.5
 - AArch64 recompiler; macOS and Windows builds
 - Indigo² (IP22 "Fullhouse") machine profile
