@@ -36,6 +36,9 @@ public:
     void write(u32 offset, u32 value);
 
     PortConfig port(Port p) const;
+    // The DAC's output level as amplitude factors: DAC_C2 mute and
+    // attenuators (1.5 dB a step), and the 8-bit volume levels.
+    void output_gain(double& left, double& right) const;
     // Called whenever a port's configuration may have changed.
     void set_change_callback(std::function<void()> cb) { changed_ = std::move(cb); }
 

@@ -53,6 +53,11 @@ public:
     // second.
     using AudioSink = std::function<void(const s16* samples, std::size_t frames, unsigned voices, double rate)>;
     void set_audio_sink(AudioSink sink) { audio_sink_ = std::move(sink); }
+    // Fills `samples` with what the HAL2 ADC records (`frames` frames of
+    // `voices` interleaved samples at `rate`); without a source it records
+    // silence.
+    using AudioSource = std::function<void(s16* samples, std::size_t frames, unsigned voices, double rate)>;
+    void set_audio_source(AudioSource source) { audio_source_ = std::move(source); }
 
 private:
     // Byte-wide devices on 4-byte strides: returns the byte-register index
@@ -71,6 +76,7 @@ private:
     static constexpr unsigned kPbusChannels = 8;
     struct PbusChannel {
         u32 bptr = 0, dptr = 0, ctrl = 0, bc = 0, flags = 0;
+        u32 filled = 0;  // input: bytes of the current descriptor already written
         bool active = false, irq = false, loaded = false;
         double bytes_per_cycle = 0;  // of the current transfer; 0 = waiting for the device
         u64 started = 0;             // when the current descriptor began moving
@@ -80,6 +86,8 @@ private:
     void pbus_complete(unsigned ch);
     void pbus_reconfigure();
     unsigned pbus_sample_bytes(unsigned ch) const;  // memory bytes per audio sample
+    const Hal2::Port* pbus_port(unsigned ch) const;  // the HAL2 port this channel serves, if any
+    void pbus_fill_input(unsigned ch, u32 upto, bool last = false);
     u32 pbus_read(u32 offset);
     void pbus_write(u32 offset, u32 value);
 
@@ -115,6 +123,7 @@ private:
     std::array<PbusChannel, kPbusChannels> pbus_{};
     std::array<std::unique_ptr<Timer>, kPbusChannels> pbus_timer_;
     AudioSink audio_sink_;
+    AudioSource audio_source_;
     Seeq8003 seeq_;
     EnetDma enet_rx_, enet_tx_;
     bool enet_irq_ = false, enet_loopback_ = false;

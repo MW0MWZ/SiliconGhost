@@ -324,6 +324,8 @@ TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
     hal2_write(t, 0x2108, 0xFFFA0001);  // ...times 1/6
     hal2_write(t, 0x1404, 0x208);       // DAC: PBUS channel 0, clock 1, stereo
     hal2_write(t, 0x9104, 0x08);        // codec transmit DMA port on
+    t.w32(kHal2 + 0x800, 0xFF);         // full volume
+    t.w32(kHal2 + 0x804, 0xFF);
     t.w32(kPbus0 + 4, kDesc);
     t.w32(kPbus0 + 0x1000, 0x30);       // LD | ACT
     CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);  // active
@@ -369,6 +371,8 @@ TEST(ip22_hal2_dac_dma_packed_16_bit_samples) {
     hal2_write(t, 0x2108, 0xFFFF0004);  // ...times 4/4, as NetBSD writes it
     hal2_write(t, 0x1404, 0x208);       // DAC: PBUS channel 0, clock 1, stereo
     hal2_write(t, 0x9104, 0x08);
+    t.w32(kHal2 + 0x800, 0xFF);  // full volume
+    t.w32(kHal2 + 0x804, 0xFF);
     t.w32(kPbus0 + 4, kDesc);
     t.w32(kPbus0 + 0x1000, 0x30);
 
@@ -381,6 +385,87 @@ TEST(ip22_hal2_dac_dma_packed_16_bit_samples) {
     for (u32 i = 0; i < played.size() / 2; ++i)
         same &= played[2 * i] == static_cast<s16>(i * 7 - 300) && played[2 * i + 1] == static_cast<s16>(-static_cast<s32>(i));
     CHECK(same);
+}
+
+// The ADC records what the host supplies, in the layout of its PBUS
+// channel: packed 16-bit samples, or 24-bit values in 32-bit words (DS16).
+TEST(ip22_hal2_adc_records_from_the_audio_source) {
+    for (const bool ds16 : {false, true}) {
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        unsigned calls = 0;
+        std::size_t next = 0;  // the source's running sample count
+        t.m.hpc3().set_audio_source([&](s16* s, std::size_t frames, unsigned voices, double rate) {
+            CHECK_EQ(voices, 2u);
+            CHECK(rate == 48000.0);
+            for (std::size_t i = 0; i < frames * voices; ++i, ++next) s[i] = static_cast<s16>(100 * next - 1000);
+            ++calls;
+        });
+        const u32 size = ds16 ? 4 : 2;
+        constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000;
+        const u32 bytes = 50 * 2 * size;  // 50 stereo frames
+        t.w32(kDesc + 0, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | bytes);  // EOX
+        t.w32(kDesc + 8, 0);
+        t.w32(kPbusCfg0 + 0x200, ds16 ? 0x08248844 : 0x08208844);  // channel 1
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2104, 0);
+        hal2_write(t, 0x2108, 0xFFFF0004);  // 48 kHz
+        hal2_write(t, 0x1504, 0x209);       // ADC: PBUS channel 1, clock 1, stereo
+        hal2_write(t, 0x9104, 0x10);        // codec receive DMA port on
+        t.w32(kPbus0 + 0x2000 + 4, kDesc);
+        t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
+        // Halfway through, what lies below the buffer pointer has arrived.
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 25 / 48000));
+        const u32 at = t.r32(kPbus0 + 0x2000) - kBuf;
+        CHECK(at >= 20 * 2 * size && at < bytes);
+        CHECK_EQ(calls, 1u);
+        CHECK_EQ(t.r32(kBuf), ds16 ? static_cast<u32>(-1000 * 256) : (static_cast<u32>(static_cast<u16>(-1000)) << 16) | static_cast<u16>(-900));
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 35 / 48000));
+        CHECK_EQ(calls, 2u);
+        bool same = true;
+        for (u32 i = 0; i < 100; ++i) {
+            const s16 want = static_cast<s16>(100 * i - 1000);
+            if (ds16) same &= t.r32(kBuf + 4 * i) == static_cast<u32>(static_cast<s32>(want) * 256);
+            else same &= static_cast<s16>(t.r32(kBuf + 4 * (i / 2)) >> (i % 2 ? 0 : 16)) == want;
+        }
+        CHECK(same);
+    }
+}
+
+// DAC_C2 attenuates each side in 1.5 dB steps, or mutes both; the volume
+// registers (8-bit levels, 0 silent) scale the result.
+TEST(ip22_hal2_dac_attenuation_mute_and_volume) {
+    for (const bool mute : {false, true}) {
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        std::vector<s16> played;
+        t.m.hpc3().set_audio_sink([&](const s16* s, std::size_t frames, unsigned voices, double) {
+            played.insert(played.end(), s, s + frames * voices);
+        });
+        constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000;
+        for (u32 i = 0; i < 4; ++i) t.w32(kBuf + 4 * i, 0x40004000);  // 16384 on both sides
+        t.w32(kDesc + 0, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | 16);
+        t.w32(kDesc + 8, 0);
+        t.w32(kPbusCfg0, 0x08208844);
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2104, 0);
+        hal2_write(t, 0x2108, 0xFFFF0004);
+        hal2_write(t, 0x1404, 0x208);
+        hal2_write(t, 0x1408, (4u << 23) | (mute ? 0x400u : 0));  // left -6 dB, right 0 dB
+        hal2_write(t, 0x9104, 0x08);
+        t.w32(kHal2 + 0x800, 0x80);  // right at about half volume
+        t.w32(kHal2 + 0x804, 0xFF);
+        t.w32(kPbus0 + 4, kDesc);
+        t.w32(kPbus0 + 0x1000, 0x30);
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 10 / 48000));
+        CHECK_EQ(played.size(), 8u);
+        if (played.size() == 8) {
+            CHECK_EQ(played[0], mute ? 0 : 8211);  // 16384 x 10^(-6/20)
+            CHECK_EQ(played[1], mute ? 0 : 8224);  // 16384 x 128/255
+        }
+    }
 }
 
 // A chain of empty descriptors that loops forever must not hang the emulator.
