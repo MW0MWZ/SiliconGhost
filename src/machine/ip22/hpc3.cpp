@@ -452,6 +452,7 @@ void Hpc3::pbus_write(u32 offset, u32 value) {
 // chain: `src` set = device to memory, `dst` set = memory to device.
 u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
     ScsiDma& d = scsi_dma_;
+    if (!d.active) return 0;  // not started yet: the controller waits for it
     u32 moved = 0;
     while (moved < length && d.active) {
         if (d.bc == 0) {
@@ -646,11 +647,16 @@ void Hpc3::write_word(u32 offset, u32 value) {
             return;
         case kScsi0Ctrl: {
             ScsiDma& d = scsi_dma_;
-            if (value & kScsiCtrlReset) {
+            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset
                 scsi0_.reset();
                 d = ScsiDma{};
+                d.in_reset = true;
                 update_dma_irq();
                 return;
+            }
+            if (d.in_reset) {
+                d.in_reset = false;
+                scsi0_.reset_released();
             }
             d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir);
             if (!(value & kScsiCtrlActiveMask)) {
@@ -662,6 +668,7 @@ void Hpc3::write_word(u32 offset, u32 value) {
                 }
             }
             if (value & kScsiCtrlFlush) d.active = false;
+            if (d.active) scsi0_.dma_kick();  // the controller may be waiting for it
             return;
         }
         case kIntStat0:

@@ -36,6 +36,11 @@ public:
     Wd33c93(Scheduler& scheduler, double cycles_per_ms);
 
     void reset();
+    // The master reset line was held and is now released: the chip comes out
+    // of reset and interrupts with the reset status, as after a RESET command.
+    void reset_released();
+    // The host's DMA channel has started: a transfer waiting for it goes on.
+    void dma_kick();
     u8 read_aux_status() const { return aux_status_; }
     void write_address(u8 value) { address_ = value & 0x1F; }
     u8 read_data();
@@ -81,6 +86,11 @@ private:
     void polled_data_done();
 
     void transfer_info();
+    void transfer_data();
+    void sat_data();
+    bool dma_starved(u32 moved) const;
+    u32 pio_count() const;
+    void pio_consumed();
     void end_pio_out();
     void pio_in_taken();
     void negate_ack();
@@ -104,6 +114,8 @@ private:
     u8 cdb_[12] = {};
     u8 target_status_ = 0;
     bool command_done_ = false;     // status sent; COMMAND COMPLETE follows
+    bool single_byte_ = false;
+    enum class DmaWait { None, TransferInfo, SelectAndTransfer } dma_wait_ = DmaWait::None;      // the current command moves one byte, leaving the count alone
     std::vector<u8> buffer_;        // data phase bytes
     std::size_t buffer_pos_ = 0;
     std::size_t polled_end_ = 0;    // end of the current polled data chunk

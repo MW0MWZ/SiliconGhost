@@ -81,11 +81,17 @@ void Wd33c93::reset() {
     if (irq_cb_) irq_cb_(false);
 }
 
+void Wd33c93::reset_released() {
+    reset();
+    complete(kStatusReset);
+}
+
 void Wd33c93::release_bus() {
     target_ = nullptr;
     bus_phase_ = 0;
     buffer_.clear();
     buffer_pos_ = polled_end_ = 0;
+    dma_wait_ = DmaWait::None;
     data_out_ = false;
     command_done_ = false;
     pio_.clear();
@@ -180,13 +186,24 @@ void Wd33c93::select_and_transfer() {
         issue_command(&regs_[0x03], len);
         regs_[kCommandPhase] = static_cast<u8>(kPhaseCdbSent + len);
     }
+    sat_data();
+}
+
+// The data phase of Select-and-Transfer, then the end of the command. With
+// DMA, the transfer waits for the host's DMA channel if it is not running
+// yet (see dma_kick()).
+void Wd33c93::sat_data() {
     u32 moved = 0;
     if (is_data_phase(bus_phase_)) {
         if (!dma_mode()) {  // polled: the host drains or fills the data register
             start_polled_data(true);
             return;
         }
-        moved = dma_data();
+        if (dma_starved(moved = dma_data())) {
+            dma_wait_ = DmaWait::SelectAndTransfer;
+            aux_status_ |= kAuxBusy;
+            return;
+        }
         if (buffer_pos_ < buffer_.size()) {
             regs_[kCommandPhase] = kPhaseTransferCount;
             finish_in(static_cast<u8>(kStatusUnexpectedPhase | bus_phase_), 0.05 + moved / kBytesPerMs);
@@ -203,6 +220,30 @@ void Wd33c93::sat_complete(u32 moved) {
     regs_[kCommandPhase] = kPhaseCommandComplete;
     release_bus();
     finish_in(kStatusSelectTransferDone, 0.05 + moved / kBytesPerMs);
+}
+
+// TRANSFER INFO in a data phase, by DMA (waiting for the host's channel if
+// it is not running yet).
+void Wd33c93::transfer_data() {
+    const u32 moved = dma_data();
+    if (dma_starved(moved)) {
+        dma_wait_ = DmaWait::TransferInfo;
+        return;
+    }
+    if (buffer_pos_ == buffer_.size()) end_data();
+    finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.05 + moved / kBytesPerMs);
+}
+
+// Data is due but the host's DMA moved none: the chip keeps requesting.
+bool Wd33c93::dma_starved(u32 moved) const {
+    return moved == 0 && transfer_count() > 0 && buffer_pos_ < buffer_.size();
+}
+
+void Wd33c93::dma_kick() {
+    const DmaWait w = dma_wait_;
+    dma_wait_ = DmaWait::None;
+    if (w == DmaWait::TransferInfo) transfer_data();
+    else if (w == DmaWait::SelectAndTransfer) sat_data();
 }
 
 u32 Wd33c93::dma_data() {
@@ -253,17 +294,12 @@ void Wd33c93::transfer_info() {
     switch (bus_phase_) {
         case kBusDataOut:
         case kBusDataIn:
-            if (!dma_mode()) {
-                start_polled_data(false);
-            } else {
-                const u32 moved = dma_data();
-                if (buffer_pos_ == buffer_.size()) end_data();
-                finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.05 + moved / kBytesPerMs);
-            }
+            if (!dma_mode()) start_polled_data(false);
+            else transfer_data();
             return;
         case kBusMessageOut:
         case kBusCommand:
-            pio_.resize(transfer_count());
+            pio_.resize(pio_count());
             if (pio_.empty()) end_pio_out();
             else aux_status_ |= kAuxDbr;
             return;
@@ -271,8 +307,16 @@ void Wd33c93::transfer_info() {
         case kBusMessageIn: pio_.assign(msg_in_.begin(), msg_in_.end()); break;
     }
     // Inbound bytes are offered one at a time through the data register.
-    if (pio_.empty() || transfer_count() == 0) finish_in(static_cast<u8>(kStatusServiceRequired | bus_phase_), 0.01);
+    if (pio_.empty() || pio_count() == 0) finish_in(static_cast<u8>(kStatusServiceRequired | bus_phase_), 0.01);
     else aux_status_ |= kAuxDbr;
+}
+
+// Bytes a non-data transfer moves: one for a single-byte transfer (SBT),
+// otherwise the transfer count, which each byte then decrements.
+u32 Wd33c93::pio_count() const { return single_byte_ ? 1 : transfer_count(); }
+
+void Wd33c93::pio_consumed() {
+    if (!single_byte_) set_transfer_count(transfer_count() - 1);
 }
 
 void Wd33c93::end_pio_out() {
@@ -294,7 +338,7 @@ void Wd33c93::end_pio_out() {
 
 // The host took an inbound byte from the data register.
 void Wd33c93::pio_in_taken() {
-    set_transfer_count(transfer_count() - 1);
+    pio_consumed();
     if (bus_phase_ == kBusStatus) {
         regs_[kTargetLun] = target_status_;
         msg_in_.assign(1, kMsgCommandComplete);
@@ -308,7 +352,7 @@ void Wd33c93::pio_in_taken() {
     // the message) so the host can inspect or reject it.
     msg_in_.pop_front();
     ++pio_pos_;
-    if (transfer_count() && !msg_in_.empty()) return;
+    if (!single_byte_ && transfer_count() && !msg_in_.empty()) return;
     aux_status_ &= static_cast<u8>(~kAuxDbr);
     finish_in(kStatusMessageInPaused, 0.01);
 }
@@ -398,7 +442,7 @@ void Wd33c93::write_data(u8 value) {
                 }
             } else if ((bus_phase_ == kBusMessageOut || bus_phase_ == kBusCommand) && pio_pos_ < pio_.size()) {
                 pio_[pio_pos_++] = value;
-                set_transfer_count(transfer_count() - 1);
+                pio_consumed();
                 if (pio_pos_ == pio_.size()) end_pio_out();
             }
             break;
@@ -415,6 +459,7 @@ void Wd33c93::command(u8 cmd) {
         return;
     }
     aux_status_ &= static_cast<u8>(~kAuxLci);
+    single_byte_ = (cmd & 0x80) != 0;  // SBT
     SG_LOG(Debug, "wd33c93", "command %02x (dest %u, phase %02x)", cmd, regs_[kDestinationId] & 7, regs_[kCommandPhase]);
     ScsiTarget* const dest = targets_[regs_[kDestinationId] & 7];
     switch (cmd & 0x7F) {

@@ -105,6 +105,7 @@ private:
     struct ScsiDma {
         u32 ndbp = 0, cbp = 0, bc = 0, flags = 0, ctrl = 0;
         bool active = false, loaded = false, irq = false;
+        bool in_reset = false;  // the reset bit is held
     } scsi_dma_;
     Ds1386 rtc_;
     Eeprom93Cxx eeprom_;

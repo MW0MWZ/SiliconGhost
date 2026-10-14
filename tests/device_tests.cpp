@@ -610,3 +610,93 @@ TEST(kbc_mouse_splits_large_movements_into_packets) {
     CHECK_EQ(x, -300);
     CHECK_EQ(y, 600);
 }
+
+TEST(wd33c93_reset_line_release_interrupts_with_reset_status) {
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.reset();  // held in reset
+    CHECK(!irq);
+    wd.reset_released();
+    CHECK(irq);
+    CHECK_EQ(wd.read_aux_status(), 0x80);  // INT only
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x00);  // reset
+    CHECK(!irq);
+}
+
+// A single-byte TRANSFER INFO (SBT) moves exactly one byte, offered
+// through DBR, and leaves the transfer count alone.
+TEST(wd33c93_single_byte_transfer_waits_for_its_byte) {
+    const std::string path = make_image(1);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);  // SELECT WITH ATN
+    clk.advance_to(150000);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);  // MESSAGE OUT requested
+    wd_write(wd, 0x12, 0);
+    wd_write(wd, 0x13, 0);
+    wd_write(wd, 0x14, 0);
+    wd_write(wd, 0x18, 0xA0);  // TRANSFER INFO, single byte
+    CHECK(wd.read_aux_status() & 0x01);  // DBR: the chip wants the byte
+    clk.advance_to(300000);
+    CHECK(!irq);  // still waiting for it
+    wd_write(wd, 0x19, 0xC0);  // IDENTIFY
+    clk.advance_to(450000);
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x1A);  // transfer done, target now in COMMAND phase
+    wd.write_address(0x14);
+    CHECK_EQ(wd.read_data(), 0u);  // count untouched
+    std::filesystem::remove(path);
+}
+
+// With DMA, a data transfer waits while the host's DMA channel is not
+// running and goes on when it starts.
+TEST(wd33c93_dma_transfer_waits_for_the_host_channel) {
+    const std::string path = make_image(8);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false, running = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma(
+        [&](const u8* d, u32 n) {
+            if (!running) return 0u;
+            memory.insert(memory.end(), d, d + n);
+            return n;
+        },
+        [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x01, 0x80);  // DMA mode
+    wd_write(wd, 0x15, 1);
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0};
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    wd_write(wd, 0x12, 0);
+    wd_write(wd, 0x13, 0x02);
+    wd_write(wd, 0x14, 0x00);
+    wd_write(wd, 0x18, 0x09);  // SELECT-AND-TRANSFER
+    clk.advance_to(1500000);
+    CHECK(!irq);
+    CHECK(memory.empty());
+    CHECK(wd.read_aux_status() & 0x20);  // busy
+    running = true;
+    wd.dma_kick();
+    clk.advance_to(3000000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 512u);
+    if (!memory.empty()) CHECK_EQ(memory[0], 3);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x16);
+    std::filesystem::remove(path);
+}
