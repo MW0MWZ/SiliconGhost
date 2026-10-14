@@ -33,7 +33,7 @@ SiliconGhost is under active development. What works today:
   privileges needed) or a Linux TAP interface.
 - **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
   TLB, exceptions, 32/64-bit addressing and cache tag operations.
-- **Speed:** hot code is translated to x86-64 machine code, and idle loops
+- **Speed:** hot code is translated to x86-64 or AArch64 machine code, and idle loops
   are skipped exactly. On a modest host, IRIX runs at about one and a half
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
   host core.
@@ -253,7 +253,7 @@ with performance layers on top that must give exactly the same results:
 - a soft-TLB for fast address translation;
 - a cache of decoded blocks, invalidated when code is written by the CPU or
   by DMA;
-- an x86-64 recompiler for hot blocks, with guest registers held in host
+- a recompiler for hot blocks (x86-64 and AArch64), with guest registers held in host
   registers and direct links between translated blocks;
 - exact idle-loop skipping: a loop whose iterations leave the machine in the
   same state is fast-forwarded to the next timer or device event.
@@ -274,14 +274,16 @@ with performance layers on top that must give exactly the same results:
   console.
 - IRIX 5.3 and NetBSD 9.0 are the systems tested so far; IRIX 6.5 and Linux
   have not been tried.
-- The recompiler is x86-64 only; on other hosts the (slower) block cache
-  and interpreter run everything. Linux is the only host built and tested.
+- The recompiler covers x86-64 and AArch64 hosts; on others the (slower)
+  block cache and interpreter run everything. Linux is the only host
+  built and tested so far; the AArch64 build has been tested under
+  emulation, not yet on Arm hardware.
 
 ## Roadmap
 
 - Newport 24-bit boards (XL24) and the remaining raster operations
 - IRIX 6.5; Linux/mips; NetBSD on the graphics console
-- AArch64 recompiler; macOS and Windows builds
+- macOS (including Apple silicon) and Windows builds
 - Indigo² (IP22 "Fullhouse") machine profile
 
 ## Legal

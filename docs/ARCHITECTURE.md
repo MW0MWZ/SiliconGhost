@@ -125,7 +125,16 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    looked up as the block loop would. Translated code tells the block loop
    which block it finished in. Generated code lives in a buffer mapped
    twice (writable, executable); when it fills, all translations are
-   dropped. `--no-jit` turns the recompiler off. Next: an AArch64 back end.
+   dropped. `--no-jit` turns the recompiler off.
+6. **AArch64 recompiler:** the same translation for AArch64 hosts
+   (`jit_a64.cpp`, encoder in `src/jit/a64_emitter.h`): callee-saved
+   x19-x23 hold the CPU, entry time, entry pc, soft-TLB table and entry
+   mode; x8-x15 hold guest registers; x16/x17 are the encoder's scratch for
+   out-of-range immediates and offsets. New code is published with a data
+   cache clean and instruction cache invalidate. CPU fields translated code
+   uses are laid out before the large tables so a single load reaches them.
+   macOS will need MAP_JIT and per-thread write protection instead of the
+   dual mapping.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
    with the same registers and stored the same values to the same RAM
@@ -190,7 +199,7 @@ clock after every 1 ms slice (`--timing`):
 | **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | ✅ IRIX 5.3 installs from its CD and boots multi-user from disk (serial console) |
 | **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | ✅ networked IRIX desktop with sound (audio input pending) |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |
-| **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | |
+| **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | AArch64 JIT on Linux done (tested under emulation) |
 
 ## Legal
 
