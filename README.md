@@ -151,8 +151,9 @@ If no window appears, check the start-up messages: a build made without
 SDL3 says so (CMake also warns when it cannot find SDL3), and SDL reports
 why it could not open a window.
 
-- **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G (or
-  switching to another window) releases it. All three buttons work.
+- **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G
+  (Ctrl+Option+G on a Mac), or switching to another window, releases it.
+  All three buttons work.
 - **Keyboard:** keys are sent by position as a PS/2 keyboard would send
   them, including the numeric keypad and the UK keys `#~` and `\|`; IRIX's
   keyboard layout setting decides what they produce.

@@ -201,8 +201,13 @@ private:
         update_title();
     }
     void update_title() {
-        SDL_SetWindowTitle(window_, captured_ ? "SiliconGhost - Ctrl+Alt+G releases the mouse"
-                                              : "SiliconGhost - click to capture the mouse");
+        // The release keys as the keyboard labels them (Alt is Option on a Mac).
+#if defined(__APPLE__)
+        constexpr const char* kCaptured = "SiliconGhost - Ctrl+Option+G releases the mouse";
+#else
+        constexpr const char* kCaptured = "SiliconGhost - Ctrl+Alt+G releases the mouse";
+#endif
+        SDL_SetWindowTitle(window_, captured_ ? kCaptured : "SiliconGhost - click to capture the mouse");
     }
 
     SDL_Window* window_;
