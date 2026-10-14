@@ -268,7 +268,8 @@ private:
 
 std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine) { return std::make_unique<AudioOut>(machine); }
 
-bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, bool audio) {
+bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, bool audio,
+                      const std::function<void()>& periodic) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SG_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -293,6 +294,7 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
     auto& cpu = machine.cpu();
     pacer.update(cpu.cycles(), cpu.instructions());
     u64 next_frame_ns = SDL_GetTicksNS();
+    u64 next_periodic_ns = next_frame_ns + 1000000000ull;
 
     while (!stop && !machine.powered_off()) {
         machine.run(slice);
@@ -300,6 +302,10 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         const u64 now_ns = SDL_GetTicksNS();
         if (now_ns < next_frame_ns) continue;
         next_frame_ns = std::max(next_frame_ns + kFrameNs, now_ns);
+        if (now_ns >= next_periodic_ns) {
+            next_periodic_ns = now_ns + 1000000000ull;
+            periodic();
+        }
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {

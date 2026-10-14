@@ -7,8 +7,11 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,7 +47,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s --prom FILE [options]\n"
                  "  --prom FILE      IP22 boot PROM image (raw, big-endian)\n"
-                 "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved on exit\n"
+                 "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved when it changes\n"
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media\n"
                  "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n"
@@ -79,19 +82,58 @@ void usage(const char* argv0) {
 }
 
 // Runs in 1 ms slices of guest time, letting the pacer relate them to the
-// host clock after each.
-void run_headless(sg::ip22::Indy& machine, sg::Pacer& pacer, unsigned long long max_cycles) {
+// host clock after each. `periodic` is called about once a second of host time.
+void run_headless(sg::ip22::Indy& machine, sg::Pacer& pacer, unsigned long long max_cycles,
+                  const std::function<void()>& periodic) {
     auto& cpu = machine.cpu();
     const sg::u64 slice = static_cast<sg::u64>(machine.cycles_per_second() / 1000);
     const sg::u64 start = cpu.cycles();
+    auto next_periodic = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     pacer.update(cpu.cycles(), cpu.instructions());
     while (!g_interrupted && !machine.powered_off()) {
         const sg::u64 done = cpu.cycles() - start;
         if (done >= max_cycles) break;
         machine.run(std::min<sg::u64>(slice, max_cycles - done));
         cpu.set_cycles_per_instruction(pacer.update(cpu.cycles(), cpu.instructions()));
+        if (const auto now = std::chrono::steady_clock::now(); now >= next_periodic) {
+            next_periodic = now + std::chrono::seconds(1);
+            periodic();
+        }
     }
 }
+
+// The NVRAM file, rewritten whenever the guest has changed the NVRAM (checked
+// periodically) and on exit, so settings survive a crash or a killed
+// process. Each save goes to a temporary file that then replaces the old one.
+class NvramFile {
+public:
+    NvramFile(std::string path, sg::Ds1386& rtc) : path_(std::move(path)), rtc_(rtc), saved_(rtc.nvram_changes()) {}
+    void save_if_changed() {
+        if (rtc_.nvram_changes() != saved_) save();
+    }
+    void save() {
+        if (path_.empty()) return;
+        saved_ = rtc_.nvram_changes();
+        const std::string tmp = path_ + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            const auto& mem = rtc_.memory();
+            f.write(reinterpret_cast<const char*>(mem.data()), static_cast<std::streamsize>(mem.size()));
+            if (!f) {
+                std::fprintf(stderr, "warning: cannot write %s\n", tmp.c_str());
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path_, ec);
+        if (ec) std::fprintf(stderr, "warning: cannot replace %s: %s\n", path_.c_str(), ec.message().c_str());
+    }
+
+private:
+    std::string path_;
+    sg::Ds1386& rtc_;
+    sg::u64 saved_;
+};
 
 void dump_state(sg::mips::R4000& cpu) {
     using namespace sg::mips;
@@ -301,6 +343,8 @@ int main(int argc, char** argv) {
         if (!nvram.empty() && !load_file(nvram, machine.rtc().memory()))
             std::fprintf(stderr, "note: %s not found, starting with empty NVRAM\n", nvram.c_str());
         machine.rtc().power_on();  // the clock follows the host's (UTC)
+        NvramFile nvram_file(nvram, machine.rtc());
+        const std::function<void()> periodic = [&] { nvram_file.save_if_changed(); };
 
         machine.set_serial_output([](unsigned, sg::u8 byte) {
             std::fputc(byte, stdout);
@@ -331,14 +375,14 @@ int main(int argc, char** argv) {
         } else {
 #if defined(SG_HAVE_SDL3)
             const bool windowed = !headless && config.graphics && max_cycles == ~0ull;
-            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, audio)) {
+            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, audio, periodic)) {
                 const auto sound = audio && max_cycles == ~0ull ? sg::app::start_audio(machine) : nullptr;
-                run_headless(machine, pacer, max_cycles);
+                run_headless(machine, pacer, max_cycles, periodic);
             }
 #else
             (void)headless;
             (void)audio;
-            run_headless(machine, pacer, max_cycles);
+            run_headless(machine, pacer, max_cycles, periodic);
 #endif
         }
         g_machine = nullptr;
@@ -359,11 +403,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "screenshot: no video signal\n");
             }
         }
-        if (!nvram.empty()) {
-            std::ofstream f(nvram, std::ios::binary);
-            const auto& mem = machine.rtc().memory();
-            f.write(reinterpret_cast<const char*>(mem.data()), static_cast<std::streamsize>(mem.size()));
-        }
+        nvram_file.save();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

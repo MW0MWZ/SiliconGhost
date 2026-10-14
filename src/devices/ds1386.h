@@ -25,6 +25,9 @@ public:
     void write(unsigned index, u8 value);
 
     std::vector<u8>& memory() { return mem_; }  // whole array, for NVRAM persistence
+    // Counts writes that changed the battery-backed RAM (not the clock), so
+    // the host can tell when its copy needs saving.
+    u64 nvram_changes() const { return nvram_changes_; }
     // After restoring memory(): the clock carries on from the time source
     // (a real battery-backed clock kept running while the machine was off),
     // replacing whatever clock registers were saved.
@@ -52,6 +55,7 @@ private:
     s64 loaded_centis_ = kNotLoaded;  // time (1/100 s) the clock registers were last loaded with
     bool frozen_ = false; // TE = 0: registers hold a snapshot
     bool valid_ = true;   // registers describe a real date/time
+    u64 nvram_changes_ = 0;
 };
 
 }  // namespace sg

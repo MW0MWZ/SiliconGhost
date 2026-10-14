@@ -74,6 +74,23 @@ TEST(pit_readback_status) {
     CHECK(status & 0x40);           // null count until loaded
 }
 
+// Only writes that change the battery-backed RAM count as changes to save.
+TEST(ds1386_counts_nvram_changes) {
+    Ds1386 rtc;
+    rtc.set_time_source([] { return 1.0e9; });
+    rtc.power_on();
+    const u64 start = rtc.nvram_changes();
+    rtc.write(0x01, 0x30);  // clock register
+    rtc.write(Ds1386::kRegCommand, 0x80);
+    CHECK_EQ(rtc.nvram_changes(), start);
+    rtc.write(0x100, 0x5A);
+    CHECK_EQ(rtc.nvram_changes(), start + 1);
+    rtc.write(0x100, 0x5A);  // same value
+    CHECK_EQ(rtc.nvram_changes(), start + 1);
+    rtc.write(0x100, 0x00);
+    CHECK_EQ(rtc.nvram_changes(), start + 2);
+}
+
 TEST(ds1386_time_freeze_and_set) {
     Ds1386 rtc;
     double host = 1700000000;  // 2023-11-14 22:13:20 UTC (a Tuesday)
