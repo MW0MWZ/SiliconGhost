@@ -121,7 +121,7 @@ void Hpc3::pbus_schedule(unsigned ch, bool restart) {
         for (unsigned p = 0; p < Hal2::kNumPorts; ++p) {
             const Hal2::PortConfig port = hal2_.port(static_cast<Hal2::Port>(p));
             if (port.enabled && port.channel == ch) {
-                bytes_per_cycle = port.rate * 2 * port.voices / cpu_hz_;
+                bytes_per_cycle = port.rate * 4 * port.voices / cpu_hz_;  // a 32-bit word per sample
                 break;
             }
         }
@@ -176,13 +176,16 @@ void Hpc3::pbus_complete(unsigned ch) {
         if (!bus_.write_block(c.bptr, zeros.data(), n))
             for (u32 i = 0; i < n; ++i) bus_.write<u8>(c.bptr + i, 0);
     } else if (audio_sink_ && dac.enabled && dac.channel == ch) {
-        std::vector<s16> samples(n / 2);
+        // Each sample is a 24-bit value in a 32-bit word; the codec takes its
+        // top 16 bits.
+        std::vector<s16> samples(n / 4);
         const bool little = dac.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
         for (u32 i = 0; i < samples.size(); ++i) {
-            u8 b[2] = {0, 0};
-            bus_.read<u8>(c.bptr + 2 * i, b[0]);
-            bus_.read<u8>(c.bptr + 2 * i + 1, b[1]);
-            samples[i] = static_cast<s16>(little ? (b[1] << 8) | b[0] : (b[0] << 8) | b[1]);
+            u8 b[4] = {0, 0, 0, 0};
+            for (u32 k = 0; k < 4; ++k) bus_.read<u8>(c.bptr + 4 * i + k, b[k]);
+            const u32 word = little ? u32{b[0]} | (u32{b[1]} << 8) | (u32{b[2]} << 16) | (u32{b[3]} << 24)
+                                    : (u32{b[0]} << 24) | (u32{b[1]} << 16) | (u32{b[2]} << 8) | u32{b[3]};
+            samples[i] = static_cast<s16>(word >> 8);
         }
         audio_sink_(samples.data(), samples.size() / dac.voices, dac.voices, dac.rate);
     }

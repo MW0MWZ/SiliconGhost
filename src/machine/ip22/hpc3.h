@@ -37,8 +37,9 @@ public:
     Wd33c93& scsi0() { return scsi0_; }
     Hal2& hal2() { return hal2_; }
 
-    // Samples played by the HAL2 DAC: `frames` frames of `voices` interleaved
-    // 16-bit samples at `rate` frames per second.
+    // Samples played by the HAL2 DAC (the top 16 bits of its 24-bit samples):
+    // `frames` frames of `voices` interleaved samples at `rate` frames per
+    // second.
     using AudioSink = std::function<void(const s16* samples, std::size_t frames, unsigned voices, double rate)>;
     void set_audio_sink(AudioSink sink) { audio_sink_ = std::move(sink); }
 

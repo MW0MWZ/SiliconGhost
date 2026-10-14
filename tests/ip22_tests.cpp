@@ -304,8 +304,9 @@ TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
         CHECK(rate == 8000.0);
         played.insert(played.end(), s, s + frames * voices);
     });
-    constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 400;  // 100 stereo frames each
-    for (u32 i = 0; i < 2 * kBytes / 2; ++i) t.m.bus().write<u16>(kBuf + 2 * i, static_cast<u16>(i * 3));
+    // 100 stereo frames per descriptor, a 32-bit word (24-bit sample) per voice
+    constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 800;
+    for (u32 i = 0; i < 2 * kBytes / 4; ++i) t.w32(kBuf + 4 * i, (static_cast<u32>(static_cast<s32>(i * 3 - 200)) << 8) & 0xFFFFFF00u);
     t.w32(kDesc + 0, kBuf);
     t.w32(kDesc + 4, (1u << 29) | kBytes);  // XIE
     t.w32(kDesc + 8, kDesc + 16);
@@ -335,7 +336,7 @@ TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
     CHECK_EQ(played.size(), 400u);
     CHECK_EQ(t.r32(kPbus0 + 0x1000), 1u);  // done
     bool same = true;
-    for (u32 i = 0; i < played.size(); ++i) same &= played[i] == static_cast<s16>(i * 3);
+    for (u32 i = 0; i < played.size(); ++i) same &= played[i] == static_cast<s16>(i * 3 - 200);
     CHECK(same);
 }
 
