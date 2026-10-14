@@ -493,3 +493,21 @@ TEST(ip22_serial_input_is_fed_in_order_and_on_demand) {
     CHECK(t.r8(ctrl_b) & 1);
     CHECK_EQ(t.r8(data_b), 'd');
 }
+
+// Software finds the graphics board by probing the base of its slot; the
+// REX3 registers sit at +0xF0000 within it.
+TEST(indy_newport_answers_across_the_graphics_slot) {
+    IndyRig t;
+    u32 v = 1;
+    CHECK(t.m.bus().read<u32>(0x1F000000, v));
+    CHECK_EQ(v, 0u);
+    CHECK(t.m.bus().write<u32>(0x1F0F0148, 0x12345678));  // XSTARTI
+    CHECK_EQ(t.r32(0x1F0F0100), 0x02B3C000u);              // XSTART
+    CHECK(t.m.bus().read<u32>(0x1F400000 - 4, v));
+    CHECK(!t.m.bus().read<u32>(0x1F400000, v));  // empty expansion slot
+
+    IndyConfig cfg;
+    cfg.graphics = false;
+    Indy bare{cfg};
+    CHECK(!bare.bus().read<u32>(0x1F000000, v));
+}

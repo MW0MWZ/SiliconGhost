@@ -50,7 +50,7 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_ram(kProm, kPromMaxSize, prom_.get(), /*writable=*/false);
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
-    if (config_.graphics) bus_.map_device(kNewportRex3, 0x10000, &newport_);
+    if (config_.graphics) bus_.map_device(kGioGfx, kGioGfxSize, &gfx_slot_);
     bus_.set_error_handler([this](u64 paddr, unsigned size, bool is_write) {
         mc_.report_bus_error(paddr, size, is_write);
     });
@@ -195,6 +195,26 @@ void Indy::pump_serial_input() {
         }
     }
     serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
+}
+
+namespace {
+constexpr u32 kRex3InSlot = kNewportRex3 - kGioGfx, kRex3WindowSize = 0x10000;
+}  // namespace
+
+bool Indy::GfxSlot::read(u32 offset, unsigned size, u64& value) {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read(offset - kRex3InSlot, size, value);
+    value = 0;
+    return true;
+}
+
+bool Indy::GfxSlot::write(u32 offset, unsigned size, u64 value) {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.write(offset - kRex3InSlot, size, value);
+    return true;
+}
+
+bool Indy::GfxSlot::read_is_pure(u32 offset, unsigned size) const {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read_is_pure(offset - kRex3InSlot, size);
+    return true;
 }
 
 }  // namespace sg::ip22

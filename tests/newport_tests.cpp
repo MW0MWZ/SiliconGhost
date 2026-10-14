@@ -168,3 +168,28 @@ TEST(newport_dcb_access_to_an_absent_slave_stays_busy_until_reset_or_timeout) {
     t.now += 150 * 20;  // 20 us at 150 MHz
     CHECK(!(t.r(kUStatus) & kBackBusy));
 }
+
+// A text glyph as NetBSD draws it: one block-mode row per ZPATTERN write
+// with GO, opaque, so clear bits take the background colour.
+TEST(newport_zpattern_rows_draw_opaque_glyph) {
+    Rig t;
+    constexpr u32 kZPattern = 0x014, kColorBack = 0x018;
+    t.w(kDrawMode0, 2u | (1u << 2) | (1u << 8) | (1u << 12) | (1u << 16));  // DRAW BLOCK STOPX ZPATTERN OPAQUE
+    t.w(kDrawMode1, 0x30000000u | 0x7000u | 0x100u | 0x80u | 0x8u | 1u);
+    t.w(kXYStartI, (8u << 16) | 16u);
+    t.w(kXYEndI, 11u << 16);
+    t.w(kColorI, 0xFF);
+    t.w(kColorBack, 0x11);
+    t.w(kWrMask, 0xFF);
+    t.w(kZPattern | kGo, 0xA0000000u);
+    t.w(kZPattern | kGo, 0x50000000u);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    t.w(kXYStartI, (8u << 16) | 16u);
+    t.w(kXYEndI, (11u << 16) | 16u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0xFF11FF11u);
+    t.w(kXYStartI, (8u << 16) | 17u);
+    t.w(kXYEndI, (11u << 16) | 17u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0x11FF11FFu);
+}

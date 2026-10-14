@@ -74,6 +74,21 @@ private:
     void pump_serial_input();
     void apply_ethernet_address();
 
+    // The graphics slot as the board decodes it: REX3 at +0xF0000, and the
+    // rest of the slot answering (reads as zero) rather than timing out, so
+    // probes of the slot base find a board there.
+    class GfxSlot final : public Device {
+    public:
+        explicit GfxSlot(Newport& board) : board_(board) {}
+        const char* name() const override { return "gfx-slot"; }
+        bool read(u32 offset, unsigned size, u64& value) override;
+        bool write(u32 offset, unsigned size, u64 value) override;
+        bool read_is_pure(u32 offset, unsigned size) const override;
+
+    private:
+        Newport& board_;
+    };
+
     IndyConfig config_;
     Scheduler scheduler_;
     Bus bus_;
@@ -84,6 +99,7 @@ private:
     Hpc3 hpc3_;
     Mc mc_;
     Newport newport_;
+    GfxSlot gfx_slot_{newport_};
     Timer serial_timer_;
     std::unique_ptr<ScsiDisk> disk_, cdrom_;
 
