@@ -3,15 +3,20 @@
 
 #if defined(SG_HAVE_SLIRP)
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 
-#include <slirp/libslirp.h>
+#include <libslirp.h>  // pkg-config's include path is the slirp directory itself
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 
 namespace sg::net {

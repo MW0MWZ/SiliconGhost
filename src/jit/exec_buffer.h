@@ -28,7 +28,7 @@ private:
     std::size_t size_ = 0, used_ = 0;
     u8* write_ = nullptr;
     u8* exec_ = nullptr;
-    int fd_ = -1;
+    [[maybe_unused]] int fd_ = -1;  // Linux: the memfd behind both views
 };
 
 }  // namespace sg::jit
