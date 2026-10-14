@@ -331,8 +331,10 @@ int main(int argc, char** argv) {
         } else {
 #if defined(SG_HAVE_SDL3)
             const bool windowed = !headless && config.graphics && max_cycles == ~0ull;
-            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, audio))
+            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, audio)) {
+                const auto sound = audio && max_cycles == ~0ull ? sg::app::start_audio(machine) : nullptr;
                 run_headless(machine, pacer, max_cycles);
+            }
 #else
             (void)headless;
             (void)audio;

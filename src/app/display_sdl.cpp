@@ -217,7 +217,7 @@ private:
 // voice count; when the guest runs ahead of real time (or the device stalls)
 // more than a quarter of a second, new samples are dropped rather than
 // letting the delay grow.
-class AudioOut {
+class AudioOut final : public AudioOutput {
 public:
     explicit AudioOut(ip22::Indy& machine) : machine_(machine) {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
@@ -229,7 +229,7 @@ public:
             play(s, frames, voices, rate);
         });
     }
-    ~AudioOut() {
+    ~AudioOut() override {
         machine_.hpc3().set_audio_sink(nullptr);
         if (stream_) SDL_DestroyAudioStream(stream_);
         if (ok_) SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -265,6 +265,8 @@ private:
 };
 
 }  // namespace
+
+std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine) { return std::make_unique<AudioOut>(machine); }
 
 bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, bool audio) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {

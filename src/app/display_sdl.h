@@ -4,6 +4,7 @@
 #pragma once
 
 #include <csignal>
+#include <memory>
 
 #include "core/pacer.h"
 #include "machine/ip22/indy.h"
@@ -15,6 +16,14 @@ namespace sg::app {
 // refreshed at 60 Hz of host time; with `audio`, what the HAL2 DAC plays is
 // sent to the default output device. Returns false if SDL could not be
 // initialised.
+// Sends what the HAL2 DAC plays to the default output device for as long as
+// it lives (used on its own when running without a window).
+class AudioOutput {
+public:
+    virtual ~AudioOutput() = default;
+};
+std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine);
+
 bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, bool audio);
 
 }  // namespace sg::app
