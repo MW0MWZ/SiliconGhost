@@ -24,6 +24,8 @@ SiliconGhost is under active development. What works today:
   the flight simulator and the atlantis and ideas demos.
 - **Audio:** the HAL2 plays through the host's sound output, from the PROM's
   start-up chime to IRIX's sounds.
+- **Networking:** the Ethernet port works, through user-mode NAT on the host
+  (no privileges needed) or a Linux TAP interface.
 - **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
   TLB, exceptions, 32/64-bit addressing and cache tag operations.
 - **Speed:** hot code is translated to x86-64 machine code, and idle loops
@@ -31,7 +33,7 @@ SiliconGhost is under active development. What works today:
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
   host core.
 
-Not there yet: Ethernet (Seeq 8003) and audio input. See [Roadmap](#roadmap).
+Not there yet: audio input and 24-bit graphics. See [Roadmap](#roadmap).
 
 ## Emulated hardware
 
@@ -39,21 +41,21 @@ Not there yet: Ethernet (Seeq 8003) and audio input. See [Roadmap](#roadmap).
 |---|---|---|
 | CPU | MIPS R4400 (R4000 family), FPU, 48-entry TLB | complete |
 | Memory controller | MC: memory configuration, GIO bus errors | working |
-| Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working (SCSI, PBUS) |
+| Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
 | Interrupts/timers | IOC2 / INT3, 8254 PIT | working |
 | Serial | Zilog 85230 SCC (two ports) | working |
 | Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved on exit |
 | SCSI | WD33C93 with disk and CD-ROM targets | working |
 | Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | PROM console and the IRIX desktop work |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
-| Ethernet | Seeq 8003 | stub |
+| Ethernet | Seeq 80C03 | working |
 | Audio | HAL2 | output works; inputs record silence |
 
 ## Building
 
-Requirements: CMake 3.21 or later, a C++20 compiler (GCC 12+ or Clang 15+),
-and optionally SDL3 for the display window. Without SDL3 the emulator still
-builds and runs on the serial console.
+Requirements: CMake 3.21 or later and a C++20 compiler (GCC 12+ or Clang
+15+). Optional: SDL3 for the display window and sound (without it the
+emulator runs on the serial console), and libslirp for user-mode networking.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -88,6 +90,8 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
 | `--no-audio` | do not play the machine's audio |
+| `--net user\|tap:NAME\|none` | Ethernet through user-mode NAT (default), a TAP interface, or none |
+| `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 
 In the display window, click to capture the mouse; Ctrl+Alt+G releases it.
@@ -113,6 +117,26 @@ the kernel.
 
 With `--no-graphics`, an NVRAM set to `console=g` disables autoboot; choose
 *Start System* from the menu.
+
+### Networking
+
+With `--net user` the Indy sits behind a NAT on 10.0.2.0/24: use 10.0.2.15
+for it, 10.0.2.2 (the host) as its gateway and 10.0.2.3 as its name server.
+For example, as root on IRIX:
+
+```sh
+ifconfig ec0 10.0.2.15 netmask 255.255.255.0 up
+route add default 10.0.2.2 1
+```
+
+To keep the address, put it in `/etc/hosts` under the system's name and set
+the gateway in `/etc/config/static-route.options`. Connections from the
+host reach the guest through forwarded ports, e.g. `--hostfwd tcp:2323:23`
+and `telnet localhost 2323`.
+
+With `--net tap:NAME` frames go to an existing TAP interface (created with
+`ip tuntap add mode tap user $USER name tap0` and bridged or routed as your
+network needs), and the Indy is configured like any machine on that network.
 
 ### Timing
 
@@ -144,8 +168,7 @@ with performance layers on top that must give exactly the same results:
 
 ## Roadmap
 
-- Newport: 24-bit (XL24) boards, remaining raster operations
-- Seeq 8003 Ethernet with a host network backend; audio input
+- Audio input; Newport 24-bit boards and the remaining raster operations
 - IRIX 6.5
 - AArch64 recompiler; macOS and Windows builds
 - Indigo² (IP22 "Fullhouse") machine profile

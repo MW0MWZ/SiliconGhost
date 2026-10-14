@@ -175,8 +175,8 @@ clock after every 1 ms slice (`--timing`):
   `repartition/rootdrive` and `label/sync`. "Install System Software" then
   copies the miniroot to the swap partition and runs `inst`. Later:
   copy-on-write disk images.
-* Networking: Seeq 8003 behind a host backend (TAP on Linux, user-mode slirp
-  everywhere).
+* Networking: the Seeq behind a small host backend interface (`src/net/`):
+  user-mode NAT through libslirp, or a Linux TAP interface.
 * Config: TOML machine profiles (RAM size, PROM path, disks, display size).
 
 ## Milestones
@@ -188,7 +188,7 @@ clock after every 1 ms slice (`--timing`):
 | **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | ✅ PROM 5.3 boots to the System Maintenance Menu on the serial console |
 | **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu; IRIX desktop with keyboard and mouse |
 | **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | ✅ IRIX 5.3 installs from its CD and boots multi-user from disk (serial console) |
-| **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop (audio output done) |
+| **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | ✅ networked IRIX desktop with sound (audio input pending) |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |
 | **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | |
 
