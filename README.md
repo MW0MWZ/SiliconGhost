@@ -22,10 +22,14 @@ SiliconGhost is under active development. What works today:
   to the graphical login and the IRIX desktop (4Dwm, Toolchest, winterm) on
   Newport, with the PS/2 keyboard and mouse. IRIS GL programs run, such as
   the flight simulator and the atlantis and ideas demos.
-- **Audio:** what the machine plays goes to the host's sound output.
-- **Networking:** the Ethernet port works (ping, telnet, file transfers),
-  through user-mode NAT on the host (no privileges needed) or a Linux TAP
-  interface.
+- **NetBSD 9.0/sgimips:** finds and attaches every device of the machine,
+  installs to disk with its own installer (over the network) and boots
+  multi-user on the serial console, with networking and sound.
+- **Audio:** what the machine plays goes to the host's sound output, with or
+  without the display window.
+- **Networking:** the Ethernet port works (DHCP, ping, DNS, telnet, ssh,
+  file transfers in both directions), through user-mode NAT on the host (no
+  privileges needed) or a Linux TAP interface.
 - **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
   TLB, exceptions, 32/64-bit addressing and cache tag operations.
 - **Speed:** hot code is translated to x86-64 machine code, and idle loops
@@ -97,7 +101,8 @@ Main options (run `siliconghost` with no arguments for the full list):
 ### The display window
 
 Without `--headless`, the Newport screen appears in a window that can be
-resized; it plays the machine's sound too.
+resized. The machine's sound plays with or without the window (unless
+`--no-audio` is given).
 
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G (or
   switching to another window) releases it. All three buttons work.
@@ -134,7 +139,9 @@ With `--no-graphics`, an NVRAM set to `console=g` disables autoboot; choose
 
 With `--net user` the Indy sits behind a NAT on 10.0.2.0/24: use 10.0.2.15
 for it, 10.0.2.2 (the host) as its gateway and 10.0.2.3 as its name server.
-For example, as root on IRIX:
+A DHCP server on the NAT hands out these settings, which systems with a DHCP
+client (such as NetBSD) pick up by themselves. IRIX 5.3 is configured by
+hand, for example as root:
 
 ```sh
 ifconfig ec0 10.0.2.15 netmask 255.255.255.0 up
@@ -151,6 +158,42 @@ reach the guest through forwarded ports, e.g. `--hostfwd tcp:2323:23` and
 With `--net tap:NAME` frames go to an existing TAP interface (created with
 `ip tuntap add mode tap user $USER name tap0` and bridged or routed as your
 network needs), and the Indy is configured like any machine on that network.
+
+### Running NetBSD
+
+NetBSD/sgimips 9.0 runs on the serial console (start with `--no-graphics`
+and an NVRAM set to `console=d`; see the limitations below about its
+graphics console). To start its installer from the CD image, from the
+Command Monitor:
+
+```
+setenv OSLoadPartition dksc(0,4,0)
+boot -f dksc(0,4,8)ip2xboot dksc(0,4,0)ip2x
+```
+
+(The PROM's default boot file name holds only 28 characters, too few for the
+kernel name on the CD, hence the explicit command.) The installer cannot
+read the installation sets from this CD on an Indy: its partition is
+labelled with a fragment size that NetBSD's ISO 9660 code also takes as a
+multi-session offset, real hardware included. Install over the network
+instead, with the installer's *HTTP* or *FTP* source, either from a NetBSD
+mirror or from the sets copied off the CD and served on the host (reached at
+10.0.2.2 with `--net user`). Choose *Configure network* and accept the
+automatic configuration.
+
+To boot the installed system:
+
+```
+setenv SystemPartition dksc(0,1,8)
+setenv OSLoader boot
+setenv OSLoadPartition dksc(0,1,0)
+setenv OSLoadFilename netbsd
+setenv OSLoadOptions auto
+setenv AutoLoad Yes
+```
+
+Without `OSLoadOptions auto`, NetBSD/sgimips stops in single-user mode
+(type `exit` to carry on).
 
 ### Timing
 
@@ -186,7 +229,12 @@ with performance layers on top that must give exactly the same results:
   are drawn without the effect, which most of the desktop and the demos tried
   so far do not use.
 - Audio input (microphone, line in, digital in) records silence.
-- IRIX 5.3 is the system tested so far; 6.5 has not been tried.
+- NetBSD's Newport console shows no text: NetBSD decides between the 8-bit
+  and 24-bit boards from a register read whose real-hardware result is not
+  known yet, and on the emulated board it chooses 24-bit. Use the serial
+  console.
+- IRIX 5.3 and NetBSD 9.0 are the systems tested so far; IRIX 6.5 and Linux
+  have not been tried.
 - The recompiler is x86-64 only; on other hosts the (slower) block cache
   and interpreter run everything. Linux is the only host built and tested.
 - The NVRAM is written back only when the emulator exits.
@@ -194,7 +242,7 @@ with performance layers on top that must give exactly the same results:
 ## Roadmap
 
 - Newport 24-bit boards (XL24) and the remaining raster operations; audio input
-- IRIX 6.5
+- IRIX 6.5; Linux/mips; NetBSD on the graphics console
 - AArch64 recompiler; macOS and Windows builds
 - Indigo² (IP22 "Fullhouse") machine profile
 
