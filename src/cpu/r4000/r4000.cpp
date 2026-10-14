@@ -49,7 +49,8 @@ inline u64 f_zimm(u32 i) { return i & 0xFFFF; }
 
 }  // namespace
 
-R4000::R4000(Bus& bus, const Options& options) : bus_(bus), opts_(options), blocks_(1u << kBlockBits) {
+R4000::R4000(Bus& bus, const Options& options)
+    : bus_(bus), opts_(options), blocks_(1u << kBlockBits), jit_victims_(1u << kBlockBits) {
     bus_.set_code_write_handler([this](const u8* page) { invalidate_code_page(page); });
     bus_.set_remap_handler([this] { flush_fast_tlb(); });  // cached host pointers are stale
     set_jit(true);
@@ -82,9 +83,42 @@ void R4000::set_jit(bool enabled) {
 void R4000::jit_flush() {
     for (Block& b : blocks_) {
         b.code = nullptr;
+        b.jit_host = nullptr;
         b.runs = 0;
     }
     if (jit_buf_) jit_buf_->clear();
+    ++jit_generation_;  // kept translations are gone too
+}
+
+void R4000::keep_translation(Block& b) {
+    if (!b.code || !b.jit_host) return;
+    auto& v = jit_victims_[static_cast<std::size_t>(&b - blocks_.data())];
+    for (unsigned i = kJitVictims - 1; i > 0; --i) v[i] = v[i - 1];
+    JitVictim& k = v[0];
+    k.host = b.jit_host;
+    k.code = b.code;
+    k.generation = jit_generation_;
+    k.count = b.count;
+    k.addr64 = b.jit_addr64;
+    for (u32 i = 0; i < b.count; ++i) k.words[i] = b.ops[i].inst;
+}
+
+// The code refers only to the slot, its decoded operations and host
+// addresses, so it is valid again for the same instructions in the slot.
+void R4000::reuse_translation(Block& b) {
+    for (JitVictim& k : jit_victims_[static_cast<std::size_t>(&b - blocks_.data())]) {
+        if (k.host != b.host || k.count != b.count || k.generation != jit_generation_ || !k.code) continue;
+        bool same = true;
+        for (u32 i = 0; i < b.count && same; ++i) same = k.words[i] == b.ops[i].inst;
+        if (!same) continue;
+        b.code = k.code;
+        b.jit_addr64 = k.addr64;
+        b.jit_host = b.host;
+        b.runs = kJitThreshold;
+        k.code = nullptr;
+        ++jit_reuses_;
+        return;
+    }
 }
 
 void R4000::reset() {
@@ -223,6 +257,8 @@ bool ends_block(u32 w) {
 // transfer and its delay slot, a block-ending instruction, the end of the
 // 4 KiB page, or the length limit.
 void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
+    keep_translation(b);
+    b.jit_host = nullptr;
     b.host = host;
     b.offset = page_offset;
     b.count = 0;
@@ -248,6 +284,7 @@ void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
         if (ends_block(w)) break;
     }
     if (u8* flag = bus_.code_flag(host)) *flag = 1;  // writes to this page now drop its blocks
+    if (jit_buf_) reuse_translation(b);
 }
 
 // `page` is the host address of a 4 KiB page that was written.
@@ -305,9 +342,15 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         Block* blk = &blocks_[block_index(host)];
         if (blk->host != host) build_block(*blk, host, offset);
         block_invalidated_ = false;
-        if (jit_buf_ && !blk->code && ++blk->runs == kJitThreshold && !jit_compile(*blk)) {
-            jit_flush();  // the code buffer is full: start afresh
-            jit_compile(*blk);
+        if (jit_buf_ && !blk->code && ++blk->runs == kJitThreshold) {
+            if (!jit_compile(*blk)) {
+                jit_flush();  // the code buffer is full: start afresh
+                jit_compile(*blk);
+            }
+            if (blk->code) {
+                blk->jit_host = blk->host;
+                ++jit_compiles_;
+            }
         }
 
         // Plain operations only advance the time (kept in `t`), so pc, npc_

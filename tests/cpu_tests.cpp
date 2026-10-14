@@ -1065,3 +1065,30 @@ TEST(cpu_fpu_code_matches_interpreter_in_every_engine) {
     std::memcpy(&acc, &bits, 8);
     CHECK(acc == 199.0 * 200 / 2 + 199.0 * 200 * 399 / 6);
 }
+
+// Two hot loops 64 KiB apart share a block slot and keep evicting each
+// other: each takes its translation back instead of being translated again,
+// unless its instructions have changed in the meantime.
+TEST(cpu_jit_takes_back_translations_of_evicted_blocks) {
+    auto JAL = [](u32 target) { return (0x03u << 26) | ((target >> 2) & 0x03FFFFFFu); };
+    Rig t;
+    use_engine(t, Engine::Jit);
+    t.cpu.set_idle_skip(false);
+    // main loop at 0x1000 calls loop A at 0x2000 and loop B at 0x12000 in turn
+    t.load({
+        ADDIU(s0, zero, 40),
+        JAL(0x80002000), NOP,  // loop: A
+        JAL(0x80012000), NOP,  // B
+        ADDIU(s0, s0, -1),
+        BNE(s0, zero, -6), NOP,
+        BEQ(zero, zero, -1), NOP,
+    });
+    t.load({ADDIU(t0, zero, 20), ADDIU(t1, t1, 1), ADDIU(t0, t0, -1), BNE(t0, zero, -3), NOP, JR(ra), NOP}, 0x2000);
+    t.load({ADDIU(t0, zero, 20), ADDIU(t2, t2, 1), ADDIU(t0, t0, -1), BNE(t0, zero, -3), NOP, JR(ra), NOP}, 0x12000);
+    t.cpu.run_until(60000);
+    CHECK_EQ(t.cpu.gpr[s0], 0u);
+    CHECK_EQ(t.cpu.gpr[t1], 800u);
+    CHECK_EQ(t.cpu.gpr[t2], 800u);
+    CHECK(t.cpu.jit_reuses() > 20);
+    CHECK(t.cpu.jit_compiles() < 20);
+}

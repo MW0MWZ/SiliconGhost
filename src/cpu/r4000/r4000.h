@@ -185,6 +185,9 @@ public:
     }
     // Dynamic recompiler: hot blocks are translated to host code (x86-64;
     // elsewhere this is a no-op). Results are identical to step().
+    // Recompiler statistics: translations made, and taken back from the per-slot cache.
+    u64 jit_compiles() const { return jit_compiles_; }
+    u64 jit_reuses() const { return jit_reuses_; }
     void set_jit(bool enabled);
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
@@ -257,6 +260,7 @@ private:
         u32 runs = 0;
         JitFn code = nullptr;
         bool jit_addr64 = false;  // addressing mode the code was translated for
+        const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
         Op ops[kMaxBlockLength];
     };
     static bool is_branch_word(u32 w);
@@ -384,6 +388,24 @@ private:
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
     std::vector<Block> blocks_;
+    // Translations of blocks recently replaced in each slot (the table is
+    // direct-mapped, so blocks 64 KiB apart evict each other), with the
+    // instructions they were made from: a block decoded into its slot again
+    // with the same instructions takes its translation back at once.
+    static constexpr unsigned kJitVictims = 2;
+    struct JitVictim {
+        const u8* host = nullptr;
+        JitFn code = nullptr;
+        u32 generation = 0;  // of the code buffer
+        u32 count = 0;
+        bool addr64 = false;
+        std::array<u32, kMaxBlockLength> words{};
+    };
+    std::vector<std::array<JitVictim, kJitVictims>> jit_victims_;
+    u32 jit_generation_ = 1;  // bumped whenever the code buffer is emptied
+    u64 jit_compiles_ = 0, jit_reuses_ = 0;
+    void keep_translation(Block& b);
+    void reuse_translation(Block& b);
     std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
     u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
     // Where translated code stopped: the block it was running (it may have
