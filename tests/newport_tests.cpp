@@ -193,3 +193,21 @@ TEST(newport_zpattern_rows_draw_opaque_glyph) {
     t.w(kDrawMode0 | kGo, 1u);
     CHECK_EQ(t.r(kHostRw0), 0x11FF11FFu);
 }
+
+// Host pixels in block mode: each GO draws one data word's pixels, and the
+// word that ends a row moves on to the next row without drawing it.
+TEST(newport_host_pixels_fill_a_block_row_by_row) {
+    Rig t;
+    t.w(kDrawMode1, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);
+    t.w(kWrMask, 0xFF);
+    t.w(kXYStartI, 0);
+    t.w(kXYEndI, (7u << 16) | 1u);
+    t.w(kDrawMode0, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));
+    CHECK(t.np.write(kHostRw0 | kGo, 8, 0x1011121314151617ull));
+    CHECK(t.np.write(kHostRw0 | kGo, 8, 0x18191a1b1c1d1e1full));
+    t.w(kDrawMode1, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w(kXYStartI, (0u << 16) | 1u);
+    t.w(kXYEndI, (3u << 16) | 1u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0x18191a1bu);
+}

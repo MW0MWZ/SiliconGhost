@@ -684,7 +684,9 @@ void Newport::draw_span_block(bool block) {
                 sy += dy;
             }
         }
-        if (!block || !row_done || !stop_y || sy == end_y) break;
+        // Host-supplied pixels come a data word per GO: a finished row
+        // waits for the next word rather than repeating this one.
+        if (!block || !row_done || !stop_y || sy == end_y || (drawmode0_ & kDm0ColorHost)) break;
     }
     write_x_start(static_cast<u32>(sx) << 11);
     if (block) write_y_start(static_cast<u32>(sy) << 11);

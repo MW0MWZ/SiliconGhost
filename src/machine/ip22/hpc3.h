@@ -76,7 +76,7 @@ private:
     static constexpr unsigned kPbusChannels = 8;
     struct PbusChannel {
         u32 bptr = 0, dptr = 0, ctrl = 0, bc = 0, flags = 0;
-        u32 filled = 0;  // input: bytes of the current descriptor already written
+        u32 filled = 0;  // audio: bytes of the current descriptor already moved
         bool active = false, irq = false, loaded = false;
         double bytes_per_cycle = 0;  // of the current transfer; 0 = waiting for the device
         u64 started = 0;             // when the current descriptor began moving
@@ -87,7 +87,8 @@ private:
     void pbus_reconfigure();
     unsigned pbus_sample_bytes(unsigned ch) const;  // memory bytes per audio sample
     const Hal2::Port* pbus_port(unsigned ch) const;  // the HAL2 port this channel serves, if any
-    void pbus_fill_input(unsigned ch, u32 upto, bool last = false);
+    void pbus_transfer(unsigned ch, u32 upto, bool last = false);
+    void play(unsigned ch, u32 addr, u32 frames, const Hal2::PortConfig& dac);
     u32 pbus_read(u32 offset);
     void pbus_write(u32 offset, u32 value);
 

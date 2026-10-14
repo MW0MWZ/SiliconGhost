@@ -363,41 +363,39 @@ void Hpc3::pbus_complete(unsigned ch) {
         pbus_schedule(ch, true);
         return;
     }
+    pbus_transfer(ch, c.bc, true);
     const u32 n = c.bc;
-    const Hal2::PortConfig dac = hal2_.port(Hal2::kDac);
-    const Hal2::Port* port = pbus_port(ch);
-    if (port && hal2_.port(*port).input) {
-        pbus_fill_input(ch, n, true);
-    } else if (audio_sink_ && dac.enabled && dac.channel == ch) {
-        // With DS16 set, each sample is a 24-bit value in a 32-bit word and
-        // the codec takes its top 16 bits; otherwise samples are packed
-        // 16-bit values.
-        const unsigned size = pbus_sample_bytes(ch);
-        std::vector<s16> samples(n / size);
-        const bool little = dac.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
-        for (u32 i = 0; i < samples.size(); ++i) {
-            u8 b[4] = {0, 0, 0, 0};
-            for (u32 k = 0; k < size; ++k) bus_.read<u8>(c.bptr + size * i + k, b[k]);
-            if (size == 2) {
-                samples[i] = static_cast<s16>(little ? b[0] | (b[1] << 8) : (b[0] << 8) | b[1]);
-                continue;
-            }
-            const u32 word = little ? u32{b[0]} | (u32{b[1]} << 8) | (u32{b[2]} << 16) | (u32{b[3]} << 24)
-                                    : (u32{b[0]} << 24) | (u32{b[1]} << 16) | (u32{b[2]} << 8) | u32{b[3]};
-            samples[i] = static_cast<s16>(word >> 8);
-        }
-        double gain[2];
-        hal2_.output_gain(gain[0], gain[1]);
-        if (gain[0] != 1.0 || gain[1] != 1.0) {
-            for (std::size_t i = 0; i < samples.size(); ++i)
-                samples[i] = static_cast<s16>(std::lround(samples[i] * gain[(i % dac.voices) & 1]));
-        }
-        audio_sink_(samples.data(), samples.size() / dac.voices, dac.voices, dac.rate);
-    }
     c.bptr += n;
     c.bc = 0;
     c.filled = 0;
     pbus_schedule(ch, true);
+}
+
+// Sends `frames` frames of DAC samples at `addr` to the audio sink. With DS16
+// set, each sample is a 24-bit value in a 32-bit word and the codec takes its
+// top 16 bits; otherwise samples are packed 16-bit values.
+void Hpc3::play(unsigned ch, u32 addr, u32 frames, const Hal2::PortConfig& dac) {
+    const unsigned size = pbus_sample_bytes(ch);
+    std::vector<s16> samples(static_cast<std::size_t>(frames) * dac.voices);
+    const bool little = dac.little_endian || (pbus_[ch].ctrl & kPbusCtrlLittleEndian);
+    for (u32 i = 0; i < samples.size(); ++i) {
+        u8 b[4] = {0, 0, 0, 0};
+        for (u32 k = 0; k < size; ++k) bus_.read<u8>(addr + size * i + k, b[k]);
+        if (size == 2) {
+            samples[i] = static_cast<s16>(little ? b[0] | (b[1] << 8) : (b[0] << 8) | b[1]);
+            continue;
+        }
+        const u32 word = little ? u32{b[0]} | (u32{b[1]} << 8) | (u32{b[2]} << 16) | (u32{b[3]} << 24)
+                                : (u32{b[0]} << 24) | (u32{b[1]} << 16) | (u32{b[2]} << 8) | u32{b[3]};
+        samples[i] = static_cast<s16>(word >> 8);
+    }
+    double gain[2];
+    hal2_.output_gain(gain[0], gain[1]);
+    if (gain[0] != 1.0 || gain[1] != 1.0) {
+        for (std::size_t i = 0; i < samples.size(); ++i)
+            samples[i] = static_cast<s16>(std::lround(samples[i] * gain[(i % dac.voices) & 1]));
+    }
+    audio_sink_(samples.data(), frames, dac.voices, dac.rate);
 }
 
 const Hal2::Port* Hpc3::pbus_port(unsigned ch) const {
@@ -409,13 +407,14 @@ const Hal2::Port* Hpc3::pbus_port(unsigned ch) const {
     return nullptr;
 }
 
-// Writes what an input port has recorded into the current descriptor, up to
-// `upto` bytes into it (whole frames; with `last`, the rest is silence). As on the hardware,
-// data reaches memory as the transfer goes, so software that follows the
-// buffer pointer finds it there. The codec input (ADC) records from the
-// host when a source is set; the digital input (AES) has nothing connected.
-// Silence otherwise.
-void Hpc3::pbus_fill_input(unsigned ch, u32 upto, bool last) {
+// Moves the audio of the current descriptor up to `upto` bytes into it
+// (whole frames; with `last`, the rest of it). As on the hardware, data moves
+// as the transfer goes: software that follows the buffer pointer refills
+// (or empties) the memory behind it, so it must be done with by then.
+// The codec input (ADC) records from the host when a source is set and the
+// digital input (AES) has nothing connected: silence otherwise. What the DAC
+// plays goes to the audio sink.
+void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
     PbusChannel& c = pbus_[ch];
     const Hal2::Port* port = pbus_port(ch);
     if (!port) return;
@@ -425,6 +424,11 @@ void Hpc3::pbus_fill_input(unsigned ch, u32 upto, bool last) {
     upto = last ? c.bc : std::min(upto, c.bc) / frame * frame;
     if (upto <= c.filled) return;
     const u32 n = upto - c.filled;
+    if (!in.input) {
+        if (*port == Hal2::kDac && audio_sink_ && n >= frame) play(ch, c.bptr + c.filled, n / frame, in);
+        c.filled = upto;
+        return;
+    }
     std::vector<u8> bytes(n, 0);
     if (audio_source_ && *port == Hal2::kAdc && in.voices && n >= frame) {
         std::vector<s16> samples(n / frame * in.voices, 0);
@@ -460,7 +464,7 @@ u32 Hpc3::pbus_read(u32 offset) {
             u32 moved = 0;
             if (c.active && c.bytes_per_cycle > 0 && c.bc) {
                 moved = std::min<u32>(c.bc, static_cast<u32>((scheduler_.now() - c.started) * c.bytes_per_cycle) & ~1u);
-                pbus_fill_input(ch, moved);  // recorded data is in memory up to here
+                pbus_transfer(ch, moved);  // the audio has moved up to here
             }
             return c.bptr + moved;
         }
