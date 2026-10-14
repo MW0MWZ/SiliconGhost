@@ -78,6 +78,7 @@ private:
     void dcb_write(unsigned size, u64 value);
     u64 dcb_read(u32 reg, unsigned size);
     void dcb_begin();
+    bool dcb_stalled() const;
     void dcb_write_byte(unsigned addr, unsigned crs, u8 b);
     u8 dcb_read_byte(unsigned addr, unsigned crs);
 
@@ -123,6 +124,7 @@ private:
     u32 dcbmode_ = 0;
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
+    u64 dcb_busy_until_ = 0;  // an access to an absent slave is waiting for its acknowledge
 
     std::vector<u32> rgbci_, cidaux_;
 

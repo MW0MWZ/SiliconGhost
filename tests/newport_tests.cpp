@@ -147,3 +147,24 @@ TEST(newport_host_pixels_advance_per_go) {
     t.w(kDrawMode0 | kGo, 1u);
     CHECK_EQ(t.r(kHostRw0), 0x11223300u);
 }
+
+// IRIX probes for an Indy Presenter adapter on DCB slave 12: with nothing
+// there, an acknowledged access leaves the bus busy until it is reset or
+// times out.
+TEST(newport_dcb_access_to_an_absent_slave_stays_busy_until_reset_or_timeout) {
+    Rig t;
+    constexpr u32 kBackBusy = 1u << 4, kSyncAck = 1u << 13, kDcbReset = 0x1340;
+    t.w(kDcbMode, width(1) | slave(0) | kSyncAck);
+    t.w(kDcbData0, 0);  // VC2 answers
+    CHECK(!(t.r(kUStatus) & kBackBusy));
+    t.w(kDcbMode, 0x0099b601);  // the probe's mode: slave 12, synchronous acknowledge
+    t.w(kDcbData0, 0);
+    CHECK(t.r(kUStatus) & kBackBusy);
+    CHECK(t.r(kUStatus) & kBackBusy);
+    t.w(kDcbReset, 0);
+    CHECK(!(t.r(kUStatus) & kBackBusy));
+    t.w(kDcbData0, 0);
+    CHECK(t.r(kUStatus) & kBackBusy);
+    t.now += 150 * 20;  // 20 us at 150 MHz
+    CHECK(!(t.r(kUStatus) & kBackBusy));
+}

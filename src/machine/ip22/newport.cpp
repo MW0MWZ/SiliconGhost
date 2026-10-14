@@ -42,6 +42,7 @@ constexpr u32 kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 
 constexpr u32 kDm1RgbMode = 1u << 15, kDm1Dither = 1u << 16, kDm1FastClear = 1u << 17, kDm1Blend = 1u << 18;
 
 constexpr u32 kStatusVersion = 3;
+constexpr u32 kStatusBackBusy = 1u << 4;  // the display control bus is busy
 constexpr u32 kStatusVrint = 1u << 5;
 
 // Planes (DRAWMODE1[2:0])
@@ -142,6 +143,7 @@ void Newport::reset() {
     clipmode_ = 0;
     config_ = kDefaultConfig;
     vrint_ = false;
+    dcb_busy_until_ = 0;
     std::fill(rgbci_.begin(), rgbci_.end(), 0);
     std::fill(cidaux_.begin(), cidaux_.end(), 0);
 
@@ -276,11 +278,11 @@ u32 Newport::rex3_read(u32 reg) {
         case kClipMode: return clipmode_;
         case kConfig: return config_;
         case kStatus: {
-            const u32 v = kStatusVersion | (vrint_ ? kStatusVrint : 0);
+            const u32 v = kStatusVersion | (vrint_ ? kStatusVrint : 0) | (dcb_stalled() ? kStatusBackBusy : 0);
             set_vrint(false);  // reading STATUS acknowledges the retrace interrupt
             return v;
         }
-        case kUStatus: return kStatusVersion | (vrint_ ? kStatusVrint : 0);
+        case kUStatus: return kStatusVersion | (vrint_ ? kStatusVrint : 0) | (dcb_stalled() ? kStatusBackBusy : 0);
         default: return 0;
     }
 }
@@ -408,6 +410,7 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kClipMode: clipmode_ = v & 0x1FFF; return;
         case kConfig: config_ = v & 0x1FFFFF; return;
         case kDcbReset:
+            dcb_busy_until_ = 0;
             vc2_.ram_hi_pending = vc2_.ram_read_hi = true;
             for (auto& x : xmap_) x.mode_count = 0;
             for (auto& c : cmap_) c.rgb = 0;
@@ -797,7 +800,17 @@ void Newport::pixel_read() {
 
 void Newport::dcb_begin() {
     for (auto& x : xmap_) x.mode_count = 0;
+    // Only slaves 0-7 exist on the board. An access to any other that waits
+    // for an acknowledge keeps the bus busy until it times out or the bus is
+    // reset. IRIX probes for an Indy Presenter adapter this way (a few
+    // back-to-back status reads); the PROM simply waits for the bus.
+    constexpr u32 kDcbSyncAck = 1u << 13, kDcbAsyncAck = 1u << 14;
+    constexpr double kAckTimeout = 10e-6;
+    if (((dcbmode_ >> 7) & 0xF) >= 8 && (dcbmode_ & (kDcbSyncAck | kDcbAsyncAck)))
+        dcb_busy_until_ = scheduler_.now() + static_cast<u64>(cpu_hz_ * kAckTimeout);
 }
+
+bool Newport::dcb_stalled() const { return scheduler_.now() < dcb_busy_until_; }
 
 void Newport::dcb_write(unsigned size, u64 value) {
     dcb_begin();
