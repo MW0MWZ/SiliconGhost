@@ -78,6 +78,29 @@ TEST(fpu_basic_double_arithmetic) {
     CHECK_EQ(t.cpu.fcr31, 0u);
 }
 
+// Each rounding mode in FCR31 applies to the arithmetic, the inexact flag
+// is raised, and the host's own rounding is left as it was.
+TEST(fpu_rounding_modes_apply_to_arithmetic) {
+    const double tiny = 0x1p-60;
+    struct Case {
+        u32 rm;
+        double a, want;
+    };
+    for (const Case c : {Case{0, 1.0, 1.0}, Case{1, -1.0, -1.0}, Case{2, 1.0, 0x1.0000000000001p0},
+                         Case{3, -1.0, -0x1.0000000000001p0}, Case{2, -1.0, -1.0}, Case{3, 1.0, 1.0}}) {
+        Rig t;
+        t.cpu.fcr31 = c.rm;
+        t.cpu.fpr[2] = dbits(c.a);
+        t.cpu.fpr[4] = dbits(c.a > 0 ? tiny : -tiny);
+        t.load({FOP(D, 0x00, 6, 2, 4)});  // ADD.D
+        t.steps(1);
+        CHECK_EQ(t.cpu.fpr[6], dbits(c.want));
+        CHECK(t.cpu.fcr31 & kFcrI);
+        volatile double x = 1.0, y = tiny;
+        CHECK(x + y == 1.0);  // the host still rounds to nearest
+    }
+}
+
 TEST(fpu_divide_by_zero_untrapped_and_trapped) {
     Rig t;
     t.cpu.fpr[2] = sbits(1.0f);

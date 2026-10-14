@@ -97,7 +97,7 @@ typename Traits<F>::Bits to_bits(F f) {
     return b;
 }
 
-int host_rounding(u32 rm) {
+[[maybe_unused]] int host_rounding(u32 rm) {
     switch (rm & 3) {
         case 0: return FE_TONEAREST;
         case 1: return FE_TOWARDZERO;
@@ -119,7 +119,63 @@ SG_FORCEINLINE void fp_barrier(T& v) {
 }
 
 // Runs `op(args...)` under the given rounding mode and returns the host
-// exception flags it raised.
+// exception flags it raised (as FE_* bits). On x86-64 and AArch64 with GCC
+// or Clang this goes straight to the SSE / FP control and status registers
+// that the arithmetic uses: the <cfenv> calls also manage the x87 unit and
+// cost several times the operation itself.
+#if (defined(__x86_64__) || defined(__aarch64__)) && (defined(__GNUC__) || defined(__clang__))
+#define SG_DIRECT_FENV 1
+#endif
+
+#if defined(SG_DIRECT_FENV) && defined(__x86_64__)
+SG_FORCEINLINE u32 get_fp_control() {
+    u32 v;
+    asm volatile("stmxcsr %0" : "=m"(v));
+    return v;
+}
+SG_FORCEINLINE void set_fp_control(u32 v) { asm volatile("ldmxcsr %0" : : "m"(v)); }
+
+template <typename R, typename Op, typename... Args>
+R host_eval(u32 rm, int& flags, Op op, Args... args) {
+    // MXCSR: exception flags in bits 5:0, rounding control in bits 14:13
+    // (nearest, down, up, toward zero).
+    static constexpr u32 kRound[4] = {0u << 13, 3u << 13, 2u << 13, 1u << 13};  // guest RN, RZ, RP, RM
+    const u32 saved = get_fp_control();
+    set_fp_control((saved & ~0x603Fu) | kRound[rm & 3]);
+    (fp_barrier(args), ...);
+    R r = op(args...);
+    fp_barrier(r);
+    const u32 status = get_fp_control();
+    set_fp_control(saved);
+    flags = ((status & 0x01) ? FE_INVALID : 0) | ((status & 0x04) ? FE_DIVBYZERO : 0) |
+            ((status & 0x08) ? FE_OVERFLOW : 0) | ((status & 0x10) ? FE_UNDERFLOW : 0) |
+            ((status & 0x20) ? FE_INEXACT : 0);
+    return r;
+}
+#elif defined(SG_DIRECT_FENV) && defined(__aarch64__)
+template <typename R, typename Op, typename... Args>
+R host_eval(u32 rm, int& flags, Op op, Args... args) {
+    // FPCR rounding mode in bits 23:22 (nearest, +inf, -inf, toward zero);
+    // FPSR cumulative flags IOC, DZC, OFC, UFC, IXC in bits 4:0.
+    static constexpr u64 kRound[4] = {0ull << 22, 3ull << 22, 1ull << 22, 2ull << 22};  // guest RN, RZ, RP, RM
+    u64 fpcr, fpsr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    asm volatile("mrs %0, fpsr" : "=r"(fpsr));
+    asm volatile("msr fpcr, %0" : : "r"((fpcr & ~(3ull << 22)) | kRound[rm & 3]));
+    asm volatile("msr fpsr, %0" : : "r"(fpsr & ~0x9Full));
+    (fp_barrier(args), ...);
+    R r = op(args...);
+    fp_barrier(r);
+    u64 status;
+    asm volatile("mrs %0, fpsr" : "=r"(status));
+    asm volatile("msr fpsr, %0" : : "r"(fpsr));
+    asm volatile("msr fpcr, %0" : : "r"(fpcr));
+    flags = ((status & 0x01) ? FE_INVALID : 0) | ((status & 0x02) ? FE_DIVBYZERO : 0) |
+            ((status & 0x04) ? FE_OVERFLOW : 0) | ((status & 0x08) ? FE_UNDERFLOW : 0) |
+            ((status & 0x10) ? FE_INEXACT : 0);
+    return r;
+}
+#else
 template <typename R, typename Op, typename... Args>
 R host_eval(u32 rm, int& flags, Op op, Args... args) {
     const int saved = std::fegetround();
@@ -132,6 +188,7 @@ R host_eval(u32 rm, int& flags, Op op, Args... args) {
     std::fesetround(saved);
     return r;
 }
+#endif
 
 // Cause bits for host flags other than underflow, which is handled separately.
 u32 cause_from_host(int flags) {
