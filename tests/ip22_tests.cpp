@@ -265,3 +265,95 @@ TEST(ip22_events_scheduled_by_running_code_fire_on_time) {
     m.run(20000);
     CHECK(out == "X");
 }
+
+namespace {
+constexpr u32 kHal2 = 0x1FBD8000;     // HPC3 PBUS PIO channel 0
+constexpr u32 kPbus0 = 0x1FB80000;    // PBUS DMA channel 0: bptr, dptr; control at +0x1000
+constexpr u32 kHpcIntStat = 0x1FBB0000;
+
+void hal2_write(IndyRig& t, u32 reg, u32 value) {
+    t.w32(kHal2 + 0x40, value & 0xFFFF);
+    t.w32(kHal2 + 0x50, value >> 16);
+    t.w32(kHal2 + 0x30, reg);
+}
+u32 hal2_read(IndyRig& t, u32 reg) {
+    t.w32(kHal2 + 0x30, reg | 0x80);
+    const u32 lo = t.r32(kHal2 + 0x40);
+    t.w32(kHal2 + 0x30, reg | 0x81);
+    return lo | (t.r32(kHal2 + 0x40) << 16);
+}
+}  // namespace
+
+TEST(ip22_hal2_indirect_registers_read_back) {
+    IndyRig t;
+    t.w32(kHal2 + 0x10, 0x18);  // out of reset
+    hal2_write(t, 0x1408, 0x000103CC);
+    CHECK_EQ(hal2_read(t, 0x1408), 0x000103CCu);
+    CHECK_EQ(t.r32(kHal2 + 0x10) & 1, 0u);  // indirect access never busy
+}
+
+// The DAC, clocked at 8 kHz, plays a two-descriptor chain on PBUS channel 0:
+// each descriptor takes as long as its frames last, raises the DMA
+// interrupt, and the chain stops at its end.
+TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);  // 64 MiB at 0x08000000
+    std::vector<s16> played;
+    t.m.hpc3().set_audio_sink([&](const s16* s, std::size_t frames, unsigned voices, double rate) {
+        CHECK_EQ(voices, 2u);
+        CHECK(rate == 8000.0);
+        played.insert(played.end(), s, s + frames * voices);
+    });
+    constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 400;  // 100 stereo frames each
+    for (u32 i = 0; i < 2 * kBytes / 2; ++i) t.m.bus().write<u16>(kBuf + 2 * i, static_cast<u16>(i * 3));
+    t.w32(kDesc + 0, kBuf);
+    t.w32(kDesc + 4, (1u << 29) | kBytes);  // XIE
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf + kBytes);
+    t.w32(kDesc + 20, (1u << 31) | (1u << 29) | kBytes);  // EOX, XIE
+    t.w32(kDesc + 24, 0);
+
+    t.w32(kHal2 + 0x10, 0x18);
+    hal2_write(t, 0x2104, 0);           // generator 1 from 48 kHz...
+    hal2_write(t, 0x2108, 0xFFFA0001);  // ...times 1/6
+    hal2_write(t, 0x1404, 0x208);       // DAC: PBUS channel 0, clock 1, stereo
+    hal2_write(t, 0x9104, 0x08);        // codec transmit DMA port on
+    t.w32(kPbus0 + 4, kDesc);
+    t.w32(kPbus0 + 0x1000, 0x30);       // LD | ACT
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);  // active
+
+    const u64 per_desc = static_cast<u64>(t.m.cycles_per_second() * 100 / 8000);
+    t.m.run(per_desc * 9 / 10);
+    CHECK(played.empty());
+    CHECK_EQ(t.r32(kHpcIntStat) & 1, 0u);
+    t.m.run(per_desc * 2 / 10);
+    CHECK_EQ(played.size(), 200u);
+    CHECK_EQ(t.r32(kHpcIntStat) & 1, 1u);
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 3u);  // interrupt and active; reading clears the interrupt
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);
+    t.m.run(per_desc);
+    CHECK_EQ(played.size(), 400u);
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 1u);  // done
+    bool same = true;
+    for (u32 i = 0; i < played.size(); ++i) same &= played[i] == static_cast<s16>(i * 3);
+    CHECK(same);
+}
+
+// A chain of empty descriptors that loops forever must not hang the emulator.
+TEST(ip22_pbus_dma_follows_an_endless_empty_chain_without_hanging) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    constexpr u32 kDesc = 0x08100000;
+    t.w32(kDesc + 0, 0);
+    t.w32(kDesc + 4, 0);  // no data, no end of chain...
+    t.w32(kDesc + 8, kDesc);  // ...and pointing to itself
+    t.w32(kHal2 + 0x10, 0x18);
+    hal2_write(t, 0x2104, 0);
+    hal2_write(t, 0x2108, 0xFFFF0001);  // 48 kHz
+    hal2_write(t, 0x1404, 0x208);
+    hal2_write(t, 0x9104, 0x08);
+    t.w32(kPbus0 + 4, kDesc);
+    t.w32(kPbus0 + 0x1000, 0x30);
+    t.m.run(1000000);
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);  // still going
+}

@@ -43,6 +43,7 @@ add_library(sg_emu STATIC
   src/devices/scsi_disk.cpp
   src/devices/wd33c93.cpp
   src/devices/z85230.cpp
+  src/machine/ip22/hal2.cpp
   src/machine/ip22/hpc3.cpp
   src/machine/ip22/indy.cpp
   src/machine/ip22/ioc2.cpp

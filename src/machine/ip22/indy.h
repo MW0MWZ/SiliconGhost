@@ -59,6 +59,7 @@ public:
     Bus& bus() { return bus_; }
     Scheduler& scheduler() { return scheduler_; }
     Ds1386& rtc() { return hpc3_.rtc(); }
+    Hpc3& hpc3() { return hpc3_; }
     Ioc2& ioc() { return ioc_; }
     Mc& mc() { return mc_; }
     Newport* newport() { return config_.graphics ? &newport_ : nullptr; }

@@ -4,7 +4,9 @@
 #include "machine/ip22/hpc3.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <vector>
 
 #include "core/log.h"
 
@@ -40,6 +42,19 @@ constexpr u32 kDescEox = 1u << 31;
 constexpr u32 kDescXie = 1u << 29;
 constexpr u32 kDescCountMask = 0x3FFF;
 constexpr u32 kIntStatScsi0 = 1u << 8;
+constexpr u32 kHal2Window = 0x58000;  // PBUS PIO channels 0-3
+constexpr u32 kHal2WindowEnd = 0x59000;
+// PBUS DMA channel n: buffer and descriptor pointers at n * 0x2000, control at +0x1000
+constexpr u32 kPbusDmaEnd = 0x10000;
+constexpr u32 kPbusStride = 0x2000;
+constexpr u32 kPbusCtrl = 0x1000;
+// Control register: written...
+constexpr u32 kPbusCtrlLittleEndian = 1u << 1;
+constexpr u32 kPbusCtrlAct = 1u << 4;
+constexpr u32 kPbusCtrlLoad = 1u << 5;  // ACT is written only with this set
+// ...and read
+constexpr u32 kPbusStatInt = 1u << 0;
+constexpr u32 kPbusStatActive = 1u << 1;
 constexpr u32 kRtcWindow = 0x60000;
 constexpr u32 kRtcWindowEnd = 0x68000;
 
@@ -52,7 +67,10 @@ constexpr u32 kEepromDataIn = 1u << 4;   // EEPROM -> CPU
 }  // namespace
 
 Hpc3::Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz)
-    : bus_(bus), ioc_(ioc), scsi0_(scheduler, cpu_hz / 1000.0) {
+    : bus_(bus), ioc_(ioc), scheduler_(scheduler), cpu_hz_(cpu_hz), scsi0_(scheduler, cpu_hz / 1000.0) {
+    for (unsigned ch = 0; ch < kPbusChannels; ++ch)
+        pbus_timer_[ch] = std::make_unique<Timer>(scheduler, [this, ch] { pbus_complete(ch); });
+    hal2_.set_change_callback([this] { pbus_reconfigure(); });
     scsi0_.set_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0Scsi0, level); });
     scsi0_.set_dma([this](const u8* data, u32 n) { return scsi_dma(data, nullptr, n); },
                    [this](u8* data, u32 n) { return scsi_dma(nullptr, data, n); });
@@ -65,7 +83,168 @@ void Hpc3::reset() {
     eeprom_.set_lines(false, false, false);
     scsi0_.reset();
     scsi_dma_ = ScsiDma{};
+    for (unsigned ch = 0; ch < kPbusChannels; ++ch) {
+        pbus_timer_[ch]->cancel();
+        pbus_[ch] = PbusChannel{};
+    }
+    hal2_.reset();
     update_dma_irq();
+}
+
+// ---------------------------------------------------------------------------
+// PBUS DMA
+// ---------------------------------------------------------------------------
+
+// Loads the descriptor at dptr; false at the end of the chain.
+bool Hpc3::pbus_load(unsigned ch) {
+    PbusChannel& c = pbus_[ch];
+    if (c.loaded && (c.flags & kDescEox)) return false;
+    u32 pbuf = 0, cnt = 0, next = 0;
+    bus_.read<u32>(c.dptr, pbuf);
+    bus_.read<u32>(c.dptr + 4, cnt);
+    bus_.read<u32>(c.dptr + 8, next);
+    c.bptr = pbuf;
+    c.bc = cnt & kDescCountMask;
+    c.flags = cnt;
+    c.dptr = next;
+    c.loaded = true;
+    return true;
+}
+
+// Times the current descriptor at the rate of the HAL2 port on this channel
+// (a channel without one waits). `restart`: the timing of the descriptor
+// begins now even if the rate is unchanged.
+void Hpc3::pbus_schedule(unsigned ch, bool restart) {
+    PbusChannel& c = pbus_[ch];
+    double bytes_per_cycle = 0;
+    if (c.active) {
+        for (unsigned p = 0; p < Hal2::kNumPorts; ++p) {
+            const Hal2::PortConfig port = hal2_.port(static_cast<Hal2::Port>(p));
+            if (port.enabled && port.channel == ch) {
+                bytes_per_cycle = port.rate * 2 * port.voices / cpu_hz_;
+                break;
+            }
+        }
+    }
+    if (!restart && bytes_per_cycle == c.bytes_per_cycle) return;
+    c.bytes_per_cycle = bytes_per_cycle;
+    pbus_timer_[ch]->cancel();
+    if (bytes_per_cycle <= 0) return;
+    // Move on to a descriptor with data. A chain of empty ones (which the
+    // hardware would also spin on) is followed a few at a time.
+    for (int empty = 0; c.bc == 0; ++empty) {
+        if (c.loaded && (c.flags & kDescXie)) {
+            c.irq = true;
+            update_dma_irq();
+        }
+        if (empty == 16 && !(c.loaded && (c.flags & kDescEox))) {
+            c.loaded = false;  // the descriptor at dptr is next
+            c.started = scheduler_.now();
+            pbus_timer_[ch]->schedule_in(std::max<u64>(1, static_cast<u64>(4 / bytes_per_cycle)));
+            return;
+        }
+        if (!pbus_load(ch)) {
+            c.active = false;
+            c.bytes_per_cycle = 0;
+            return;
+        }
+    }
+    c.started = scheduler_.now();
+    pbus_timer_[ch]->schedule_in(std::max<u64>(1, static_cast<u64>(std::ceil(c.bc / bytes_per_cycle))));
+}
+
+// The current descriptor's data has moved.
+void Hpc3::pbus_complete(unsigned ch) {
+    PbusChannel& c = pbus_[ch];
+    if (!c.active) return;
+    if (!c.bc) {  // after a run of empty descriptors
+        pbus_schedule(ch, true);
+        return;
+    }
+    const u32 n = c.bc;
+    const Hal2::PortConfig dac = hal2_.port(Hal2::kDac);
+    bool input = false;
+    for (unsigned p = 0; p < Hal2::kNumPorts; ++p) {
+        const Hal2::PortConfig port = hal2_.port(static_cast<Hal2::Port>(p));
+        if (port.enabled && port.channel == ch) {
+            input = port.input;
+            break;
+        }
+    }
+    if (input) {  // nothing is connected to the inputs: silence
+        static const std::vector<u8> zeros(kDescCountMask + 1);
+        if (!bus_.write_block(c.bptr, zeros.data(), n))
+            for (u32 i = 0; i < n; ++i) bus_.write<u8>(c.bptr + i, 0);
+    } else if (audio_sink_ && dac.enabled && dac.channel == ch) {
+        std::vector<s16> samples(n / 2);
+        const bool little = dac.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
+        for (u32 i = 0; i < samples.size(); ++i) {
+            u8 b[2] = {0, 0};
+            bus_.read<u8>(c.bptr + 2 * i, b[0]);
+            bus_.read<u8>(c.bptr + 2 * i + 1, b[1]);
+            samples[i] = static_cast<s16>(little ? (b[1] << 8) | b[0] : (b[0] << 8) | b[1]);
+        }
+        audio_sink_(samples.data(), samples.size() / dac.voices, dac.voices, dac.rate);
+    }
+    c.bptr += n;
+    c.bc = 0;
+    pbus_schedule(ch, true);
+}
+
+void Hpc3::pbus_reconfigure() {
+    for (unsigned ch = 0; ch < kPbusChannels; ++ch)
+        if (pbus_[ch].active) pbus_schedule(ch, false);
+}
+
+u32 Hpc3::pbus_read(u32 offset) {
+    const unsigned ch = offset / kPbusStride;
+    PbusChannel& c = pbus_[ch];
+    switch (offset % kPbusStride) {
+        case 0: {  // buffer pointer: how far the current descriptor has got
+            u32 moved = 0;
+            if (c.active && c.bytes_per_cycle > 0 && c.bc)
+                moved = std::min<u32>(c.bc, static_cast<u32>((scheduler_.now() - c.started) * c.bytes_per_cycle) & ~1u);
+            return c.bptr + moved;
+        }
+        case 4: return c.dptr;
+        case kPbusCtrl: {
+            const u32 v = (c.irq ? kPbusStatInt : 0) | (c.active ? kPbusStatActive : 0);
+            c.irq = false;  // reading acknowledges the interrupt
+            update_dma_irq();
+            return v;
+        }
+        default: return 0;
+    }
+}
+
+void Hpc3::pbus_write(u32 offset, u32 value) {
+    const unsigned ch = offset / kPbusStride;
+    PbusChannel& c = pbus_[ch];
+    switch (offset % kPbusStride) {
+        case 0: c.bptr = value; return;
+        case 4:
+            c.dptr = value;
+            return;
+        case kPbusCtrl: {
+            c.ctrl = value;
+            if (!(value & kPbusCtrlLoad)) return;
+            const bool start = (value & kPbusCtrlAct) && !c.active;
+            c.active = value & kPbusCtrlAct;
+            if (start) {  // from the descriptor at dptr
+                c.bc = 0;
+                c.loaded = false;
+                c.bytes_per_cycle = 0;
+            }
+            if (c.active) {
+                pbus_schedule(ch, start);
+            } else {
+                pbus_timer_[ch]->cancel();
+                c.bytes_per_cycle = 0;
+            }
+            return;
+        }
+        default: return;
+    }
 }
 
 // Moves bytes between the SCSI controller and memory along the descriptor
@@ -115,7 +294,11 @@ u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
     return moved;
 }
 
-void Hpc3::update_dma_irq() { ioc_.set_local1(Ioc2::kL1HpcDma, scsi_dma_.irq); }
+void Hpc3::update_dma_irq() {
+    bool pbus = false;
+    for (const PbusChannel& c : pbus_) pbus |= c.irq;
+    ioc_.set_local1(Ioc2::kL1HpcDma, scsi_dma_.irq || pbus);
+}
 
 int Hpc3::byte_index(u32 offset, unsigned size, u32 window_base) {
     const u32 rel = offset - window_base;
@@ -210,9 +393,16 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
 }
 
 u32 Hpc3::read_word(u32 offset) {
+    if (offset < kPbusDmaEnd) return pbus_read(offset);
+    if (offset >= kHal2Window && offset < kHal2WindowEnd) return hal2_.read(offset - kHal2Window);
     switch (offset) {
         case kIntStat0:
-        case kIntStat1: return scsi_dma_.irq ? kIntStatScsi0 : 0;
+        case kIntStat1: {
+            u32 v = scsi_dma_.irq ? kIntStatScsi0 : 0;
+            for (unsigned ch = 0; ch < kPbusChannels; ++ch)
+                if (pbus_[ch].irq) v |= 1u << ch;
+            return v;
+        }
         case kScsi0Cbp: return scsi_dma_.cbp;
         case kScsi0Ndbp: return scsi_dma_.ndbp;
         case kScsi0Bc: return (scsi_dma_.flags & ~kDescCountMask) | scsi_dma_.bc;
@@ -235,6 +425,8 @@ u32 Hpc3::read_word(u32 offset) {
 }
 
 void Hpc3::write_word(u32 offset, u32 value) {
+    if (offset < kPbusDmaEnd) return pbus_write(offset, value);
+    if (offset >= kHal2Window && offset < kHal2WindowEnd) return hal2_.write(offset - kHal2Window, value);
     switch (offset) {
         case kEepromReg:
             eeprom_reg_ = value & 0x1F;
