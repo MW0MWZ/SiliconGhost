@@ -979,3 +979,36 @@ TEST(cpu_soft_tlb_keeps_address_spaces_apart_across_asid_switches) {
     CHECK_EQ(reference.gpr[t2], 200u * 11);
     CHECK_EQ(reference.gpr[t3], 200u * 22);
 }
+
+// Status writes that leave a pending interrupt masked (IRIX's spl calls)
+// let the code run on; the write that unmasks it takes the interrupt
+// straight after it, whichever engine runs the code.
+TEST(cpu_status_write_that_unmasks_a_pending_interrupt_takes_it_at_once) {
+    auto run = [](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.load({
+            ADDIU(t1, zero, 300),
+            ORI(a1, zero, sr::IE),               // interrupts on, Int0 masked
+            ORI(a2, zero, sr::IE | (0x04u << 8)), // and unmasked
+            MTC0(a1, cop0::Status),              // loop
+            ADDIU(t0, t0, 1),
+            BNE(t0, t1, -3), NOP,
+            MTC0(a2, cop0::Status),
+            ADDIU(t2, zero, 7),  // not reached before the interrupt
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.load({MFC0(t3, cop0::EPC), BEQ(zero, zero, -1), NOP}, 0x180);
+        t.cpu.cp0_write(cop0::Status, sr::IE);
+        t.cpu.set_int_line(0, true);
+        t.cpu.run_until(20000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK_EQ(reference.gpr[t0], 300u);
+    CHECK_EQ(reference.gpr[t2], 0u);
+    CHECK_EQ(reference.gpr[t3], kCode + 8 * 4);
+}

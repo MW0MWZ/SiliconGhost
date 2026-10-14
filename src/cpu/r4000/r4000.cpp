@@ -1568,6 +1568,16 @@ void R4000::execute_cop0(u32 inst) {
         return;
     }
     const unsigned rt = f_rt(inst), rd = f_rd(inst);
+    // Status is written all the time (IRIX's spl calls raise and lower the
+    // interrupt mask): only a change of mode or addressing, or an interrupt
+    // that can now be taken, needs the run loop to look again.
+    if ((f_rs(inst) == 0x04 || (f_rs(inst) == 0x05 && ops64_enabled())) && rd == cop0::Status) {
+        const u32 old = status_;
+        cp0_write(rd, f_rs(inst) == 0x04 ? sext32(gpr[rt]) : gpr[rt]);
+        touch();
+        if (((old ^ status_) & ~(sr::IE | sr::IM_MASK)) || interrupt_pending()) io_ = true;
+        return;
+    }
     // Reading a constant register (PRId, Config, Status...) is pure; Count
     // and Random change with time, and everything else alters CP0 state.
     if (f_rs(inst) > 0x01 || rd == cop0::Count || rd == cop0::Random) touch();
