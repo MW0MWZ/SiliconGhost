@@ -77,6 +77,7 @@ void usage(const char* argv0) {
                  "  --no-audio       do not play the machine's audio output\n"
                  "  --audio-in       let the machine record from the host's audio input\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
+                 "  --dump-state     print the CPU registers when the emulator stops\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "Both serial ports are connected to this terminal; Ctrl-C quits.\n",
                  argv0);
@@ -237,7 +238,7 @@ int main(int argc, char** argv) {
     std::string prom, nvram, screenshot;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true, audio = true,
+    bool trace = false, dump = false, headless = false, idle_skip = true, block_cache = true, jit = true, audio = true,
          audio_in = false;
     const char* timing = nullptr;
     double max_speed = 2.0;
@@ -284,6 +285,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
+        else if (!std::strcmp(a, "--dump-state")) dump = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
         else if (!std::strcmp(a, "--timing")) timing = next();
         else if (!std::strcmp(a, "--max-speed")) max_speed = std::strtod(next(), nullptr);
@@ -395,7 +397,7 @@ int main(int argc, char** argv) {
         }
         g_machine = nullptr;
         if (machine.powered_off()) std::fprintf(stderr, "\n[powered off]\n");
-        dump_state(cpu);
+        if (dump) dump_state(cpu);
 
         if (!screenshot.empty()) {
             std::vector<sg::u32> pixels;

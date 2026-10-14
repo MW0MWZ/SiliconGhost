@@ -140,6 +140,7 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--net user\|tap:NAME\|none` | Ethernet through user-mode NAT (default), a TAP interface, or none |
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
+| `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
 
 ### The display window
 
