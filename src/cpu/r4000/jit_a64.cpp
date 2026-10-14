@@ -154,19 +154,22 @@ bool R4000::jit_compile(Block& b) {
         e.madd(x0, x0, kScratch0, kTime);
         e.str(x0, kCpu, o_time);
     };
-    auto pc_plus = [&](Reg dst, s64 bytes) { e.add_imm(dst, kPc, bytes); };
+    auto pc_plus = [&](Reg dst, s64 bytes) {
+        if (bytes == 0) return e.mov(dst, kPc);
+        e.add_imm(dst, kPc, bytes);
+    };
     auto store_byte_imm = [&](s64 off, u32 v) {
         if (v == 0) return e.str(xzr, kCpu, off, 1);
         e.mov_imm32(x0, v);
         e.str(x0, kCpu, off, 1);
     };
     auto call = [&](const void* fn) {
-        e.mov_imm(kScratch0, reinterpret_cast<u64>(fn));
+        e.load_constant(kScratch0, reinterpret_cast<u64>(fn));
         e.blr(kScratch0);
     };
     auto call_handler = [&](const Op& op) {
         e.mov(x0, kCpu);
-        e.mov_imm(x1, reinterpret_cast<u64>(&op));
+        e.load_constant(x1, reinterpret_cast<u64>(&op));
         call(reinterpret_cast<const void*>(op.fn));
     };
 
@@ -653,8 +656,7 @@ bool R4000::jit_compile(Block& b) {
         e.ldr(x4, block, offsetof(Block, code));
         to_finish.push_back(e.cbz(x4));
         e.ldr(x5, block, offsetof(Block, jit_addr64), 1);
-        e.cmp_imm(x5, addr64 ? 1 : 0, false);
-        to_finish.push_back(e.b(Cond::Ne));
+        to_finish.push_back(addr64 ? e.cbz(x5, false) : e.cbnz(x5, false));
         e.ldr(x5, block, offsetof(Block, count), 4);
         e.sub_imm(x5, x5, 1, false);
         e.ldr(kScratch0, kCpu, o_weight);
@@ -673,8 +675,8 @@ bool R4000::jit_compile(Block& b) {
         e.cmp(x0, x1);
         const Site next = e.b(Cond::Ne);
         const u8* const host = page_host + static_cast<u32>(static_cast<s64>(page_offset) + delta);
-        e.mov_imm(x3, reinterpret_cast<u64>(&blocks_[block_index(host)]));
-        e.mov_imm(x1, reinterpret_cast<u64>(host));
+        e.load_constant(x3, reinterpret_cast<u64>(&blocks_[block_index(host)]));
+        e.load_constant(x1, reinterpret_cast<u64>(host));
         e.ldr(kScratch0, x3, offsetof(Block, host));
         e.cmp(x1, kScratch0);
         to_finish.push_back(e.b(Cond::Ne));
@@ -700,7 +702,7 @@ bool R4000::jit_compile(Block& b) {
     e.lsr(x1, x3, 2);
     e.and_imm(x1, x1, (1u << kBlockBits) - 1);
     e.mov_imm(kScratch0, sizeof(Block));
-    e.mov_imm(x4, reinterpret_cast<u64>(blocks_.data()));
+    e.load_constant(x4, reinterpret_cast<u64>(blocks_.data()));
     e.madd(x1, x1, kScratch0, x4);
     e.ldr(kScratch0, x1, offsetof(Block, host));
     e.cmp(x3, kScratch0);
@@ -722,7 +724,7 @@ bool R4000::jit_compile(Block& b) {
     }
     for (const Site& s : to_epilogue) e.bind(s);
     // Tell run_block() which block (and entry pc) the count belongs to.
-    e.mov_imm(kScratch0, reinterpret_cast<u64>(&b));
+    e.load_constant(kScratch0, reinterpret_cast<u64>(&b));
     e.str(kScratch0, kCpu, offset_of(this, &jit_block_));
     e.str(kPc, kCpu, offset_of(this, &jit_entry_pc_));
     e.ldp(x23, x24, sp, 48);
@@ -730,6 +732,7 @@ bool R4000::jit_compile(Block& b) {
     e.ldp(x19, x20, sp, 16);
     e.ldp_post(x29, x30, sp, 64);
     e.ret();
+    e.finish_literals();
 
     const void* fn = jit_buf_->add(e.code().data(), e.size());
     if (!fn) return false;

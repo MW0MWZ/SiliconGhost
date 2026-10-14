@@ -8,6 +8,7 @@
 // instruction encodings.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <vector>
@@ -124,6 +125,40 @@ public:
             }
         }
         if (first) emit((inverted ? 0x92800000u : 0xD2800000u) | d);  // all zeros or all ones
+    }
+    // A 64-bit constant: built in place when that takes at most two
+    // instructions, otherwise loaded from the literal pool that
+    // finish_literals() places after the code (one PC-relative load).
+    void load_constant(Reg d, u64 v) {
+        unsigned zeros = 0, ones = 0;
+        for (unsigned hw = 0; hw < 4; ++hw) {
+            const u32 part = static_cast<u32>(v >> (16 * hw)) & 0xFFFF;
+            zeros += part == 0;
+            ones += part == 0xFFFF;
+        }
+        if (std::max(zeros, ones) >= 2) return mov_imm(d, v);
+        literals_.push_back({emit_site(0x58000000u | d, Fix::B19), v});  // LDR Xd, literal
+    }
+    // Places the literal pool (8-byte aligned) and points the loads at it.
+    // Call once, after the last instruction.
+    void finish_literals() {
+        if (literals_.empty()) return;
+        if (code_.size() % 8) emit(0xD503201Fu);  // NOP: align the pool
+        std::vector<std::pair<u64, std::size_t>> pool;  // value, offset
+        for (const Literal& l : literals_) {
+            std::size_t at = 0;
+            bool found = false;
+            for (const auto& [value, offset] : pool)
+                if (value == l.value) at = offset, found = true;
+            if (!found) {
+                at = code_.size();
+                code_.resize(at + 8);
+                std::memcpy(&code_[at], &l.value, 8);  // little-endian, as the host
+                pool.emplace_back(l.value, at);
+            }
+            bind_to(l.site, at);
+        }
+        literals_.clear();
     }
     void mov_imm32(Reg d, u32 v) {  // W register: upper half cleared
         emit(0x52800000u | ((v & 0xFFFF) << 5) | d);
@@ -271,7 +306,12 @@ private:
         emit(ls_reg_op(load, size, sign) | (u32{kScratch1} << 16) | (u32{base} << 5) | t);
     }
 
+    struct Literal {
+        Site site;
+        u64 value;
+    };
     std::vector<u8> code_;
+    std::vector<Literal> literals_;
 };
 
 }  // namespace sg::jit::a64
