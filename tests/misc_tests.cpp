@@ -162,6 +162,26 @@ TEST(pacer_realtime_recovers_from_a_stall) {
     CHECK(cpi > 0.45 && cpi < 0.55);
 }
 
+TEST(pacer_realtime_caps_the_speed_up) {
+    FakeHost host;
+    const double hz = 175e6, host_ips = 1000e6;  // could run the guest CPU 5.7x as fast
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    p.set_max_speed(2.0);
+    double cpi = p.update(0, 0);
+    u64 cycles = 0, instructions = 0;
+    for (int slice = 0; slice < 2000; ++slice) {  // 1 ms slices of guest time
+        const u64 n = static_cast<u64>(175000 / cpi);
+        instructions += n;
+        cycles += 175000;
+        host.now += static_cast<u64>(static_cast<double>(n) / host_ips * 1e9);
+        cpi = p.update(cycles, instructions);
+    }
+    CHECK_EQ(cpi, 0.5);
+    // Ahead of the wall clock, it waits: guest time still matches.
+    const double wall = static_cast<double>(host.now - 1000000000) * 1e-9, guest = static_cast<double>(cycles) / hz;
+    CHECK(guest > wall - 0.01 && guest < wall + 0.01);
+}
+
 TEST(pacer_max_mode_never_waits) {
     FakeHost host;
     Pacer p(Pacer::Mode::Max, 100e6, host.clock());
