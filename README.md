@@ -20,7 +20,10 @@ SiliconGhost is under active development. What works today:
 - **IRIX 5.3:** installs from its CD onto a blank disk image (labelled with
   `fx`, as on real hardware) and boots multi-user, on the serial console or
   to the graphical login and the IRIX desktop (4Dwm, Toolchest, winterm) on
-  Newport, with the PS/2 keyboard and mouse.
+  Newport, with the PS/2 keyboard and mouse. IRIS GL programs run, such as
+  the flight simulator and the atlantis and ideas demos.
+- **Audio:** the HAL2 plays through the host's sound output, from the PROM's
+  start-up chime to IRIX's sounds.
 - **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
   TLB, exceptions, 32/64-bit addressing and cache tag operations.
 - **Speed:** hot code is translated to x86-64 machine code, and idle loops
@@ -28,7 +31,7 @@ SiliconGhost is under active development. What works today:
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
   host core.
 
-Not there yet: Ethernet (Seeq 8003) and audio (HAL2). See [Roadmap](#roadmap).
+Not there yet: Ethernet (Seeq 8003) and audio input. See [Roadmap](#roadmap).
 
 ## Emulated hardware
 
@@ -36,7 +39,7 @@ Not there yet: Ethernet (Seeq 8003) and audio (HAL2). See [Roadmap](#roadmap).
 |---|---|---|
 | CPU | MIPS R4400 (R4000 family), FPU, 48-entry TLB | complete |
 | Memory controller | MC: memory configuration, GIO bus errors | working |
-| Peripheral controller | HPC3: SCSI and Ethernet DMA, PBUS | working (SCSI) |
+| Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working (SCSI, PBUS) |
 | Interrupts/timers | IOC2 / INT3, 8254 PIT | working |
 | Serial | Zilog 85230 SCC (two ports) | working |
 | Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved on exit |
@@ -44,7 +47,7 @@ Not there yet: Ethernet (Seeq 8003) and audio (HAL2). See [Roadmap](#roadmap).
 | Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | PROM console and the IRIX desktop work |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 8003 | stub |
-| Audio | HAL2 | stub |
+| Audio | HAL2 | output works; inputs record silence |
 
 ## Building
 
@@ -84,6 +87,7 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--no-graphics`, `--headless` | serial console only / no display window |
 | `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
+| `--no-audio` | do not play the machine's audio |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 
 In the display window, click to capture the mouse; Ctrl+Alt+G releases it.
@@ -141,7 +145,7 @@ with performance layers on top that must give exactly the same results:
 ## Roadmap
 
 - Newport: 24-bit (XL24) boards, remaining raster operations
-- Seeq 8003 Ethernet with a host network backend, HAL2 audio
+- Seeq 8003 Ethernet with a host network backend; audio input
 - IRIX 6.5
 - AArch64 recompiler; macOS and Windows builds
 - Indigo² (IP22 "Fullhouse") machine profile
