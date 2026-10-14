@@ -56,6 +56,9 @@ constexpr u32 kPbusCtrlLoad = 1u << 5;  // ACT is written only with this set
 // ...and read
 constexpr u32 kPbusStatInt = 1u << 0;
 constexpr u32 kPbusStatActive = 1u << 1;
+// Per-channel DMA configuration (device timing and bus width), 0x200 apart
+constexpr u32 kPbusDmaCfg = 0x5C000, kPbusDmaCfgStride = 0x200;
+constexpr u32 kPbusCfgDs16 = 1u << 18;
 // Ethernet DMA (receive channel at 0x14000, transmit at 0x16000) and the
 // Seeq's registers on 4-byte strides
 constexpr u32 kEnetStart = 0x14000, kEnetEnd = 0x18000;
@@ -319,7 +322,7 @@ void Hpc3::pbus_schedule(unsigned ch, bool restart) {
         for (unsigned p = 0; p < Hal2::kNumPorts; ++p) {
             const Hal2::PortConfig port = hal2_.port(static_cast<Hal2::Port>(p));
             if (port.enabled && port.channel == ch) {
-                bytes_per_cycle = port.rate * 4 * port.voices / cpu_hz_;  // a 32-bit word per sample
+                bytes_per_cycle = port.rate * pbus_sample_bytes(ch) * port.voices / cpu_hz_;
                 break;
             }
         }
@@ -374,13 +377,19 @@ void Hpc3::pbus_complete(unsigned ch) {
         if (!bus_.write_block(c.bptr, zeros.data(), n))
             for (u32 i = 0; i < n; ++i) bus_.write<u8>(c.bptr + i, 0);
     } else if (audio_sink_ && dac.enabled && dac.channel == ch) {
-        // Each sample is a 24-bit value in a 32-bit word; the codec takes its
-        // top 16 bits.
-        std::vector<s16> samples(n / 4);
+        // With DS16 set, each sample is a 24-bit value in a 32-bit word and
+        // the codec takes its top 16 bits; otherwise samples are packed
+        // 16-bit values.
+        const unsigned size = pbus_sample_bytes(ch);
+        std::vector<s16> samples(n / size);
         const bool little = dac.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
         for (u32 i = 0; i < samples.size(); ++i) {
             u8 b[4] = {0, 0, 0, 0};
-            for (u32 k = 0; k < 4; ++k) bus_.read<u8>(c.bptr + 4 * i + k, b[k]);
+            for (u32 k = 0; k < size; ++k) bus_.read<u8>(c.bptr + size * i + k, b[k]);
+            if (size == 2) {
+                samples[i] = static_cast<s16>(little ? b[0] | (b[1] << 8) : (b[0] << 8) | b[1]);
+                continue;
+            }
             const u32 word = little ? u32{b[0]} | (u32{b[1]} << 8) | (u32{b[2]} << 16) | (u32{b[3]} << 24)
                                     : (u32{b[0]} << 24) | (u32{b[1]} << 16) | (u32{b[2]} << 8) | u32{b[3]};
             samples[i] = static_cast<s16>(word >> 8);
@@ -390,6 +399,11 @@ void Hpc3::pbus_complete(unsigned ch) {
     c.bptr += n;
     c.bc = 0;
     pbus_schedule(ch, true);
+}
+
+unsigned Hpc3::pbus_sample_bytes(unsigned ch) const {
+    const auto it = regs_.find(kPbusDmaCfg + ch * kPbusDmaCfgStride);
+    return it != regs_.end() && (it->second & kPbusCfgDs16) ? 4 : 2;
 }
 
 void Hpc3::pbus_reconfigure() {
@@ -634,6 +648,11 @@ void Hpc3::write_word(u32 offset, u32 value) {
     if (offset >= kEnetStart && offset < kEnetEnd) return enet_write(offset, value);
     if (offset >= kSeeqWindow && offset < kSeeqWindowEnd) return seeq_.write((offset - kSeeqWindow) >> 2, static_cast<u8>(value));
     if (offset >= kHal2Window && offset < kHal2WindowEnd) return hal2_.write(offset - kHal2Window, value);
+    if (offset >= kPbusDmaCfg && offset < kPbusDmaCfg + kPbusChannels * kPbusDmaCfgStride) {
+        regs_[offset] = value;
+        if (offset % kPbusDmaCfgStride == 0) pbus_reconfigure();  // the sample size may have changed
+        return;
+    }
     switch (offset) {
         case kEepromReg:
             eeprom_reg_ = value & 0x1F;

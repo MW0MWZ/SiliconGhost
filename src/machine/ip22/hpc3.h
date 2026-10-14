@@ -79,6 +79,7 @@ private:
     void pbus_schedule(unsigned ch, bool restart);
     void pbus_complete(unsigned ch);
     void pbus_reconfigure();
+    unsigned pbus_sample_bytes(unsigned ch) const;  // memory bytes per audio sample
     u32 pbus_read(u32 offset);
     void pbus_write(u32 offset, u32 value);
 

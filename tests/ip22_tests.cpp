@@ -271,6 +271,7 @@ TEST(ip22_events_scheduled_by_running_code_fire_on_time) {
 namespace {
 constexpr u32 kHal2 = 0x1FBD8000;     // HPC3 PBUS PIO channel 0
 constexpr u32 kPbus0 = 0x1FB80000;    // PBUS DMA channel 0: bptr, dptr; control at +0x1000
+constexpr u32 kPbusCfg0 = 0x1FBDC000;  // PBUS DMA channel 0 configuration
 constexpr u32 kHpcIntStat = 0x1FBB0000;
 
 void hal2_write(IndyRig& t, u32 reg, u32 value) {
@@ -306,7 +307,9 @@ TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
         CHECK(rate == 8000.0);
         played.insert(played.end(), s, s + frames * voices);
     });
-    // 100 stereo frames per descriptor, a 32-bit word (24-bit sample) per voice
+    // 100 stereo frames per descriptor, a 32-bit word (24-bit sample) per
+    // voice: the channel's 16-bit device bus mode (DS16), as the PROM sets it
+    t.w32(kPbusCfg0, 0x08248844);
     constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 800;
     for (u32 i = 0; i < 2 * kBytes / 4; ++i) t.w32(kBuf + 4 * i, (static_cast<u32>(static_cast<s32>(i * 3 - 200)) << 8) & 0xFFFFFF00u);
     t.w32(kDesc + 0, kBuf);
@@ -339,6 +342,44 @@ TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
     CHECK_EQ(t.r32(kPbus0 + 0x1000), 1u);  // done
     bool same = true;
     for (u32 i = 0; i < played.size(); ++i) same &= played[i] == static_cast<s16>(i * 3 - 200);
+    CHECK(same);
+}
+
+// Without DS16 (the configuration the NetBSD and Linux drivers use), the
+// samples are packed 16-bit values.
+TEST(ip22_hal2_dac_dma_packed_16_bit_samples) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    std::vector<s16> played;
+    t.m.hpc3().set_audio_sink([&](const s16* s, std::size_t frames, unsigned voices, double rate) {
+        CHECK_EQ(voices, 2u);
+        CHECK(rate == 48000.0);
+        played.insert(played.end(), s, s + frames * voices);
+    });
+    constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 400;  // 100 stereo frames
+    for (u32 i = 0; i < kBytes / 4; ++i)
+        t.w32(kBuf + 4 * i, (static_cast<u32>(static_cast<u16>(i * 7 - 300)) << 16) | static_cast<u16>(-static_cast<s32>(i)));
+    t.w32(kDesc + 0, kBuf);
+    t.w32(kDesc + 4, (1u << 31) | kBytes);  // EOX
+    t.w32(kDesc + 8, 0);
+
+    t.w32(kPbusCfg0, 0x08208844);
+    t.w32(kHal2 + 0x10, 0x18);
+    hal2_write(t, 0x2104, 0);           // generator 1 from 48 kHz...
+    hal2_write(t, 0x2108, 0xFFFF0004);  // ...times 4/4, as NetBSD writes it
+    hal2_write(t, 0x1404, 0x208);       // DAC: PBUS channel 0, clock 1, stereo
+    hal2_write(t, 0x9104, 0x08);
+    t.w32(kPbus0 + 4, kDesc);
+    t.w32(kPbus0 + 0x1000, 0x30);
+
+    const u64 duration = static_cast<u64>(t.m.cycles_per_second() * 100 / 48000);
+    t.m.run(duration * 9 / 10);
+    CHECK(played.empty());
+    t.m.run(duration * 2 / 10);
+    CHECK_EQ(played.size(), 200u);
+    bool same = true;
+    for (u32 i = 0; i < played.size() / 2; ++i)
+        same &= played[2 * i] == static_cast<s16>(i * 7 - 300) && played[2 * i + 1] == static_cast<s16>(-static_cast<s32>(i));
     CHECK(same);
 }
 
