@@ -70,14 +70,54 @@ KeyCodes key_codes(SDL_Scancode sc) {
         case SDL_SCANCODE_END: return {0x69, true, 0x65};
         case SDL_SCANCODE_PAGEUP: return {0x7D, true, 0x6F};
         case SDL_SCANCODE_PAGEDOWN: return {0x7A, true, 0x6D};
+        // ISO keys: "#~" beside Enter and "\|" beside left Shift
+        case SDL_SCANCODE_NONUSHASH: return {0x5D, false, 0x53};
+        case SDL_SCANCODE_NONUSBACKSLASH: return {0x61, false, 0x13};
+        case SDL_SCANCODE_SCROLLLOCK: return {0x7E, false, 0x5F};
+        case SDL_SCANCODE_NUMLOCKCLEAR: return {0x77, false, 0x76};
+        case SDL_SCANCODE_KP_DIVIDE: return {0x4A, true, 0x77};
+        case SDL_SCANCODE_KP_MULTIPLY: return {0x7C, false, 0x7E};
+        case SDL_SCANCODE_KP_MINUS: return {0x7B, false, 0x84};
+        case SDL_SCANCODE_KP_PLUS: return {0x79, false, 0x7C};
+        case SDL_SCANCODE_KP_ENTER: return {0x5A, true, 0x79};
+        case SDL_SCANCODE_KP_PERIOD: return {0x71, false, 0x71};
+        case SDL_SCANCODE_KP_0: return {0x70, false, 0x70};
+        case SDL_SCANCODE_KP_1: return {0x69, false, 0x69};
+        case SDL_SCANCODE_KP_2: return {0x72, false, 0x72};
+        case SDL_SCANCODE_KP_3: return {0x7A, false, 0x7A};
+        case SDL_SCANCODE_KP_4: return {0x6B, false, 0x6B};
+        case SDL_SCANCODE_KP_5: return {0x73, false, 0x73};
+        case SDL_SCANCODE_KP_6: return {0x74, false, 0x74};
+        case SDL_SCANCODE_KP_7: return {0x6C, false, 0x6C};
+        case SDL_SCANCODE_KP_8: return {0x75, false, 0x75};
+        case SDL_SCANCODE_KP_9: return {0x7D, false, 0x7D};
+        case SDL_SCANCODE_LGUI: return {0x1F, true, 0x8B};
+        case SDL_SCANCODE_RGUI: return {0x27, true, 0x8C};
+        case SDL_SCANCODE_APPLICATION: return {0x2F, true, 0x8D};
         default: return {0, false, 0};
     }
 }
 
 void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
+    auto& kbc = m.ioc().kbc();
+    // Print Screen and Pause are sequences in set 2 (Pause has no break).
+    if (sc == SDL_SCANCODE_PRINTSCREEN || sc == SDL_SCANCODE_PAUSE) {
+        const bool print = sc == SDL_SCANCODE_PRINTSCREEN;
+        if (kbc.scan_set() == 3) {
+            if (!down) kbc.key_input(0xF0);
+            kbc.key_input(print ? 0x57 : 0x62);
+        } else if (print) {
+            static constexpr u8 kMake[] = {0xE0, 0x12, 0xE0, 0x7C};
+            static constexpr u8 kBreak[] = {0xE0, 0xF0, 0x7C, 0xE0, 0xF0, 0x12};
+            if (down) for (u8 b : kMake) kbc.key_input(b);
+            else for (u8 b : kBreak) kbc.key_input(b);
+        } else if (down) {
+            for (u8 b : {0xE1, 0x14, 0x77, 0xE1, 0xF0, 0x14, 0xF0, 0x77}) kbc.key_input(b);
+        }
+        return;
+    }
     const KeyCodes k = key_codes(sc);
     if (!k.set2) return;
-    auto& kbc = m.ioc().kbc();
     if (kbc.scan_set() == 3) {
         if (!down) kbc.key_input(0xF0);
         kbc.key_input(k.set3);
