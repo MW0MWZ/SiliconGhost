@@ -260,6 +260,16 @@ private:
         Op ops[kMaxBlockLength];
     };
     static bool is_branch_word(u32 w);
+    // Which guest registers a translation keeps in host registers, and in
+    // which of the back end's cache slots (jit_plan.cpp).
+    static constexpr unsigned kJitSlots = 8;
+    struct JitPlan {
+        u32 alloc = 0;     // cached guest registers
+        u32 written = 0;   // cached registers the block writes inline
+        s8 slot[32] = {};  // cache slot of each guest register (-1: none)
+        bool self_loop = false;
+    };
+    static JitPlan jit_plan(const Block& b);
     bool jit_compile(Block& b);  // false if the code buffer is full
     static bool jit_compile_supported();
     void jit_flush();
