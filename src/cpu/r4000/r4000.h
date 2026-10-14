@@ -213,8 +213,11 @@ private:
     // Soft-TLB: direct-mapped cache of recent 4 KiB virtual->physical
     // translations per (mode, read/write). Entries for RAM/ROM carry a host
     // pointer so the common case is one compare plus a byte-swapped load.
+    // Tags carry the ASID they were made under (in bits 52-59, which a page
+    // number never uses), so a change of address space needs no flush and
+    // returning to one finds its translations still there.
     struct FastEntry {
-        u64 tag = ~u64{0};  // vaddr >> 12
+        u64 tag = ~u64{0};  // (vaddr >> 12) | asid_tag_
         u8* host = nullptr; // host pointer to the 4 KiB page, or nullptr for MMIO
         u64 ppage = 0;      // physical page address
         u8* code = nullptr; // the page's code flag (host pages only; see Bus::code_flag)
@@ -462,6 +465,12 @@ private:
     // Separate tables for fetch, load and store (indexed by Access), so code
     // and data pages that share low address bits do not evict each other.
     FastEntry fast_[kNumModes][3][kFastEntries];
+    u64 asid_tag_ = 0;  // EntryHi's ASID, placed as in FastEntry::tag
+    static constexpr unsigned kAsidTagShift = 52;
+    void set_entryhi(u64 v) {
+        entryhi_ = v;
+        asid_tag_ = (v & 0xFF) << kAsidTagShift;
+    }
 };
 
 }  // namespace sg::mips

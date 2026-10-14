@@ -144,6 +144,7 @@ bool R4000::jit_compile(Block& b) {
     const Mem m_safe{kCpu, offset_of(this, &jit_safe_)};
     const Mem m_lo{kCpu, offset_of(this, &lo)};
     const Mem m_weight{kCpu, offset_of(this, &weight_)};
+    const Mem m_asid_tag{kCpu, offset_of(this, &asid_tag_)};
     const Mem m_entry_mode{rsp, 0};
 
     // Prologue (six pushes and 8 bytes keep calls 16-byte aligned).
@@ -305,6 +306,7 @@ bool R4000::jit_compile(Block& b) {
         e.mov(rcx, rax);
         e.shift_imm(Shift::Shr, rcx, 12, true);  // tag
         e.mov(rdx, rcx);
+        e.alu(Alu::Or, rcx, m_asid_tag);
         e.alu_imm(Alu::And, rdx, kFastEntries - 1, false);
         e.shift_imm(Shift::Shl, rdx, 5, false);
         e.alu(Alu::Add, rdx, kTlb);  // the entry, less `table`
@@ -800,6 +802,7 @@ bool R4000::jit_compile(Block& b) {
     e.mov(rcx, rax);
     e.shift_imm(Shift::Shr, rcx, 12, true);  // tag
     e.mov(rsi, rcx);
+    e.alu(Alu::Or, rcx, m_asid_tag);
     e.alu_imm(Alu::And, rsi, kFastEntries - 1, false);
     e.shift_imm(Shift::Shl, rsi, 5, false);
     e.alu(Alu::Add, rsi, kTlb);  // the load entry; the fetch table precedes it

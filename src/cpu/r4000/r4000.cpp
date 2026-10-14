@@ -91,6 +91,7 @@ void R4000::reset() {
     watchlo_ = watchhi_ = ecc_ = cacheerr_ = taglo_ = taghi_ = lladdr_ = 0;
     entrylo0_ = entrylo1_ = context_ = xcontext_ = badvaddr_ = 0;
     entryhi_ = epc_ = errorepc_ = 0;
+    asid_tag_ = 0;
     llbit_ = false;
     random_base_ = cycles();                               // Random restarts at 47
     count_offset_ = 0u - static_cast<u32>(cycles() >> 1);  // Count restarts at 0
@@ -272,7 +273,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     const unsigned mode = mode_;
     const u64 vpage = pc >> 12;
     const FastEntry& fe = fast_[mode][static_cast<unsigned>(Access::Fetch)][vpage & (kFastEntries - 1)];
-    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != vpage || fe.host == nullptr)) {
+    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != (vpage | asid_tag_) || fe.host == nullptr)) {
         step_inline();  // delay slot on a new page, misaligned or untranslated pc, uncached fetch
         return;
     }
@@ -388,7 +389,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         }
 
         // Link to the block at the new pc if nothing it relies on changed.
-        if (idle_ready_ || next_delay_ || (pc >> 12) != vpage || (pc & 3) || mode_ != mode || fe.tag != vpage ||
+        if (idle_ready_ || next_delay_ || (pc >> 12) != vpage || (pc & 3) || mode_ != mode || fe.tag != (vpage | asid_tag_) ||
             fe.host != page)
             return;
     }
@@ -702,7 +703,7 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     const bool is_store = acc == Access::Store;
     host = is_store ? bus_.host_write_ptr(ppage) : bus_.host_read_ptr(ppage);
     FastEntry& e = fast_[mode_][static_cast<unsigned>(acc)][(vaddr >> 12) & (kFastEntries - 1)];
-    e.tag = vaddr >> 12;
+    e.tag = (vaddr >> 12) | asid_tag_;
     e.host = host;
     e.ppage = ppage;
     e.code = host ? bus_.code_flag(host) : nullptr;
@@ -715,7 +716,7 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
 template <R4000::Access A>
 SG_FORCEINLINE bool R4000::lookup(u64 vaddr, u8*& host, u64& paddr) {
     const FastEntry& e = fast_[mode_][static_cast<unsigned>(A)][(vaddr >> 12) & (kFastEntries - 1)];
-    if (SG_LIKELY(e.tag == (vaddr >> 12))) {
+    if (SG_LIKELY(e.tag == ((vaddr >> 12) | asid_tag_))) {
         host = e.host;
         paddr = e.ppage | (vaddr & 0xFFF);
         if constexpr (A == Access::Store) store_code_ = e.code;
@@ -1663,9 +1664,7 @@ void R4000::cp0_write(unsigned reg, u64 v) {
             reschedule_timer();
             break;
         case cop0::EntryHi: {
-            const u64 nv = v & kEntryHiMask;
-            if ((nv ^ entryhi_) & 0xFF) flush_fast_tlb();  // ASID change
-            entryhi_ = nv;
+            set_entryhi(v & kEntryHiMask);
             break;
         }
         case cop0::Compare:
@@ -1716,9 +1715,8 @@ void R4000::tlb_read() {
     const unsigned index = index_ & 63;
     if (index >= kTlbEntries) return;
     const TlbEntry& e = tlb_[index];
-    if ((e.hi ^ entryhi_) & 0xFF) flush_fast_tlb();
     pagemask_ = static_cast<u32>(e.mask);
-    entryhi_ = e.hi;
+    set_entryhi(e.hi);
     entrylo0_ = e.lo[0] | (e.global ? 1 : 0);
     entrylo1_ = e.lo[1] | (e.global ? 1 : 0);
 }

@@ -941,3 +941,41 @@ TEST(cpu_jit_links_follow_the_guest_translation_when_ram_is_not_host_page_aligne
         CHECK_EQ(cpu.gpr[t1], 40u);
     }
 }
+
+// The same virtual page mapped to different memory under two ASIDs: code
+// switching between the address spaces must always see the current one's
+// page, whichever engine runs it.
+TEST(cpu_soft_tlb_keeps_address_spaces_apart_across_asid_switches) {
+    auto run = [](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.w32(0x200000, 11);  // ASID 5's page
+        t.w32(0x300000, 22);  // ASID 6's page
+        t.cpu.gpr[t4] = 200;
+        t.load({
+            ADDIU(t5, zero, 5), ADDIU(t6, zero, 6), LUI(t0, 0x0040), MTC0(zero, cop0::PageMask),
+            MTC0(zero, cop0::EntryLo1),
+            ADDIU(a0, zero, 3), MTC0(a0, cop0::Index), ORI(a1, t0, 5), MTC0(a1, cop0::EntryHi),
+            ORI(a2, zero, (0x200u << 6) | 0x1E), MTC0(a2, cop0::EntryLo0), TLBWI,
+            ADDIU(a0, zero, 4), MTC0(a0, cop0::Index), ORI(a1, t0, 6), MTC0(a1, cop0::EntryHi),
+            ORI(a2, zero, (0x300u << 6) | 0x1E), MTC0(a2, cop0::EntryLo0), TLBWI,
+            MTC0(t5, cop0::EntryHi),  // loop:
+            LW(t1, 0, t0),
+            ADDU(t2, t2, t1),
+            MTC0(t6, cop0::EntryHi),
+            LW(t1, 0, t0),
+            ADDU(t3, t3, t1),
+            ADDIU(t4, t4, -1),
+            BNE(t4, zero, -8), NOP,  // -> loop
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.cpu.run_until(20000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK_EQ(reference.gpr[t2], 200u * 11);
+    CHECK_EQ(reference.gpr[t3], 200u * 22);
+}
