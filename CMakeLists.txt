@@ -70,7 +70,7 @@ if(SG_WITH_SLIRP)
     target_compile_definitions(sg_emu PRIVATE SG_HAVE_SLIRP=1)
     target_link_libraries(sg_emu PUBLIC PkgConfig::SLIRP)
   else()
-    message(STATUS "libslirp not found: building without user-mode networking")
+    message(WARNING "libslirp not found: building without user-mode networking")
   endif()
 endif()
 

@@ -58,15 +58,43 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 
 ## Building
 
-Requirements: CMake 3.21 or later and a C++20 compiler (GCC 12+ or Clang
-15+). Optional: SDL3 for the display window and sound (without it the
-emulator runs on the serial console), and libslirp for user-mode networking.
+You need:
+
+- **CMake** 3.21 or later, **Ninja** (or make) and **pkg-config**;
+- a **C++20 compiler**: GCC 12 or later, or Clang 15 or later;
+- **SDL3** for the display window, keyboard, mouse and sound. Without it the
+  emulator still builds, but runs on the serial console only (CMake warns
+  when it cannot find SDL3);
+- **libslirp** for user-mode networking (`--net user`). Without it only
+  `--net tap:NAME` is available.
+
+On **Debian 13** or **Ubuntu 25.04 and later** (including 26.04 LTS):
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config libsdl3-dev libslirp-dev
+```
+
+On **Fedora**:
+
+```sh
+sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config SDL3-devel libslirp-devel
+```
+
+Ubuntu 24.04 LTS and older releases do not package SDL3; build and install
+it from source first ([SDL's build instructions](https://github.com/libsdl-org/SDL/blob/main/docs/README-cmake.md)),
+or build without it for the serial console only. Distribution SDL3 packages
+support both Wayland and X11 desktops; an SDL3 built from source needs the
+Wayland and X11 development headers installed beforehand to support them.
+
+Then:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build      # unit tests
 ```
+
+Check the configure output: it says if SDL3 or libslirp was not found.
 
 ## Running
 
