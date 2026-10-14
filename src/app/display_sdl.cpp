@@ -131,13 +131,17 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
 
 // PS/2 mouse fed from the window: a click captures the pointer (relative
 // mode), Ctrl+Alt+G or losing focus releases it. Motion is gathered per
-// frame and sent as one movement; button changes are sent at once.
+// frame, in guest pixels whatever the window's scale, and sent as one
+// movement; button changes are sent at once.
 class MouseCapture {
 public:
-    MouseCapture(SDL_Window* window, ip22::Indy& machine) : window_(window), machine_(machine) { update_title(); }
+    MouseCapture(SDL_Window* window, SDL_Renderer* renderer, ip22::Indy& machine)
+        : window_(window), renderer_(renderer), machine_(machine) {
+        update_title();
+    }
 
     // True if the event was consumed.
-    bool handle(const SDL_Event& ev) {
+    bool handle(SDL_Event ev) {
         switch (ev.type) {
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
             case SDL_EVENT_MOUSE_BUTTON_UP: {
@@ -156,6 +160,7 @@ public:
             }
             case SDL_EVENT_MOUSE_MOTION:
                 if (captured_) {
+                    SDL_ConvertEventToRenderCoordinates(renderer_, &ev);
                     dx_ += ev.motion.xrel;
                     dy_ += ev.motion.yrel;
                 }
@@ -201,6 +206,7 @@ private:
     }
 
     SDL_Window* window_;
+    SDL_Renderer* renderer_;
     ip22::Indy& machine_;
     bool captured_ = false;
     unsigned buttons_ = 0;
@@ -273,7 +279,7 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         return false;
     }
     SDL_SetRenderLogicalPresentation(renderer, 1280, 1024, SDL_LOGICAL_PRESENTATION_LETTERBOX);
-    MouseCapture mouse(window, machine);
+    MouseCapture mouse(window, renderer, machine);
     std::optional<AudioOut> sound;
     if (audio) sound.emplace(machine);
     SDL_Texture* texture = nullptr;
