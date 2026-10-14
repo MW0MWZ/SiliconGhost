@@ -626,7 +626,7 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
                                             0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B};
     static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19};
     static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F, 0x22, 0x26};
-    static constexpr unsigned kBranches[] = {0x04, 0x05, 0x06, 0x07, 0x14, 0x15};
+    static constexpr unsigned kBranches[] = {0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17};
 
     // The body runs several times, so that its blocks become hot.
     std::vector<u32> prog{ADDIU(s1, zero, 12)};
@@ -651,11 +651,12 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
             case 6: {  // forward branch or jump; the delay slot is a plain instruction
                 if (room < 12) break;
                 const s32 off = static_cast<s32>(1 + rnd(8));
-                if (rnd(4) == 0) {
+                if (rnd(4) == 0) {  // J or JAL
                     const u64 target = kCode + 4 * (prog.size() + 1 + static_cast<unsigned>(off));
-                    prog.push_back((0x02u << 26) | static_cast<u32>((target >> 2) & 0x03FFFFFF));
+                    prog.push_back(((0x02u + rnd(2)) << 26) | static_cast<u32>((target >> 2) & 0x03FFFFFF));
                 } else if (rnd(3) == 0) {
-                    prog.push_back(I(0x01, reg(), rnd(2), off));  // BLTZ/BGEZ
+                    static constexpr unsigned kRegimm[] = {0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13};
+                    prog.push_back(I(0x01, reg(), kRegimm[rnd(std::size(kRegimm))], off));  // BLTZ/BGEZ(AL)(L)
                 } else {
                     prog.push_back(I(kBranches[rnd(std::size(kBranches))], reg(), reg(), off));
                 }
@@ -790,4 +791,59 @@ TEST(cpu_jit_self_loop_takes_interrupts_where_the_interpreter_does) {
     CHECK(run(Engine::Jit) == reference);
     CHECK(reference.gpr[t3] > 20u);
     CHECK_EQ(reference.gpr[t0], 5000u);
+}
+
+TEST(cpu_jit_links_only_within_a_guest_page_when_ram_is_not_host_page_aligned) {
+    for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+        // Guest RAM 2 KiB off host page alignment.
+        constexpr std::size_t kSize = 8u << 20;
+        std::vector<u8> backing(kSize + 0x2000);
+        u8* const base = backing.data() + ((0x1000 - reinterpret_cast<uintptr_t>(backing.data()) % 0x1000) % 0x1000) + 0x800;
+        Bus bus;
+        bus.map_ram(0, kSize, base);
+        R4000 cpu(bus);
+        cpu.cp0_write(cop0::Status, 0);
+        cpu.set_block_cache(engine != Engine::Interpreter);
+        cpu.set_jit(engine == Engine::Jit);
+        cpu.set_idle_skip(false);
+        auto w32 = [&](u64 paddr, u32 v) { store_be<u32>(base + paddr, v); };
+        // VA 0x400000 -> PA 0x200000, VA 0x401000 -> PA 0x300000 (not the
+        // physically following page, which holds different code).
+        cpu.cp0_write(cop0::Index, 3);
+        cpu.cp0_write(cop0::PageMask, 0);
+        cpu.cp0_write(cop0::EntryHi, 0x00400000);
+        cpu.cp0_write(cop0::EntryLo0, (0x200u << 6) | (3u << 3) | 4u | 2u);
+        cpu.cp0_write(cop0::EntryLo1, (0x300u << 6) | (3u << 3) | 4u | 2u);
+        // First make the physically following code hot (through kseg0, so
+        // it has a translation), then clear t1 and enter the mapped pages.
+        w32(0x1000, ADDIU(t4, zero, 10));
+        w32(0x1004, LUI(t5, 0x8020));
+        w32(0x1008, ORI(t5, t5, 0x1000));
+        w32(0x100C, R(0x09, t5, 0, ra));  // jalr t5
+        w32(0x1010, NOP);
+        w32(0x1014, ADDIU(t4, t4, -1));
+        w32(0x1018, BNE(t4, zero, -4));   // back to 0x100C
+        w32(0x101C, NOP);
+        w32(0x1020, ADDIU(t1, zero, 0));
+        w32(0x1024, TLBWI);
+        w32(0x1028, LUI(t9, 0x0040));
+        w32(0x102C, ORI(t9, t9, 0x0FF8));
+        w32(0x1030, JR(t9));
+        w32(0x1034, ADDIU(t3, zero, 40));
+        w32(0x201004, JR(ra));
+        w32(0x201008, NOP);
+        // Last two words of the first mapped page, then the second page.
+        w32(0x200FF8, ADDIU(t0, t0, 1));
+        w32(0x200FFC, ADDIU(t2, t2, 1));
+        w32(0x201000, ADDIU(t1, t1, 100));  // physically next: must not run from VA 0x401000
+        w32(0x300000, ADDIU(t1, t1, 1));
+        w32(0x300004, BNE(t0, t3, -4));    // back to 0x400FF8
+        w32(0x300008, NOP);
+        w32(0x30000C, BEQ(zero, zero, -1));
+        w32(0x300010, NOP);
+        cpu.set_pc(kCode);
+        cpu.run_until(3000);
+        CHECK_EQ(cpu.gpr[t0], 40u);
+        CHECK_EQ(cpu.gpr[t1], 40u);
+    }
 }

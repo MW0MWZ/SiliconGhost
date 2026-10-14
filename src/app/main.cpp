@@ -53,9 +53,11 @@ void usage(const char* argv0) {
                  "  --screenshot F   on exit, save the display as a binary PPM image\n"
                  "  --max N          stop after N cycles (default: run until Ctrl-C)\n"
                  "  --timing MODE    realtime: guest clocks follow the host clock and the CPU runs as\n"
-                 "                             fast as the host allows (default)\n"
+                 "                             fast as the host allows, up to --max-speed (default)\n"
                  "                   cycle:    one cycle per instruction, reproducible; waits when ahead\n"
                  "                   max:      no waiting; guest time runs ahead (default with --max)\n"
+                 "  --max-speed X    realtime: run the CPU at most X times as fast as the real one\n"
+                 "                   (default 2; IRIX 5.3 fails to boot beyond about 2.9)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "  --no-jit         run decoded blocks without translating them to host code\n"
@@ -183,6 +185,7 @@ int main(int argc, char** argv) {
     unsigned long long max_cycles = ~0ull;
     bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true;
     const char* timing = nullptr;
+    double max_speed = 2.0;
     sg::log::set_level(sg::log::Level::Warn);
 
     for (int i = 1; i < argc; ++i) {
@@ -215,6 +218,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--trace")) trace = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
         else if (!std::strcmp(a, "--timing")) timing = next();
+        else if (!std::strcmp(a, "--max-speed")) max_speed = std::strtod(next(), nullptr);
         else if (!std::strcmp(a, "--no-idle-skip")) idle_skip = false;
         else if (!std::strcmp(a, "--no-block-cache")) block_cache = false;
         else if (!std::strcmp(a, "--no-jit")) jit = false;
@@ -272,6 +276,7 @@ int main(int argc, char** argv) {
         cpu.set_block_cache(block_cache);
         cpu.set_jit(jit);
         sg::Pacer pacer(timing_mode, machine.cycles_per_second());
+        pacer.set_max_speed(max_speed);
         if (trace) {
             for (unsigned long long n = 0; n < max_cycles && !g_interrupted && !machine.powered_off(); ++n) {
                 sg::u32 inst = 0;

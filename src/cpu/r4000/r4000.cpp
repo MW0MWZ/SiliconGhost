@@ -213,6 +213,7 @@ bool ends_block(u32 w) {
 // 4 KiB page, or the length limit.
 void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
     b.host = host;
+    b.offset = page_offset;
     b.count = 0;
     b.runs = 0;
     b.code = nullptr;
@@ -290,12 +291,12 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     for (unsigned linked = 0; linked < kMaxLinkedBlocks; ++linked) {
         const u32 offset = static_cast<u32>(pc & 0xFFF);
         const u8* const host = page + offset;
-        Block& b = blocks_[block_index(host)];
-        if (b.host != host) build_block(b, host, offset);
+        Block* blk = &blocks_[block_index(host)];
+        if (blk->host != host) build_block(*blk, host, offset);
         block_invalidated_ = false;
-        if (jit_buf_ && !b.code && ++b.runs == kJitThreshold && !jit_compile(b)) {
+        if (jit_buf_ && !blk->code && ++blk->runs == kJitThreshold && !jit_compile(*blk)) {
             jit_flush();  // the code buffer is full: start afresh
-            jit_compile(b);
+            jit_compile(*blk);
         }
 
         // Plain operations only advance the time (kept in `t`), so pc, npc_
@@ -308,14 +309,17 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         bool leave = false;
         // Translated code runs the block when no time check falls inside it
         // and no interrupt is pending; it stops early where the loop below
-        // would break, or after an access that may need the checks redone.
-        if (b.code && b.jit_addr64 == addr64_ && t + (b.count - 1) * weight_ < safe) {
+        // would break, or after an access that may need the checks redone,
+        // and may carry on directly into other translated blocks.
+        if (blk->code && blk->jit_addr64 == addr64_ && t + (blk->count - 1) * weight_ < safe) {
             if (check_irq && !interrupt_pending()) check_irq = false;
             if (!check_irq) {
                 jit_safe_ = safe;
-                i = b.code(this, ipc, t);
+                i = blk->code(this, ipc, t);
+                // It may have gone on into other blocks of the page.
+                blk = jit_block_;
+                ipc = jit_entry_pc_ + 4 * u64{i};
                 t = time_fp_;
-                ipc += 4 * u64{i};
                 first = false;
                 if (SG_UNLIKELY(io_)) {
                     check_irq = true;
@@ -324,7 +328,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                 leave = pc != ipc || block_invalidated_ || idle_ready_;
             }
         }
-        for (; !leave && i < b.count; ++i, ipc += 4) {
+        for (; !leave && i < blk->count; ++i, ipc += 4) {
             if (SG_UNLIKELY(t >= safe)) {
                 time_fp_ = t;
                 if (!first && !(cycles() < cycle && cycles() < *limit)) {
@@ -350,8 +354,8 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                     break;
                 }
             }
-            const Op& op = b.ops[i];
-            if ((b.plain >> i) & 1) {
+            const Op& op = blk->ops[i];
+            if ((blk->plain >> i) & 1) {
                 op.fn(*this, op);
                 synced = false;
                 continue;
@@ -378,7 +382,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             }
             if (pc != ipc + 4 || block_invalidated_ || idle_ready_) break;
         }
-        if (i == b.count) {  // ran off the end of the block
+        if (i == blk->count) {  // ran off the end of the block
             time_fp_ = t;
             if (!synced) set_pc(ipc);
         }

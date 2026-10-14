@@ -109,15 +109,18 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    with a small encoder in `src/jit/`). Register operations and RAM loads
    and stores are emitted inline, the latter with the soft-TLB lookup;
    misses, MMIO, unaligned addresses and pages holding translated code take
-   the handler path. Other instructions call their handlers with the same
-   bookkeeping as the block loop, and the function returns early wherever
-   the block loop would stop, so the two always agree. A block that branches
-   back to itself loops inside the function while the next pass fits before
-   the next timer or run-limit check. Generated code lives in a buffer
+   the handler path. Branches and jumps are inline too, including the cheap
+   case of the idle-loop bookkeeping. Other instructions call their handlers
+   with the same bookkeeping as the block loop, and the function returns
+   early wherever the block loop would stop, so the two always agree. At the
+   end of a block, translated code jumps straight into the translation of
+   the next block when that is in the same page (a direct branch target or
+   the fall-through), the mode is unchanged, nothing needs checking and the
+   next block fits before the next timer or run-limit check; it tells the
+   block loop which block it finished in. Generated code lives in a buffer
    mapped twice (writable, executable); when it fills, all translations are
-   dropped. `--no-jit` turns the recompiler off. Next: branches and jumps
-   inline, direct links between translated blocks, keeping guest registers
-   in host registers, then an AArch64 back end.
+   dropped. `--no-jit` turns the recompiler off. Next: links across pages,
+   keeping guest registers in host registers, then an AArch64 back end.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
    with the same registers and stored the same values to the same RAM
@@ -145,8 +148,12 @@ clock after every 1 ms slice (`--timing`):
 
 * `realtime` (default): guest time follows the wall clock. The CPU runs as
   many instructions as the host can, and the charge per instruction adapts
-  (1/64 to 16 cycles), so a fast host looks like a faster R4400 while a guest
-  second remains a second.
+  (down to 1/`--max-speed` and up to 16 cycles), so a fast host looks like a
+  faster R4400 while a guest second remains a second. The speed-up is capped
+  (2x by default) because guest software times the CPU against its timers:
+  IRIX 5.3 times a 1024-instruction loop against the 8254 at boot and
+  divides by zero if it takes under 2 us, i.e. beyond about 2.9x a 175 MHz
+  part.
 * `cycle`: one cycle per instruction, reproducible from run to run; waits
   when ahead of the wall clock and lags when the host is too slow.
 * `max`: no waiting, one cycle per instruction (the default with `--max`).

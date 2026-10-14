@@ -13,6 +13,7 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 
+#include <algorithm>
 #include <cstddef>
 #include <vector>
 
@@ -78,6 +79,9 @@ bool R4000::jit_compile(Block& b) {
     e.alu(Alu::Add, kTlb, kCpu);
     e.alu_imm(Alu::Add, kTlb, offset_of(this, &fast_[0][static_cast<unsigned>(Access::Load)][0]));
     const std::size_t top = e.size();
+    // Linked blocks enter here, so the prologue must be the same everywhere.
+    if (jit_link_offset_ == 0) jit_link_offset_ = top;
+    if (top != jit_link_offset_) return false;
     // Effective addresses follow the addressing mode the block is compiled
     // for; run_block() only calls it in that mode.
     const bool addr64 = addr64_;
@@ -88,7 +92,7 @@ bool R4000::jit_compile(Block& b) {
         e.alu(Alu::Add, rax, kTime);
         e.mov(m_time, rax);
     };
-    auto pc_plus = [&](Reg dst, unsigned bytes) {
+    auto pc_plus = [&](Reg dst, s64 bytes) {  // dst = entry pc + bytes
         e.mov(dst, kPc);
         e.alu_imm(Alu::Add, dst, static_cast<s32>(bytes));
     };
@@ -200,186 +204,350 @@ bool R4000::jit_compile(Block& b) {
         return true;
     };
 
+    // Register operations, inline; others of the kind call their handler
+    // (they observe nothing, so they need no bookkeeping).
+    auto emit_plain = [&](const Op& op) {
+        const u32 w = op.inst;
+        // Inline register operations; dest 0 was decoded to a no-op.
+        const unsigned rs = f_rs(w), rt = f_rt(w), rd = f_rd(w), sa = f_sa(w);
+        const s32 simm = static_cast<s16>(w & 0xFFFF);
+        const s32 zimm = static_cast<s32>(w & 0xFFFF);
+        const unsigned opc = w >> 26, funct = w & 63;
+        auto alu32_store = [&](unsigned dest) {  // rax <- sext32(eax), stored to dest
+            e.movsxd(rax, rax);
+            e.mov(gpr_at(dest), rax);
+        };
+        auto set_flag = [&](Cond c, unsigned dest) {
+            e.setcc(c, rax);
+            e.movzx8(rax, rax);
+            e.mov(gpr_at(dest), rax);
+        };
+        const bool is_mult = opc == 0x00 && (funct == 0x18 || funct == 0x19);
+        const unsigned dest = opc == 0x00 ? rd : rt;
+        bool done = true;
+        if (dest == 0 && !is_mult) {  // writes r0: decoded as a no-op
+        } else if (opc == 0x00) {
+            switch (funct) {
+                case 0x00:  // SLL
+                case 0x02:  // SRL
+                case 0x03:  // SRA
+                    e.mov(rax, gpr_at(rt), false);
+                    e.shift_imm(funct == 0x00 ? Shift::Shl : funct == 0x02 ? Shift::Shr : Shift::Sar, rax,
+                                static_cast<u8>(sa), false);
+                    alu32_store(rd);
+                    break;
+                case 0x04:  // SLLV
+                case 0x06:  // SRLV
+                case 0x07:  // SRAV (x86 masks 32-bit shift counts to 5 bits, as MIPS does)
+                    e.mov(rcx, gpr_at(rs), false);
+                    e.mov(rax, gpr_at(rt), false);
+                    e.shift_cl(funct == 0x04 ? Shift::Shl : funct == 0x06 ? Shift::Shr : Shift::Sar, rax, false);
+                    alu32_store(rd);
+                    break;
+                case 0x10: e.mov(rax, m_hi), e.mov(gpr_at(rd), rax); break;  // MFHI
+                case 0x12: e.mov(rax, m_lo), e.mov(gpr_at(rd), rax); break;  // MFLO
+                case 0x18:                                                   // MULT
+                    e.movsxd(rax, gpr_at(rs));
+                    e.movsxd(rcx, gpr_at(rt));
+                    e.imul(rax, rcx);
+                    e.movsxd(rcx, rax);
+                    e.mov(m_lo, rcx);
+                    e.shift_imm(Shift::Sar, rax, 32, true);
+                    e.mov(m_hi, rax);
+                    break;
+                case 0x19:  // MULTU
+                    e.mov(rax, gpr_at(rs), false);
+                    e.mov(rcx, gpr_at(rt), false);
+                    e.imul(rax, rcx);
+                    e.movsxd(rcx, rax);
+                    e.mov(m_lo, rcx);
+                    e.shift_imm(Shift::Shr, rax, 32, true);
+                    e.movsxd(rax, rax);
+                    e.mov(m_hi, rax);
+                    break;
+                case 0x21:  // ADDU
+                case 0x23:  // SUBU
+                    e.mov(rax, gpr_at(rs), false);
+                    e.alu(funct == 0x21 ? Alu::Add : Alu::Sub, rax, gpr_at(rt), false);
+                    alu32_store(rd);
+                    break;
+                case 0x24:  // AND
+                case 0x25:  // OR
+                case 0x26:  // XOR
+                case 0x27:  // NOR
+                    e.mov(rax, gpr_at(rs));
+                    e.alu(funct == 0x24 ? Alu::And : funct == 0x26 ? Alu::Xor : Alu::Or, rax, gpr_at(rt));
+                    if (funct == 0x27) e.not_(rax);
+                    e.mov(gpr_at(rd), rax);
+                    break;
+                case 0x2A:  // SLT
+                case 0x2B:  // SLTU
+                    e.mov(rcx, gpr_at(rs));
+                    e.alu(Alu::Xor, rax, rax, false);
+                    e.alu(Alu::Cmp, rcx, gpr_at(rt));
+                    set_flag(funct == 0x2A ? Cond::L : Cond::B, rd);
+                    break;
+                default: done = false; break;
+            }
+        } else {
+            switch (opc) {
+                case 0x09:  // ADDIU
+                    e.mov(rax, gpr_at(rs), false);
+                    e.alu_imm(Alu::Add, rax, simm, false);
+                    alu32_store(rt);
+                    break;
+                case 0x0A:  // SLTI
+                case 0x0B:  // SLTIU (the immediate is sign-extended, then compared unsigned)
+                    e.mov(rcx, gpr_at(rs));
+                    e.alu(Alu::Xor, rax, rax, false);
+                    e.alu_imm(Alu::Cmp, rcx, simm);
+                    set_flag(opc == 0x0A ? Cond::L : Cond::B, rt);
+                    break;
+                case 0x0C:  // ANDI
+                case 0x0D:  // ORI
+                case 0x0E:  // XORI
+                    e.mov(rax, gpr_at(rs));
+                    e.alu_imm(opc == 0x0C ? Alu::And : opc == 0x0D ? Alu::Or : Alu::Xor, rax, zimm);
+                    e.mov(gpr_at(rt), rax);
+                    break;
+                case 0x0F: e.mov_store_imm(gpr_at(rt), static_cast<s32>(static_cast<u32>(zimm) << 16)); break;  // LUI
+                default: done = false; break;
+            }
+        }
+        if (!done) call_handler(op);
+    };
+
     struct Exit {
         std::size_t site;
         u32 completed;
     };
     std::vector<Exit> exits;
-    bool fast_last = false;  // the last op may complete without syncing pc
-    bool delay_slot = false;  // ops[i] is the delay slot of ops[i - 1]
+    auto exit_if = [&](Cond c, u32 completed) { exits.push_back({e.jcc(c), completed}); };
+    // Leave when run_block() would after ops[i]: a device or CP0 access, the
+    // block's memory written, a confirmed idle loop, or control leaving the
+    // straight line (an exception, or a taken branch after its delay slot).
+    auto exit_checks = [&](u32 i) {
+        e.movzx8(rax, m_io);
+        e.alu8(Alu::Or, rax, m_invalidated);
+        e.alu8(Alu::Or, rax, m_idle_ready);  // ZF: all three clear
+        exit_if(Cond::Ne, i + 1);
+        pc_plus(rax, 4 * i + 4);
+        e.alu(Alu::Cmp, rax, m_pc);
+        exit_if(Cond::Ne, i + 1);
+    };
+    // The delay slot ran without bookkeeping: move on to the branch's choice.
+    auto leave_delay_slot = [&] {
+        e.mov(rax, m_npc);
+        e.mov(m_pc, rax);
+        e.alu_imm(Alu::Add, rax, 4);
+        e.mov(m_npc, rax);
+        e.mov_store_imm8(m_next_delay, 0);
+    };
+
+    // Guest RAM need not be page-aligned in host memory: page positions come
+    // from the guest address.
+    const u32 page_offset = b.offset;
+    const u8* const page_host = b.host - page_offset;
+    // Successor blocks this one can jump straight into: pc deltas from the
+    // block's entry, within the same page.
+    std::vector<s64> successors;
+    auto add_successor = [&](s64 delta) {
+        const s64 off = static_cast<s64>(page_offset) + delta;
+        if (off >= 0 && off < 0x1000) successors.push_back(delta);
+    };
+
+    bool synced = true;  // pc and npc_ are up to date after the last op
+
+    // Branches and jumps, inline: the same state as branch()/jump() (pc at
+    // the delay slot, npc_ at the next instruction after it, next_delay_),
+    // and for a taken branch backwards the idle-loop bookkeeping of
+    // backward_branch(): its cheap cooldown case inline, the rest by a call.
+    auto emit_branch = [&](const Op& op, u32 i) -> bool {
+        const u32 w = op.inst;
+        const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
+        const s64 simm = static_cast<s16>(w & 0xFFFF);
+        enum Kind { kCompare, kSign, kJump, kJumpReg } kind;
+        Cond not_taken = Cond::E;
+        bool likely = false;
+        switch (opc) {
+            case 0x04: case 0x14: kind = kCompare, not_taken = Cond::Ne; break;  // BEQ(L)
+            case 0x05: case 0x15: kind = kCompare, not_taken = Cond::E; break;   // BNE(L)
+            case 0x06: case 0x16: kind = kSign, not_taken = Cond::G; break;      // BLEZ(L)
+            case 0x07: case 0x17: kind = kSign, not_taken = Cond::Le; break;     // BGTZ(L)
+            case 0x01:
+                switch (rt) {
+                    case 0x00: case 0x02: kind = kSign, not_taken = Cond::Ge; break;  // BLTZ(L)
+                    case 0x01: case 0x03: kind = kSign, not_taken = Cond::L; break;   // BGEZ(L)
+                    default: return false;
+                }
+                likely = rt >= 2;
+                break;
+            case 0x02: case 0x03: kind = kJump; break;  // J, JAL
+            case 0x00:
+                if ((w & 63) != 0x08 && (w & 63) != 0x09) return false;
+                kind = kJumpReg;  // JR, JALR
+                break;
+            default: return false;
+        }
+        if (opc >= 0x14 && opc <= 0x17) likely = true;
+
+        pc_plus(rax, 4 * i + 4);
+        e.mov(m_pc, rax);
+        std::size_t to_not_taken = 0;
+        if (kind == kCompare) {
+            e.mov(rcx, gpr_at(rs));
+            e.alu(Alu::Cmp, rcx, gpr_at(rt));
+            to_not_taken = e.jcc(not_taken);
+        } else if (kind == kSign) {
+            e.mov(rcx, gpr_at(rs));
+            e.test(rcx, rcx);
+            to_not_taken = e.jcc(not_taken);
+        }
+
+        // Taken: the target in rcx.
+        const s64 delta = 4 * static_cast<s64>(i) + 4 + 4 * simm;
+        if (kind == kCompare || kind == kSign) {
+            pc_plus(rcx, delta);
+            add_successor(delta);
+        } else if (kind == kJump) {
+            pc_plus(rcx, 4 * i + 4);
+            e.alu_imm(Alu::And, rcx, static_cast<s32>(0xF0000000u));
+            e.alu_imm(Alu::Or, rcx, static_cast<s32>((w & 0x03FFFFFF) << 2));
+            if (opc == 0x03) {
+                pc_plus(rax, 4 * i + 8);
+                e.mov(gpr_at(31), rax);
+            }
+        } else {
+            e.mov(rcx, gpr_at(rs));
+            const unsigned rd = f_rd(w);
+            if ((w & 63) == 0x09 && rd != 0) {
+                pc_plus(rax, 4 * i + 8);
+                e.mov(gpr_at(rd), rax);
+            }
+        }
+        e.mov(m_npc, rcx);
+        e.mov_store_imm8(m_next_delay, 1);
+        const bool maybe_backward = ((kind == kCompare || kind == kSign) && simm < 0) || opc == 0x02;
+        if (maybe_backward) {
+            const unsigned idx = ((page_offset + 4 * i) >> 2) & ((1u << kLoopTableBits) - 1);
+            const Mem m_loop_pc{kCpu, offset_of(this, &loops_[idx].branch_pc)};
+            const Mem m_cooldown{kCpu, offset_of(this, &loops_[idx].cooldown)};
+            std::vector<std::size_t> done;
+            pc_plus(rax, 4 * i);  // cur_pc_
+            if (opc == 0x02) {
+                e.alu(Alu::Cmp, rcx, rax);
+                done.push_back(e.jcc(Cond::A));  // forwards
+            }
+            e.alu(Alu::Cmp, rax, m_loop_pc);
+            const std::size_t visit1 = e.jcc(Cond::Ne);
+            e.mov(rdx, m_cooldown, false);
+            e.test(rdx, rdx);
+            const std::size_t visit2 = e.jcc(Cond::E);
+            e.alu_imm(Alu::Sub, rdx, 1, false);
+            e.mov(m_cooldown, rdx, false);
+            done.push_back(e.jcc(Cond::Ne));
+            e.mov_store_imm(m_loop_pc, -1);  // cooldown over: start afresh
+            done.push_back(e.jmp());
+            e.bind(visit1);
+            e.bind(visit2);
+            e.mov(m_cur_pc, rax);
+            set_time(i + 1);
+            e.mov(rdi, kCpu);
+            e.mov(rsi, rcx);
+            e.mov_imm64(rax, reinterpret_cast<u64>(&R4000::jit_backward_branch));
+            e.call(rax);
+            e.movzx8(rax, m_idle_ready);
+            e.test(rax, rax);
+            exit_if(Cond::Ne, i + 1);
+            for (std::size_t site : done) e.bind(site);
+        }
+
+        if (to_not_taken) {
+            const std::size_t to_done = e.jmp();
+            e.bind(to_not_taken);
+            if (likely) {  // the delay slot is skipped: leave, as run_block() does
+                pc_plus(rax, 4 * i + 8);
+                e.mov(m_pc, rax);
+                e.alu_imm(Alu::Add, rax, 4);
+                e.mov(m_npc, rax);
+                set_time(i + 1);
+                exits.push_back({e.jmp(), i + 1});
+            } else {
+                pc_plus(rax, 4 * i + 8);
+                e.mov(m_npc, rax);
+                e.mov_store_imm8(m_next_delay, 1);
+            }
+            e.bind(to_done);
+        }
+        return true;
+    };
     for (u32 i = 0; i < b.count; ++i) {
         const Op& op = b.ops[i];
         const u32 w = op.inst;
-        if ((b.plain >> i) & 1) {
-            // Inline register operations; dest 0 was decoded to a no-op.
-            const unsigned rs = f_rs(w), rt = f_rt(w), rd = f_rd(w), sa = f_sa(w);
-            const s32 simm = static_cast<s16>(w & 0xFFFF);
-            const s32 zimm = static_cast<s32>(w & 0xFFFF);
-            const unsigned opc = w >> 26, funct = w & 63;
-            auto alu32_store = [&](unsigned dest) {  // rax <- sext32(eax), stored to dest
-                e.movsxd(rax, rax);
-                e.mov(gpr_at(dest), rax);
-            };
-            auto set_flag = [&](Cond c, unsigned dest) {
-                e.setcc(c, rax);
-                e.movzx8(rax, rax);
-                e.mov(gpr_at(dest), rax);
-            };
-            const bool is_mult = opc == 0x00 && (funct == 0x18 || funct == 0x19);
-            const unsigned dest = opc == 0x00 ? rd : rt;
-            bool done = true;
-            if (dest == 0 && !is_mult) {  // writes r0: decoded as a no-op
-            } else if (opc == 0x00) {
-                switch (funct) {
-                    case 0x00:  // SLL
-                    case 0x02:  // SRL
-                    case 0x03:  // SRA
-                        e.mov(rax, gpr_at(rt), false);
-                        e.shift_imm(funct == 0x00 ? Shift::Shl : funct == 0x02 ? Shift::Shr : Shift::Sar, rax,
-                                    static_cast<u8>(sa), false);
-                        alu32_store(rd);
-                        break;
-                    case 0x04:  // SLLV
-                    case 0x06:  // SRLV
-                    case 0x07:  // SRAV (x86 masks 32-bit shift counts to 5 bits, as MIPS does)
-                        e.mov(rcx, gpr_at(rs), false);
-                        e.mov(rax, gpr_at(rt), false);
-                        e.shift_cl(funct == 0x04 ? Shift::Shl : funct == 0x06 ? Shift::Shr : Shift::Sar, rax, false);
-                        alu32_store(rd);
-                        break;
-                    case 0x10: e.mov(rax, m_hi), e.mov(gpr_at(rd), rax); break;  // MFHI
-                    case 0x12: e.mov(rax, m_lo), e.mov(gpr_at(rd), rax); break;  // MFLO
-                    case 0x18:                                                   // MULT
-                        e.movsxd(rax, gpr_at(rs));
-                        e.movsxd(rcx, gpr_at(rt));
-                        e.imul(rax, rcx);
-                        e.movsxd(rcx, rax);
-                        e.mov(m_lo, rcx);
-                        e.shift_imm(Shift::Sar, rax, 32, true);
-                        e.mov(m_hi, rax);
-                        break;
-                    case 0x19:  // MULTU
-                        e.mov(rax, gpr_at(rs), false);
-                        e.mov(rcx, gpr_at(rt), false);
-                        e.imul(rax, rcx);
-                        e.movsxd(rcx, rax);
-                        e.mov(m_lo, rcx);
-                        e.shift_imm(Shift::Shr, rax, 32, true);
-                        e.movsxd(rax, rax);
-                        e.mov(m_hi, rax);
-                        break;
-                    case 0x21:  // ADDU
-                    case 0x23:  // SUBU
-                        e.mov(rax, gpr_at(rs), false);
-                        e.alu(funct == 0x21 ? Alu::Add : Alu::Sub, rax, gpr_at(rt), false);
-                        alu32_store(rd);
-                        break;
-                    case 0x24:  // AND
-                    case 0x25:  // OR
-                    case 0x26:  // XOR
-                    case 0x27:  // NOR
-                        e.mov(rax, gpr_at(rs));
-                        e.alu(funct == 0x24 ? Alu::And : funct == 0x26 ? Alu::Xor : Alu::Or, rax, gpr_at(rt));
-                        if (funct == 0x27) e.not_(rax);
-                        e.mov(gpr_at(rd), rax);
-                        break;
-                    case 0x2A:  // SLT
-                    case 0x2B:  // SLTU
-                        e.mov(rcx, gpr_at(rs));
-                        e.alu(Alu::Xor, rax, rax, false);
-                        e.alu(Alu::Cmp, rcx, gpr_at(rt));
-                        set_flag(funct == 0x2A ? Cond::L : Cond::B, rd);
-                        break;
-                    default: done = false; break;
-                }
-            } else {
-                switch (opc) {
-                    case 0x09:  // ADDIU
-                        e.mov(rax, gpr_at(rs), false);
-                        e.alu_imm(Alu::Add, rax, simm, false);
-                        alu32_store(rt);
-                        break;
-                    case 0x0A:  // SLTI
-                    case 0x0B:  // SLTIU (the immediate is sign-extended, then compared unsigned)
-                        e.mov(rcx, gpr_at(rs));
-                        e.alu(Alu::Xor, rax, rax, false);
-                        e.alu_imm(Alu::Cmp, rcx, simm);
-                        set_flag(opc == 0x0A ? Cond::L : Cond::B, rt);
-                        break;
-                    case 0x0C:  // ANDI
-                    case 0x0D:  // ORI
-                    case 0x0E:  // XORI
-                        e.mov(rax, gpr_at(rs));
-                        e.alu_imm(opc == 0x0C ? Alu::And : opc == 0x0D ? Alu::Or : Alu::Xor, rax, zimm);
-                        e.mov(gpr_at(rt), rax);
-                        break;
-                    case 0x0F: e.mov_store_imm(gpr_at(rt), static_cast<s32>(static_cast<u32>(zimm) << 16)); break;  // LUI
-                    default: done = false; break;
-                }
-            }
-            if (!done) call_handler(op);
-            delay_slot = false;
-            continue;
-        }
+        const bool delay_slot = i > 0 && is_branch_word(b.ops[i - 1].inst);
+        bool plain;
+        decode(w, plain);
 
-        // Loads and stores try the inline path first (not in a delay slot,
-        // where pc follows the branch).
-        std::vector<std::size_t> slow;
-        std::size_t skip_slow = 0;
-        const bool fast = !delay_slot && emit_memory(w, slow);
-        if (fast) {
-            skip_slow = e.jmp();
-            for (std::size_t site : slow) e.bind(site);
-        }
-        fast_last = fast;
-
-        // Anything else: the bookkeeping of run_block(), then the handler.
-        set_time(i + 1);
-        pc_plus(rax, 4 * i);
-        e.mov(m_cur_pc, rax);
-        if (delay_slot) {
-            e.mov_store_imm8(m_in_delay, 1);
-            e.mov_store_imm8(m_next_delay, 0);
-            e.mov(rax, m_npc);
-            e.mov(m_pc, rax);
-            e.alu_imm(Alu::Add, rax, 4);
-            e.mov(m_npc, rax);
+        if (plain) {
+            emit_plain(op);
+            if (delay_slot) leave_delay_slot();
+            synced = delay_slot;
+        } else if (!delay_slot && emit_branch(op, i)) {
+            synced = true;
         } else {
-            e.mov_store_imm8(m_in_delay, 0);  // next_delay_ is already clear
-            pc_plus(rax, 4 * i + 4);
-            e.mov(m_pc, rax);
-            e.alu_imm(Alu::Add, rax, 4);
-            e.mov(m_npc, rax);
-        }
-        e.mov_store_imm8(m_io, 0);
-        call_handler(op);
-        e.mov_store_imm(gpr_at(0), 0);
-        if (i + 1 < b.count || fast) {
-            // Leave when run_block() would: a device or CP0 access, the
-            // block's memory written, a confirmed idle loop, or control
-            // leaving the straight line (an exception or a taken branch
-            // after its delay slot; a branch itself continues into its slot).
-            e.movzx8(rax, m_io);
-            e.alu8(Alu::Or, rax, m_invalidated);
-            e.alu8(Alu::Or, rax, m_idle_ready);  // ZF: all three clear
-            exits.push_back({e.jcc(Cond::Ne), i + 1});
-            pc_plus(rax, 4 * i + 4);
-            e.alu(Alu::Cmp, rax, m_pc);
-            exits.push_back({e.jcc(Cond::Ne), i + 1});
-        }
-        if (fast) e.bind(skip_slow);
-        delay_slot = is_branch_word(w);
-    }
+            // Loads and stores try the inline path first.
+            std::vector<std::size_t> slow;
+            std::size_t skip_slow = 0;
+            const bool fast = emit_memory(w, slow);
+            if (fast) {
+                if (delay_slot) leave_delay_slot();
+                skip_slow = e.jmp();
+                for (std::size_t site : slow) e.bind(site);
+            }
 
-    // A block that branched back to its own start runs again straight away
-    // when run_block() would run it again with nothing checked in between:
-    // the next pass must fit below the safe time (run_block() stores it in
-    // jit_safe_), and no access may have happened that needs the checks.
+            // Anything else: the bookkeeping of run_block(), then the handler.
+            set_time(i + 1);
+            pc_plus(rax, 4 * i);
+            e.mov(m_cur_pc, rax);
+            if (delay_slot) {
+                e.mov_store_imm8(m_in_delay, 1);
+                e.mov_store_imm8(m_next_delay, 0);
+                e.mov(rax, m_npc);
+                e.mov(m_pc, rax);
+                e.alu_imm(Alu::Add, rax, 4);
+                e.mov(m_npc, rax);
+            } else {
+                e.mov_store_imm8(m_in_delay, 0);  // next_delay_ is already clear
+                pc_plus(rax, 4 * i + 4);
+                e.mov(m_pc, rax);
+                e.alu_imm(Alu::Add, rax, 4);
+                e.mov(m_npc, rax);
+            }
+            e.mov_store_imm8(m_io, 0);
+            call_handler(op);
+            e.mov_store_imm(gpr_at(0), 0);
+            // The last op is checked by the block's end. (A branch continues
+            // into its delay slot; a branch-likely not taken does not.)
+            if (i + 1 < b.count || fast) exit_checks(i);
+            if (fast) e.bind(skip_slow);
+            synced = !fast || delay_slot;
+        }
+    }
+    if (!synced) {  // plain operations or inline accesses ran last
+        pc_plus(rax, 4 * b.count);
+        e.mov(m_pc, rax);
+        e.alu_imm(Alu::Add, rax, 4);
+        e.mov(m_npc, rax);
+    }
+    if (!is_branch_word(b.ops[b.count - 1].inst)) add_successor(4 * static_cast<s64>(b.count));
+
+    // Block linking: run the next block's translation straight away when
+    // run_block() would run it next with nothing checked in between. The
+    // pass must fit below the safe time (run_block() stores it in
+    // jit_safe_), no access may have happened that needs the checks, and the
+    // mode (so the translation of this page) must be unchanged.
     std::vector<std::size_t> to_finish;
-    if (b.count >= 2 && is_branch_word(b.ops[b.count - 2].inst)) {
-        e.mov(rax, m_pc);
-        e.alu(Alu::Cmp, rax, kPc);
-        to_finish.push_back(e.jcc(Cond::Ne));
+    if (!successors.empty()) {
         e.movzx8(rax, m_io);
         e.alu8(Alu::Or, rax, m_invalidated);
         e.alu8(Alu::Or, rax, m_idle_ready);
@@ -387,25 +555,53 @@ bool R4000::jit_compile(Block& b) {
         to_finish.push_back(e.jcc(Cond::Ne));
         e.alu(Alu::Cmp, kMode, m_mode, false);
         to_finish.push_back(e.jcc(Cond::Ne));
-        e.imul_imm(rcx, kWeight, static_cast<s32>(b.count));
-        e.alu(Alu::Add, rcx, kTime);  // entry time of the next pass
-        e.imul_imm(rax, kWeight, static_cast<s32>(b.count - 1));
-        e.alu(Alu::Add, rax, rcx);
-        e.alu(Alu::Cmp, rax, m_safe);
-        to_finish.push_back(e.jcc(Cond::Ae));
-        e.mov(kTime, rcx);
-        e.jmp_to(top);
+        e.imul_imm(r8, kWeight, static_cast<s32>(b.count));
+        e.alu(Alu::Add, r8, kTime);  // entry time of the next block
+        e.mov(rax, m_pc);
+        std::sort(successors.begin(), successors.end());
+        successors.erase(std::unique(successors.begin(), successors.end()), successors.end());
+        for (s64 delta : successors) {
+            pc_plus(rcx, static_cast<unsigned>(delta));
+            e.alu(Alu::Cmp, rax, rcx);
+            const std::size_t next = e.jcc(Cond::Ne);
+            if (delta == 0) {  // this block again
+                e.imul_imm(rdi, kWeight, static_cast<s32>(b.count - 1));
+                e.alu(Alu::Add, rdi, r8);
+                e.alu(Alu::Cmp, rdi, m_safe);
+                to_finish.push_back(e.jcc(Cond::Ae));
+                e.mov(kTime, r8);
+                e.jmp_to(top);
+            } else {
+                const u8* const host = page_host + static_cast<u32>(static_cast<s64>(page_offset) + delta);
+                const Block& target = blocks_[block_index(host)];
+                const Reg tb = rdx;
+                e.mov_imm64(tb, reinterpret_cast<u64>(&target));
+                e.mov_imm64(rsi, reinterpret_cast<u64>(host));
+                e.alu(Alu::Cmp, rsi, Mem{tb, static_cast<s32>(offsetof(Block, host))});
+                to_finish.push_back(e.jcc(Cond::Ne));
+                e.mov(rsi, Mem{tb, static_cast<s32>(offsetof(Block, code))});
+                e.test(rsi, rsi);
+                to_finish.push_back(e.jcc(Cond::E));
+                e.cmp8_imm(Mem{tb, static_cast<s32>(offsetof(Block, jit_addr64))}, addr64 ? 1 : 0);
+                to_finish.push_back(e.jcc(Cond::Ne));
+                e.mov(rdi, Mem{tb, static_cast<s32>(offsetof(Block, count))}, false);
+                e.alu_imm(Alu::Sub, rdi, 1, false);
+                e.imul(rdi, kWeight);
+                e.alu(Alu::Add, rdi, r8);
+                e.alu(Alu::Cmp, rdi, m_safe);
+                to_finish.push_back(e.jcc(Cond::Ae));
+                e.mov(kTime, r8);
+                e.mov(kPc, rcx);
+                e.alu_imm(Alu::Add, rsi, static_cast<s32>(top));
+                e.jmp(rsi);
+            }
+            e.bind(next);
+        }
     }
     for (std::size_t site : to_finish) e.bind(site);
 
-    // Completed the block: the time, and pc if plain operations ran last.
+    // Completed the block.
     set_time(b.count);
-    if (((b.plain >> (b.count - 1)) & 1) || fast_last) {
-        pc_plus(rax, 4 * b.count);
-        e.mov(m_pc, rax);
-        e.alu_imm(Alu::Add, rax, 4);
-        e.mov(m_npc, rax);
-    }
     e.mov_imm32(rax, b.count);
     std::vector<std::size_t> to_epilogue{e.jmp()};
     for (const Exit& x : exits) {
@@ -414,6 +610,10 @@ bool R4000::jit_compile(Block& b) {
         to_epilogue.push_back(e.jmp());
     }
     for (std::size_t site : to_epilogue) e.bind(site);
+    // Tell run_block() which block (and entry pc) the count belongs to.
+    e.mov_imm64(rcx, reinterpret_cast<u64>(&b));
+    e.mov(Mem{kCpu, offset_of(this, &jit_block_)}, rcx);
+    e.mov(Mem{kCpu, offset_of(this, &jit_entry_pc_)}, kPc);
     e.add_rsp(8);
     e.pop(r15), e.pop(r14), e.pop(r13), e.pop(r12), e.pop(rbp), e.pop(rbx);
     e.ret();

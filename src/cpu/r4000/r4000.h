@@ -248,6 +248,7 @@ private:
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
+        u32 offset = 0;            // of the first instruction within its 4 KiB page
         u32 count = 0;
         u32 plain = 0;             // bit i: ops[i] is plain (never a delay slot)
         u32 runs = 0;
@@ -372,6 +373,12 @@ private:
     std::vector<Block> blocks_;
     std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
     u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
+    // Where translated code stopped: the block it was running (it may have
+    // gone on into other blocks) and that block's entry pc.
+    Block* jit_block_ = nullptr;
+    u64 jit_entry_pc_ = 0;
+    std::size_t jit_link_offset_ = 0;  // offset of the linked entry point in every translation
+    static void jit_backward_branch(R4000* cpu, u64 target) { cpu->backward_branch(target); }
     u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 

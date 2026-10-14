@@ -19,7 +19,7 @@ struct Mem {
 
 enum class Alu : unsigned { Add = 0, Or = 1, And = 4, Sub = 5, Xor = 6, Cmp = 7 };
 enum class Shift : unsigned { Shl = 4, Shr = 5, Sar = 7 };
-enum class Cond : unsigned { B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, L = 0xC };
+enum class Cond : unsigned { B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, L = 0xC, Ge = 0xD, Le = 0xE, G = 0xF };
 
 class Emitter {
 public:
@@ -30,6 +30,7 @@ public:
     void pop(Reg r) { rex_opt(false, 0, r), byte(0x58 + (r & 7)); }
     void ret() { byte(0xC3); }
     void call(Reg r) { rex_opt(false, 0, r), byte(0xFF), byte(0xC0 | (2 << 3) | (r & 7)); }
+    void jmp(Reg r) { rex_opt(false, 0, r), byte(0xFF), byte(0xC0 | (4 << 3) | (r & 7)); }
 
     // Loads and stores (w: 64-bit operand size)
     void mov(Reg dst, Mem m, bool w = true) { op_mem(w, 0x8B, dst, m); }
@@ -49,6 +50,10 @@ public:
     void mov_store_imm(Mem m, s32 imm) {
         op_mem(true, 0xC7, Reg(0), m);
         u32v(static_cast<u32>(imm));
+    }
+    void cmp8_imm(Mem m, u8 imm) {  // cmp byte [m], imm8
+        op_mem(false, 0x80, Reg(7), m);
+        byte(imm);
     }
     void mov_store_imm8(Mem m, u8 imm) {
         op_mem(false, 0xC6, Reg(0), m);
