@@ -26,7 +26,8 @@ SiliconGhost is under active development. What works today:
   installs to disk with its own installer (over the network) and boots
   multi-user on the serial console, with networking and sound.
 - **Audio:** what the machine plays goes to the host's sound output, with or
-  without the display window.
+  without the display window, at the volume the guest sets; with
+  `--audio-in` it can also record from the host's audio input.
 - **Networking:** the Ethernet port works (DHCP, ping, DNS, telnet, ssh,
   file transfers in both directions), through user-mode NAT on the host (no
   privileges needed) or a Linux TAP interface.
@@ -48,12 +49,12 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
 | Interrupts/timers | IOC2 / INT3, 8254 PIT | working |
 | Serial | Zilog 85230 SCC (two ports) | working |
-| Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved on exit |
+| Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved as it changes |
 | SCSI | WD33C93 with disk and CD-ROM targets | working |
 | Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit board) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
-| Audio | HAL2 | output works; inputs record silence |
+| Audio | HAL2 | playback and recording (codec); digital input silent |
 
 ## Building
 
@@ -86,7 +87,7 @@ Main options (run `siliconghost` with no arguments for the full list):
 | Option | Meaning |
 |---|---|
 | `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
-| `--nvram FILE` | DS1386 NVRAM, loaded at start and saved on exit |
+| `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image |
 | `--ram MB` | memory size, 16 to 256 (default 64) |
 | `--cpu-mhz N` | CPU clock (default 150) |
@@ -94,6 +95,7 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
 | `--no-audio` | do not play the machine's audio |
+| `--audio-in` | let the machine record from the host's audio input (off by default) |
 | `--net user\|tap:NAME\|none` | Ethernet through user-mode NAT (default), a TAP interface, or none |
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
@@ -103,6 +105,10 @@ Main options (run `siliconghost` with no arguments for the full list):
 Without `--headless`, the Newport screen appears in a window that can be
 resized. The machine's sound plays with or without the window (unless
 `--no-audio` is given).
+
+If no window appears, check the start-up messages: a build made without
+SDL3 says so (CMake also warns when it cannot find SDL3), and SDL reports
+why it could not open a window.
 
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G (or
   switching to another window) releases it. All three buttons work.
@@ -195,6 +201,9 @@ setenv AutoLoad Yes
 Without `OSLoadOptions auto`, NetBSD/sgimips stops in single-user mode
 (type `exit` to carry on).
 
+NetBSD's audio driver starts with the output volume at zero, so nothing is
+heard until it is raised, e.g. `mixerctl -w outputs.master=200,200`.
+
 ### Timing
 
 The CPU's cycle counter is the master clock for every timer in the machine,
@@ -228,7 +237,9 @@ with performance layers on top that must give exactly the same results:
 - Only the 8-bit Newport (XL8) is emulated. Blending and antialiased lines
   are drawn without the effect, which most of the desktop and the demos tried
   so far do not use.
-- Audio input (microphone, line in, digital in) records silence.
+- Audio recording takes the host's default input as is: the codec's input
+  gain and its microphone/line selection are not applied, and the digital
+  (AES) input records silence. NetBSD's driver plays but does not record.
 - NetBSD's Newport console shows no text: NetBSD decides between the 8-bit
   and 24-bit boards from a register read whose real-hardware result is not
   known yet, and on the emulated board it chooses 24-bit. Use the serial
@@ -237,11 +248,10 @@ with performance layers on top that must give exactly the same results:
   have not been tried.
 - The recompiler is x86-64 only; on other hosts the (slower) block cache
   and interpreter run everything. Linux is the only host built and tested.
-- The NVRAM is written back only when the emulator exits.
 
 ## Roadmap
 
-- Newport 24-bit boards (XL24) and the remaining raster operations; audio input
+- Newport 24-bit boards (XL24) and the remaining raster operations
 - IRIX 6.5; Linux/mips; NetBSD on the graphics console
 - AArch64 recompiler; macOS and Windows builds
 - Indigo² (IP22 "Fullhouse") machine profile
