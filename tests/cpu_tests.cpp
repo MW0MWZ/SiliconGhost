@@ -606,7 +606,8 @@ CpuState capture(Rig& t, u64 data_paddr, std::size_t data_size) {
 
 // A random straight-line program with forward branches, using every
 // instruction the block cache decodes ahead (and a few it does not).
-std::vector<u32> random_program(u32 seed, unsigned length) {
+// Runs from `base` (kseg0), which may be anywhere in the first 64 KiB.
+std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
     u64 x = seed * 0x9E3779B97F4A7C15ull + 1;
     auto rnd = [&](u32 n) {
         x ^= x << 13;
@@ -615,10 +616,10 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
         return static_cast<u32>(x % n);
     };
     auto reg = [&] { return rnd(32); };
-    auto dst = [&] {  // never s0 (the data pointer) or s1 (the loop counter)
+    auto dst = [&] {  // never s0 (the data pointer), s1 (the loop counter) or s2 (jump targets)
         unsigned r;
         do r = rnd(32);
-        while (r == s0 || r == s1);
+        while (r == s0 || r == s1 || r == s2);
         return r;
     };
     static constexpr unsigned kRFuncts[] = {0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x12, 0x18, 0x19,
@@ -651,8 +652,13 @@ std::vector<u32> random_program(u32 seed, unsigned length) {
             case 6: {  // forward branch or jump; the delay slot is a plain instruction
                 if (room < 12) break;
                 const s32 off = static_cast<s32>(1 + rnd(8));
-                if (rnd(4) == 0) {  // J or JAL
-                    const u64 target = kCode + 4 * (prog.size() + 1 + static_cast<unsigned>(off));
+                if (rnd(5) == 0) {  // JR or JALR through s2
+                    const u64 target = base + 4 * (prog.size() + 3 + static_cast<unsigned>(off));
+                    prog.push_back(LUI(s2, static_cast<u16>(target >> 16)));
+                    prog.push_back(ORI(s2, s2, static_cast<u16>(target)));
+                    prog.push_back(rnd(2) ? JR(s2) : R(0x09, s2, 0, dst()));
+                } else if (rnd(4) == 0) {  // J or JAL
+                    const u64 target = base + 4 * (prog.size() + 1 + static_cast<unsigned>(off));
                     prog.push_back(((0x02u + rnd(2)) << 26) | static_cast<u32>((target >> 2) & 0x03FFFFFF));
                 } else if (rnd(3) == 0) {
                     static constexpr unsigned kRegimm[] = {0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13};
@@ -683,10 +689,11 @@ void use_engine(Rig& t, Engine engine) {
     t.cpu.set_jit(engine == Engine::Jit);
 }
 
-TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) {
+// Each engine runs `seeds` random programs from physical address `base`.
+static void check_random_programs(u32 seeds, unsigned length, u64 base) {
     constexpr u64 kData = 0x10000;
-    for (u32 seed = 1; seed <= 200; ++seed) {
-        const std::vector<u32> prog = random_program(seed, 600);
+    for (u32 seed = 1; seed <= seeds; ++seed) {
+        const std::vector<u32> prog = random_program(seed, length, 0xFFFFFFFF80000000ull + base);
         auto run = [&](Engine engine) {
             Rig t;
             use_engine(t, engine);
@@ -698,13 +705,14 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) {
             }
             t.cpu.gpr[s0] = 0xFFFFFFFF80000000ull + kData;
             for (u64 a = 0; a < 0x800; a += 4) t.w32(kData + a, static_cast<u32>(a * 0x01010101u ^ seed));
-            u64 paddr = 0x1000;
+            u64 paddr = base;
             for (u32 w : prog) {
                 t.w32(paddr, w);
                 paddr += 4;
             }
             t.load({BEQ(zero, zero, -1), NOP}, 0x180);  // exceptions end up here
-            t.cpu.run_until(20000);
+            t.cpu.set_pc(0xFFFFFFFF80000000ull + base);
+            t.cpu.run_until(20 * length + 8000);
             return capture(t, kData, 0x800);
         };
         const CpuState reference = run(Engine::Interpreter);
@@ -713,6 +721,12 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) {
             break;
         }
     }
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) { check_random_programs(200, 600, 0x1000); }
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs_across_pages) {
+    check_random_programs(60, 1500, 0x1E00);
 }
 
 TEST(cpu_linked_blocks_and_jit_match_interpreter_with_timer_interrupts) {
@@ -793,7 +807,87 @@ TEST(cpu_jit_self_loop_takes_interrupts_where_the_interpreter_does) {
     CHECK_EQ(reference.gpr[t0], 5000u);
 }
 
-TEST(cpu_jit_links_only_within_a_guest_page_when_ram_is_not_host_page_aligned) {
+// A self-looping block whose loads and stores keep missing the soft-TLB
+// (two data pages 4 MiB apart share its slots) and which calls a handler
+// mid-way: registers held in host registers must survive both.
+TEST(cpu_jit_keeps_registers_across_soft_tlb_refills_and_handler_calls) {
+    auto run = [](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+        t.cpu.gpr[s3] = 0xFFFFFFFF80410000ull;
+        t.cpu.gpr[t4] = 300;
+        t.cpu.gpr[t6] = 7;
+        t.w32(0x10000, 5);
+        t.load({
+            ADDU(t2, t2, t6),       // 1000: loop
+            ADDU(t7, t7, t6),
+            LW(t1, 0, s0),
+            ADDU(t2, t2, t1),
+            R(0x2D, t5, t0, t5),    // daddu t5, t5, t0 (a handler)
+            ADDIU(t0, t0, 1),
+            SW(t0, 0, s3),
+            LW(t3, 0, s3),
+            ADDU(t2, t2, t3),
+            BNE(t0, t4, -10), NOP,  // -> 1000
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.cpu.run_until(10000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK_EQ(reference.gpr[t0], 300u);
+    CHECK_EQ(reference.gpr[t7], 2100u);
+    CHECK_EQ(reference.gpr[t2], 300u * (7 + 5) + 300u * 301u / 2);
+}
+
+// Pages whose fetch translations share a soft-TLB slot: translated code
+// jumping from one to the other must not take the slot's translation for
+// its own.
+TEST(cpu_jit_links_across_pages_only_through_their_own_translation) {
+    auto run = [](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        // VA 0x402000 -> PA 0x300000; its slot is that of kseg0 0x80002000.
+        t.cpu.cp0_write(cop0::Index, 5);
+        t.cpu.cp0_write(cop0::PageMask, 0);
+        t.cpu.cp0_write(cop0::EntryHi, 0x00402000);
+        t.cpu.cp0_write(cop0::EntryLo0, (0x300u << 6) | (3u << 3) | 4u | 2u);
+        t.cpu.cp0_write(cop0::EntryLo1, 0);
+        t.cpu.gpr[t8] = 0xFFFFFFFF80002000ull;
+        t.cpu.gpr[t9] = 0x00402000;
+        t.cpu.gpr[t4] = 10;  // the first loop runs ten times, so it is translated
+        t.cpu.gpr[t3] = 40;
+        t.load({TLBWI, JR(t8), NOP});
+        t.load({
+                   ADDIU(t1, t1, 1),      // 80002000
+                   BNE(t1, t4, -2), NOP,  // -> 80002000 until t1 == t4
+                   JR(t9), NOP,           // -> 402000
+               },
+               0x2000);
+        t.load({
+                   ADDIU(t2, t2, 1),      // 402000
+                   ADDIU(t4, t1, 1),
+                   BEQ(t2, t3, 3), NOP,   // -> 402018 when done
+                   JR(t8), NOP,           // -> 80002000
+                   BEQ(zero, zero, -1), NOP,
+               },
+               0x300000);
+        t.cpu.run_until(5000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK_EQ(reference.gpr[t2], 40u);
+    CHECK_EQ(reference.gpr[t1], 49u);
+}
+
+TEST(cpu_jit_links_follow_the_guest_translation_when_ram_is_not_host_page_aligned) {
     for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
         // Guest RAM 2 KiB off host page alignment.
         constexpr std::size_t kSize = 8u << 20;

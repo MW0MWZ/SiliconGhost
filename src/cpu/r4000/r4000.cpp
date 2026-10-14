@@ -316,7 +316,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             if (!check_irq) {
                 jit_safe_ = safe;
                 i = blk->code(this, ipc, t);
-                // It may have gone on into other blocks of the page.
+                // It may have gone on into other blocks, in this page or others.
                 blk = jit_block_;
                 ipc = jit_entry_pc_ + 4 * u64{i};
                 t = time_fp_;

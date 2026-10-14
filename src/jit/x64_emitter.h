@@ -23,6 +23,7 @@ enum class Cond : unsigned { B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A =
 
 class Emitter {
 public:
+    Emitter() { buf_.reserve(8192); }
     const std::vector<u8>& code() const { return buf_; }
     std::size_t size() const { return buf_.size(); }
 
@@ -36,6 +37,7 @@ public:
     void mov(Reg dst, Mem m, bool w = true) { op_mem(w, 0x8B, dst, m); }
     void mov(Mem m, Reg src, bool w = true) { op_mem(w, 0x89, src, m); }
     void mov(Reg dst, Reg src) { op_rr(true, 0x89, src, dst); }
+    void mov32(Reg dst, Reg src) { op_rr(false, 0x89, src, dst); }  // zero-extends
     void mov_imm64(Reg dst, u64 imm) {
         rex(true, 0, dst);
         byte(0xB8 + (dst & 7));
@@ -50,6 +52,11 @@ public:
     void mov_store_imm(Mem m, s32 imm) {
         op_mem(true, 0xC7, Reg(0), m);
         u32v(static_cast<u32>(imm));
+    }
+    // mov dword [m], imm32
+    void mov_store_imm32(Mem m, u32 imm) {
+        op_mem(false, 0xC7, Reg(0), m);
+        u32v(imm);
     }
     void cmp8_imm(Mem m, u8 imm) {  // cmp byte [m], imm8
         op_mem(false, 0x80, Reg(7), m);
@@ -86,6 +93,15 @@ public:
     void imul(Reg dst, Reg src) {  // 64-bit, low half
         rex(true, dst, src);
         byte(0x0F), byte(0xAF), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+    void imul(Reg dst, Mem m) {  // 64-bit, low half
+        rex(true, dst, m.base);
+        byte(0x0F);
+        modrm_mem(0xAF, dst, m);
+    }
+    void imul_imm(Reg dst, Mem m, s32 imm) {
+        op_mem(true, 0x69, dst, m);
+        u32v(static_cast<u32>(imm));
     }
     void imul_imm(Reg dst, Reg src, s32 imm) {
         rex(true, dst, src);

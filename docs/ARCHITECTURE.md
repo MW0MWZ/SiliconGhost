@@ -112,15 +112,20 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    the handler path. Branches and jumps are inline too, including the cheap
    case of the idle-loop bookkeeping. Other instructions call their handlers
    with the same bookkeeping as the block loop, and the function returns
-   early wherever the block loop would stop, so the two always agree. At the
-   end of a block, translated code jumps straight into the translation of
-   the next block when that is in the same page (a direct branch target or
-   the fall-through), the mode is unchanged, nothing needs checking and the
-   next block fits before the next timer or run-limit check; it tells the
-   block loop which block it finished in. Generated code lives in a buffer
-   mapped twice (writable, executable); when it fills, all translations are
-   dropped. `--no-jit` turns the recompiler off. Next: links across pages,
-   keeping guest registers in host registers, then an AArch64 back end.
+   early wherever the block loop would stop, so the two always agree. The
+   guest registers a block uses most (up to eight) live in host registers
+   while it runs: loaded on first use, written back before handler calls,
+   the idle-loop bookkeeping and leaving the block, and kept across passes
+   of a block that loops on itself. At the end of a block, translated code
+   jumps straight into the translation of the next block when the mode is
+   unchanged, nothing needs checking and the next block fits before the
+   next timer or run-limit check. Within the page the target is known (a
+   direct branch target or the fall-through); anywhere else, including
+   jumps through a register, the fetch soft-TLB and the block cache are
+   looked up as the block loop would. Translated code tells the block loop
+   which block it finished in. Generated code lives in a buffer mapped
+   twice (writable, executable); when it fills, all translations are
+   dropped. `--no-jit` turns the recompiler off. Next: an AArch64 back end.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
    with the same registers and stored the same values to the same RAM
