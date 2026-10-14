@@ -123,6 +123,7 @@ Newport::Newport(Scheduler& scheduler, double cpu_hz, const Options& options)
 }
 
 void Newport::reset() {
+    ++display_version_;  // what the screen shows may change
     drawmode0_ = 0;
     drawmode1_ = kDefaultDrawMode1;
     lsmode_ = lspattern_ = lspatsave_ = zpattern_ = colorback_ = colorvram_ = alpharef_ = 0;
@@ -405,7 +406,10 @@ void Newport::rex3_write(u32 reg, u32 v) {
             host_shift_ = -1;
             return;
         case kDcbMode: dcbmode_ = v & 0x1FFFFFFF; return;
-        case kTopScan: topscan_ = v & 0x3FF; return;
+        case kTopScan:
+            topscan_ = v & 0x3FF;
+            ++display_version_;
+            return;
         case kXYWin: xywin_ = v; return;
         case kClipMode: clipmode_ = v & 0x1FFF; return;
         case kConfig: config_ = v & 0x1FFFFF; return;
@@ -633,7 +637,11 @@ void Newport::store(int px, int py, u32 colour) {
         SG_LOG(Debug, "newport", "blending requested (drawmode1 %08x); drawn unblended", drawmode1_);
     }
     const u32 mask = wrmask_ & (opts_.xl24 ? 0xFFFFFFu : 0xFFu);
-    dst = (dst & ~mask) | (v & mask);
+    const u32 updated = (dst & ~mask) | (v & mask);
+    if (updated != dst) {
+        dst = updated;
+        ++display_version_;
+    }
 }
 
 void Newport::plot(int x, int y, u32 colour) {
@@ -901,6 +909,7 @@ u8 Newport::dcb_read_byte(unsigned addr, unsigned crs) {
 }
 
 void Newport::vc2_write(unsigned crs, u8 b) {
+    ++display_version_;  // what the screen shows may change
     switch (crs) {
         case 0: vc2_.index = b & 0x1F; break;
         case 1: vc2_.data_hi = b; break;
@@ -959,6 +968,7 @@ u8 Newport::vc2_read(unsigned crs) {
 }
 
 void Newport::xmap_write(unsigned which, unsigned crs, u8 b) {
+    ++display_version_;  // what the screen shows may change
     Xmap& x = xmap_[which];
     switch (crs) {
         case 0: x.config = b; break;
@@ -991,6 +1001,7 @@ u8 Newport::xmap_read(unsigned which, unsigned crs) {
 }
 
 void Newport::cmap_write(unsigned which, unsigned crs, u8 b) {
+    ++display_version_;  // what the screen shows may change
     Cmap& c = cmap_[which];
     switch (crs) {
         case 0:
@@ -1042,6 +1053,7 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
 }
 
 void Newport::ramdac_write(unsigned crs, u8 b) {
+    ++display_version_;  // what the screen shows may change
     switch (crs) {
         case 0:
             ramdac_.addr = b;

@@ -37,6 +37,10 @@ public:
     // Vertical retrace interrupt (INT3 LOCAL1 bit 7).
     void set_retrace_callback(std::function<void(bool)> cb) { retrace_cb_ = std::move(cb); }
 
+    // Bumped by anything that can change the picture (frame buffer writes,
+    // VC2, XMAP, CMAP, RAMDAC, TOPSCAN): a front end can skip render() while
+    // it stays the same.
+    u64 display_version() const { return display_version_; }
     // Scans out the visible screen as 0xAARRGGBB pixels. Returns false when
     // video timing is not running (no signal); width/height come from the
     // VC2 timing tables.
@@ -127,6 +131,7 @@ private:
     u64 dcb_busy_until_ = 0;
     bool warned_blend_ = false, warned_aline_ = false;  // unmodelled features, reported once  // an access to an absent slave is waiting for its acknowledge
 
+    u64 display_version_ = 0;
     std::vector<u32> rgbci_, cidaux_;
 
     // DCB slaves

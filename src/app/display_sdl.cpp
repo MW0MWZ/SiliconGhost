@@ -345,6 +345,11 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
     pacer.update(cpu.cycles(), cpu.instructions());
     u64 next_frame_ns = SDL_GetTicksNS();
     u64 next_periodic_ns = next_frame_ns + 1000000000ull;
+    // The picture is converted and presented only when the Newport has
+    // changed it, or the window needs redrawing: an idle desktop costs next
+    // to nothing.
+    u64 shown_version = 0;
+    bool shown = false, signal = false, redraw = true;
 
     while (!stop && !machine.powered_off()) {
         machine.run(slice);
@@ -360,15 +365,23 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) stop = 1;
-            else if (mouse.handle(ev)) continue;
+            else if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) redraw = true;
+            if (mouse.handle(ev)) continue;
             else if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
                 send_key(machine, ev.key.scancode, ev.type == SDL_EVENT_KEY_DOWN);
         }
         mouse.flush();
 
+        const ip22::Newport* newport = machine.newport();
+        const bool changed = !shown || (newport && newport->display_version() != shown_version);
+        if (!changed && !redraw) continue;
         unsigned w = 0, h = 0;
-        const bool signal = machine.newport() && machine.newport()->render(pixels, w, h);
-        if (signal) {
+        if (changed) {
+            shown = true;
+            shown_version = newport ? newport->display_version() : 0;
+            signal = newport && machine.newport()->render(pixels, w, h);
+        }
+        if (changed && signal) {
             if (!texture || w != tex_w || h != tex_h) {
                 if (texture) SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
@@ -384,6 +397,7 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         SDL_RenderClear(renderer);
         if (signal && texture) SDL_RenderTexture(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
+        redraw = false;
     }
 
     sound.reset();  // before SDL shuts down

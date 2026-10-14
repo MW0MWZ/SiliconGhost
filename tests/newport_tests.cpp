@@ -211,3 +211,20 @@ TEST(newport_host_pixels_fill_a_block_row_by_row) {
     t.w(kDrawMode0 | kGo, 1u);
     CHECK_EQ(t.r(kHostRw0), 0x18191a1bu);
 }
+
+// The display version moves when the picture can change, and not when a
+// drawing operation leaves the frame buffer as it was.
+TEST(newport_display_version_tracks_visible_changes) {
+    Rig t;
+    const u64 v0 = t.np.display_version();
+    t.fill(0, 0, 3, 3, 0x42);
+    const u64 v1 = t.np.display_version();
+    CHECK(v1 != v0);
+    t.fill(0, 0, 3, 3, 0x42);  // the same pixels again
+    CHECK_EQ(t.np.display_version(), v1);
+    t.w(kTopScan, 0x3FF);
+    const u64 v2 = t.np.display_version();
+    CHECK(v2 != v1);
+    t.cmap_entry(0x42, 0x123456);
+    CHECK(t.np.display_version() != v2);
+}
