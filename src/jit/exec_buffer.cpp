@@ -40,6 +40,12 @@ const void* ExecBuffer::add(const u8* code, std::size_t size) {
     const std::size_t start = (used_ + kAlign - 1) & ~(kAlign - 1);
     if (!ok() || start + size > size_) return nullptr;
     std::memcpy(write_ + start, code, size);
+#if defined(__aarch64__)
+    // The instruction cache does not see data writes: clean them to the point
+    // of unification, then drop stale instructions at the executable view.
+    __builtin___clear_cache(reinterpret_cast<char*>(write_ + start), reinterpret_cast<char*>(write_ + start + size));
+    __builtin___clear_cache(reinterpret_cast<char*>(exec_ + start), reinterpret_cast<char*>(exec_ + start + size));
+#endif
     used_ = start + size;
     return exec_ + start;
 }

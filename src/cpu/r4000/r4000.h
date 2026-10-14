@@ -439,13 +439,16 @@ private:
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
-    std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
-    std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    // Fields translated code uses come before the large arrays, so they lie
+    // within reach of a single load or store on every host.
     bool idle_ready_ = false;  // confirmed spin: skip once the branch has executed
-    u64 idle_period_fp_ = 0;
-    u64 idle_skipped_fp_ = 0;
     unsigned mode_ = kKernelErl;
     bool addr64_ = false;  // 64-bit addressing in the current mode (KX/SX/UX)
+    u64 asid_tag_ = 0;     // EntryHi's ASID, placed as in FastEntry::tag
+    std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
+    std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    u64 idle_period_fp_ = 0;
+    u64 idle_skipped_fp_ = 0;
 
     // COP0
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
@@ -465,7 +468,6 @@ private:
     // Separate tables for fetch, load and store (indexed by Access), so code
     // and data pages that share low address bits do not evict each other.
     FastEntry fast_[kNumModes][3][kFastEntries];
-    u64 asid_tag_ = 0;  // EntryHi's ASID, placed as in FastEntry::tag
     static constexpr unsigned kAsidTagShift = 52;
     void set_entryhi(u64 v) {
         entryhi_ = v;

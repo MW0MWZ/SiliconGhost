@@ -855,7 +855,7 @@ bool R4000::jit_compile(Block& b) {
 
 }  // namespace sg::mips
 
-#else
+#elif !defined(__aarch64__)  // no back end for this host (AArch64: jit_a64.cpp)
 
 namespace sg::mips {
 bool R4000::jit_compile_supported() { return false; }
