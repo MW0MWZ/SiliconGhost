@@ -217,21 +217,60 @@ private:
 // voice count; when the guest runs ahead of real time (or the device stalls)
 // more than a quarter of a second, new samples are dropped rather than
 // letting the delay grow.
+// One SDL audio stream in the guest's current format, reopened when that
+// changes. A format the device refuses is not retried until it changes.
+class AudioStream {
+public:
+    ~AudioStream() { close(); }
+    SDL_AudioStream* get(SDL_AudioDeviceID device, unsigned voices, double rate, const char* what) {
+        const int freq = static_cast<int>(rate + 0.5);
+        if (freq == freq_ && static_cast<int>(voices) == voices_) return stream_;
+        close();
+        freq_ = freq;
+        voices_ = static_cast<int>(voices);
+        const SDL_AudioSpec spec{SDL_AUDIO_S16, voices_, freq_};
+        stream_ = SDL_OpenAudioDeviceStream(device, &spec, nullptr, nullptr);
+        if (!stream_) {
+            SG_LOG(Warn, "audio", "cannot open audio %s: %s", what, SDL_GetError());
+            return nullptr;
+        }
+        SDL_ResumeAudioStreamDevice(stream_);
+        return stream_;
+    }
+    // A quarter of a second of audio in this format, in bytes.
+    int quarter_second() const { return freq_ * voices_ * static_cast<int>(sizeof(s16)) / 4; }
+
+private:
+    void close() {
+        if (stream_) SDL_DestroyAudioStream(stream_);
+        stream_ = nullptr;
+    }
+    SDL_AudioStream* stream_ = nullptr;
+    int freq_ = 0, voices_ = 0;
+};
+
 class AudioOut final : public AudioOutput {
 public:
-    explicit AudioOut(ip22::Indy& machine) : machine_(machine) {
+    AudioOut(ip22::Indy& machine, AudioOptions options) : machine_(machine) {
         if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-            SG_LOG(Warn, "audio", "no audio output: %s", SDL_GetError());
+            SG_LOG(Warn, "audio", "no audio: %s", SDL_GetError());
             return;
         }
         ok_ = true;
-        machine_.hpc3().set_audio_sink([this](const s16* s, std::size_t frames, unsigned voices, double rate) {
-            play(s, frames, voices, rate);
-        });
+        if (options.output)
+            machine_.hpc3().set_audio_sink([this](const s16* s, std::size_t frames, unsigned voices, double rate) {
+                play(s, frames, voices, rate);
+            });
+        if (options.input)
+            machine_.hpc3().set_audio_source([this](s16* s, std::size_t frames, unsigned voices, double rate) {
+                record(s, frames, voices, rate);
+            });
     }
     ~AudioOut() override {
         machine_.hpc3().set_audio_sink(nullptr);
-        if (stream_) SDL_DestroyAudioStream(stream_);
+        machine_.hpc3().set_audio_source(nullptr);
+        playback_.reset();
+        recording_.reset();
         if (ok_) SDL_QuitSubSystem(SDL_INIT_AUDIO);
     }
     AudioOut(const AudioOut&) = delete;
@@ -239,36 +278,42 @@ public:
 
 private:
     void play(const s16* samples, std::size_t frames, unsigned voices, double rate) {
-        const int freq = static_cast<int>(rate + 0.5);
-        if (!stream_ || freq != freq_ || static_cast<int>(voices) != voices_) {
-            if (stream_) SDL_DestroyAudioStream(stream_);
-            const SDL_AudioSpec spec{SDL_AUDIO_S16, static_cast<int>(voices), freq};
-            stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
-            freq_ = freq;
-            voices_ = static_cast<int>(voices);
-            if (!stream_) {
-                SG_LOG(Warn, "audio", "cannot open audio output: %s", SDL_GetError());
-                return;
-            }
-            SDL_ResumeAudioStreamDevice(stream_);
-        }
-        if (!stream_) return;
+        SDL_AudioStream* stream = playback_->get(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, voices, rate, "output");
+        if (!stream) return;
+        if (SDL_GetAudioStreamQueued(stream) > playback_->quarter_second()) return;
+        SDL_PutAudioStreamData(stream, samples, static_cast<int>(frames * voices * sizeof(s16)));
+    }
+
+    // The recording device opens when the guest first records. What it has
+    // not delivered yet is silence; a backlog beyond a quarter of a second
+    // (the guest stopped recording for a while) is dropped.
+    void record(s16* samples, std::size_t frames, unsigned voices, double rate) {
         const int bytes = static_cast<int>(frames * voices * sizeof(s16));
-        if (SDL_GetAudioStreamQueued(stream_) > freq_ * voices_ * static_cast<int>(sizeof(s16)) / 4) return;
-        SDL_PutAudioStreamData(stream_, samples, bytes);
+        int got = 0;
+        if (SDL_AudioStream* stream = recording_->get(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, voices, rate, "input")) {
+            std::vector<u8> discard;
+            for (int extra = SDL_GetAudioStreamAvailable(stream) - bytes - recording_->quarter_second(); extra > 0;
+                 extra = SDL_GetAudioStreamAvailable(stream) - bytes - recording_->quarter_second()) {
+                discard.resize(static_cast<std::size_t>(extra));
+                if (SDL_GetAudioStreamData(stream, discard.data(), extra) <= 0) break;
+            }
+            got = std::max(0, SDL_GetAudioStreamData(stream, samples, bytes));
+        }
+        std::fill(reinterpret_cast<u8*>(samples) + got, reinterpret_cast<u8*>(samples) + bytes, u8{0});
     }
 
     ip22::Indy& machine_;
     bool ok_ = false;
-    SDL_AudioStream* stream_ = nullptr;
-    int freq_ = 0, voices_ = 0;
+    std::optional<AudioStream> playback_{std::in_place}, recording_{std::in_place};
 };
 
 }  // namespace
 
-std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine) { return std::make_unique<AudioOut>(machine); }
+std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine, AudioOptions options) {
+    return std::make_unique<AudioOut>(machine, options);
+}
 
-bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, bool audio,
+bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, AudioOptions audio,
                       const std::function<void()>& periodic) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SG_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
@@ -284,7 +329,7 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
     SDL_SetRenderLogicalPresentation(renderer, 1280, 1024, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     MouseCapture mouse(window, renderer, machine);
     std::optional<AudioOut> sound;
-    if (audio) sound.emplace(machine);
+    if (audio.output || audio.input) sound.emplace(machine, audio);
     SDL_Texture* texture = nullptr;
     unsigned tex_w = 0, tex_h = 0;
     std::vector<u32> pixels;

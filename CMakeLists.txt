@@ -92,7 +92,7 @@ if(SG_WITH_SDL3)
     target_compile_definitions(siliconghost PRIVATE SG_HAVE_SDL3=1)
     target_link_libraries(siliconghost PRIVATE SDL3::SDL3)
   else()
-    message(STATUS "SDL3 not found: building without a display window")
+    message(WARNING "SDL3 not found: building without a display window or sound")
   endif()
 endif()
 

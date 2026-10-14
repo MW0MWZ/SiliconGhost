@@ -75,6 +75,7 @@ void usage(const char* argv0) {
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "  --no-jit         run decoded blocks without translating them to host code\n"
                  "  --no-audio       do not play the machine's audio output\n"
+                 "  --audio-in       let the machine record from the host's audio input\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "Both serial ports are connected to this terminal; Ctrl-C quits.\n",
@@ -236,7 +237,8 @@ int main(int argc, char** argv) {
     std::string prom, nvram, screenshot;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true, audio = true;
+    bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true, audio = true,
+         audio_in = false;
     const char* timing = nullptr;
     double max_speed = 2.0;
     std::string net_mode = "user";
@@ -289,6 +291,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--no-block-cache")) block_cache = false;
         else if (!std::strcmp(a, "--no-jit")) jit = false;
         else if (!std::strcmp(a, "--no-audio")) audio = false;
+        else if (!std::strcmp(a, "--audio-in")) audio_in = true;
         else if (!std::strcmp(a, "--no-graphics")) config.graphics = false;
         else if (!std::strcmp(a, "--log")) {
             const std::string l = next();
@@ -375,13 +378,18 @@ int main(int argc, char** argv) {
         } else {
 #if defined(SG_HAVE_SDL3)
             const bool windowed = !headless && config.graphics && max_cycles == ~0ull;
-            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, audio, periodic)) {
-                const auto sound = audio && max_cycles == ~0ull ? sg::app::start_audio(machine) : nullptr;
+            const sg::app::AudioOptions sound_options{audio, audio_in};
+            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, sound_options, periodic)) {
+                const bool any = (audio || audio_in) && max_cycles == ~0ull;
+                const auto sound = any ? sg::app::start_audio(machine, sound_options) : nullptr;
                 run_headless(machine, pacer, max_cycles, periodic);
             }
 #else
-            (void)headless;
+            if (!headless && config.graphics)
+                std::fprintf(stderr, "note: this build has no display window or sound (SDL3 was not found when it was "
+                                     "built); using the serial console\n");
             (void)audio;
+            (void)audio_in;
             run_headless(machine, pacer, max_cycles, periodic);
 #endif
         }
