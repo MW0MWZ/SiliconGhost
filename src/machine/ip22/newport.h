@@ -37,10 +37,19 @@ public:
     // Vertical retrace interrupt (INT3 LOCAL1 bit 7).
     void set_retrace_callback(std::function<void(bool)> cb) { retrace_cb_ = std::move(cb); }
 
+    // Bumped by anything that can change the picture (frame buffer writes,
+    // VC2, XMAP, CMAP, RAMDAC, TOPSCAN): a front end can skip render() while
+    // it stays the same.
+    u64 display_version() const { return display_version_; }
     // Scans out the visible screen as 0xAARRGGBB pixels. Returns false when
     // video timing is not running (no signal); width/height come from the
-    // VC2 timing tables.
+    // VC2 timing tables. `argb` should hold the previous call's picture: only
+    // the lines that changed since then are converted again (all of them if
+    // the size differs or the display set-up changed).
     bool render(std::vector<u32>& argb, unsigned& width, unsigned& height);
+    // The same picture, converted from scratch the straightforward way
+    // (screenshots; render() is checked against it).
+    bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
     u64 frames() const { return frames_; }
 
 private:
@@ -78,6 +87,7 @@ private:
     void dcb_write(unsigned size, u64 value);
     u64 dcb_read(u32 reg, unsigned size);
     void dcb_begin();
+    bool dcb_stalled() const;
     void dcb_write_byte(unsigned addr, unsigned crs, u8 b);
     u8 dcb_read_byte(unsigned addr, unsigned crs);
 
@@ -92,6 +102,24 @@ private:
 
     // ---- Display ----
     bool screen_size(unsigned& width, unsigned& height) const;
+    // Scan-out changes: a whole-picture change (timing, DID tables, cursor
+    // glyph, maps, gamma) or just the lines the cursor covers.
+    void picture_changed() {
+        ++display_version_;
+        full_redraw_ = true;
+    }
+    void cursor_moving();
+    // Raw pixel value -> final colour for one XMAP mode, gamma included.
+    struct ModeTable {
+        u32 mode = ~0u;
+        unsigned shift = 0;
+        u32 mask = 0;
+        bool direct = false;  // 24-bit RGB: no table, converted per pixel
+        std::vector<u32> lut;
+    };
+    const ModeTable& mode_table(unsigned did);
+    u32 direct_colour(u32 mode, u32 pix) const;
+    u32 special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const;  // cursor, PUP, overlay
     u8 did_at(const std::vector<std::pair<int, u8>>& records, int x) const;
     unsigned cursor_pixel(int x, int y) const;
     void retrace();
@@ -123,7 +151,14 @@ private:
     u32 dcbmode_ = 0;
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
+    u64 dcb_busy_until_ = 0;
+    bool warned_blend_ = false, warned_aline_ = false;  // unmodelled features, reported once  // an access to an absent slave is waiting for its acknowledge
 
+    u64 display_version_ = 0;
+    bool full_redraw_ = true;
+    std::vector<u8> row_dirty_ = std::vector<u8>(kRows, 1);  // frame buffer rows written since the last render
+    std::vector<std::pair<int, int>> cursor_rows_;          // screen lines [first, end) the cursor left or entered
+    std::array<ModeTable, 32> mode_tables_{};                // per DID, rebuilt when its mode or the maps change
     std::vector<u32> rgbci_, cidaux_;
 
     // DCB slaves

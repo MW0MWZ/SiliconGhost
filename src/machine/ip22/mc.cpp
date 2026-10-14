@@ -342,7 +342,9 @@ void Mc::update_irq() {
 
 // ---------------------------------------------------------------------------
 // Virtual DMA: moves rectangular memory areas to or from a GIO64 address, or
-// fills memory with a constant. Memory addresses go through a 4-entry TLB of
+// fills memory with a constant. The GIO address stays fixed: it names a
+// device's data port (such as REX3's host data register with GO), which
+// takes every doubleword in turn. Memory addresses go through a 4-entry TLB of
 // 4 MiB segments whose PTEs live in main memory; addresses no entry covers
 // are used as physical addresses (the boot PROM clears memory this way).
 // ---------------------------------------------------------------------------
@@ -385,7 +387,7 @@ void Mc::finish_dma() {
     const bool to_host = dma_mode_ & kDmaModeToHost, fill = dma_mode_ & kDmaModeFill;
     const s32 step = (dma_mode_ & kDmaModeIncrement) ? 1 : -1;
     u32 addr = dma_mem_addr_;
-    u64 gio = dma_gio_addr_;
+    const u64 gio = dma_gio_addr_;
     for (u32 line = 0; line < lines; ++line) {
         for (u32 z = 0; z < std::max(zoom, 1u); ++z) {
             u32 a = addr;
@@ -393,14 +395,14 @@ void Mc::finish_dma() {
                 for (u32 n = 0; n < width; n += 4, a += static_cast<u32>(4 * step))
                     bus_.write<u32>(dma_translate(a), dma_gio_addr_);
             } else if (to_host) {
-                for (u32 n = 0; n < width; n += 8, gio += 8) {
+                for (u32 n = 0; n < width; n += 8) {
                     u64 data = 0;
                     bus_.read<u64>(gio, data);
                     for (u32 b = 0; b < 8 && n + b < width; ++b, a += static_cast<u32>(step))
                         bus_.write<u8>(dma_translate(a), static_cast<u8>(data >> (56 - 8 * b)));
                 }
             } else {
-                for (u32 n = 0; n < width; n += 8, gio += 8) {
+                for (u32 n = 0; n < width; n += 8) {
                     u64 data = 0;
                     for (u32 b = 0; b < 8 && n + b < width; ++b, a += static_cast<u32>(step)) {
                         u8 v = 0;

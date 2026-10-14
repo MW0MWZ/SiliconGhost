@@ -42,6 +42,7 @@ constexpr u32 kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 
 constexpr u32 kDm1RgbMode = 1u << 15, kDm1Dither = 1u << 16, kDm1FastClear = 1u << 17, kDm1Blend = 1u << 18;
 
 constexpr u32 kStatusVersion = 3;
+constexpr u32 kStatusBackBusy = 1u << 4;  // the display control bus is busy
 constexpr u32 kStatusVrint = 1u << 5;
 
 // Planes (DRAWMODE1[2:0])
@@ -122,6 +123,7 @@ Newport::Newport(Scheduler& scheduler, double cpu_hz, const Options& options)
 }
 
 void Newport::reset() {
+    picture_changed();
     drawmode0_ = 0;
     drawmode1_ = kDefaultDrawMode1;
     lsmode_ = lspattern_ = lspatsave_ = zpattern_ = colorback_ = colorvram_ = alpharef_ = 0;
@@ -142,6 +144,7 @@ void Newport::reset() {
     clipmode_ = 0;
     config_ = kDefaultConfig;
     vrint_ = false;
+    dcb_busy_until_ = 0;
     std::fill(rgbci_.begin(), rgbci_.end(), 0);
     std::fill(cidaux_.begin(), cidaux_.end(), 0);
 
@@ -276,11 +279,11 @@ u32 Newport::rex3_read(u32 reg) {
         case kClipMode: return clipmode_;
         case kConfig: return config_;
         case kStatus: {
-            const u32 v = kStatusVersion | (vrint_ ? kStatusVrint : 0);
+            const u32 v = kStatusVersion | (vrint_ ? kStatusVrint : 0) | (dcb_stalled() ? kStatusBackBusy : 0);
             set_vrint(false);  // reading STATUS acknowledges the retrace interrupt
             return v;
         }
-        case kUStatus: return kStatusVersion | (vrint_ ? kStatusVrint : 0);
+        case kUStatus: return kStatusVersion | (vrint_ ? kStatusVrint : 0) | (dcb_stalled() ? kStatusBackBusy : 0);
         default: return 0;
     }
 }
@@ -403,11 +406,15 @@ void Newport::rex3_write(u32 reg, u32 v) {
             host_shift_ = -1;
             return;
         case kDcbMode: dcbmode_ = v & 0x1FFFFFFF; return;
-        case kTopScan: topscan_ = v & 0x3FF; return;
+        case kTopScan:
+            topscan_ = v & 0x3FF;
+            picture_changed();
+            return;
         case kXYWin: xywin_ = v; return;
         case kClipMode: clipmode_ = v & 0x1FFF; return;
         case kConfig: config_ = v & 0x1FFFFF; return;
         case kDcbReset:
+            dcb_busy_until_ = 0;
             vc2_.ram_hi_pending = vc2_.ram_read_hi = true;
             for (auto& x : xmap_) x.mode_count = 0;
             for (auto& c : cmap_) c.rgb = 0;
@@ -625,8 +632,17 @@ void Newport::store(int px, int py, u32 colour) {
         }
     }
     // Blending is not modelled yet: blended pixels are written as the source colour.
+    if ((drawmode1_ & kDm1Blend) && !warned_blend_) {
+        warned_blend_ = true;
+        SG_LOG(Debug, "newport", "blending requested (drawmode1 %08x); drawn unblended", drawmode1_);
+    }
     const u32 mask = wrmask_ & (opts_.xl24 ? 0xFFFFFFu : 0xFFu);
-    dst = (dst & ~mask) | (v & mask);
+    const u32 updated = (dst & ~mask) | (v & mask);
+    if (updated != dst) {
+        dst = updated;
+        ++display_version_;
+        row_dirty_[static_cast<std::size_t>(py)] = 1;
+    }
 }
 
 void Newport::plot(int x, int y, u32 colour) {
@@ -677,7 +693,9 @@ void Newport::draw_span_block(bool block) {
                 sy += dy;
             }
         }
-        if (!block || !row_done || !stop_y || sy == end_y) break;
+        // Host-supplied pixels come a data word per GO: a finished row
+        // waits for the next word rather than repeating this one.
+        if (!block || !row_done || !stop_y || sy == end_y || (drawmode0_ & kDm0ColorHost)) break;
     }
     write_x_start(static_cast<u32>(sx) << 11);
     if (block) write_y_start(static_cast<u32>(sy) << 11);
@@ -687,6 +705,10 @@ void Newport::draw_line() {
     // Integer Bresenham between the start and end points. Fractional (F_LINE)
     // and antialiased (A_LINE) lines use the integer endpoints for now.
     const u32 octant = (bresoctinc1_ >> 24) & 7;
+    if (((drawmode0_ >> 2) & 7) == 4 && !warned_aline_) {
+        warned_aline_ = true;
+        SG_LOG(Debug, "newport", "antialiased line requested; drawn as a plain line");
+    }
     const int x1 = int_part(xstart_), y1 = int_part(ystart_), x2 = int_part(xend_), y2 = int_part(yend_);
     const bool xmajor = octant & 4;
     const int sx_step = (octant & 2) ? -1 : 1, sy_step = (octant & 1) ? -1 : 1;
@@ -797,7 +819,17 @@ void Newport::pixel_read() {
 
 void Newport::dcb_begin() {
     for (auto& x : xmap_) x.mode_count = 0;
+    // Only slaves 0-7 exist on the board. An access to any other that waits
+    // for an acknowledge keeps the bus busy until it times out or the bus is
+    // reset. IRIX probes for an Indy Presenter adapter this way (a few
+    // back-to-back status reads); the PROM simply waits for the bus.
+    constexpr u32 kDcbSyncAck = 1u << 13, kDcbAsyncAck = 1u << 14;
+    constexpr double kAckTimeout = 10e-6;
+    if (((dcbmode_ >> 7) & 0xF) >= 8 && (dcbmode_ & (kDcbSyncAck | kDcbAsyncAck)))
+        dcb_busy_until_ = scheduler_.now() + static_cast<u64>(cpu_hz_ * kAckTimeout);
 }
+
+bool Newport::dcb_stalled() const { return scheduler_.now() < dcb_busy_until_; }
 
 void Newport::dcb_write(unsigned size, u64 value) {
     dcb_begin();
@@ -883,6 +915,9 @@ void Newport::vc2_write(unsigned crs, u8 b) {
         case 1: vc2_.data_hi = b; break;
         case 2: {
             const u16 v = static_cast<u16>((vc2_.data_hi << 8) | b);
+            // A cursor move only changes the lines it leaves and enters.
+            const bool cursor = vc2_.index == kVc2CursorX || vc2_.index == kVc2CursorY || vc2_.index == kVc2CurCursorX;
+            if (cursor) cursor_moving();
             vc2_.reg[vc2_.index] = v;
             if (vc2_.index == kVc2RamAddr) {
                 vc2_.reg[kVc2RamAddr] = v & 0x7FFF;
@@ -890,6 +925,8 @@ void Newport::vc2_write(unsigned crs, u8 b) {
             } else if (vc2_.index == kVc2CursorY) {
                 vc2_.reg[kVc2CurCursorX] = vc2_.reg[kVc2CursorX];
             }
+            if (cursor) cursor_moving();
+            else if (vc2_.index != kVc2RamAddr) picture_changed();
             break;
         }
         case 3:
@@ -901,6 +938,7 @@ void Newport::vc2_write(unsigned crs, u8 b) {
                 vc2_.ram[addr & 0x7FFF] = static_cast<u16>((vc2_.data_hi << 8) | b);
                 addr = (addr + 1) & 0x7FFF;
                 vc2_.ram_hi_pending = true;
+                picture_changed();  // timing, DID tables or the cursor glyph
             }
             break;
         default: break;
@@ -936,6 +974,7 @@ u8 Newport::vc2_read(unsigned crs) {
 }
 
 void Newport::xmap_write(unsigned which, unsigned crs, u8 b) {
+    picture_changed();
     Xmap& x = xmap_[which];
     switch (crs) {
         case 0: x.config = b; break;
@@ -968,6 +1007,7 @@ u8 Newport::xmap_read(unsigned which, unsigned crs) {
 }
 
 void Newport::cmap_write(unsigned which, unsigned crs, u8 b) {
+    picture_changed();
     Cmap& c = cmap_[which];
     switch (crs) {
         case 0:
@@ -1019,6 +1059,7 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
 }
 
 void Newport::ramdac_write(unsigned crs, u8 b) {
+    picture_changed();
     switch (crs) {
         case 0:
             ramdac_.addr = b;
@@ -1106,10 +1147,175 @@ unsigned Newport::cursor_pixel(int x, int y) const {
     return ((vc2_.ram[word & 0x7FFF] >> bit) & 1) | (((vc2_.ram[(word + 64) & 0x7FFF] >> bit) & 1) << 1);
 }
 
+void Newport::cursor_moving() {
+    ++display_version_;
+    const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
+    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1);
+    if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
+        full_redraw_ = true;
+        cursor_rows_.clear();
+    }
+    cursor_rows_.emplace_back(first, first + size);
+}
+
+const Newport::ModeTable& Newport::mode_table(unsigned did) {
+    const u32 mode = xmap_[0].mode[did & 31];
+    ModeTable& t = mode_tables_[did & 31];
+    if (t.mode == mode) return t;
+    t.mode = mode;
+    const std::vector<u32>& pal = cmap_[0].palette;
+    const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3, buf = mode & 1;
+    auto finish = [&](u32 rgb) {
+        if (!(mode & 4))  // gamma correction in the RAMDAC unless bypassed
+            rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
+                  ramdac_.lut[2][rgb & 0xFF];
+        return 0xFF000000u | rgb;
+    };
+    t.direct = pix_mode != 0 && pix_size == 3;
+    if (t.direct) {
+        t.lut.clear();
+        return t;
+    }
+    if (pix_mode == 0) {  // colour index
+        const u32 ci_msb = (mode & 0xF8) << 5;
+        u32 base;
+        switch (pix_size) {
+            case 0: t.shift = buf ? 4 : 0, t.mask = 0xF, base = ci_msb; break;
+            case 2: t.shift = buf ? 12 : 0, t.mask = 0xFFF, base = ci_msb & 0x1000; break;
+            default: t.shift = 0, t.mask = 0xFF, base = ci_msb; break;
+        }
+        t.lut.resize(t.mask + 1);
+        for (u32 v = 0; v <= t.mask; ++v) t.lut[v] = finish(pal[(base | v) & 0x1FFF]);
+    } else {  // RGB through CMAP map 0..2
+        t.shift = pix_size == 0 ? (buf ? 4 : 0) : pix_size == 2 ? (buf ? 12 : 0) : 0;
+        t.mask = depth_mask(pix_size);
+        t.lut.resize(t.mask + 1);
+        const u32 map = 0x1C00 + pix_mode * 0x100;
+        for (u32 v = 0; v <= t.mask; ++v) {
+            u32 r, g, b;
+            unpack(v, pix_size, r, g, b);
+            t.lut[v] = finish((pal[map + r] & 0xFF0000) | (pal[map + g] & 0xFF00) | (pal[map + b] & 0xFF));
+        }
+    }
+    return t;
+}
+
+u32 Newport::direct_colour(u32 mode, u32 pix) const {
+    const std::vector<u32>& pal = cmap_[0].palette;
+    u32 r, g, b;
+    unpack(pix & 0xFFFFFF, 3, r, g, b);
+    const u32 map = 0x1C00 + ((mode >> 8) & 3) * 0x100;
+    u32 rgb = (pal[map + r] & 0xFF0000) | (pal[map + g] & 0xFF00) | (pal[map + b] & 0xFF);
+    if (!(mode & 4))
+        rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
+              ramdac_.lut[2][rgb & 0xFF];
+    return 0xFF000000u | rgb;
+}
+
+u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
+    const Xmap& xm = xmap_[0];
+    const std::vector<u32>& pal = cmap_[0].palette;
+    u32 rgb;
+    if (cursor) rgb = pal[((xm.cursor_msb << 5) | cursor) & 0x1FFF];
+    else if (const unsigned pup = (aux >> 2) & 3) rgb = pal[((xm.pup_msb << 5) | pup) & 0x1FFF];
+    else if (((mode >> 16) & 7) == 2 && ((aux >> 8) & 0xFF)) rgb = pal[((mode >> 11) & 0x1F00) | ((aux >> 8) & 0xFF)];
+    else return direct_colour(mode, pix);  // not reached for table modes
+    if (!(mode & 4))
+        rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
+              ramdac_.lut[2][rgb & 0xFF];
+    return 0xFF000000u | rgb;
+}
+
+// As render_full(), but converting only the lines that may have changed,
+// with a colour table per display mode instead of decoding every pixel.
 bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(vc2_.reg[kVc2Config] & 1) || !(dcr & kDcrVTiming) || !screen_size(width, height)) return false;
-    width = std::min(width, 2048u);
+    constexpr unsigned kPipelineDelay = 2;  // see render_full()
+    if (width <= kPipelineDelay) return false;
+    width = std::min(width - kPipelineDelay, 2048u);
+    height = std::min(height, 2048u);
+    const std::size_t total = static_cast<std::size_t>(width) * height;
+    if (!(dcr & kDcrDisplay)) {  // blanked
+        argb.assign(total, 0xFF000000u);
+        full_redraw_ = true;
+        return true;
+    }
+    const bool full = full_redraw_ || argb.size() != total;
+    if (full) {
+        argb.resize(total);
+        for (ModeTable& t : mode_tables_) t.mode = ~0u;  // the maps may have changed
+    }
+
+    // The cursor's rows and columns (scan-out coordinates).
+    const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible) && !(dcr & kDcrCrosshair);
+    const int cursor_size = (dcr & kDcrLargeCursor) ? 64 : 32;
+    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (cursor_size - 1);
+    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - (cursor_size - 1);
+
+    std::vector<std::pair<int, u8>> records;
+    for (unsigned y = 0; y < height; ++y) {
+        const unsigned row = (topscan_ + 1 + y) & 0x3FF;
+        bool needed = full || row_dirty_[row];
+        for (std::size_t i = 0; !needed && i < cursor_rows_.size(); ++i)
+            needed = static_cast<int>(y) >= cursor_rows_[i].first && static_cast<int>(y) < cursor_rows_[i].second;
+        if (!needed) continue;
+        records.clear();
+        if (dcr & kDcrDid) {
+            unsigned p = vc2_.ram[(vc2_.reg[kVc2DidEntry] + y) & 0x7FFF];
+            for (int i = 0; i < 1024; ++i) {
+                const u16 r = vc2_.ram[p++ & 0x7FFF];
+                const int rx = r >> 5;
+                if (rx == 0x7FF) break;
+                records.emplace_back(rx, static_cast<u8>(r & 31));
+            }
+        }
+        const bool cursor_row = cursor_on && static_cast<int>(y) >= cursor_y0 && static_cast<int>(y) < cursor_y0 + cursor_size;
+        const u32* const pix_row = &rgbci_[static_cast<std::size_t>(row) * kPitch];
+        const u32* const aux_row = &cidaux_[static_cast<std::size_t>(row) * kPitch];
+        u32* const out = &argb[static_cast<std::size_t>(y) * width];
+        std::size_t rec = 0;
+        u8 did = 0;
+        unsigned x = kPipelineDelay;  // scan-out position
+        const unsigned end = width + kPipelineDelay;
+        while (x < end) {
+            while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
+            // A run of one display mode: up to the next DID change.
+            unsigned stop = end;
+            if (rec < records.size()) stop = std::min<unsigned>(stop, static_cast<unsigned>(std::max(records[rec].first, 0)));
+            if (stop <= x) stop = x + 1;
+            const ModeTable& t = mode_table(did);
+            const u32 mode = t.mode;
+            const u32 special = ((mode >> 16) & 7) == 2 ? 0xFF0Cu : 0x0Cu;  // aux bits that override: PUP, overlay
+            for (; x < stop; ++x) {
+                const bool inside = x < static_cast<unsigned>(kPitch);
+                const u32 pix = inside ? pix_row[x] : 0;
+                const u32 aux = inside ? aux_row[x] : 0;
+                const unsigned cp = cursor_row && static_cast<int>(x) >= cursor_x0 && static_cast<int>(x) < cursor_x0 + cursor_size
+                                        ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
+                                        : 0;
+                u32& o = out[x - kPipelineDelay];
+                if (cp || (aux & special)) o = special_colour(mode, pix, aux, cp);
+                else if (t.direct) o = direct_colour(mode, pix);
+                else o = t.lut[(pix >> t.shift) & t.mask];
+            }
+        }
+    }
+    std::fill(row_dirty_.begin(), row_dirty_.end(), u8{0});
+    cursor_rows_.clear();
+    full_redraw_ = false;
+    return true;
+}
+
+bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const {
+    const u16 dcr = vc2_.reg[kVc2Control];
+    if (!(vc2_.reg[kVc2Config] & 1) || !(dcr & kDcrVTiming) || !screen_size(width, height)) return false;
+    // The first pixel clocks of each active line fill the display pipeline;
+    // software allows for it by placing the screen that far into the
+    // framebuffer (XYWIN x = 0x1002), and the timing tables count them.
+    constexpr unsigned kPipelineDelay = 2;
+    if (width <= kPipelineDelay) return false;
+    width = std::min(width - kPipelineDelay, 2048u);
     height = std::min(height, 2048u);
     argb.assign(static_cast<std::size_t>(width) * height, 0xFF000000u);
     if (!(dcr & kDcrDisplay)) return true;  // blanked
@@ -1132,7 +1338,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
         u32* out = &argb[static_cast<std::size_t>(y) * width];
         std::size_t rec = 0;
         u8 did = 0;
-        for (unsigned x = 0; x < width; ++x) {
+        for (unsigned ox = 0; ox < width; ++ox) {
+            const unsigned x = ox + kPipelineDelay;  // scan-out position
             while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
             const u32 mode = xm.mode[did];
             const std::size_t idx = static_cast<std::size_t>(row) * kPitch + x;
@@ -1170,7 +1377,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                 rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
                       ramdac_.lut[2][rgb & 0xFF];
             }
-            out[x] = 0xFF000000u | rgb;
+            out[ox] = 0xFF000000u | rgb;
         }
     }
     return true;

@@ -8,6 +8,7 @@
 #include "core/scheduler.h"
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
+#include "devices/kbc8042.h"
 #include "devices/pit8254.h"
 #include "devices/scsi_disk.h"
 #include "devices/wd33c93.h"
@@ -71,6 +72,23 @@ TEST(pit_readback_status) {
     const u8 status = pit.read(1);
     CHECK_EQ(status & 0x3F, 0x36);  // rw=3, mode=3, binary
     CHECK(status & 0x40);           // null count until loaded
+}
+
+// Only writes that change the battery-backed RAM count as changes to save.
+TEST(ds1386_counts_nvram_changes) {
+    Ds1386 rtc;
+    rtc.set_time_source([] { return 1.0e9; });
+    rtc.power_on();
+    const u64 start = rtc.nvram_changes();
+    rtc.write(0x01, 0x30);  // clock register
+    rtc.write(Ds1386::kRegCommand, 0x80);
+    CHECK_EQ(rtc.nvram_changes(), start);
+    rtc.write(0x100, 0x5A);
+    CHECK_EQ(rtc.nvram_changes(), start + 1);
+    rtc.write(0x100, 0x5A);  // same value
+    CHECK_EQ(rtc.nvram_changes(), start + 1);
+    rtc.write(0x100, 0x00);
+    CHECK_EQ(rtc.nvram_changes(), start + 2);
 }
 
 TEST(ds1386_time_freeze_and_set) {
@@ -233,6 +251,19 @@ std::string make_image(unsigned blocks) {
     }
     return path;
 }
+// A disk image for one test, deleted when it goes out of scope: declared
+// before the devices that open it, it outlives them (an open file cannot
+// be deleted on every host).
+struct TempImage {
+    explicit TempImage(unsigned blocks) : path(make_image(blocks)) {}
+    ~TempImage() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    TempImage(const TempImage&) = delete;
+    TempImage& operator=(const TempImage&) = delete;
+    std::string path;
+};
 void wd_write(Wd33c93& wd, u8 reg, u8 v) {
     wd.write_address(reg);
     wd.write_data(v);
@@ -240,7 +271,8 @@ void wd_write(Wd33c93& wd, u8 reg, u8 v) {
 }  // namespace
 
 TEST(scsi_cdrom_inquiry_capacity_read) {
-    const std::string path = make_image(16);
+    const TempImage image(16);
+    const std::string& path = image.path;
     ScsiDisk cd(ScsiDisk::Kind::CdRom, path);
     CHECK(cd.ok());
     const u8 inquiry[6] = {0x12, 0, 0, 0, 36, 0};
@@ -259,11 +291,45 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     const u8 write10[10] = {0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0};
     r = cd.command(write10, 10);
     CHECK_EQ(r.status, 0x02);  // write-protected medium
-    std::filesystem::remove(path);
+}
+
+TEST(scsi_cdrom_eject_changes_disc_with_unit_attention) {
+    const TempImage first(16), second(32);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, first.path);
+    int ejects = 0;
+    cd.set_eject_callback([&] {
+        ++ejects;
+        CHECK(cd.change_medium(second.path));
+    });
+    const u8 eject[6] = {0x1B, 0, 0, 0, 0x02, 0};  // LoEj, stop
+    auto r = cd.command(eject, 6);
+    CHECK_EQ(r.status, 0x00);
+    CHECK_EQ(ejects, 1);
+    const u8 tur[6] = {0x00};
+    r = cd.command(tur, 6);
+    CHECK_EQ(r.status, 0x02);  // check condition: medium may have changed
+    const u8 sense[6] = {0x03, 0, 0, 0, 18, 0};
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x06);
+    CHECK_EQ(r.data_in[12], 0x28);
+    r = cd.command(tur, 6);
+    CHECK_EQ(r.status, 0x00);
+    const u8 capacity[10] = {0x25};
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[3], 31);  // the new disc
+    // Ejected with nothing put back: not ready, medium not present.
+    cd.set_eject_callback({});
+    cd.command(eject, 6);
+    r = cd.command(tur, 6);
+    CHECK_EQ(r.status, 0x02);
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x02);
+    CHECK_EQ(r.data_in[12], 0x3A);
 }
 
 TEST(wd33c93_select_and_transfer_dma) {
-    const std::string path = make_image(8);
+    const TempImage image(8);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -289,11 +355,11 @@ TEST(wd33c93_select_and_transfer_dma) {
     CHECK_EQ(wd.read_data(), 0x00);  // target status GOOD
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);  // select-and-transfer complete
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {
-    const std::string path = make_image(8);
+    const TempImage image(8);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -333,11 +399,11 @@ TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {
     }
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_select_with_atn_reports_selection_then_message_out) {
-    const std::string path = make_image(1);
+    const TempImage image(1);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -357,11 +423,11 @@ TEST(wd33c93_select_with_atn_reports_selection_then_message_out) {
     wd_write(wd, 0x18, 0x04);  // DISCONNECT: no interrupt
     clk.advance_to(300000);
     CHECK(!irq);
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_sync_negotiation_then_command) {
-    const std::string path = make_image(4);
+    const TempImage image(4);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -421,11 +487,11 @@ TEST(wd33c93_sync_negotiation_then_command) {
     CHECK_EQ(status(), 0x16);
     CHECK_EQ(memory.size(), 512u);
     if (!memory.empty()) CHECK_EQ(memory[0], 3);
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_message_in_whole_message_holds_ack_on_last_byte) {
-    const std::string path = make_image(1);
+    const TempImage image(1);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -466,11 +532,11 @@ TEST(wd33c93_message_in_whole_message_holds_ack_on_last_byte) {
     CHECK_EQ(status(), 0x20);  // ACK held on the last byte
     wd_write(wd, 0x18, 0x03);
     CHECK_EQ(status(), 0x8A);  // then COMMAND
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_manual_phases_command_status_message) {
-    const std::string path = make_image(2);
+    const TempImage image(2);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -521,7 +587,6 @@ TEST(wd33c93_manual_phases_command_status_message) {
     CHECK_EQ(status(), 0x20);
     wd_write(wd, 0x18, 0x03);
     CHECK_EQ(status(), 0x85);  // target released the bus
-    std::filesystem::remove(path);
 }
 
 TEST(ds1386_year_counted_from_a_base) {
@@ -555,4 +620,147 @@ TEST(ds1386_power_on_discards_saved_clock_registers) {
     rtc.write(Ds1386::kRegCommand, 0x80);
     CHECK_EQ(rtc.read(0xA), 0x83);  // 2023
     CHECK_EQ(rtc.read(0x4), 0x22);
+}
+
+namespace {
+// Sends a byte to the mouse through the controller and returns its replies.
+std::vector<u8> to_mouse(Kbc8042& k, u8 value) {
+    k.write_command(0xD4);
+    k.write_data(value);
+    std::vector<u8> out;
+    while (k.read_status() & 0x01) {
+        CHECK(k.read_status() & 0x20);  // from the auxiliary device
+        out.push_back(k.read_data());
+    }
+    return out;
+}
+}  // namespace
+
+TEST(kbc_mouse_reports_movement_only_when_enabled) {
+    Kbc8042 k;
+    bool irq = false;
+    k.set_irq_callback([&](bool a) { irq = a; });
+    k.write_command(0x60);
+    k.write_data(0x47);  // keyboard and mouse interrupts on
+    CHECK(to_mouse(k, 0xFF) == (std::vector<u8>{0xFA, 0xAA, 0x00}));
+    k.mouse_motion(5, 5, 0);
+    CHECK(!(k.read_status() & 0x01));  // reporting is off after reset
+    CHECK(to_mouse(k, 0xF4) == std::vector<u8>{0xFA});
+    k.mouse_motion(3, -2, 1);  // left button, right and down
+    CHECK(irq);
+    CHECK_EQ(k.read_data(), 0x08u | 0x01u | 0x20u);
+    CHECK_EQ(k.read_data(), 3u);
+    CHECK_EQ(k.read_data(), 0xFEu);
+    CHECK(!irq);
+    CHECK(to_mouse(k, 0xE9) == (std::vector<u8>{0xFA, 0x24, 0x02, 0x64}));  // enabled, left held
+    CHECK(to_mouse(k, 0xF5) == std::vector<u8>{0xFA});
+    k.mouse_motion(1, 1, 0);
+    CHECK(!(k.read_status() & 0x01));
+}
+
+TEST(kbc_mouse_splits_large_movements_into_packets) {
+    Kbc8042 k;
+    to_mouse(k, 0xF4);
+    k.mouse_motion(-300, 600, 4);
+    std::vector<u8> b;
+    while (k.read_status() & 0x01) b.push_back(k.read_data());
+    CHECK_EQ(b.size(), 9u);
+    int x = 0, y = 0;
+    for (std::size_t i = 0; i + 2 < b.size(); i += 3) {
+        CHECK_EQ(b[i] & 0x0Fu, 0x08u | 0x04u);
+        x += (b[i] & 0x10) ? static_cast<int>(b[i + 1]) - 256 : b[i + 1];
+        y += (b[i] & 0x20) ? static_cast<int>(b[i + 2]) - 256 : b[i + 2];
+    }
+    CHECK_EQ(x, -300);
+    CHECK_EQ(y, 600);
+}
+
+TEST(wd33c93_reset_line_release_interrupts_with_reset_status) {
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.reset();  // held in reset
+    CHECK(!irq);
+    wd.reset_released();
+    CHECK(irq);
+    CHECK_EQ(wd.read_aux_status(), 0x80);  // INT only
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x00);  // reset
+    CHECK(!irq);
+}
+
+// A single-byte TRANSFER INFO (SBT) moves exactly one byte, offered
+// through DBR, and leaves the transfer count alone.
+TEST(wd33c93_single_byte_transfer_waits_for_its_byte) {
+    const TempImage image(1);
+    const std::string& path = image.path;
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);  // SELECT WITH ATN
+    clk.advance_to(150000);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);  // MESSAGE OUT requested
+    wd_write(wd, 0x12, 0);
+    wd_write(wd, 0x13, 0);
+    wd_write(wd, 0x14, 0);
+    wd_write(wd, 0x18, 0xA0);  // TRANSFER INFO, single byte
+    CHECK(wd.read_aux_status() & 0x01);  // DBR: the chip wants the byte
+    clk.advance_to(300000);
+    CHECK(!irq);  // still waiting for it
+    wd_write(wd, 0x19, 0xC0);  // IDENTIFY
+    clk.advance_to(450000);
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x1A);  // transfer done, target now in COMMAND phase
+    wd.write_address(0x14);
+    CHECK_EQ(wd.read_data(), 0u);  // count untouched
+}
+
+// With DMA, a data transfer waits while the host's DMA channel is not
+// running and goes on when it starts.
+TEST(wd33c93_dma_transfer_waits_for_the_host_channel) {
+    const TempImage image(8);
+    const std::string& path = image.path;
+    ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    bool irq = false, running = false;
+    std::vector<u8> memory;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.set_dma(
+        [&](const u8* d, u32 n) {
+            if (!running) return 0u;
+            memory.insert(memory.end(), d, d + n);
+            return n;
+        },
+        [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    wd_write(wd, 0x01, 0x80);  // DMA mode
+    wd_write(wd, 0x15, 1);
+    const u8 cdb[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0};
+    for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+    wd_write(wd, 0x12, 0);
+    wd_write(wd, 0x13, 0x02);
+    wd_write(wd, 0x14, 0x00);
+    wd_write(wd, 0x18, 0x09);  // SELECT-AND-TRANSFER
+    clk.advance_to(1500000);
+    CHECK(!irq);
+    CHECK(memory.empty());
+    CHECK(wd.read_aux_status() & 0x20);  // busy
+    running = true;
+    wd.dma_kick();
+    clk.advance_to(3000000);
+    CHECK(irq);
+    CHECK_EQ(memory.size(), 512u);
+    if (!memory.empty()) CHECK_EQ(memory[0], 3);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x16);
 }

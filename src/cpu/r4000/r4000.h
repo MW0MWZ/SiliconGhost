@@ -185,6 +185,9 @@ public:
     }
     // Dynamic recompiler: hot blocks are translated to host code (x86-64;
     // elsewhere this is a no-op). Results are identical to step().
+    // Recompiler statistics: translations made, and taken back from the per-slot cache.
+    u64 jit_compiles() const { return jit_compiles_; }
+    u64 jit_reuses() const { return jit_reuses_; }
     void set_jit(bool enabled);
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
@@ -213,8 +216,11 @@ private:
     // Soft-TLB: direct-mapped cache of recent 4 KiB virtual->physical
     // translations per (mode, read/write). Entries for RAM/ROM carry a host
     // pointer so the common case is one compare plus a byte-swapped load.
+    // Tags carry the ASID they were made under (in bits 52-59, which a page
+    // number never uses), so a change of address space needs no flush and
+    // returning to one finds its translations still there.
     struct FastEntry {
-        u64 tag = ~u64{0};  // vaddr >> 12
+        u64 tag = ~u64{0};  // (vaddr >> 12) | asid_tag_
         u8* host = nullptr; // host pointer to the 4 KiB page, or nullptr for MMIO
         u64 ppage = 0;      // physical page address
         u8* code = nullptr; // the page's code flag (host pages only; see Bus::code_flag)
@@ -248,14 +254,26 @@ private:
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
+        u32 offset = 0;            // of the first instruction within its 4 KiB page
         u32 count = 0;
         u32 plain = 0;             // bit i: ops[i] is plain (never a delay slot)
         u32 runs = 0;
         JitFn code = nullptr;
         bool jit_addr64 = false;  // addressing mode the code was translated for
+        const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
         Op ops[kMaxBlockLength];
     };
     static bool is_branch_word(u32 w);
+    // Which guest registers a translation keeps in host registers, and in
+    // which of the back end's cache slots (jit_plan.cpp).
+    static constexpr unsigned kJitSlots = 8;
+    struct JitPlan {
+        u32 alloc = 0;     // cached guest registers
+        u32 written = 0;   // cached registers the block writes inline
+        s8 slot[32] = {};  // cache slot of each guest register (-1: none)
+        bool self_loop = false;
+    };
+    static JitPlan jit_plan(const Block& b);
     bool jit_compile(Block& b);  // false if the code buffer is full
     static bool jit_compile_supported();
     void jit_flush();
@@ -370,8 +388,32 @@ private:
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
     std::vector<Block> blocks_;
+    // Translations of blocks recently replaced in each slot (the table is
+    // direct-mapped, so blocks 64 KiB apart evict each other), with the
+    // instructions they were made from: a block decoded into its slot again
+    // with the same instructions takes its translation back at once.
+    static constexpr unsigned kJitVictims = 2;
+    struct JitVictim {
+        const u8* host = nullptr;
+        JitFn code = nullptr;
+        u32 generation = 0;  // of the code buffer
+        u32 count = 0;
+        bool addr64 = false;
+        std::array<u32, kMaxBlockLength> words{};
+    };
+    std::vector<std::array<JitVictim, kJitVictims>> jit_victims_;
+    u32 jit_generation_ = 1;  // bumped whenever the code buffer is emptied
+    u64 jit_compiles_ = 0, jit_reuses_ = 0;
+    void keep_translation(Block& b);
+    void reuse_translation(Block& b);
     std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
     u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
+    // Where translated code stopped: the block it was running (it may have
+    // gone on into other blocks) and that block's entry pc.
+    Block* jit_block_ = nullptr;
+    u64 jit_entry_pc_ = 0;
+    std::size_t jit_link_offset_ = 0;  // offset of the linked entry point in every translation
+    static void jit_backward_branch(R4000* cpu, u64 target) { cpu->backward_branch(target); }
     u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 
@@ -429,13 +471,16 @@ private:
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
-    std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
-    std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    // Fields translated code uses come before the large arrays, so they lie
+    // within reach of a single load or store on every host.
     bool idle_ready_ = false;  // confirmed spin: skip once the branch has executed
-    u64 idle_period_fp_ = 0;
-    u64 idle_skipped_fp_ = 0;
     unsigned mode_ = kKernelErl;
     bool addr64_ = false;  // 64-bit addressing in the current mode (KX/SX/UX)
+    u64 asid_tag_ = 0;     // EntryHi's ASID, placed as in FastEntry::tag
+    std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
+    std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    u64 idle_period_fp_ = 0;
+    u64 idle_skipped_fp_ = 0;
 
     // COP0
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
@@ -455,6 +500,11 @@ private:
     // Separate tables for fetch, load and store (indexed by Access), so code
     // and data pages that share low address bits do not evict each other.
     FastEntry fast_[kNumModes][3][kFastEntries];
+    static constexpr unsigned kAsidTagShift = 52;
+    void set_entryhi(u64 v) {
+        entryhi_ = v;
+        asid_tag_ = (v & 0xFF) << kAsidTagShift;
+    }
 };
 
 }  // namespace sg::mips

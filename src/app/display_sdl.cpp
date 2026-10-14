@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <optional>
 #include <vector>
 
 #include "core/log.h"
@@ -70,14 +71,54 @@ KeyCodes key_codes(SDL_Scancode sc) {
         case SDL_SCANCODE_END: return {0x69, true, 0x65};
         case SDL_SCANCODE_PAGEUP: return {0x7D, true, 0x6F};
         case SDL_SCANCODE_PAGEDOWN: return {0x7A, true, 0x6D};
+        // ISO keys: "#~" beside Enter and "\|" beside left Shift
+        case SDL_SCANCODE_NONUSHASH: return {0x5D, false, 0x53};
+        case SDL_SCANCODE_NONUSBACKSLASH: return {0x61, false, 0x13};
+        case SDL_SCANCODE_SCROLLLOCK: return {0x7E, false, 0x5F};
+        case SDL_SCANCODE_NUMLOCKCLEAR: return {0x77, false, 0x76};
+        case SDL_SCANCODE_KP_DIVIDE: return {0x4A, true, 0x77};
+        case SDL_SCANCODE_KP_MULTIPLY: return {0x7C, false, 0x7E};
+        case SDL_SCANCODE_KP_MINUS: return {0x7B, false, 0x84};
+        case SDL_SCANCODE_KP_PLUS: return {0x79, false, 0x7C};
+        case SDL_SCANCODE_KP_ENTER: return {0x5A, true, 0x79};
+        case SDL_SCANCODE_KP_PERIOD: return {0x71, false, 0x71};
+        case SDL_SCANCODE_KP_0: return {0x70, false, 0x70};
+        case SDL_SCANCODE_KP_1: return {0x69, false, 0x69};
+        case SDL_SCANCODE_KP_2: return {0x72, false, 0x72};
+        case SDL_SCANCODE_KP_3: return {0x7A, false, 0x7A};
+        case SDL_SCANCODE_KP_4: return {0x6B, false, 0x6B};
+        case SDL_SCANCODE_KP_5: return {0x73, false, 0x73};
+        case SDL_SCANCODE_KP_6: return {0x74, false, 0x74};
+        case SDL_SCANCODE_KP_7: return {0x6C, false, 0x6C};
+        case SDL_SCANCODE_KP_8: return {0x75, false, 0x75};
+        case SDL_SCANCODE_KP_9: return {0x7D, false, 0x7D};
+        case SDL_SCANCODE_LGUI: return {0x1F, true, 0x8B};
+        case SDL_SCANCODE_RGUI: return {0x27, true, 0x8C};
+        case SDL_SCANCODE_APPLICATION: return {0x2F, true, 0x8D};
         default: return {0, false, 0};
     }
 }
 
 void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
+    auto& kbc = m.ioc().kbc();
+    // Print Screen and Pause are sequences in set 2 (Pause has no break).
+    if (sc == SDL_SCANCODE_PRINTSCREEN || sc == SDL_SCANCODE_PAUSE) {
+        const bool print = sc == SDL_SCANCODE_PRINTSCREEN;
+        if (kbc.scan_set() == 3) {
+            if (!down) kbc.key_input(0xF0);
+            kbc.key_input(print ? 0x57 : 0x62);
+        } else if (print) {
+            static constexpr u8 kMake[] = {0xE0, 0x12, 0xE0, 0x7C};
+            static constexpr u8 kBreak[] = {0xE0, 0xF0, 0x7C, 0xE0, 0xF0, 0x12};
+            if (down) for (u8 b : kMake) kbc.key_input(b);
+            else for (u8 b : kBreak) kbc.key_input(b);
+        } else if (down) {
+            for (u8 b : {0xE1, 0x14, 0x77, 0xE1, 0xF0, 0x14, 0xF0, 0x77}) kbc.key_input(b);
+        }
+        return;
+    }
     const KeyCodes k = key_codes(sc);
     if (!k.set2) return;
-    auto& kbc = m.ioc().kbc();
     if (kbc.scan_set() == 3) {
         if (!down) kbc.key_input(0xF0);
         kbc.key_input(k.set3);
@@ -88,9 +129,197 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
     kbc.key_input(k.set2);
 }
 
+// PS/2 mouse fed from the window: a click captures the pointer (relative
+// mode), Ctrl+Alt+G or losing focus releases it. Motion is gathered per
+// frame, in guest pixels whatever the window's scale, and sent as one
+// movement; button changes are sent at once.
+class MouseCapture {
+public:
+    MouseCapture(SDL_Window* window, SDL_Renderer* renderer, ip22::Indy& machine)
+        : window_(window), renderer_(renderer), machine_(machine) {
+        update_title();
+    }
+
+    // True if the event was consumed.
+    bool handle(SDL_Event ev) {
+        switch (ev.type) {
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP: {
+                if (!captured_) {
+                    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) set_captured(true);
+                    return true;
+                }
+                const unsigned bit = ev.button.button == SDL_BUTTON_LEFT    ? 1u
+                                     : ev.button.button == SDL_BUTTON_RIGHT ? 2u
+                                     : ev.button.button == SDL_BUTTON_MIDDLE ? 4u
+                                                                             : 0u;
+                if (!bit) return true;
+                buttons_ = ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? (buttons_ | bit) : (buttons_ & ~bit);
+                flush(true);
+                return true;
+            }
+            case SDL_EVENT_MOUSE_MOTION:
+                if (captured_) {
+                    SDL_ConvertEventToRenderCoordinates(renderer_, &ev);
+                    dx_ += ev.motion.xrel;
+                    dy_ += ev.motion.yrel;
+                }
+                return true;
+            case SDL_EVENT_KEY_DOWN:
+                if (captured_ && ev.key.scancode == SDL_SCANCODE_G && (ev.key.mod & SDL_KMOD_CTRL) &&
+                    (ev.key.mod & SDL_KMOD_ALT)) {
+                    set_captured(false);
+                    return true;
+                }
+                return false;
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                set_captured(false);
+                return false;
+            default: return false;
+        }
+    }
+
+    // Sends the motion gathered since the last call (or the buttons, if forced).
+    void flush(bool force = false) {
+        const int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
+        if (!force && x == 0 && y == 0) return;
+        dx_ -= static_cast<float>(x);
+        dy_ -= static_cast<float>(y);
+        machine_.ioc().kbc().mouse_motion(x, -y, buttons_);  // PS/2 counts up as positive
+    }
+
+private:
+    void set_captured(bool on) {
+        if (on == captured_) return;
+        captured_ = on;
+        SDL_SetWindowRelativeMouseMode(window_, on);
+        if (!on && buttons_) {
+            buttons_ = 0;
+            flush(true);
+        }
+        dx_ = dy_ = 0;
+        update_title();
+    }
+    void update_title() {
+        // The release keys as the keyboard labels them (Alt is Option on a Mac).
+#if defined(__APPLE__)
+        constexpr const char* kCaptured = "SiliconGhost - Ctrl+Option+G releases the mouse";
+#else
+        constexpr const char* kCaptured = "SiliconGhost - Ctrl+Alt+G releases the mouse";
+#endif
+        SDL_SetWindowTitle(window_, captured_ ? kCaptured : "SiliconGhost - click to capture the mouse");
+    }
+
+    SDL_Window* window_;
+    SDL_Renderer* renderer_;
+    ip22::Indy& machine_;
+    bool captured_ = false;
+    unsigned buttons_ = 0;
+    float dx_ = 0, dy_ = 0;
+};
+
+// Plays HAL2 DAC output. The stream follows the guest's sample rate and
+// voice count; when the guest runs ahead of real time (or the device stalls)
+// more than a quarter of a second, new samples are dropped rather than
+// letting the delay grow.
+// One SDL audio stream in the guest's current format, reopened when that
+// changes. A format the device refuses is not retried until it changes.
+class AudioStream {
+public:
+    ~AudioStream() { close(); }
+    SDL_AudioStream* get(SDL_AudioDeviceID device, unsigned voices, double rate, const char* what) {
+        const int freq = static_cast<int>(rate + 0.5);
+        if (freq == freq_ && static_cast<int>(voices) == voices_) return stream_;
+        close();
+        freq_ = freq;
+        voices_ = static_cast<int>(voices);
+        const SDL_AudioSpec spec{SDL_AUDIO_S16, voices_, freq_};
+        stream_ = SDL_OpenAudioDeviceStream(device, &spec, nullptr, nullptr);
+        if (!stream_) {
+            SG_LOG(Warn, "audio", "cannot open audio %s: %s", what, SDL_GetError());
+            return nullptr;
+        }
+        SDL_ResumeAudioStreamDevice(stream_);
+        return stream_;
+    }
+    // A quarter of a second of audio in this format, in bytes.
+    int quarter_second() const { return freq_ * voices_ * static_cast<int>(sizeof(s16)) / 4; }
+
+private:
+    void close() {
+        if (stream_) SDL_DestroyAudioStream(stream_);
+        stream_ = nullptr;
+    }
+    SDL_AudioStream* stream_ = nullptr;
+    int freq_ = 0, voices_ = 0;
+};
+
+class AudioOut final : public AudioOutput {
+public:
+    AudioOut(ip22::Indy& machine, AudioOptions options) : machine_(machine) {
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            SG_LOG(Warn, "audio", "no audio: %s", SDL_GetError());
+            return;
+        }
+        ok_ = true;
+        if (options.output)
+            machine_.hpc3().set_audio_sink([this](const s16* s, std::size_t frames, unsigned voices, double rate) {
+                play(s, frames, voices, rate);
+            });
+        if (options.input)
+            machine_.hpc3().set_audio_source([this](s16* s, std::size_t frames, unsigned voices, double rate) {
+                record(s, frames, voices, rate);
+            });
+    }
+    ~AudioOut() override {
+        machine_.hpc3().set_audio_sink(nullptr);
+        machine_.hpc3().set_audio_source(nullptr);
+        playback_.reset();
+        recording_.reset();
+        if (ok_) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+    AudioOut(const AudioOut&) = delete;
+    AudioOut& operator=(const AudioOut&) = delete;
+
+private:
+    void play(const s16* samples, std::size_t frames, unsigned voices, double rate) {
+        SDL_AudioStream* stream = playback_->get(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, voices, rate, "output");
+        if (!stream) return;
+        if (SDL_GetAudioStreamQueued(stream) > playback_->quarter_second()) return;
+        SDL_PutAudioStreamData(stream, samples, static_cast<int>(frames * voices * sizeof(s16)));
+    }
+
+    // The recording device opens when the guest first records. What it has
+    // not delivered yet is silence; a backlog beyond a quarter of a second
+    // (the guest stopped recording for a while) is dropped.
+    void record(s16* samples, std::size_t frames, unsigned voices, double rate) {
+        const int bytes = static_cast<int>(frames * voices * sizeof(s16));
+        int got = 0;
+        if (SDL_AudioStream* stream = recording_->get(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, voices, rate, "input")) {
+            std::vector<u8> discard;
+            for (int extra = SDL_GetAudioStreamAvailable(stream) - bytes - recording_->quarter_second(); extra > 0;
+                 extra = SDL_GetAudioStreamAvailable(stream) - bytes - recording_->quarter_second()) {
+                discard.resize(static_cast<std::size_t>(extra));
+                if (SDL_GetAudioStreamData(stream, discard.data(), extra) <= 0) break;
+            }
+            got = std::max(0, SDL_GetAudioStreamData(stream, samples, bytes));
+        }
+        std::fill(reinterpret_cast<u8*>(samples) + got, reinterpret_cast<u8*>(samples) + bytes, u8{0});
+    }
+
+    ip22::Indy& machine_;
+    bool ok_ = false;
+    std::optional<AudioStream> playback_{std::in_place}, recording_{std::in_place};
+};
+
 }  // namespace
 
-bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop) {
+std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine, AudioOptions options) {
+    return std::make_unique<AudioOut>(machine, options);
+}
+
+bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, AudioOptions audio,
+                      const std::function<void()>& periodic) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SG_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -103,6 +332,9 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         return false;
     }
     SDL_SetRenderLogicalPresentation(renderer, 1280, 1024, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+    MouseCapture mouse(window, renderer, machine);
+    std::optional<AudioOut> sound;
+    if (audio.output || audio.input) sound.emplace(machine, audio);
     SDL_Texture* texture = nullptr;
     unsigned tex_w = 0, tex_h = 0;
     std::vector<u32> pixels;
@@ -112,6 +344,12 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
     auto& cpu = machine.cpu();
     pacer.update(cpu.cycles(), cpu.instructions());
     u64 next_frame_ns = SDL_GetTicksNS();
+    u64 next_periodic_ns = next_frame_ns + 1000000000ull;
+    // The picture is converted and presented only when the Newport has
+    // changed it, or the window needs redrawing: an idle desktop costs next
+    // to nothing.
+    u64 shown_version = 0;
+    bool shown = false, signal = false, redraw = true;
 
     while (!stop && !machine.powered_off()) {
         machine.run(slice);
@@ -119,17 +357,37 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         const u64 now_ns = SDL_GetTicksNS();
         if (now_ns < next_frame_ns) continue;
         next_frame_ns = std::max(next_frame_ns + kFrameNs, now_ns);
+        if (now_ns >= next_periodic_ns) {
+            next_periodic_ns = now_ns + 1000000000ull;
+            periodic();
+        }
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) stop = 1;
-            else if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
+            else if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) redraw = true;
+            if (mouse.handle(ev)) continue;
+            // Ctrl+Alt+E: put the next CD-ROM disc in the drive.
+            if ((ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) && ev.key.scancode == SDL_SCANCODE_E &&
+                (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_ALT)) {
+                if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) machine.request_next_disc();
+                continue;
+            }
+            if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
                 send_key(machine, ev.key.scancode, ev.type == SDL_EVENT_KEY_DOWN);
         }
+        mouse.flush();
 
+        const ip22::Newport* newport = machine.newport();
+        const bool changed = !shown || (newport && newport->display_version() != shown_version);
+        if (!changed && !redraw) continue;
         unsigned w = 0, h = 0;
-        const bool signal = machine.newport() && machine.newport()->render(pixels, w, h);
-        if (signal) {
+        if (changed) {
+            shown = true;
+            shown_version = newport ? newport->display_version() : 0;
+            signal = newport && machine.newport()->render(pixels, w, h);
+        }
+        if (changed && signal) {
             if (!texture || w != tex_w || h != tex_h) {
                 if (texture) SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
@@ -145,8 +403,10 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         SDL_RenderClear(renderer);
         if (signal && texture) SDL_RenderTexture(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
+        redraw = false;
     }
 
+    sound.reset();  // before SDL shuts down
     if (texture) SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);

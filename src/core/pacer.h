@@ -10,6 +10,11 @@
 //             instructions as the host manages and the time charged per
 //             instruction adapts, so a fast host behaves like a faster CPU and a
 //             slow one like a slower CPU, while a guest second stays a second.
+//             The speed-up is capped (set_max_speed): guest software measures
+//             the CPU against its timers at boot, and IRIX 5.3 divides by zero
+//             if a 1024-instruction loop takes under 2 us (about 2.9x a real
+//             175 MHz R4400). Beyond the cap the guest is simply ahead of the
+//             wall clock and waits, as in Cycle mode.
 //   Max       No waiting and one cycle per instruction: as fast as possible,
 //             with guest time running ahead of the wall clock.
 #pragma once
@@ -38,10 +43,12 @@ public:
     double update(u64 guest_cycles, u64 instructions);
 
     Mode mode() const { return mode_; }
+    // Realtime mode: the most the guest CPU may be sped up, as a multiple of
+    // the real CPU (one cycle per instruction). Default 2.
+    void set_max_speed(double factor) { min_cpi_ = factor > 0 ? 1.0 / factor : kMaxCpi; }
     double cycles_per_instruction() const { return cpi_; }
 
     // Limits on the time charged per instruction in Realtime mode.
-    static constexpr double kMinCpi = 1.0 / 64;
     static constexpr double kMaxCpi = 16.0;
 
 private:
@@ -56,6 +63,7 @@ private:
     double rate_ = 0;                          // measured host speed, instructions per second
     u64 sample_ran_ = 0, sample_busy_ns_ = 0;  // slices pooled until they make a sample
     double cpi_ = 1.0;
+    double min_cpi_ = 0.5;  // see set_max_speed()
 };
 
 }  // namespace sg

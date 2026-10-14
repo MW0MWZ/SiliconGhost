@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Memory for generated code. The same pages are mapped twice, writable and
-// executable, so no mapping is ever both (W^X); code is written through one
-// view and run through the other.
+// Memory for generated code, never writable and executable at once (W^X).
+// Linux: the same pages are mapped twice, writable and executable; code is
+// written through one view and run through the other (Windows: the same
+// with a paging-file section). macOS: one MAP_JIT
+// mapping, made writable for the calling thread while code is copied in.
+// Elsewhere there is no buffer (ok() is false) and the recompiler is off.
 #pragma once
 
 #include <cstddef>
@@ -28,7 +31,8 @@ private:
     std::size_t size_ = 0, used_ = 0;
     u8* write_ = nullptr;
     u8* exec_ = nullptr;
-    int fd_ = -1;
+    [[maybe_unused]] int fd_ = -1;  // Linux: the memfd behind both views
+    [[maybe_unused]] void* section_ = nullptr;  // Windows: the section behind both views
 };
 
 }  // namespace sg::jit

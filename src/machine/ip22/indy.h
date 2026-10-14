@@ -3,12 +3,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/scheduler.h"
 #include "cpu/r4000/r4000.h"
@@ -27,7 +29,9 @@ struct IndyConfig {
     u32 prid = 0x00000450;      // R4400 revision 5.0
     bool graphics = true;       // Newport XL8 in the GFX slot
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
-    std::string cdrom_image;    // SCSI CD-ROM (ID 4), raw 512-byte blocks (IRIX media layout)
+    // SCSI CD-ROM (ID 4) discs, raw 512-byte blocks (IRIX media layout). The
+    // first is in the drive at power-on; ejecting moves on to the next.
+    std::vector<std::string> cdrom_images;
     // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
     // use a default when the NVRAM has none (IRIX requires one).
     std::optional<std::array<u8, 6>> mac;
@@ -49,6 +53,10 @@ public:
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+
+    // Thread-safe: put the next CD-ROM disc in the drive (after the last,
+    // the first again), as if the operator had swapped it.
+    void request_next_disc();
     double cycles_per_second() const { return config_.cpu_hz; }
 
     void set_serial_output(SerialOutput out) { serial_out_ = std::move(out); }
@@ -59,6 +67,10 @@ public:
     Bus& bus() { return bus_; }
     Scheduler& scheduler() { return scheduler_; }
     Ds1386& rtc() { return hpc3_.rtc(); }
+    Hpc3& hpc3() { return hpc3_; }
+    // The host side of the Ethernet port (null: unplugged); it must outlive
+    // the machine or be detached first.
+    void set_network(net::NetBackend* backend) { hpc3_.set_network(backend); }
     Ioc2& ioc() { return ioc_; }
     Mc& mc() { return mc_; }
     Newport* newport() { return config_.graphics ? &newport_ : nullptr; }
@@ -68,6 +80,22 @@ private:
     static constexpr unsigned kNvramEaddr = 250;   // Ethernet address, 6 bytes
     void pump_serial_input();
     void apply_ethernet_address();
+    void next_disc();
+
+    // The graphics slot as the board decodes it: REX3 at +0xF0000, and the
+    // rest of the slot answering (reads as zero) rather than timing out, so
+    // probes of the slot base find a board there.
+    class GfxSlot final : public Device {
+    public:
+        explicit GfxSlot(Newport& board) : board_(board) {}
+        const char* name() const override { return "gfx-slot"; }
+        bool read(u32 offset, unsigned size, u64& value) override;
+        bool write(u32 offset, unsigned size, u64 value) override;
+        bool read_is_pure(u32 offset, unsigned size) const override;
+
+    private:
+        Newport& board_;
+    };
 
     IndyConfig config_;
     Scheduler scheduler_;
@@ -79,12 +107,16 @@ private:
     Hpc3 hpc3_;
     Mc mc_;
     Newport newport_;
+    GfxSlot gfx_slot_{newport_};
     Timer serial_timer_;
     std::unique_ptr<ScsiDisk> disk_, cdrom_;
 
     SerialOutput serial_out_;
     std::mutex serial_mutex_;
     std::deque<std::pair<unsigned, u8>> serial_in_;
+    std::atomic<bool> serial_pending_{false};  // input queued: run() starts the pump
+    std::size_t disc_ = 0;                   // index into config_.cdrom_images
+    std::atomic<bool> disc_change_{false};  // host asked for the next disc
     bool reset_pending_ = false;
     bool powered_off_ = false;
 };

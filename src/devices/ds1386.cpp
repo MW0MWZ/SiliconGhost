@@ -153,6 +153,7 @@ void Ds1386::write(unsigned index, u8 value) {
         if (!frozen_) commit();
         return;
     }
+    if (mem_[index] != value) ++nvram_changes_;
     mem_[index] = value;
 }
 

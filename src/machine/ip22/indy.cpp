@@ -50,7 +50,7 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_ram(kProm, kPromMaxSize, prom_.get(), /*writable=*/false);
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
-    if (config_.graphics) bus_.map_device(kNewportRex3, 0x10000, &newport_);
+    if (config_.graphics) bus_.map_device(kGioGfx, kGioGfxSize, &gfx_slot_);
     bus_.set_error_handler([this](u64 paddr, unsigned size, bool is_write) {
         mc_.report_bus_error(paddr, size, is_write);
     });
@@ -79,7 +79,12 @@ Indy::Indy(const IndyConfig& config)
                static_cast<unsigned long long>(slot->blocks()));
     };
     attach(disk_, ScsiDisk::Kind::Disk, config_.disk_image, 1);
-    attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_image, 4);
+    if (!config_.cdrom_images.empty()) {
+        for (const auto& path : config_.cdrom_images)
+            if (!std::ifstream(path, std::ios::binary)) throw std::runtime_error("cannot open " + path);
+        attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_images.front(), 4);
+        cdrom_->set_eject_callback([this] { next_disc(); });
+    }
 
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
@@ -95,6 +100,21 @@ Indy::Indy(const IndyConfig& config)
 }
 
 Indy::~Indy() = default;
+
+void Indy::request_next_disc() {
+    disc_change_.store(true, std::memory_order_release);
+    cpu_.request_stop();
+}
+
+void Indy::next_disc() {
+    if (!cdrom_) return;
+    disc_ = (disc_ + 1) % config_.cdrom_images.size();
+    const std::string& path = config_.cdrom_images[disc_];
+    if (cdrom_->change_medium(path))
+        SG_LOG(Info, "indy", "CD-ROM: %s (%llu blocks)", path.c_str(), static_cast<unsigned long long>(cdrom_->blocks()));
+    else
+        SG_LOG(Warn, "indy", "CD-ROM: cannot open %s, drive empty", path.c_str());
+}
 
 bool Indy::load_prom(const std::string& path, std::string& error) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -140,7 +160,7 @@ void Indy::reset() {
     newport_.reset();
     cpu_.reset();
     for (unsigned line = 0; line < 5; ++line) cpu_.set_int_line(line, false);
-    serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
+    serial_timer_.cancel();  // run() starts it again while input is queued
     reset_pending_ = false;
     powered_off_ = false;
 }
@@ -154,6 +174,11 @@ u64 Indy::run(u64 cycles) {
             SG_LOG(Info, "indy", "system reset");
             reset();
         }
+        if (disc_change_.exchange(false, std::memory_order_acq_rel)) next_disc();
+        // Host input (serial bytes, Ethernet frames) is taken in by timers
+        // that run only while there is some.
+        if (serial_pending_.load(std::memory_order_acquire) && !serial_timer_.active()) serial_timer_.schedule_in(1);
+        hpc3_.poll_network();
         cpu_.run_until(end, scheduler_.next_event_ptr());
         scheduler_.run_due(cpu_.cycles());
         if (cpu_.stop_requested() && !reset_pending_) break;
@@ -164,11 +189,12 @@ u64 Indy::run(u64 cycles) {
 void Indy::serial_input(unsigned channel, u8 byte) {
     std::lock_guard<std::mutex> lock(serial_mutex_);
     serial_in_.emplace_back(channel, byte);
+    serial_pending_.store(true, std::memory_order_release);
 }
 
 // Feed queued input at most one byte per channel per millisecond of guest
 // time, and only into an enabled receiver with an empty FIFO, so typed-ahead
-// and pasted text is not lost.
+// and pasted text is not lost. The pump runs only while input is queued.
 void Indy::pump_serial_input() {
     {
         std::lock_guard<std::mutex> lock(serial_mutex_);
@@ -184,8 +210,32 @@ void Indy::pump_serial_input() {
                 ++it;
             }
         }
+        if (serial_in_.empty()) {
+            serial_pending_.store(false, std::memory_order_release);
+            return;
+        }
     }
     serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
+}
+
+namespace {
+constexpr u32 kRex3InSlot = kNewportRex3 - kGioGfx, kRex3WindowSize = 0x10000;
+}  // namespace
+
+bool Indy::GfxSlot::read(u32 offset, unsigned size, u64& value) {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read(offset - kRex3InSlot, size, value);
+    value = 0;
+    return true;
+}
+
+bool Indy::GfxSlot::write(u32 offset, unsigned size, u64 value) {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.write(offset - kRex3InSlot, size, value);
+    return true;
+}
+
+bool Indy::GfxSlot::read_is_pure(u32 offset, unsigned size) const {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read_is_pure(offset - kRex3InSlot, size);
+    return true;
 }
 
 }  // namespace sg::ip22

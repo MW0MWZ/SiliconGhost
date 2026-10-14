@@ -109,15 +109,32 @@ workloads (TLB-heavy, lots of MMIO, FP) need more:
    with a small encoder in `src/jit/`). Register operations and RAM loads
    and stores are emitted inline, the latter with the soft-TLB lookup;
    misses, MMIO, unaligned addresses and pages holding translated code take
-   the handler path. Other instructions call their handlers with the same
-   bookkeeping as the block loop, and the function returns early wherever
-   the block loop would stop, so the two always agree. A block that branches
-   back to itself loops inside the function while the next pass fits before
-   the next timer or run-limit check. Generated code lives in a buffer
-   mapped twice (writable, executable); when it fills, all translations are
-   dropped. `--no-jit` turns the recompiler off. Next: branches and jumps
-   inline, direct links between translated blocks, keeping guest registers
-   in host registers, then an AArch64 back end.
+   the handler path. Branches and jumps are inline too, including the cheap
+   case of the idle-loop bookkeeping. Other instructions call their handlers
+   with the same bookkeeping as the block loop, and the function returns
+   early wherever the block loop would stop, so the two always agree. The
+   guest registers a block uses most (up to eight) live in host registers
+   while it runs: loaded on first use, written back before handler calls,
+   the idle-loop bookkeeping and leaving the block, and kept across passes
+   of a block that loops on itself. At the end of a block, translated code
+   jumps straight into the translation of the next block when the mode is
+   unchanged, nothing needs checking and the next block fits before the
+   next timer or run-limit check. Within the page the target is known (a
+   direct branch target or the fall-through); anywhere else, including
+   jumps through a register, the fetch soft-TLB and the block cache are
+   looked up as the block loop would. Translated code tells the block loop
+   which block it finished in. Generated code lives in a buffer mapped
+   twice (writable, executable); when it fills, all translations are
+   dropped. `--no-jit` turns the recompiler off.
+6. **AArch64 recompiler:** the same translation for AArch64 hosts
+   (`jit_a64.cpp`, encoder in `src/jit/a64_emitter.h`): callee-saved
+   x19-x23 hold the CPU, entry time, entry pc, soft-TLB table and entry
+   mode; x8-x15 hold guest registers; x16/x17 are the encoder's scratch for
+   out-of-range immediates and offsets. New code is published with a data
+   cache clean and instruction cache invalidate. CPU fields translated code
+   uses are laid out before the large tables so a single load reaches them.
+   macOS will need MAP_JIT and per-thread write protection instead of the
+   dual mapping.
 4. **Idle detection:** loops are tracked per backward branch (so nested
    loops are seen too). A loop is a spin when two consecutive iterations end
    with the same registers and stored the same values to the same RAM
@@ -145,8 +162,12 @@ clock after every 1 ms slice (`--timing`):
 
 * `realtime` (default): guest time follows the wall clock. The CPU runs as
   many instructions as the host can, and the charge per instruction adapts
-  (1/64 to 16 cycles), so a fast host looks like a faster R4400 while a guest
-  second remains a second.
+  (down to 1/`--max-speed` and up to 16 cycles), so a fast host looks like a
+  faster R4400 while a guest second remains a second. The speed-up is capped
+  (2x by default) because guest software times the CPU against its timers:
+  IRIX 5.3 times a 1024-instruction loop against the 8254 at boot and
+  divides by zero if it takes under 2 us, i.e. beyond about 2.9x a 175 MHz
+  part.
 * `cycle`: one cycle per instruction, reproducible from run to run; waits
   when ahead of the wall clock and lags when the host is too slow.
 * `max`: no waiting, one cycle per instruction (the default with `--max`).
@@ -163,8 +184,8 @@ clock after every 1 ms slice (`--timing`):
   `repartition/rootdrive` and `label/sync`. "Install System Software" then
   copies the miniroot to the swap partition and runs `inst`. Later:
   copy-on-write disk images.
-* Networking: Seeq 8003 behind a host backend (TAP on Linux, user-mode slirp
-  everywhere).
+* Networking: the Seeq behind a small host backend interface (`src/net/`):
+  user-mode NAT through libslirp, or a Linux TAP interface.
 * Config: TOML machine profiles (RAM size, PROM path, disks, display size).
 
 ## Milestones
@@ -174,11 +195,11 @@ clock after every 1 ms slice (`--timing`):
 | **M0** | Scaffold: bus, R4000 integer interpreter, TLB, tests, CLI | ✅ |
 | **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
 | **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | ✅ PROM 5.3 boots to the System Maintenance Menu on the serial console |
-| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu with keyboard input; mouse pending |
+| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu; IRIX desktop with keyboard and mouse |
 | **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | ✅ IRIX 5.3 installs from its CD and boots multi-user from disk (serial console) |
-| **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop |
+| **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | ✅ networked IRIX desktop with sound (audio input pending) |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |
-| **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | |
+| **M7** | AArch64 JIT, macOS/Windows packaging; Indigo² profile | AArch64 JIT on Linux done (tested under emulation) |
 
 ## Legal
 

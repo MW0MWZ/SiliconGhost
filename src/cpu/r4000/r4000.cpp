@@ -49,7 +49,8 @@ inline u64 f_zimm(u32 i) { return i & 0xFFFF; }
 
 }  // namespace
 
-R4000::R4000(Bus& bus, const Options& options) : bus_(bus), opts_(options), blocks_(1u << kBlockBits) {
+R4000::R4000(Bus& bus, const Options& options)
+    : bus_(bus), opts_(options), blocks_(1u << kBlockBits), jit_victims_(1u << kBlockBits) {
     bus_.set_code_write_handler([this](const u8* page) { invalidate_code_page(page); });
     bus_.set_remap_handler([this] { flush_fast_tlb(); });  // cached host pointers are stale
     set_jit(true);
@@ -62,19 +63,62 @@ void R4000::set_jit(bool enabled) {
     if (enabled && !jit_buf_) {
         constexpr std::size_t kJitBufferSize = 32u << 20;
         jit_buf_ = std::make_unique<jit::ExecBuffer>(kJitBufferSize);
-        if (!jit_buf_->ok() || !jit_compile_supported()) jit_buf_.reset();
+        if (!jit_buf_->ok() || !jit_compile_supported()) {
+            jit_buf_.reset();
+            SG_LOG(Info, "cpu", "recompiler not available on this host: running the block cache");
+        } else {
+#if defined(__aarch64__)
+            SG_LOG(Info, "cpu", "recompiler on (AArch64)");
+#else
+            SG_LOG(Info, "cpu", "recompiler on (x86-64)");
+#endif
+        }
     } else if (!enabled && jit_buf_) {
         jit_flush();
         jit_buf_.reset();
+        SG_LOG(Info, "cpu", "recompiler off");
     }
 }
 
 void R4000::jit_flush() {
     for (Block& b : blocks_) {
         b.code = nullptr;
+        b.jit_host = nullptr;
         b.runs = 0;
     }
     if (jit_buf_) jit_buf_->clear();
+    ++jit_generation_;  // kept translations are gone too
+}
+
+void R4000::keep_translation(Block& b) {
+    if (!b.code || !b.jit_host) return;
+    auto& v = jit_victims_[static_cast<std::size_t>(&b - blocks_.data())];
+    for (unsigned i = kJitVictims - 1; i > 0; --i) v[i] = v[i - 1];
+    JitVictim& k = v[0];
+    k.host = b.jit_host;
+    k.code = b.code;
+    k.generation = jit_generation_;
+    k.count = b.count;
+    k.addr64 = b.jit_addr64;
+    for (u32 i = 0; i < b.count; ++i) k.words[i] = b.ops[i].inst;
+}
+
+// The code refers only to the slot, its decoded operations and host
+// addresses, so it is valid again for the same instructions in the slot.
+void R4000::reuse_translation(Block& b) {
+    for (JitVictim& k : jit_victims_[static_cast<std::size_t>(&b - blocks_.data())]) {
+        if (k.host != b.host || k.count != b.count || k.generation != jit_generation_ || !k.code) continue;
+        bool same = true;
+        for (u32 i = 0; i < b.count && same; ++i) same = k.words[i] == b.ops[i].inst;
+        if (!same) continue;
+        b.code = k.code;
+        b.jit_addr64 = k.addr64;
+        b.jit_host = b.host;
+        b.runs = kJitThreshold;
+        k.code = nullptr;
+        ++jit_reuses_;
+        return;
+    }
 }
 
 void R4000::reset() {
@@ -91,6 +135,7 @@ void R4000::reset() {
     watchlo_ = watchhi_ = ecc_ = cacheerr_ = taglo_ = taghi_ = lladdr_ = 0;
     entrylo0_ = entrylo1_ = context_ = xcontext_ = badvaddr_ = 0;
     entryhi_ = epc_ = errorepc_ = 0;
+    asid_tag_ = 0;
     llbit_ = false;
     random_base_ = cycles();                               // Random restarts at 47
     count_offset_ = 0u - static_cast<u32>(cycles() >> 1);  // Count restarts at 0
@@ -212,7 +257,10 @@ bool ends_block(u32 w) {
 // transfer and its delay slot, a block-ending instruction, the end of the
 // 4 KiB page, or the length limit.
 void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
+    keep_translation(b);
+    b.jit_host = nullptr;
     b.host = host;
+    b.offset = page_offset;
     b.count = 0;
     b.runs = 0;
     b.code = nullptr;
@@ -236,6 +284,7 @@ void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
         if (ends_block(w)) break;
     }
     if (u8* flag = bus_.code_flag(host)) *flag = 1;  // writes to this page now drop its blocks
+    if (jit_buf_) reuse_translation(b);
 }
 
 // `page` is the host address of a 4 KiB page that was written.
@@ -271,7 +320,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     const unsigned mode = mode_;
     const u64 vpage = pc >> 12;
     const FastEntry& fe = fast_[mode][static_cast<unsigned>(Access::Fetch)][vpage & (kFastEntries - 1)];
-    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != vpage || fe.host == nullptr)) {
+    if (SG_UNLIKELY(next_delay_ || (pc & 3) || fe.tag != (vpage | asid_tag_) || fe.host == nullptr)) {
         step_inline();  // delay slot on a new page, misaligned or untranslated pc, uncached fetch
         return;
     }
@@ -290,12 +339,18 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     for (unsigned linked = 0; linked < kMaxLinkedBlocks; ++linked) {
         const u32 offset = static_cast<u32>(pc & 0xFFF);
         const u8* const host = page + offset;
-        Block& b = blocks_[block_index(host)];
-        if (b.host != host) build_block(b, host, offset);
+        Block* blk = &blocks_[block_index(host)];
+        if (blk->host != host) build_block(*blk, host, offset);
         block_invalidated_ = false;
-        if (jit_buf_ && !b.code && ++b.runs == kJitThreshold && !jit_compile(b)) {
-            jit_flush();  // the code buffer is full: start afresh
-            jit_compile(b);
+        if (jit_buf_ && !blk->code && ++blk->runs == kJitThreshold) {
+            if (!jit_compile(*blk)) {
+                jit_flush();  // the code buffer is full: start afresh
+                jit_compile(*blk);
+            }
+            if (blk->code) {
+                blk->jit_host = blk->host;
+                ++jit_compiles_;
+            }
         }
 
         // Plain operations only advance the time (kept in `t`), so pc, npc_
@@ -308,14 +363,17 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         bool leave = false;
         // Translated code runs the block when no time check falls inside it
         // and no interrupt is pending; it stops early where the loop below
-        // would break, or after an access that may need the checks redone.
-        if (b.code && b.jit_addr64 == addr64_ && t + (b.count - 1) * weight_ < safe) {
+        // would break, or after an access that may need the checks redone,
+        // and may carry on directly into other translated blocks.
+        if (blk->code && blk->jit_addr64 == addr64_ && t + (blk->count - 1) * weight_ < safe) {
             if (check_irq && !interrupt_pending()) check_irq = false;
             if (!check_irq) {
                 jit_safe_ = safe;
-                i = b.code(this, ipc, t);
+                i = blk->code(this, ipc, t);
+                // It may have gone on into other blocks, in this page or others.
+                blk = jit_block_;
+                ipc = jit_entry_pc_ + 4 * u64{i};
                 t = time_fp_;
-                ipc += 4 * u64{i};
                 first = false;
                 if (SG_UNLIKELY(io_)) {
                     check_irq = true;
@@ -324,7 +382,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                 leave = pc != ipc || block_invalidated_ || idle_ready_;
             }
         }
-        for (; !leave && i < b.count; ++i, ipc += 4) {
+        for (; !leave && i < blk->count; ++i, ipc += 4) {
             if (SG_UNLIKELY(t >= safe)) {
                 time_fp_ = t;
                 if (!first && !(cycles() < cycle && cycles() < *limit)) {
@@ -350,8 +408,8 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                     break;
                 }
             }
-            const Op& op = b.ops[i];
-            if ((b.plain >> i) & 1) {
+            const Op& op = blk->ops[i];
+            if ((blk->plain >> i) & 1) {
                 op.fn(*this, op);
                 synced = false;
                 continue;
@@ -378,13 +436,13 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             }
             if (pc != ipc + 4 || block_invalidated_ || idle_ready_) break;
         }
-        if (i == b.count) {  // ran off the end of the block
+        if (i == blk->count) {  // ran off the end of the block
             time_fp_ = t;
             if (!synced) set_pc(ipc);
         }
 
         // Link to the block at the new pc if nothing it relies on changed.
-        if (idle_ready_ || next_delay_ || (pc >> 12) != vpage || (pc & 3) || mode_ != mode || fe.tag != vpage ||
+        if (idle_ready_ || next_delay_ || (pc >> 12) != vpage || (pc & 3) || mode_ != mode || fe.tag != (vpage | asid_tag_) ||
             fe.host != page)
             return;
     }
@@ -698,7 +756,7 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     const bool is_store = acc == Access::Store;
     host = is_store ? bus_.host_write_ptr(ppage) : bus_.host_read_ptr(ppage);
     FastEntry& e = fast_[mode_][static_cast<unsigned>(acc)][(vaddr >> 12) & (kFastEntries - 1)];
-    e.tag = vaddr >> 12;
+    e.tag = (vaddr >> 12) | asid_tag_;
     e.host = host;
     e.ppage = ppage;
     e.code = host ? bus_.code_flag(host) : nullptr;
@@ -711,7 +769,7 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
 template <R4000::Access A>
 SG_FORCEINLINE bool R4000::lookup(u64 vaddr, u8*& host, u64& paddr) {
     const FastEntry& e = fast_[mode_][static_cast<unsigned>(A)][(vaddr >> 12) & (kFastEntries - 1)];
-    if (SG_LIKELY(e.tag == (vaddr >> 12))) {
+    if (SG_LIKELY(e.tag == ((vaddr >> 12) | asid_tag_))) {
         host = e.host;
         paddr = e.ppage | (vaddr & 0xFFF);
         if constexpr (A == Access::Store) store_code_ = e.code;
@@ -1356,6 +1414,41 @@ struct R4000::Ops {
     }
 
     static void other(R4000& c, const Op& o) { c.execute(o.inst); }
+
+    // FPU (COP1) operations and the FPU loads and stores, straight to their
+    // implementation rather than through execute() again.
+    static bool cop1_usable(R4000& c) {
+        c.touch();  // FPU state is not part of the idle-loop comparison
+        if (c.status_ & sr::CU1) return true;
+        c.raise(Exc::CpU, false, false, 1);
+        return false;
+    }
+    template <typename F>
+    static void cop1_fmt(R4000& c, const Op& o) {  // arithmetic, compares, conversions (.S, .D)
+        if (cop1_usable(c)) c.fp_compute<F>(o.inst & 63, o.rt, o.rd, o.sa);
+    }
+    static void mfc1(R4000& c, const Op& o) {
+        if (cop1_usable(c)) c.gpr[o.rt] = sext32(c.fpr_read32(o.rd));
+    }
+    static void mtc1(R4000& c, const Op& o) {
+        if (cop1_usable(c)) c.fpr_write32(o.rd, static_cast<u32>(c.gpr[o.rt]));
+    }
+    template <unsigned kOpcode>
+    static void fp_mem(R4000& c, const Op& o) {  // LWC1, LDC1, SWC1, SDC1
+        if (!cop1_usable(c)) return;
+        const u64 va = c.effective_address(c.gpr[o.rs], simm(o));
+        if constexpr (kOpcode == 0x31) {
+            u32 v;
+            if (c.load<u32>(va, v)) c.fpr_write32(o.rt, v);
+        } else if constexpr (kOpcode == 0x35) {
+            u64 v;
+            if (c.load<u64>(va, v)) c.fpr_write64(o.rt, v);
+        } else if constexpr (kOpcode == 0x39) {
+            c.store<u32>(va, c.fpr_read32(o.rt));
+        } else {
+            c.store<u64>(va, c.fpr_read64(o.rt));
+        }
+    }
     static void nop(R4000&, const Op&) {}
 
     // Immediate ALU
@@ -1535,6 +1628,14 @@ R4000::Handler R4000::decode(u32 w, bool& plain) {
         case 0x0D: return pure(Ops::ori, f_rt(w));
         case 0x0E: return pure(Ops::xori, f_rt(w));
         case 0x0F: return pure(Ops::lui, f_rt(w));
+        case 0x11:  // COP1
+            switch (f_rs(w)) {
+                case 0x00: return Ops::mfc1;
+                case 0x04: return Ops::mtc1;
+                case 0x10: return Ops::cop1_fmt<float>;
+                case 0x11: return Ops::cop1_fmt<double>;
+                default: return Ops::other;  // branches, control registers, W/L conversions
+            }
         case 0x14: return Ops::beql;
         case 0x15: return Ops::bnel;
         case 0x19: return Ops::daddiu;
@@ -1547,6 +1648,10 @@ R4000::Handler R4000::decode(u32 w, bool& plain) {
         case 0x28: return Ops::store<u8>;
         case 0x29: return Ops::store<u16>;
         case 0x2B: return Ops::store<u32>;
+        case 0x31: return Ops::fp_mem<0x31>;
+        case 0x35: return Ops::fp_mem<0x35>;
+        case 0x39: return Ops::fp_mem<0x39>;
+        case 0x3D: return Ops::fp_mem<0x3D>;
         case 0x37: return Ops::load<u64, false, true>;  // LD
         case 0x3F: return Ops::store<u64, true>;        // SD
         default: return Ops::other;
@@ -1563,6 +1668,16 @@ void R4000::execute_cop0(u32 inst) {
         return;
     }
     const unsigned rt = f_rt(inst), rd = f_rd(inst);
+    // Status is written all the time (IRIX's spl calls raise and lower the
+    // interrupt mask): only a change of mode or addressing, or an interrupt
+    // that can now be taken, needs the run loop to look again.
+    if ((f_rs(inst) == 0x04 || (f_rs(inst) == 0x05 && ops64_enabled())) && rd == cop0::Status) {
+        const u32 old = status_;
+        cp0_write(rd, f_rs(inst) == 0x04 ? sext32(gpr[rt]) : gpr[rt]);
+        touch();
+        if (((old ^ status_) & ~(sr::IE | sr::IM_MASK)) || interrupt_pending()) io_ = true;
+        return;
+    }
     // Reading a constant register (PRId, Config, Status...) is pure; Count
     // and Random change with time, and everything else alters CP0 state.
     if (f_rs(inst) > 0x01 || rd == cop0::Count || rd == cop0::Random) touch();
@@ -1659,9 +1774,7 @@ void R4000::cp0_write(unsigned reg, u64 v) {
             reschedule_timer();
             break;
         case cop0::EntryHi: {
-            const u64 nv = v & kEntryHiMask;
-            if ((nv ^ entryhi_) & 0xFF) flush_fast_tlb();  // ASID change
-            entryhi_ = nv;
+            set_entryhi(v & kEntryHiMask);
             break;
         }
         case cop0::Compare:
@@ -1712,9 +1825,8 @@ void R4000::tlb_read() {
     const unsigned index = index_ & 63;
     if (index >= kTlbEntries) return;
     const TlbEntry& e = tlb_[index];
-    if ((e.hi ^ entryhi_) & 0xFF) flush_fast_tlb();
     pagemask_ = static_cast<u32>(e.mask);
-    entryhi_ = e.hi;
+    set_entryhi(e.hi);
     entrylo0_ = e.lo[0] | (e.global ? 1 : 0);
     entrylo1_ = e.lo[1] | (e.global ? 1 : 0);
 }

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,14 @@ public:
     bool ok() const { return file_.is_open(); }
     u64 blocks() const { return blocks_; }
 
+    // Removable media: puts another image in the drive. The next command
+    // (other than INQUIRY and REQUEST SENSE) reports UNIT ATTENTION, medium
+    // may have changed, as a real drive does. False if it cannot be opened
+    // (the drive is then empty).
+    bool change_medium(const std::string& path);
+    // Called when the initiator ejects the medium (START STOP UNIT, LoEj).
+    void set_eject_callback(std::function<void()> cb) { eject_cb_ = std::move(cb); }
+
     Result command(const u8* cdb, unsigned length) override;
     u8 finish_data_out(const u8* cdb, const std::vector<u8>& data) override;
 
@@ -50,8 +59,12 @@ private:
     std::vector<u8> inquiry(unsigned allocation) const;
     std::vector<u8> mode_sense(const u8* cdb, bool ten_byte) const;
 
+    bool open(const std::string& path);
+
     Kind kind_;
     std::fstream file_;
+    bool unit_attention_ = false;
+    std::function<void()> eject_cb_;
     u64 blocks_ = 0;
     bool read_only_;
     u8 sense_key_ = 0, sense_asc_ = 0, sense_ascq_ = 0;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // IP22 chipset tests: MC, HPC3, IOC2/INT3 accessed at their physical addresses.
+#include <array>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@
 #include "cpu/r4000/r4000.h"
 #include "machine/ip22/indy.h"
 #include "mips_asm.h"
+#include "net/net_backend.h"
 #include "test.h"
 
 using namespace sg;
@@ -264,4 +266,414 @@ TEST(ip22_events_scheduled_by_running_code_fire_on_time) {
     m.reset();
     m.run(20000);
     CHECK(out == "X");
+}
+
+namespace {
+constexpr u32 kHal2 = 0x1FBD8000;     // HPC3 PBUS PIO channel 0
+constexpr u32 kPbus0 = 0x1FB80000;    // PBUS DMA channel 0: bptr, dptr; control at +0x1000
+constexpr u32 kPbusCfg0 = 0x1FBDC000;  // PBUS DMA channel 0 configuration
+constexpr u32 kHpcIntStat = 0x1FBB0000;
+
+void hal2_write(IndyRig& t, u32 reg, u32 value) {
+    t.w32(kHal2 + 0x40, value & 0xFFFF);
+    t.w32(kHal2 + 0x50, value >> 16);
+    t.w32(kHal2 + 0x30, reg);
+}
+u32 hal2_read(IndyRig& t, u32 reg) {
+    t.w32(kHal2 + 0x30, reg | 0x80);
+    const u32 lo = t.r32(kHal2 + 0x40);
+    t.w32(kHal2 + 0x30, reg | 0x81);
+    return lo | (t.r32(kHal2 + 0x40) << 16);
+}
+}  // namespace
+
+TEST(ip22_hal2_indirect_registers_read_back) {
+    IndyRig t;
+    t.w32(kHal2 + 0x10, 0x18);  // out of reset
+    hal2_write(t, 0x1408, 0x000103CC);
+    CHECK_EQ(hal2_read(t, 0x1408), 0x000103CCu);
+    CHECK_EQ(t.r32(kHal2 + 0x10) & 1, 0u);  // indirect access never busy
+}
+
+// The DAC, clocked at 8 kHz, plays a two-descriptor chain on PBUS channel 0:
+// each descriptor takes as long as its frames last, raises the DMA
+// interrupt, and the chain stops at its end.
+TEST(ip22_hal2_dac_dma_runs_at_the_sample_rate) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);  // 64 MiB at 0x08000000
+    std::vector<s16> played;
+    t.m.hpc3().set_audio_sink([&](const s16* s, std::size_t frames, unsigned voices, double rate) {
+        CHECK_EQ(voices, 2u);
+        CHECK(rate == 8000.0);
+        played.insert(played.end(), s, s + frames * voices);
+    });
+    // 100 stereo frames per descriptor, a 32-bit word (24-bit sample) per
+    // voice: the channel's 16-bit device bus mode (DS16), as the PROM sets it
+    t.w32(kPbusCfg0, 0x08248844);
+    constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 800;
+    for (u32 i = 0; i < 2 * kBytes / 4; ++i) t.w32(kBuf + 4 * i, (static_cast<u32>(static_cast<s32>(i * 3 - 200)) << 8) & 0xFFFFFF00u);
+    t.w32(kDesc + 0, kBuf);
+    t.w32(kDesc + 4, (1u << 29) | kBytes);  // XIE
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf + kBytes);
+    t.w32(kDesc + 20, (1u << 31) | (1u << 29) | kBytes);  // EOX, XIE
+    t.w32(kDesc + 24, 0);
+
+    t.w32(kHal2 + 0x10, 0x18);
+    hal2_write(t, 0x2104, 0);           // generator 1 from 48 kHz...
+    hal2_write(t, 0x2108, 0xFFFA0001);  // ...times 1/6
+    hal2_write(t, 0x1404, 0x208);       // DAC: PBUS channel 0, clock 1, stereo
+    hal2_write(t, 0x9104, 0x08);        // codec transmit DMA port on
+    t.w32(kHal2 + 0x800, 0xFF);         // full volume
+    t.w32(kHal2 + 0x804, 0xFF);
+    t.w32(kPbus0 + 4, kDesc);
+    t.w32(kPbus0 + 0x1000, 0x30);       // LD | ACT
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);  // active
+
+    const u64 per_desc = static_cast<u64>(t.m.cycles_per_second() * 100 / 8000);
+    t.m.run(per_desc * 9 / 10);
+    CHECK(played.empty());
+    CHECK_EQ(t.r32(kHpcIntStat) & 1, 0u);
+    t.m.run(per_desc * 2 / 10);
+    CHECK_EQ(played.size(), 200u);
+    CHECK_EQ(t.r32(kHpcIntStat) & 1, 1u);
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 3u);  // interrupt and active; reading clears the interrupt
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);
+    t.m.run(per_desc);
+    CHECK_EQ(played.size(), 400u);
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 1u);  // done
+    bool same = true;
+    for (u32 i = 0; i < played.size(); ++i) same &= played[i] == static_cast<s16>(i * 3 - 200);
+    CHECK(same);
+}
+
+// Without DS16 (the configuration the NetBSD and Linux drivers use), the
+// samples are packed 16-bit values.
+TEST(ip22_hal2_dac_dma_packed_16_bit_samples) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    std::vector<s16> played;
+    t.m.hpc3().set_audio_sink([&](const s16* s, std::size_t frames, unsigned voices, double rate) {
+        CHECK_EQ(voices, 2u);
+        CHECK(rate == 48000.0);
+        played.insert(played.end(), s, s + frames * voices);
+    });
+    constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000, kBytes = 400;  // 100 stereo frames
+    for (u32 i = 0; i < kBytes / 4; ++i)
+        t.w32(kBuf + 4 * i, (static_cast<u32>(static_cast<u16>(i * 7 - 300)) << 16) | static_cast<u16>(-static_cast<s32>(i)));
+    t.w32(kDesc + 0, kBuf);
+    t.w32(kDesc + 4, (1u << 31) | kBytes);  // EOX
+    t.w32(kDesc + 8, 0);
+
+    t.w32(kPbusCfg0, 0x08208844);
+    t.w32(kHal2 + 0x10, 0x18);
+    hal2_write(t, 0x2104, 0);           // generator 1 from 48 kHz...
+    hal2_write(t, 0x2108, 0xFFFF0004);  // ...times 4/4, as NetBSD writes it
+    hal2_write(t, 0x1404, 0x208);       // DAC: PBUS channel 0, clock 1, stereo
+    hal2_write(t, 0x9104, 0x08);
+    t.w32(kHal2 + 0x800, 0xFF);  // full volume
+    t.w32(kHal2 + 0x804, 0xFF);
+    t.w32(kPbus0 + 4, kDesc);
+    t.w32(kPbus0 + 0x1000, 0x30);
+
+    const u64 duration = static_cast<u64>(t.m.cycles_per_second() * 100 / 48000);
+    t.m.run(duration * 4 / 10);
+    CHECK(played.empty());
+    // Software that follows the buffer pointer refills what lies behind it:
+    // the frames below it have been played by then.
+    const u32 at = t.r32(kPbus0) - kBuf;
+    CHECK(at >= 36 * 4 && at <= 44 * 4);
+    CHECK_EQ(played.size(), at / 4 * 2);
+    t.m.run(duration * 7 / 10);
+    CHECK_EQ(played.size(), 200u);
+    bool same = true;
+    for (u32 i = 0; i < played.size() / 2; ++i)
+        same &= played[2 * i] == static_cast<s16>(i * 7 - 300) && played[2 * i + 1] == static_cast<s16>(-static_cast<s32>(i));
+    CHECK(same);
+}
+
+// The ADC records what the host supplies, in the layout of its PBUS
+// channel: packed 16-bit samples, or 24-bit values in 32-bit words (DS16).
+TEST(ip22_hal2_adc_records_from_the_audio_source) {
+    for (const bool ds16 : {false, true}) {
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        unsigned calls = 0;
+        std::size_t next = 0;  // the source's running sample count
+        t.m.hpc3().set_audio_source([&](s16* s, std::size_t frames, unsigned voices, double rate) {
+            CHECK_EQ(voices, 2u);
+            CHECK(rate == 48000.0);
+            for (std::size_t i = 0; i < frames * voices; ++i, ++next) s[i] = static_cast<s16>(100 * next - 1000);
+            ++calls;
+        });
+        const u32 size = ds16 ? 4 : 2;
+        constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000;
+        const u32 bytes = 50 * 2 * size;  // 50 stereo frames
+        t.w32(kDesc + 0, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | bytes);  // EOX
+        t.w32(kDesc + 8, 0);
+        t.w32(kPbusCfg0 + 0x200, ds16 ? 0x08248844 : 0x08208844);  // channel 1
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2104, 0);
+        hal2_write(t, 0x2108, 0xFFFF0004);  // 48 kHz
+        hal2_write(t, 0x1504, 0x209);       // ADC: PBUS channel 1, clock 1, stereo
+        hal2_write(t, 0x9104, 0x10);        // codec receive DMA port on
+        t.w32(kPbus0 + 0x2000 + 4, kDesc);
+        t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
+        // Halfway through, what lies below the buffer pointer has arrived.
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 25 / 48000));
+        const u32 at = t.r32(kPbus0 + 0x2000) - kBuf;
+        CHECK(at >= 20 * 2 * size && at < bytes);
+        CHECK_EQ(calls, 1u);
+        CHECK_EQ(t.r32(kBuf), ds16 ? static_cast<u32>(-1000 * 256) : (static_cast<u32>(static_cast<u16>(-1000)) << 16) | static_cast<u16>(-900));
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 35 / 48000));
+        CHECK_EQ(calls, 2u);
+        bool same = true;
+        for (u32 i = 0; i < 100; ++i) {
+            const s16 want = static_cast<s16>(100 * i - 1000);
+            if (ds16) same &= t.r32(kBuf + 4 * i) == static_cast<u32>(static_cast<s32>(want) * 256);
+            else same &= static_cast<s16>(t.r32(kBuf + 4 * (i / 2)) >> (i % 2 ? 0 : 16)) == want;
+        }
+        CHECK(same);
+    }
+}
+
+// DAC_C2 attenuates each side in 1.5 dB steps, or mutes both; the volume
+// registers (8-bit levels, 0 silent) scale the result.
+TEST(ip22_hal2_dac_attenuation_mute_and_volume) {
+    for (const bool mute : {false, true}) {
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        std::vector<s16> played;
+        t.m.hpc3().set_audio_sink([&](const s16* s, std::size_t frames, unsigned voices, double) {
+            played.insert(played.end(), s, s + frames * voices);
+        });
+        constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000;
+        for (u32 i = 0; i < 4; ++i) t.w32(kBuf + 4 * i, 0x40004000);  // 16384 on both sides
+        t.w32(kDesc + 0, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | 16);
+        t.w32(kDesc + 8, 0);
+        t.w32(kPbusCfg0, 0x08208844);
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2104, 0);
+        hal2_write(t, 0x2108, 0xFFFF0004);
+        hal2_write(t, 0x1404, 0x208);
+        hal2_write(t, 0x1408, (4u << 23) | (mute ? 0x400u : 0));  // left -6 dB, right 0 dB
+        hal2_write(t, 0x9104, 0x08);
+        t.w32(kHal2 + 0x800, 0x80);  // right at about half volume
+        t.w32(kHal2 + 0x804, 0xFF);
+        t.w32(kPbus0 + 4, kDesc);
+        t.w32(kPbus0 + 0x1000, 0x30);
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 10 / 48000));
+        CHECK_EQ(played.size(), 8u);
+        if (played.size() == 8) {
+            CHECK_EQ(played[0], mute ? 0 : 8211);  // 16384 x 10^(-6/20)
+            CHECK_EQ(played[1], mute ? 0 : 8224);  // 16384 x 128/255
+        }
+    }
+}
+
+// A chain of empty descriptors that loops forever must not hang the emulator.
+TEST(ip22_pbus_dma_follows_an_endless_empty_chain_without_hanging) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    constexpr u32 kDesc = 0x08100000;
+    t.w32(kDesc + 0, 0);
+    t.w32(kDesc + 4, 0);  // no data, no end of chain...
+    t.w32(kDesc + 8, kDesc);  // ...and pointing to itself
+    t.w32(kHal2 + 0x10, 0x18);
+    hal2_write(t, 0x2104, 0);
+    hal2_write(t, 0x2108, 0xFFFF0001);  // 48 kHz
+    hal2_write(t, 0x1404, 0x208);
+    hal2_write(t, 0x9104, 0x08);
+    t.w32(kPbus0 + 4, kDesc);
+    t.w32(kPbus0 + 0x1000, 0x30);
+    t.m.run(1000000);
+    CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);  // still going
+}
+
+namespace {
+constexpr u32 kEnetRxNdbp = 0x1FB94004, kEnetRxCtrl = 0x1FB95004, kEnetReset = 0x1FB95014;
+constexpr u32 kEnetTxNdbp = 0x1FB96004, kEnetTxCtrl = 0x1FB97004, kSeeq = 0x1FBD4000;
+constexpr u32 kOwn = 1u << 14, kTxDone = 1u << 15, kEop = 1u << 30, kEnd = 1u << 31, kXie = 1u << 29;
+
+// Records what the guest sends; frames for the guest are queued by hand.
+class LoopBackend final : public net::NetBackend {
+public:
+    void send(const u8* frame, std::size_t length) override { sent.emplace_back(frame, frame + length); }
+    void inject(const std::vector<u8>& frame) { deliver(frame.data(), frame.size()); }
+    std::vector<std::vector<u8>> sent;
+};
+
+struct EnetRig : IndyRig {
+    LoopBackend net;
+    EnetRig() {
+        w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        m.set_network(&net);
+        w32(kEnetReset, 3);  // reset the channels and clear the interrupt
+        w32(kEnetReset, 0);
+        const u8 mac[6] = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+        w32(kSeeq + 28, 0);  // transmit command: register bank 0
+        for (unsigned i = 0; i < 6; ++i) w32(kSeeq + 4 * i, mac[i]);
+        w32(kSeeq + 28, 0x08);  // interrupt when a frame has been sent
+        w32(kSeeq + 24, 0xA0);  // receive own address and broadcasts, interrupt on good frames
+    }
+    bool enet_irq() { return (r8(ioc_addr(0x80)) >> Ioc2::kL0Ethernet) & 1; }  // LOCAL0 status
+};
+
+std::vector<u8> test_frame(const std::array<u8, 6>& dst, std::size_t length) {
+    std::vector<u8> f(length);
+    for (std::size_t i = 0; i < length; ++i) f[i] = static_cast<u8>(i * 7 + 1);
+    std::copy(dst.begin(), dst.end(), f.begin());
+    return f;
+}
+}  // namespace
+
+TEST(ip22_ethernet_transmits_a_frame_across_descriptors) {
+    EnetRig t;
+    constexpr u32 kDesc = 0x08200000, kBuf = 0x08201000;
+    const std::vector<u8> frame = test_frame({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, 100);
+    for (std::size_t i = 0; i < frame.size(); ++i) t.m.bus().write<u8>(static_cast<u32>(kBuf + i), frame[i]);
+    t.w32(kDesc + 0, kBuf);  // the frame in two pieces
+    t.w32(kDesc + 4, 40);
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf + 40);
+    t.w32(kDesc + 20, kEnd | kEop | 60);
+    t.w32(kDesc + 24, 0);
+    t.w32(kEnetTxNdbp, kDesc);
+    t.w32(kEnetTxCtrl, 0x200);  // active
+    t.m.run(200000);
+    CHECK_EQ(t.net.sent.size(), 1u);
+    if (!t.net.sent.empty()) CHECK(t.net.sent[0] == frame);
+    CHECK(t.r32(kDesc + 4) & kTxDone);
+    CHECK(t.r32(kDesc + 20) & kTxDone);
+    CHECK_EQ(t.r32(kEnetTxCtrl), 0x08u);  // sent, no longer active
+    CHECK(t.enet_irq());
+    t.w32(kEnetReset, 2);  // clear the interrupt
+    CHECK(!t.enet_irq());
+}
+
+TEST(ip22_ethernet_receives_into_owned_descriptors_only) {
+    EnetRig t;
+    constexpr u32 kDesc = 0x08300000, kBuf0 = 0x08301000, kBuf1 = 0x08302000, kSize = 1586;
+    t.w32(kDesc + 0, kBuf0);
+    t.w32(kDesc + 4, kOwn | kXie | kSize);
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf1);
+    t.w32(kDesc + 20, kEnd | kOwn | kXie | kSize);  // end of the ring
+    t.w32(kDesc + 24, kDesc);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+
+    const std::array<u8, 6> us = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+    t.net.inject(test_frame({0x08, 0x00, 0x69, 0x00, 0x00, 0x02}, 80));  // for someone else: ignored
+    const std::vector<u8> mine = test_frame(us, 200);
+    t.net.inject(mine);
+    t.net.inject(test_frame({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, 40));  // broadcast, padded to 60
+    t.net.inject(test_frame(us, 100));  // no buffer left: lost
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 50));  // 20 ms
+
+    // First buffer: two bytes of padding, the frame, the status byte; OWN
+    // cleared and the unused count left behind.
+    const u32 c0 = t.r32(kDesc + 4);
+    CHECK(!(c0 & kOwn));
+    CHECK_EQ(c0 & 0x3FFF, kSize - (2 + 200 + 1));
+    bool same = true;
+    for (std::size_t i = 0; i < mine.size(); ++i) {
+        u8 b = 0;
+        t.m.bus().read<u8>(static_cast<u32>(kBuf0 + 2 + i), b);
+        same &= b == mine[i];
+    }
+    CHECK(same);
+    u8 status = 0;
+    t.m.bus().read<u8>(kBuf0 + 2 + 200, status);
+    CHECK_EQ(status, 0x30u);  // good frame, end of frame
+    CHECK_EQ(t.r32(kDesc + 20) & 0x3FFF, kSize - (2 + 60 + 1));
+    CHECK(!(t.r32(kEnetRxCtrl) & 0x200));  // stopped at the end of the ring...
+    CHECK_EQ(t.r32(0x1FB98000), kDesc + 16);  // ...at this descriptor, as the driver reads back to restart
+    CHECK(t.enet_irq());
+    // Restarted on a buffer the driver has not handed back: nothing is written.
+    u32 before = t.r32(kBuf0 + 4);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+    t.net.inject(test_frame(us, 120));
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 100));
+    CHECK_EQ(t.r32(kBuf0 + 4), before);
+    CHECK_EQ(t.r32(kDesc + 4), c0);
+}
+
+// Typed-ahead input is fed one byte at a time as the guest takes it; the
+// feeder only runs while something is queued, and starts again for input
+// that arrives later.
+TEST(ip22_serial_input_is_fed_in_order_and_on_demand) {
+    IndyRig t;
+    const u32 ctrl_b = ioc_addr(0x30), data_b = ioc_addr(0x34);
+    t.w8(ctrl_b, 3);
+    t.w8(ctrl_b, 0xC1);  // receiver on, 8 bits
+    for (char c : {'a', 'b', 'c'}) t.m.serial_input(1, static_cast<u8>(c));
+    std::string got;
+    for (int i = 0; i < 3; ++i) {
+        t.m.run(400000);  // a little over a millisecond at 150 MHz
+        if (t.r8(ctrl_b) & 1) got.push_back(static_cast<char>(t.r8(data_b)));
+    }
+    CHECK(got == "abc");
+    t.m.run(1000000);  // nothing queued
+    CHECK(!(t.r8(ctrl_b) & 1));
+    t.m.serial_input(1, 'd');
+    t.m.run(400000);
+    CHECK(t.r8(ctrl_b) & 1);
+    CHECK_EQ(t.r8(data_b), 'd');
+}
+
+// Software finds the graphics board by probing the base of its slot; the
+// REX3 registers sit at +0xF0000 within it.
+TEST(indy_newport_answers_across_the_graphics_slot) {
+    IndyRig t;
+    u32 v = 1;
+    CHECK(t.m.bus().read<u32>(0x1F000000, v));
+    CHECK_EQ(v, 0u);
+    CHECK(t.m.bus().write<u32>(0x1F0F0148, 0x12345678));  // XSTARTI
+    CHECK_EQ(t.r32(0x1F0F0100), 0x02B3C000u);              // XSTART
+    CHECK(t.m.bus().read<u32>(0x1F400000 - 4, v));
+    CHECK(!t.m.bus().read<u32>(0x1F400000, v));  // empty expansion slot
+
+    IndyConfig cfg;
+    cfg.graphics = false;
+    Indy bare{cfg};
+    CHECK(!bare.bus().read<u32>(0x1F000000, v));
+}
+
+// The MC's virtual DMA sends a memory rectangle to one GIO address, the
+// device's data port: here REX3's host data register with GO, drawing a
+// block of host-supplied pixels as IRIX's graphics library does.
+TEST(ip22_mc_dma_feeds_one_gio_address) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    constexpr u32 kRex3 = 0x1F0F0000, kGo = 0x800;
+    constexpr u32 kMc = 0x1FA00000, kSrc = 0x08100000;
+    for (u32 i = 0; i < 16; ++i) t.w8(kSrc + i, static_cast<u8>(0x10 + i));  // 2 lines of 8 pixels
+    // 8-bit pixels from the host, eight per doubleword, into the block (0,0)-(7,1)
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
+    t.w32(kRex3 + 0x220, 0xFF);                                                  // WRMASK
+    t.w32(kRex3 + 0x150, 0);                                                     // XYSTARTI (0,0)
+    t.w32(kRex3 + 0x154, (7u << 16) | 1u);                                       // XYENDI (7,1)
+    t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));   // DRAW BLOCK COLORHOST STOPX STOPY
+    t.w32(kMc + 0x2004, kSrc);              // DMA_MEMADR
+    t.w32(kMc + 0x2014, (2u << 16) | 8u);   // DMA_SIZE: 2 lines of 8 bytes
+    t.w32(kMc + 0x201C, 1u << 16);          // DMA_STRIDE: zoom 1, no gap
+    t.w32(kMc + 0x2034, 1u << 4);           // DMA_MODE: memory to GIO, incrementing
+    t.w32(kMc + 0x202C, kRex3 + kGo + 0x230);  // DMA_GIO_ADR, and start
+    t.m.run(10000);
+    CHECK(t.r32(kMc + 0x204C) & (1u << 3));  // DMA_RUN: done
+    // Read both lines back.
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    for (u32 y = 0; y < 2; ++y) {
+        for (u32 x = 0; x < 8; x += 4) {
+            t.w32(kRex3 + 0x150, (x << 16) | y);
+            t.w32(kRex3 + 0x154, ((x + 3) << 16) | y);
+            t.w32(kRex3 + kGo + 0x004, 1u);  // READ
+            const u32 base = 0x10 + y * 8 + x;
+            CHECK_EQ(t.r32(kRex3 + 0x230), (base << 24) | ((base + 1) << 16) | ((base + 2) << 8) | (base + 3));
+        }
+    }
 }
