@@ -19,6 +19,15 @@
 #include <string>
 #include <thread>
 
+// libslirp 4.9 replaced the descriptor-based polling interface with a
+// socket-based one (SlirpConfig version 6); older releases only have the
+// former. On Unix both take plain file descriptors.
+#if defined(SLIRP_CHECK_VERSION)
+#if SLIRP_CHECK_VERSION(4, 9, 0)
+#define SG_SLIRP_SOCKETS 1
+#endif
+#endif
+
 namespace sg::net {
 
 namespace {
@@ -36,7 +45,11 @@ public:
         for (int fd : wake_) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 
         SlirpConfig cfg{};
+#if defined(SG_SLIRP_SOCKETS)
+        cfg.version = 6;
+#else
         cfg.version = 4;
+#endif
         cfg.in_enabled = true;
         inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);
         inet_pton(AF_INET, "255.255.255.0", &cfg.vnetmask);
@@ -44,37 +57,48 @@ public:
         inet_pton(AF_INET, "10.0.2.15", &cfg.vdhcp_start);
         inet_pton(AF_INET, "10.0.2.3", &cfg.vnameserver);
         cfg.vhostname = "IRIS";
-        static const SlirpCb callbacks = {
-            .send_packet = [](const void* buf, size_t len, void* opaque) -> slirp_ssize_t {
+        // Filled in place, once: what is not set stays null (including, with
+        // libslirp 4.9, the deprecated descriptor callbacks, which a copy of
+        // the struct would touch).
+        static SlirpCb callbacks;
+        static std::once_flag callbacks_set;
+        std::call_once(callbacks_set, [] {
+            SlirpCb& cb = callbacks;
+            cb.send_packet = [](const void* buf, size_t len, void* opaque) -> slirp_ssize_t {
                 static_cast<SlirpBackend*>(opaque)->deliver(static_cast<const u8*>(buf), len);
                 return static_cast<slirp_ssize_t>(len);
-            },
-            .guest_error = [](const char*, void*) {},
-            .clock_get_ns = [](void*) -> int64_t {
+            };
+            cb.guest_error = [](const char*, void*) {};
+            cb.clock_get_ns = [](void*) -> int64_t {
                 return std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now().time_since_epoch())
                     .count();
-            },
-            .timer_new = [](SlirpTimerCb cb, void* cb_opaque, void* opaque) -> void* {
+            };
+            cb.timer_new = [](SlirpTimerCb timer_cb, void* cb_opaque, void* opaque) -> void* {
                 auto* self = static_cast<SlirpBackend*>(opaque);
-                self->timers_.push_back(std::make_unique<Timer>(Timer{cb, cb_opaque, -1}));
+                self->timers_.push_back(std::make_unique<Timer>(Timer{timer_cb, cb_opaque, -1}));
                 return self->timers_.back().get();
-            },
-            .timer_free = [](void* timer, void* opaque) {
+            };
+            cb.timer_free = [](void* timer, void* opaque) {
                 auto& timers = static_cast<SlirpBackend*>(opaque)->timers_;
                 for (auto it = timers.begin(); it != timers.end(); ++it)
                     if (it->get() == timer) {
                         timers.erase(it);
                         break;
                     }
-            },
-            .timer_mod = [](void* timer, int64_t expire_ms, void*) { static_cast<Timer*>(timer)->expire_ms = expire_ms; },
-            .register_poll_fd = [](int, void*) {},
-            .unregister_poll_fd = [](int, void*) {},
-            .notify = [](void* opaque) { static_cast<SlirpBackend*>(opaque)->wake(); },
-            .init_completed = nullptr,
-            .timer_new_opaque = nullptr,
-        };
+            };
+            cb.timer_mod = [](void* timer, int64_t expire_ms, void*) { static_cast<Timer*>(timer)->expire_ms = expire_ms; };
+            cb.notify = [](void* opaque) { static_cast<SlirpBackend*>(opaque)->wake(); };
+            // Every socket is polled each time round the loop, so there is
+            // nothing to do when libslirp registers one.
+#if defined(SG_SLIRP_SOCKETS)
+            cb.register_poll_socket = [](slirp_os_socket, void*) {};
+            cb.unregister_poll_socket = [](slirp_os_socket, void*) {};
+#else
+            cb.register_poll_fd = [](int, void*) {};
+            cb.unregister_poll_fd = [](int, void*) {};
+#endif
+        });
         slirp_ = slirp_new(&cfg, &callbacks, this);
         if (!slirp_) {
             error = "libslirp failed to start";
@@ -134,7 +158,11 @@ private:
             fds.assign(1, pollfd{wake_[0], POLLIN, 0});
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+#if defined(SG_SLIRP_SOCKETS)
+                slirp_pollfds_fill_socket(
+#else
                 slirp_pollfds_fill(
+#endif
                     slirp_, &timeout,
                     [](int fd, int events, void* opaque) {
                         auto& v = static_cast<SlirpBackend*>(opaque)->fds_;
