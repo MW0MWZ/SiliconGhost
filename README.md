@@ -8,7 +8,8 @@
 An open-source emulator for the SGI **Indy** (IP22): MIPS R4400 CPU, the
 MC/HPC3/IOC2 chipset and **Newport (REX3)** graphics. The aim is to run the
 original boot PROM and IRIX unmodified, at or above the speed of the real
-machine. Linux is the primary host; macOS and Windows are planned.
+machine. Linux is the primary host; it also builds and runs on macOS, and
+builds for Windows.
 
 ## Status
 
@@ -289,16 +290,18 @@ with performance layers on top that must give exactly the same results:
   console.
 - IRIX 5.3 and NetBSD 9.0 are the systems tested so far; IRIX 6.5 and Linux
   have not been tried.
-- The recompiler covers x86-64 and AArch64 hosts on Linux; on macOS and
-  other hosts the (slower) block cache and interpreter run everything.
-  Linux is the host built and tested most; the AArch64 build has been
-  tested under emulation, not yet on Arm hardware.
+- The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
+  macOS); elsewhere the slower block cache and interpreter run everything.
+  Linux is the host tested most. macOS on Apple silicon has run the IRIX
+  desktop. The Windows build is cross-compiled with MinGW-w64 and tested
+  under Wine; a native Windows build (MSVC, SDL3, libslirp) has not been
+  tried yet.
 
 ## Roadmap
 
 - Newport 24-bit boards (XL24) and the remaining raster operations
 - IRIX 6.5; Linux/mips; NetBSD on the graphics console
-- macOS (including Apple silicon) and Windows builds
+- Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
 - Indigo² (IP22 "Fullhouse") machine profile
 
 ## Legal
