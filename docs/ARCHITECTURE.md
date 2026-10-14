@@ -186,7 +186,7 @@ clock after every 1 ms slice (`--timing`):
 | **M0** | Scaffold: bus, R4000 integer interpreter, TLB, tests, CLI | ✅ |
 | **M1** | CPU complete: FPU arithmetic (IEEE + unimplemented-op traps), CACHE ops + primary/secondary cache tag model sufficient for PROM diagnostics | ✅ |
 | **M2** | Chipset: MC, HPC3, IOC2/INT3, 8254, Z85230, DS1386, EEPROM. Event scheduler | ✅ PROM 5.3 boots to the System Maintenance Menu on the serial console |
-| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu with keyboard input; mouse pending |
+| **M3** | Newport + SDL3 front end, 8042 keyboard/mouse | ✅ graphical PROM menu; IRIX desktop with keyboard and mouse |
 | **M4** | WD33C93 SCSI, HPC3 SCSI DMA, disk and CD-ROM images | ✅ IRIX 5.3 installs from its CD and boots multi-user from disk (serial console) |
 | **M5** | Seeq ethernet, HAL2 audio, NVRAM persistence | networked IRIX desktop |
 | **M6** | Performance: threaded interpreter, fastmem, x86-64 JIT, idle skip | ≥100% of a 150 MHz R4400 Indy |

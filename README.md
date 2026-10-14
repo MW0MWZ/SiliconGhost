@@ -18,8 +18,9 @@ SiliconGhost is under active development. What works today:
   the System Maintenance Menu, on the serial console or on the Newport
   graphics console with the PS/2 keyboard.
 - **IRIX 5.3:** installs from its CD onto a blank disk image (labelled with
-  `fx`, as on real hardware) and boots multi-user to a login prompt on the
-  serial console.
+  `fx`, as on real hardware) and boots multi-user, on the serial console or
+  to the graphical login and the IRIX desktop (4Dwm, Toolchest, winterm) on
+  Newport, with the PS/2 keyboard and mouse.
 - **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
   TLB, exceptions, 32/64-bit addressing and cache tag operations.
 - **Speed:** hot code is translated to x86-64 machine code, and idle loops
@@ -27,8 +28,7 @@ SiliconGhost is under active development. What works today:
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
   host core.
 
-Not there yet: the IRIX desktop (Xsgi on Newport), the PS/2 mouse, Ethernet
-(Seeq 8003) and audio (HAL2). See [Roadmap](#roadmap).
+Not there yet: Ethernet (Seeq 8003) and audio (HAL2). See [Roadmap](#roadmap).
 
 ## Emulated hardware
 
@@ -41,8 +41,8 @@ Not there yet: the IRIX desktop (Xsgi on Newport), the PS/2 mouse, Ethernet
 | Serial | Zilog 85230 SCC (two ports) | working |
 | Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved on exit |
 | SCSI | WD33C93 with disk and CD-ROM targets | working |
-| Graphics | Newport (REX3, VC2, XMAP9, CMAP, RAMDAC) | PROM console works; IRIX X server untested |
-| Keyboard / mouse | 8042-compatible PS/2 | keyboard works; mouse pending |
+| Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | PROM console and the IRIX desktop work |
+| Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 8003 | stub |
 | Audio | HAL2 | stub |
 
@@ -86,6 +86,8 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 
+In the display window, click to capture the mouse; Ctrl+Alt+G releases it.
+
 ### Installing IRIX on a new disk
 
 IRIX CDs carry an SGI volume header and an EFS file system rather than
@@ -97,6 +99,13 @@ ISO 9660, so a raw dump of the disc is used as it is. To install:
    `repartition/rootdrive` and `label/sync`.
 3. Choose *Install System Software* from the maintenance menu and install
    from the CD-ROM as on a real Indy.
+
+Install with the graphics board present (no `--no-graphics`): IRIX only
+installs the Newport kernel driver and X server on a machine where it finds
+the board. To add them to a system installed without graphics, start
+*Install System Software* again with the board present, install
+`eoe1.sw.unix`, `eoe1.sw.gfx_lib` and `x_eoe.sw.Server`, and let it rebuild
+the kernel.
 
 With `--no-graphics`, an NVRAM set to `console=g` disables autoboot; choose
 *Start System* from the menu.
@@ -131,7 +140,7 @@ with performance layers on top that must give exactly the same results:
 
 ## Roadmap
 
-- IRIX desktop on Newport (Xsgi), PS/2 mouse
+- Newport: 24-bit (XL24) boards, remaining raster operations
 - Seeq 8003 Ethernet with a host network backend, HAL2 audio
 - IRIX 6.5
 - AArch64 recompiler; macOS and Windows builds
