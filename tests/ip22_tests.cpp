@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // IP22 chipset tests: MC, HPC3, IOC2/INT3 accessed at their physical addresses.
+#include <array>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@
 #include "cpu/r4000/r4000.h"
 #include "machine/ip22/indy.h"
 #include "mips_asm.h"
+#include "net/net_backend.h"
 #include "test.h"
 
 using namespace sg;
@@ -357,4 +359,113 @@ TEST(ip22_pbus_dma_follows_an_endless_empty_chain_without_hanging) {
     t.w32(kPbus0 + 0x1000, 0x30);
     t.m.run(1000000);
     CHECK_EQ(t.r32(kPbus0 + 0x1000), 2u);  // still going
+}
+
+namespace {
+constexpr u32 kEnetRxNdbp = 0x1FB94004, kEnetRxCtrl = 0x1FB95004, kEnetReset = 0x1FB95014;
+constexpr u32 kEnetTxNdbp = 0x1FB96004, kEnetTxCtrl = 0x1FB97004, kSeeq = 0x1FBD4000;
+constexpr u32 kOwn = 1u << 14, kTxDone = 1u << 15, kEop = 1u << 30, kEnd = 1u << 31, kXie = 1u << 29;
+
+// Records what the guest sends; frames for the guest are queued by hand.
+class LoopBackend final : public net::NetBackend {
+public:
+    void send(const u8* frame, std::size_t length) override { sent.emplace_back(frame, frame + length); }
+    void inject(const std::vector<u8>& frame) { deliver(frame.data(), frame.size()); }
+    std::vector<std::vector<u8>> sent;
+};
+
+struct EnetRig : IndyRig {
+    LoopBackend net;
+    EnetRig() {
+        w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        m.set_network(&net);
+        w32(kEnetReset, 3);  // reset the channels and clear the interrupt
+        w32(kEnetReset, 0);
+        const u8 mac[6] = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+        w32(kSeeq + 28, 0);  // transmit command: register bank 0
+        for (unsigned i = 0; i < 6; ++i) w32(kSeeq + 4 * i, mac[i]);
+        w32(kSeeq + 28, 0x08);  // interrupt when a frame has been sent
+        w32(kSeeq + 24, 0xA0);  // receive own address and broadcasts, interrupt on good frames
+    }
+    bool enet_irq() { return (r8(ioc_addr(0x80)) >> Ioc2::kL0Ethernet) & 1; }  // LOCAL0 status
+};
+
+std::vector<u8> test_frame(const std::array<u8, 6>& dst, std::size_t length) {
+    std::vector<u8> f(length);
+    for (std::size_t i = 0; i < length; ++i) f[i] = static_cast<u8>(i * 7 + 1);
+    std::copy(dst.begin(), dst.end(), f.begin());
+    return f;
+}
+}  // namespace
+
+TEST(ip22_ethernet_transmits_a_frame_across_descriptors) {
+    EnetRig t;
+    constexpr u32 kDesc = 0x08200000, kBuf = 0x08201000;
+    const std::vector<u8> frame = test_frame({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, 100);
+    for (std::size_t i = 0; i < frame.size(); ++i) t.m.bus().write<u8>(static_cast<u32>(kBuf + i), frame[i]);
+    t.w32(kDesc + 0, kBuf);  // the frame in two pieces
+    t.w32(kDesc + 4, 40);
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf + 40);
+    t.w32(kDesc + 20, kEnd | kEop | 60);
+    t.w32(kDesc + 24, 0);
+    t.w32(kEnetTxNdbp, kDesc);
+    t.w32(kEnetTxCtrl, 0x200);  // active
+    t.m.run(200000);
+    CHECK_EQ(t.net.sent.size(), 1u);
+    if (!t.net.sent.empty()) CHECK(t.net.sent[0] == frame);
+    CHECK(t.r32(kDesc + 4) & kTxDone);
+    CHECK(t.r32(kDesc + 20) & kTxDone);
+    CHECK_EQ(t.r32(kEnetTxCtrl), 0x08u);  // sent, no longer active
+    CHECK(t.enet_irq());
+    t.w32(kEnetReset, 2);  // clear the interrupt
+    CHECK(!t.enet_irq());
+}
+
+TEST(ip22_ethernet_receives_into_owned_descriptors_only) {
+    EnetRig t;
+    constexpr u32 kDesc = 0x08300000, kBuf0 = 0x08301000, kBuf1 = 0x08302000, kSize = 1586;
+    t.w32(kDesc + 0, kBuf0);
+    t.w32(kDesc + 4, kOwn | kXie | kSize);
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf1);
+    t.w32(kDesc + 20, kEnd | kOwn | kXie | kSize);  // end of the ring
+    t.w32(kDesc + 24, kDesc);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+
+    const std::array<u8, 6> us = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+    t.net.inject(test_frame({0x08, 0x00, 0x69, 0x00, 0x00, 0x02}, 80));  // for someone else: ignored
+    const std::vector<u8> mine = test_frame(us, 200);
+    t.net.inject(mine);
+    t.net.inject(test_frame({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, 40));  // broadcast, padded to 60
+    t.net.inject(test_frame(us, 100));  // no buffer left: lost
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 50));  // 20 ms
+
+    // First buffer: two bytes of padding, the frame, the status byte; OWN
+    // cleared and the unused count left behind.
+    const u32 c0 = t.r32(kDesc + 4);
+    CHECK(!(c0 & kOwn));
+    CHECK_EQ(c0 & 0x3FFF, kSize - (2 + 200 + 1));
+    bool same = true;
+    for (std::size_t i = 0; i < mine.size(); ++i) {
+        u8 b = 0;
+        t.m.bus().read<u8>(static_cast<u32>(kBuf0 + 2 + i), b);
+        same &= b == mine[i];
+    }
+    CHECK(same);
+    u8 status = 0;
+    t.m.bus().read<u8>(kBuf0 + 2 + 200, status);
+    CHECK_EQ(status, 0x30u);  // good frame, end of frame
+    CHECK_EQ(t.r32(kDesc + 20) & 0x3FFF, kSize - (2 + 60 + 1));
+    CHECK(!(t.r32(kEnetRxCtrl) & 0x200));  // stopped at the end of the ring
+    CHECK(t.enet_irq());
+    // Restarted on a buffer the driver has not handed back: nothing is written.
+    u32 before = t.r32(kBuf0 + 4);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+    t.net.inject(test_frame(us, 120));
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 100));
+    CHECK_EQ(t.r32(kBuf0 + 4), before);
+    CHECK_EQ(t.r32(kDesc + 4), c0);
 }

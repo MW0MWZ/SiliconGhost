@@ -3,9 +3,9 @@
 // SCSI and Ethernet DMA channels, interrupt status, the serial EEPROM, the
 // PBUS device windows (IOC2 on channel 6) and the DS1386 RTC/NVRAM.
 //
-// SCSI channel 0 (WD33C93 plus its DMA channel) and the PBUS DMA channels
-// serving the HAL2 audio processor are modelled; the Ethernet DMA engine and
-// the Seeq Ethernet controller are register storage for now.
+// SCSI channel 0 (WD33C93 plus its DMA channel), the PBUS DMA channels
+// serving the HAL2 audio processor and the Ethernet DMA channels with their
+// Seeq 8003 controller are modelled.
 #pragma once
 
 #include <array>
@@ -15,10 +15,15 @@
 
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
+#include "devices/seeq8003.h"
 #include "devices/wd33c93.h"
 #include "machine/ip22/hal2.h"
 #include "machine/ip22/ioc2.h"
 #include "mem/bus.h"
+
+namespace sg::net {
+class NetBackend;
+}
 
 namespace sg::ip22 {
 
@@ -36,6 +41,9 @@ public:
     Eeprom93Cxx& eeprom() { return eeprom_; }
     Wd33c93& scsi0() { return scsi0_; }
     Hal2& hal2() { return hal2_; }
+    Seeq8003& seeq() { return seeq_; }
+    // Ethernet frames go to and come from `backend` (null: no cable).
+    void set_network(net::NetBackend* backend);
 
     // Samples played by the HAL2 DAC (the top 16 bits of its 24-bit samples):
     // `frames` frames of `voices` interleaved samples at `rate` frames per
@@ -71,6 +79,21 @@ private:
     u32 pbus_read(u32 offset);
     void pbus_write(u32 offset, u32 value);
 
+    // Ethernet DMA: receive writes each accepted frame into the next
+    // descriptor(s); transmit sends a frame per end-of-packet descriptor,
+    // spaced by its time on a 10 Mbit/s wire.
+    struct EnetDma {
+        u32 cbp = 0, ndbp = 0, ctrl = 0;
+        bool active = false;
+    };
+    void enet_receive(const u8* frame, std::size_t length);
+    void enet_transmit();
+    void enet_poll();
+    void enet_interrupt();
+    void enet_reset();
+    u32 enet_read(u32 offset);
+    void enet_write(u32 offset, u32 value);
+
     Bus& bus_;
     Ioc2& ioc_;
     Scheduler& scheduler_;
@@ -86,6 +109,12 @@ private:
     std::array<PbusChannel, kPbusChannels> pbus_{};
     std::array<std::unique_ptr<Timer>, kPbusChannels> pbus_timer_;
     AudioSink audio_sink_;
+    Seeq8003 seeq_;
+    EnetDma enet_rx_, enet_tx_;
+    bool enet_irq_ = false, enet_loopback_ = false;
+    u32 enet_dconfig_ = 0, enet_pconfig_ = 0;
+    net::NetBackend* net_ = nullptr;
+    std::unique_ptr<Timer> enet_tx_timer_, enet_poll_timer_;
     u32 eeprom_reg_ = 0;
     std::unordered_map<u32, u32> regs_;  // registers without behaviour yet
 };

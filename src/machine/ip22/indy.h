@@ -60,6 +60,9 @@ public:
     Scheduler& scheduler() { return scheduler_; }
     Ds1386& rtc() { return hpc3_.rtc(); }
     Hpc3& hpc3() { return hpc3_; }
+    // The host side of the Ethernet port (null: unplugged); it must outlive
+    // the machine or be detached first.
+    void set_network(net::NetBackend* backend) { hpc3_.set_network(backend); }
     Ioc2& ioc() { return ioc_; }
     Mc& mc() { return mc_; }
     Newport* newport() { return config_.graphics ? &newport_ : nullptr; }

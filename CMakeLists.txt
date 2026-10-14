@@ -41,6 +41,7 @@ add_library(sg_emu STATIC
   src/devices/kbc8042.cpp
   src/devices/pit8254.cpp
   src/devices/scsi_disk.cpp
+  src/devices/seeq8003.cpp
   src/devices/wd33c93.cpp
   src/devices/z85230.cpp
   src/machine/ip22/hal2.cpp
@@ -49,9 +50,29 @@ add_library(sg_emu STATIC
   src/machine/ip22/ioc2.cpp
   src/machine/ip22/mc.cpp
   src/machine/ip22/newport.cpp
+  src/net/net_backend.cpp
+  src/net/slirp_backend.cpp
+  src/net/tap_backend.cpp
 )
 target_include_directories(sg_emu PUBLIC src)
 target_link_libraries(sg_emu PRIVATE sg_warnings)
+find_package(Threads REQUIRED)
+target_link_libraries(sg_emu PUBLIC Threads::Threads)
+
+# User-mode networking (optional)
+option(SG_WITH_SLIRP "Build user-mode networking with libslirp" ON)
+if(SG_WITH_SLIRP)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(SLIRP IMPORTED_TARGET slirp)
+  endif()
+  if(SLIRP_FOUND)
+    target_compile_definitions(sg_emu PRIVATE SG_HAVE_SLIRP=1)
+    target_link_libraries(sg_emu PUBLIC PkgConfig::SLIRP)
+  else()
+    message(STATUS "libslirp not found: building without user-mode networking")
+  endif()
+endif()
 
 # The FPU relies on the host rounding mode and exception flags.
 if(MSVC)

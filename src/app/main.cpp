@@ -17,6 +17,8 @@
 #include "core/pacer.h"
 #include "cpu/r4000/disasm.h"
 #include "machine/ip22/indy.h"
+#include "net/slirp_backend.h"
+#include "net/tap_backend.h"
 
 #if defined(SG_HAVE_SDL3)
 #include "app/display_sdl.h"
@@ -46,6 +48,14 @@ void usage(const char* argv0) {
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media\n"
                  "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n"
+                 "  --net MODE       user:     NAT through the host, no privileges needed (the default;\n"
+                 "                             the guest is 10.0.2.15, the host and gateway 10.0.2.2,\n"
+                 "                             DNS 10.0.2.3)\n"
+                 "                   tap:NAME: an existing Linux TAP interface\n"
+                 "                   none:     no cable\n"
+                 "  --hostfwd tcp|udp:HOSTPORT:GUESTPORT\n"
+                 "                   with --net user, forward a port on the host's loopback\n"
+                 "                   interface to the guest (may be repeated)\n"
                  "  --ram MB         memory size, 16..256 (default 64)\n"
                  "  --cpu-mhz N      R4400 pipeline clock (default 150)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only)\n"
@@ -187,6 +197,8 @@ int main(int argc, char** argv) {
     bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true, audio = true;
     const char* timing = nullptr;
     double max_speed = 2.0;
+    std::string net_mode = "user";
+    std::vector<sg::net::PortForward> forwards;
     sg::log::set_level(sg::log::Level::Warn);
 
     for (int i = 1; i < argc; ++i) {
@@ -212,6 +224,17 @@ int main(int argc, char** argv) {
             }
             for (unsigned k = 0; k < 6; ++k) mac[k] = static_cast<sg::u8>(b[k]);
             config.mac = mac;
+        }
+        else if (!std::strcmp(a, "--net")) net_mode = next();
+        else if (!std::strcmp(a, "--hostfwd")) {
+            char proto[4] = {};
+            unsigned host = 0, guest = 0;
+            if (std::sscanf(next(), "%3[a-z]:%u:%u", proto, &host, &guest) != 3 || (std::strcmp(proto, "tcp") && std::strcmp(proto, "udp")) ||
+                !host || host > 65535 || !guest || guest > 65535) {
+                std::fprintf(stderr, "error: --hostfwd expects tcp|udp:HOSTPORT:GUESTPORT\n");
+                return 2;
+            }
+            forwards.push_back({!std::strcmp(proto, "udp"), static_cast<sg::u16>(host), static_cast<sg::u16>(guest)});
         }
         else if (!std::strcmp(a, "--ram")) config.ram_mb = static_cast<unsigned>(std::strtoul(next(), nullptr, 0));
         else if (!std::strcmp(a, "--cpu-mhz")) config.cpu_hz = std::strtod(next(), nullptr) * 1.0e6;
@@ -250,8 +273,26 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::unique_ptr<sg::net::NetBackend> network;
+    {
+        std::string err;
+        if (net_mode == "user") {
+            if (sg::net::slirp_available()) network = sg::net::make_slirp_backend(forwards, err);
+            else if (!forwards.empty()) err = "--hostfwd needs user-mode networking, which this build lacks";
+        } else if (net_mode.rfind("tap:", 0) == 0) {
+            network = sg::net::make_tap_backend(net_mode.substr(4), err);
+        } else if (net_mode != "none") {
+            err = "--net expects user, tap:NAME or none";
+        }
+        if (!err.empty()) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 2;
+        }
+    }
+
     try {
         sg::ip22::Indy machine(config);
+        machine.set_network(network.get());
         std::string err;
         if (!machine.load_prom(prom, err)) {
             std::fprintf(stderr, "error: %s\n", err.c_str());
