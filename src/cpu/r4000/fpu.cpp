@@ -203,6 +203,29 @@ R host_eval(u32 rm, int& flags, Op op, Args... args) {
 }
 #endif
 
+// The integral value of `v` in rounding mode `mode` (FCR31.RM order:
+// nearest-even, toward zero, up, down). Computed exactly without the host's
+// rounding mode, since some C libraries round to integers with the x87
+// unit's setting rather than the one the arithmetic uses.
+double round_integral(double v, u32 mode) {
+    switch (mode & 3) {
+        case 1: return std::trunc(v);
+        case 2: return std::ceil(v);
+        case 3: return std::floor(v);
+        default: {
+            // From trunc() alone: v - trunc(v) is exact, so the comparison
+            // with one half is too (some round() implementations add 0.5
+            // first and round 0.49999999999999994 up).
+            const double t = std::trunc(v);
+            const double frac = std::fabs(v - t);
+            const double away = t + (v < 0 ? -1.0 : 1.0);
+            if (frac < 0.5) return t;
+            if (frac > 0.5) return away;
+            return std::fmod(t, 2.0) == 0 ? t : away;  // a tie: to the even neighbour
+        }
+    }
+}
+
 // Cause bits for host flags other than underflow, which is handled separately.
 u32 cause_from_host(int flags) {
     u32 c = 0;
@@ -367,7 +390,7 @@ void R4000::fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd) {
                 return;
             }
             const double v = static_cast<double>(fa);
-            const double r = host_eval<double>(mode, flags, [](double x) { return std::nearbyint(x); }, v);
+            const double r = round_integral(v, mode);
             const bool inexact = r != v;
             if (to_long) {
                 if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0)) {

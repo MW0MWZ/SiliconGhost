@@ -251,6 +251,19 @@ std::string make_image(unsigned blocks) {
     }
     return path;
 }
+// A disk image for one test, deleted when it goes out of scope: declared
+// before the devices that open it, it outlives them (an open file cannot
+// be deleted on every host).
+struct TempImage {
+    explicit TempImage(unsigned blocks) : path(make_image(blocks)) {}
+    ~TempImage() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    TempImage(const TempImage&) = delete;
+    TempImage& operator=(const TempImage&) = delete;
+    std::string path;
+};
 void wd_write(Wd33c93& wd, u8 reg, u8 v) {
     wd.write_address(reg);
     wd.write_data(v);
@@ -258,7 +271,8 @@ void wd_write(Wd33c93& wd, u8 reg, u8 v) {
 }  // namespace
 
 TEST(scsi_cdrom_inquiry_capacity_read) {
-    const std::string path = make_image(16);
+    const TempImage image(16);
+    const std::string& path = image.path;
     ScsiDisk cd(ScsiDisk::Kind::CdRom, path);
     CHECK(cd.ok());
     const u8 inquiry[6] = {0x12, 0, 0, 0, 36, 0};
@@ -277,11 +291,11 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     const u8 write10[10] = {0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0};
     r = cd.command(write10, 10);
     CHECK_EQ(r.status, 0x02);  // write-protected medium
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_select_and_transfer_dma) {
-    const std::string path = make_image(8);
+    const TempImage image(8);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -307,11 +321,11 @@ TEST(wd33c93_select_and_transfer_dma) {
     CHECK_EQ(wd.read_data(), 0x00);  // target status GOOD
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);  // select-and-transfer complete
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {
-    const std::string path = make_image(8);
+    const TempImage image(8);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -351,11 +365,11 @@ TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {
     }
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_select_with_atn_reports_selection_then_message_out) {
-    const std::string path = make_image(1);
+    const TempImage image(1);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -375,11 +389,11 @@ TEST(wd33c93_select_with_atn_reports_selection_then_message_out) {
     wd_write(wd, 0x18, 0x04);  // DISCONNECT: no interrupt
     clk.advance_to(300000);
     CHECK(!irq);
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_sync_negotiation_then_command) {
-    const std::string path = make_image(4);
+    const TempImage image(4);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -439,11 +453,11 @@ TEST(wd33c93_sync_negotiation_then_command) {
     CHECK_EQ(status(), 0x16);
     CHECK_EQ(memory.size(), 512u);
     if (!memory.empty()) CHECK_EQ(memory[0], 3);
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_message_in_whole_message_holds_ack_on_last_byte) {
-    const std::string path = make_image(1);
+    const TempImage image(1);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -484,11 +498,11 @@ TEST(wd33c93_message_in_whole_message_holds_ack_on_last_byte) {
     CHECK_EQ(status(), 0x20);  // ACK held on the last byte
     wd_write(wd, 0x18, 0x03);
     CHECK_EQ(status(), 0x8A);  // then COMMAND
-    std::filesystem::remove(path);
 }
 
 TEST(wd33c93_manual_phases_command_status_message) {
-    const std::string path = make_image(2);
+    const TempImage image(2);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -539,7 +553,6 @@ TEST(wd33c93_manual_phases_command_status_message) {
     CHECK_EQ(status(), 0x20);
     wd_write(wd, 0x18, 0x03);
     CHECK_EQ(status(), 0x85);  // target released the bus
-    std::filesystem::remove(path);
 }
 
 TEST(ds1386_year_counted_from_a_base) {
@@ -646,7 +659,8 @@ TEST(wd33c93_reset_line_release_interrupts_with_reset_status) {
 // A single-byte TRANSFER INFO (SBT) moves exactly one byte, offered
 // through DBR, and leaves the transfer count alone.
 TEST(wd33c93_single_byte_transfer_waits_for_its_byte) {
-    const std::string path = make_image(1);
+    const TempImage image(1);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -674,13 +688,13 @@ TEST(wd33c93_single_byte_transfer_waits_for_its_byte) {
     CHECK_EQ(wd.read_data(), 0x1A);  // transfer done, target now in COMMAND phase
     wd.write_address(0x14);
     CHECK_EQ(wd.read_data(), 0u);  // count untouched
-    std::filesystem::remove(path);
 }
 
 // With DMA, a data transfer waits while the host's DMA channel is not
 // running and goes on when it starts.
 TEST(wd33c93_dma_transfer_waits_for_the_host_channel) {
-    const std::string path = make_image(8);
+    const TempImage image(8);
+    const std::string& path = image.path;
     ScsiDisk disk(ScsiDisk::Kind::Disk, path);
     Clock clk;
     Wd33c93 wd(clk.sched, 150000.0);
@@ -715,5 +729,4 @@ TEST(wd33c93_dma_transfer_waits_for_the_host_channel) {
     if (!memory.empty()) CHECK_EQ(memory[0], 3);
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);
-    std::filesystem::remove(path);
 }

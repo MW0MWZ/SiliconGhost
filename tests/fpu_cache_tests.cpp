@@ -289,3 +289,23 @@ TEST(cp0_config_and_random_after_wired) {
     t.cpu.cp0_write(cop0::Wired, 8);
     CHECK_EQ(t.cpu.cp0_read(cop0::Random), 47ull);
 }
+
+// CVT.W.D in each rounding mode, ties included, as the R4000 rounds.
+TEST(fpu_convert_to_integer_in_every_rounding_mode) {
+    struct Case {
+        double v;
+        s32 want[4];  // RN, RZ, RP, RM
+    };
+    for (const Case c : {Case{2.5, {2, 2, 3, 2}}, Case{3.5, {4, 3, 4, 3}}, Case{-2.5, {-2, -2, -2, -3}},
+                         Case{-2.7, {-3, -2, -2, -3}}, Case{0.49999999999999994, {0, 0, 1, 0}},
+                         Case{-0.5, {0, 0, 0, -1}}, Case{1e9 + 0.5, {1000000000, 1000000000, 1000000001, 1000000000}}}) {
+        for (u32 rm = 0; rm < 4; ++rm) {
+            Rig t;
+            t.cpu.fcr31 = rm;
+            t.cpu.fpr[2] = dbits(c.v);
+            t.load({FOP(D, 0x24, 6, 2)});  // CVT.W.D
+            t.steps(1);
+            CHECK_EQ(static_cast<s32>(t.cpu.fpr[6] & 0xFFFFFFFF), c.want[rm]);
+        }
+    }
+}

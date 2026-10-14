@@ -14,6 +14,10 @@ option(SG_BUILD_TESTS "Build unit tests" ON)
 option(SG_WERROR "Treat warnings as errors" OFF)
 
 add_library(sg_warnings INTERFACE)
+if(MINGW)
+  # The C99-conforming printf family (%zu, %lld), as the code expects.
+  add_compile_definitions(__USE_MINGW_ANSI_STDIO=1)
+endif()
 if(MSVC)
   target_compile_options(sg_warnings INTERFACE /W4 /permissive- /Zc:__cplusplus)
   if(SG_WERROR)

@@ -27,7 +27,13 @@ constexpr u64 sext32(u64 v) { return static_cast<u64>(static_cast<s64>(static_ca
 #define SG_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define SG_FORCEINLINE inline __attribute__((always_inline))
 #define SG_NOINLINE __attribute__((noinline))
+// MinGW checks formats against the C99 printf it is built with
+// (__USE_MINGW_ANSI_STDIO), not Microsoft's.
+#if defined(__MINGW32__)
+#define SG_PRINTF(fmt_idx, arg_idx) __attribute__((format(gnu_printf, fmt_idx, arg_idx)))
+#else
 #define SG_PRINTF(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
+#endif
 #elif defined(_MSC_VER)
 #define SG_LIKELY(x) (x)
 #define SG_UNLIKELY(x) (x)
