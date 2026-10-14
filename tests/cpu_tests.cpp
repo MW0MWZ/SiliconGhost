@@ -1012,3 +1012,56 @@ TEST(cpu_status_write_that_unmasks_a_pending_interrupt_takes_it_at_once) {
     CHECK_EQ(reference.gpr[t2], 0u);
     CHECK_EQ(reference.gpr[t3], kCode + 8 * 4);
 }
+
+// FPU code under every engine: COP1 arithmetic, compares and conversions,
+// MTC1, and the FPU loads and stores (pre-decoded handlers) must behave as
+// in the interpreter, registers and memory alike.
+TEST(cpu_fpu_code_matches_interpreter_in_every_engine) {
+    auto fop = [](unsigned fmt, unsigned func, unsigned fd, unsigned fs, unsigned ft = 0) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    constexpr unsigned S = 16, D = 17, W = 20;
+    const u32 kMtc1 = (0x11u << 26) | (4u << 21);
+    const u32 kBc1t = (0x11u << 26) | (8u << 21) | (1u << 16);
+    auto run = [&](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.cpu.cp0_write(cop0::Status, sr::CU1);
+        t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+        t.cpu.gpr[t4] = 200;
+        t.load({
+            kMtc1 | (t0 << 16) | (0u << 11),   // loop: f0 = i (as an integer)
+            fop(W, 0x21, 2, 0),                // cvt.d.w f2, f0
+            I(0x35, s0, 4, 0),                 // ldc1 f4, 0(s0)
+            fop(D, 0x00, 4, 4, 2),             // add.d f4, f4, f2
+            fop(D, 0x02, 6, 2, 2),             // mul.d f6, f2, f2
+            fop(D, 0x00, 4, 4, 6),             // add.d f4, f4, f6
+            I(0x3D, s0, 4, 0),                 // sdc1 f4, 0(s0)
+            I(0x31, s0, 8, 8),                 // lwc1 f8, 8(s0)
+            fop(D, 0x20, 10, 2),               // cvt.s.d f10, f2
+            fop(S, 0x00, 8, 8, 10),            // add.s f8, f8, f10
+            I(0x39, s0, 8, 8),                 // swc1 f8, 8(s0)
+            fop(D, 0x3C, 0, 2, 6),             // c.lt.d f2, f6
+            kBc1t | 2,                         // bc1t +2
+            NOP,
+            ADDIU(t5, t5, 1),                  // counts i where !(i < i*i)
+            ADDIU(t0, t0, 1),
+            BNE(t0, t4, -17), NOP,             // -> loop
+            BEQ(zero, zero, -1), NOP,
+        });
+        t.cpu.run_until(200000);
+        return capture(t, 0x10000, 16);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK_EQ(reference.gpr[t0], 200u);
+    CHECK_EQ(reference.gpr[t5], 2u);
+    double acc;
+    std::memcpy(&acc, &reference.data[0], 8);  // stored big-endian by the guest
+    u64 bits = 0;
+    for (int i = 0; i < 8; ++i) bits = (bits << 8) | reference.data[i];
+    std::memcpy(&acc, &bits, 8);
+    CHECK(acc == 199.0 * 200 / 2 + 199.0 * 200 * 399 / 6);
+}

@@ -1371,6 +1371,41 @@ struct R4000::Ops {
     }
 
     static void other(R4000& c, const Op& o) { c.execute(o.inst); }
+
+    // FPU (COP1) operations and the FPU loads and stores, straight to their
+    // implementation rather than through execute() again.
+    static bool cop1_usable(R4000& c) {
+        c.touch();  // FPU state is not part of the idle-loop comparison
+        if (c.status_ & sr::CU1) return true;
+        c.raise(Exc::CpU, false, false, 1);
+        return false;
+    }
+    template <typename F>
+    static void cop1_fmt(R4000& c, const Op& o) {  // arithmetic, compares, conversions (.S, .D)
+        if (cop1_usable(c)) c.fp_compute<F>(o.inst & 63, o.rt, o.rd, o.sa);
+    }
+    static void mfc1(R4000& c, const Op& o) {
+        if (cop1_usable(c)) c.gpr[o.rt] = sext32(c.fpr_read32(o.rd));
+    }
+    static void mtc1(R4000& c, const Op& o) {
+        if (cop1_usable(c)) c.fpr_write32(o.rd, static_cast<u32>(c.gpr[o.rt]));
+    }
+    template <unsigned kOpcode>
+    static void fp_mem(R4000& c, const Op& o) {  // LWC1, LDC1, SWC1, SDC1
+        if (!cop1_usable(c)) return;
+        const u64 va = c.effective_address(c.gpr[o.rs], simm(o));
+        if constexpr (kOpcode == 0x31) {
+            u32 v;
+            if (c.load<u32>(va, v)) c.fpr_write32(o.rt, v);
+        } else if constexpr (kOpcode == 0x35) {
+            u64 v;
+            if (c.load<u64>(va, v)) c.fpr_write64(o.rt, v);
+        } else if constexpr (kOpcode == 0x39) {
+            c.store<u32>(va, c.fpr_read32(o.rt));
+        } else {
+            c.store<u64>(va, c.fpr_read64(o.rt));
+        }
+    }
     static void nop(R4000&, const Op&) {}
 
     // Immediate ALU
@@ -1550,6 +1585,14 @@ R4000::Handler R4000::decode(u32 w, bool& plain) {
         case 0x0D: return pure(Ops::ori, f_rt(w));
         case 0x0E: return pure(Ops::xori, f_rt(w));
         case 0x0F: return pure(Ops::lui, f_rt(w));
+        case 0x11:  // COP1
+            switch (f_rs(w)) {
+                case 0x00: return Ops::mfc1;
+                case 0x04: return Ops::mtc1;
+                case 0x10: return Ops::cop1_fmt<float>;
+                case 0x11: return Ops::cop1_fmt<double>;
+                default: return Ops::other;  // branches, control registers, W/L conversions
+            }
         case 0x14: return Ops::beql;
         case 0x15: return Ops::bnel;
         case 0x19: return Ops::daddiu;
@@ -1562,6 +1605,10 @@ R4000::Handler R4000::decode(u32 w, bool& plain) {
         case 0x28: return Ops::store<u8>;
         case 0x29: return Ops::store<u16>;
         case 0x2B: return Ops::store<u32>;
+        case 0x31: return Ops::fp_mem<0x31>;
+        case 0x35: return Ops::fp_mem<0x35>;
+        case 0x39: return Ops::fp_mem<0x39>;
+        case 0x3D: return Ops::fp_mem<0x3D>;
         case 0x37: return Ops::load<u64, false, true>;  // LD
         case 0x3F: return Ops::store<u64, true>;        // SD
         default: return Ops::other;

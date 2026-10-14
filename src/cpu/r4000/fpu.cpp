@@ -135,41 +135,54 @@ SG_FORCEINLINE u32 get_fp_control() {
 }
 SG_FORCEINLINE void set_fp_control(u32 v) { asm volatile("ldmxcsr %0" : : "m"(v)); }
 
+// The host's MXCSR with no exception flags and rounding to nearest, as the
+// emulator itself runs. Each guest operation starts from it with its own
+// rounding mode, so flags left over from host code never leak in; the host's
+// leftover flags are not restored (nothing on the host reads them).
+const u32 kHostFpBase = get_fp_control() & ~0x603Fu;
+
 template <typename R, typename Op, typename... Args>
 R host_eval(u32 rm, int& flags, Op op, Args... args) {
     // MXCSR: exception flags in bits 5:0, rounding control in bits 14:13
     // (nearest, down, up, toward zero).
     static constexpr u32 kRound[4] = {0u << 13, 3u << 13, 2u << 13, 1u << 13};  // guest RN, RZ, RP, RM
-    const u32 saved = get_fp_control();
-    set_fp_control((saved & ~0x603Fu) | kRound[rm & 3]);
+    const u32 round = kRound[rm & 3];
+    set_fp_control(kHostFpBase | round);
     (fp_barrier(args), ...);
     R r = op(args...);
     fp_barrier(r);
     const u32 status = get_fp_control();
-    set_fp_control(saved);
+    if (round) set_fp_control(kHostFpBase);  // back to nearest for the host
     flags = ((status & 0x01) ? FE_INVALID : 0) | ((status & 0x04) ? FE_DIVBYZERO : 0) |
             ((status & 0x08) ? FE_OVERFLOW : 0) | ((status & 0x10) ? FE_UNDERFLOW : 0) |
             ((status & 0x20) ? FE_INEXACT : 0);
     return r;
 }
 #elif defined(SG_DIRECT_FENV) && defined(__aarch64__)
+// The host's FPCR with rounding to nearest, as the emulator itself runs; see
+// the x86-64 version. FPSR's cumulative flags are cleared before each
+// operation and not restored.
+u64 read_fpcr() {
+    u64 v;
+    asm volatile("mrs %0, fpcr" : "=r"(v));
+    return v;
+}
+const u64 kHostFpcr = read_fpcr() & ~(3ull << 22);
+
 template <typename R, typename Op, typename... Args>
 R host_eval(u32 rm, int& flags, Op op, Args... args) {
     // FPCR rounding mode in bits 23:22 (nearest, +inf, -inf, toward zero);
     // FPSR cumulative flags IOC, DZC, OFC, UFC, IXC in bits 4:0.
     static constexpr u64 kRound[4] = {0ull << 22, 3ull << 22, 1ull << 22, 2ull << 22};  // guest RN, RZ, RP, RM
-    u64 fpcr, fpsr;
-    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
-    asm volatile("mrs %0, fpsr" : "=r"(fpsr));
-    asm volatile("msr fpcr, %0" : : "r"((fpcr & ~(3ull << 22)) | kRound[rm & 3]));
-    asm volatile("msr fpsr, %0" : : "r"(fpsr & ~0x9Full));
+    const u64 round = kRound[rm & 3];
+    if (round) asm volatile("msr fpcr, %0" : : "r"(kHostFpcr | round));
+    asm volatile("msr fpsr, xzr");
     (fp_barrier(args), ...);
     R r = op(args...);
     fp_barrier(r);
     u64 status;
     asm volatile("mrs %0, fpsr" : "=r"(status));
-    asm volatile("msr fpsr, %0" : : "r"(fpsr));
-    asm volatile("msr fpcr, %0" : : "r"(fpcr));
+    if (round) asm volatile("msr fpcr, %0" : : "r"(kHostFpcr));
     flags = ((status & 0x01) ? FE_INVALID : 0) | ((status & 0x02) ? FE_DIVBYZERO : 0) |
             ((status & 0x04) ? FE_OVERFLOW : 0) | ((status & 0x08) ? FE_UNDERFLOW : 0) |
             ((status & 0x10) ? FE_INEXACT : 0);
@@ -471,5 +484,9 @@ void R4000::execute_cop1(u32 inst) {
         default: raise(Exc::RI); return;
     }
 }
+
+// Used by the pre-decoded COP1 handlers (r4000.cpp).
+template void R4000::fp_compute<float>(unsigned, unsigned, unsigned, unsigned);
+template void R4000::fp_compute<double>(unsigned, unsigned, unsigned, unsigned);
 
 }  // namespace sg::mips
