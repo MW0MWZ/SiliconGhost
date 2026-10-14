@@ -62,10 +62,20 @@ void R4000::set_jit(bool enabled) {
     if (enabled && !jit_buf_) {
         constexpr std::size_t kJitBufferSize = 32u << 20;
         jit_buf_ = std::make_unique<jit::ExecBuffer>(kJitBufferSize);
-        if (!jit_buf_->ok() || !jit_compile_supported()) jit_buf_.reset();
+        if (!jit_buf_->ok() || !jit_compile_supported()) {
+            jit_buf_.reset();
+            SG_LOG(Info, "cpu", "recompiler not available on this host: running the block cache");
+        } else {
+#if defined(__aarch64__)
+            SG_LOG(Info, "cpu", "recompiler on (AArch64)");
+#else
+            SG_LOG(Info, "cpu", "recompiler on (x86-64)");
+#endif
+        }
     } else if (!enabled && jit_buf_) {
         jit_flush();
         jit_buf_.reset();
+        SG_LOG(Info, "cpu", "recompiler off");
     }
 }
 

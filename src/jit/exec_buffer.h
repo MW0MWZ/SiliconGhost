@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Memory for generated code. The same pages are mapped twice, writable and
-// executable, so no mapping is ever both (W^X); code is written through one
-// view and run through the other.
+// Memory for generated code, never writable and executable at once (W^X).
+// Linux: the same pages are mapped twice, writable and executable; code is
+// written through one view and run through the other. macOS: one MAP_JIT
+// mapping, made writable for the calling thread while code is copied in.
+// Elsewhere there is no buffer (ok() is false) and the recompiler is off.
 #pragma once
 
 #include <cstddef>
