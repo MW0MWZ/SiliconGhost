@@ -228,3 +228,95 @@ TEST(newport_display_version_tracks_visible_changes) {
     t.cmap_entry(0x42, 0x123456);
     CHECK(t.np.display_version() != v2);
 }
+
+// The incremental, table-driven render() gives exactly what the plain
+// conversion (render_full()) gives: random display modes per DID, random
+// DID layouts, maps and gamma, drawing in every plane, a moving cursor, and
+// changes between pictures.
+TEST(newport_render_matches_the_reference_conversion) {
+    u32 seed = 12345;
+    auto rnd = [&](u32 n) {
+        seed = seed * 1664525u + 1013904223u;
+        return (seed >> 8) % n;
+    };
+    for (int round = 0; round < 6; ++round) {
+        Rig t;
+        constexpr unsigned kW = 60, kH = 40;  // visible size (the pipeline adds 2 clocks)
+        t.vc2_ram(0x000, {static_cast<u16>(0x8080 | ((kW + 2) << 7))});
+        t.vc2_ram(0x400, {0x000, kH, 0, 0});
+        // DID table: a pointer per line, then 0-3 runs per line
+        std::vector<u16> ptrs;
+        for (unsigned y = 0; y < kH; ++y) {
+            const u16 at = static_cast<u16>(0x800 + y * 8);
+            ptrs.push_back(at);
+            std::vector<u16> recs;
+            unsigned x = 0;
+            for (unsigned n = rnd(4); n > 0; --n) {
+                x += rnd(30);
+                recs.push_back(static_cast<u16>((x << 5) | rnd(32)));
+            }
+            recs.push_back(0xFFE0);
+            for (std::size_t k = 0; k < recs.size(); ++k) t.vc2_ram(static_cast<u16>(at + k), {recs[k]});
+        }
+        for (unsigned y = 0; y < kH; ++y) t.vc2_ram(0x600 + y, {ptrs[y]});
+        for (u32 d = 0; d < 32; ++d) t.xmap_mode(d, rnd(0x1000000) & 0x07FFFF);
+        for (int i = 0; i < 300; ++i) t.cmap_entry(rnd(0x2000), rnd(0x1000000));
+        auto gamma = [&] {
+            for (int i = 0; i < 20; ++i) {
+                t.w(kDcbMode, width(1) | crs(0) | slave(7));
+                t.w(kDcbData0, rnd(256) << 24);
+                t.w(kDcbMode, width(3) | crs(1) | slave(7));
+                t.w(kDcbData0, rnd(0x1000000) << 8);
+            }
+        };
+        gamma();
+        // cursor glyph and position
+        for (u16 a = 0; a < 256; ++a) t.vc2_ram(static_cast<u16>(0x3000 + a), {static_cast<u16>(rnd(0x10000))});
+        t.vc2_reg(0x01, 0x3000);
+        auto move_cursor = [&] {
+            t.vc2_reg(0x02, rnd(kW + 40));
+            t.vc2_reg(0x03, rnd(kH + 40));
+        };
+        move_cursor();
+        t.vc2_reg(0x05, 0x600);  // DID entry
+        t.vc2_reg(0x1F, 1);
+        t.vc2_reg(0x00, 0x400);
+        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080 | (round % 2 ? 0x0200 : 0));  // display, timing, DID, cursor
+        t.w(kTopScan, 0x3FF);
+        t.w(kXYWin, 0x10001000);
+        auto draw = [&](int n) {
+            for (int i = 0; i < n; ++i) {
+                static constexpr u32 kPlanes[] = {1, 1, 1, 4, 5, 6};
+                const u32 planes = kPlanes[rnd(6)], depth = rnd(4);
+                t.w(kDrawMode1, (3u << 28) | (depth << 3) | planes);
+                t.w(kWrMask, 0xFFFFFF);
+                t.w(kColorI, rnd(0x1000000));
+                const u32 x0 = rnd(kW + 4), y0 = rnd(kH), x1 = x0 + rnd(20), y1 = y0 + rnd(10);
+                t.w(kXYStartI, (x0 << 16) | y0);
+                t.w(kXYEndI, (x1 << 16) | y1);
+                t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9));
+            }
+        };
+        draw(40);
+        std::vector<u32> fast, ref;
+        unsigned fw = 0, fh = 0, rw = 0, rh = 0;
+        auto compare = [&] {
+            CHECK(t.np.render(fast, fw, fh));
+            CHECK(t.np.render_full(ref, rw, rh));
+            CHECK_EQ(fw, rw);
+            CHECK_EQ(fh, rh);
+            CHECK(fast == ref);
+        };
+        compare();
+        for (int step = 0; step < 12; ++step) {
+            switch (rnd(5)) {
+                case 0: draw(1 + static_cast<int>(rnd(5))); break;
+                case 1: move_cursor(); break;
+                case 2: t.cmap_entry(rnd(0x2000), rnd(0x1000000)); break;
+                case 3: gamma(); break;
+                default: t.w(kTopScan, (0x3FF + rnd(8)) & 0x3FF); break;
+            }
+            compare();
+        }
+    }
+}
