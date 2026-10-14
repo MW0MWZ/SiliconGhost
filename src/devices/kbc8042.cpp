@@ -34,6 +34,8 @@ void Kbc8042::reset() {
     pending_ = Pending::None;
     kbd_arg_command_ = mouse_arg_command_ = 0;
     scan_set_ = 2;
+    mouse_reporting_ = false;
+    mouse_buttons_ = 0;
     update_irq();
 }
 
@@ -164,6 +166,7 @@ void Kbc8042::mouse_command(u8 value) {
     }
     switch (value) {
         case 0xFF:  // reset
+            mouse_reporting_ = false;
             push(kAck, true);
             push(kSelfTestPassed, true);
             push(0x00, true);
@@ -172,9 +175,20 @@ void Kbc8042::mouse_command(u8 value) {
             push(kAck, true);
             push(0x00, true);
             break;
-        case 0xE9:  // status request
+        case 0xF4:  // enable data reporting
+            mouse_reporting_ = true;
             push(kAck, true);
-            push(0x00, true);
+            break;
+        case 0xF5:  // disable data reporting
+        case 0xF6:  // set defaults
+            mouse_reporting_ = false;
+            push(kAck, true);
+            break;
+        case 0xE9:  // status request: stream mode, scaling 1:1, 4 counts/mm, 100 samples/s
+            push(kAck, true);
+            push(static_cast<u8>((mouse_reporting_ ? 0x20 : 0x00) | (mouse_buttons_ & 1 ? 4 : 0) |
+                                 (mouse_buttons_ & 4 ? 2 : 0) | (mouse_buttons_ & 2 ? 1 : 0)),
+                 true);
             push(0x02, true);
             push(0x64, true);
             break;
@@ -193,6 +207,23 @@ void Kbc8042::key_input(u8 scancode) {
 
 void Kbc8042::mouse_input(u8 byte) {
     if (!(command_byte_ & kCmdAuxDisable)) push(byte, true);
+}
+
+void Kbc8042::mouse_motion(int dx, int dy, unsigned buttons) {
+    if (!mouse_reporting_ || (command_byte_ & kCmdAuxDisable)) return;
+    buttons &= 7;
+    do {
+        // Movement is a 9-bit two's complement count per packet.
+        const int px = dx < -256 ? -256 : dx > 255 ? 255 : dx;
+        const int py = dy < -256 ? -256 : dy > 255 ? 255 : dy;
+        dx -= px;
+        dy -= py;
+        const u8 first = static_cast<u8>(0x08 | buttons | (px < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0));
+        push(first, true);
+        push(static_cast<u8>(px & 0xFF), true);
+        push(static_cast<u8>(py & 0xFF), true);
+    } while (dx != 0 || dy != 0);
+    mouse_buttons_ = buttons;
 }
 
 }  // namespace sg

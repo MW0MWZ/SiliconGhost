@@ -88,6 +88,84 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
     kbc.key_input(k.set2);
 }
 
+// PS/2 mouse fed from the window: a click captures the pointer (relative
+// mode), Ctrl+Alt+G or losing focus releases it. Motion is gathered per
+// frame and sent as one movement; button changes are sent at once.
+class MouseCapture {
+public:
+    MouseCapture(SDL_Window* window, ip22::Indy& machine) : window_(window), machine_(machine) { update_title(); }
+
+    // True if the event was consumed.
+    bool handle(const SDL_Event& ev) {
+        switch (ev.type) {
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP: {
+                if (!captured_) {
+                    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) set_captured(true);
+                    return true;
+                }
+                const unsigned bit = ev.button.button == SDL_BUTTON_LEFT    ? 1u
+                                     : ev.button.button == SDL_BUTTON_RIGHT ? 2u
+                                     : ev.button.button == SDL_BUTTON_MIDDLE ? 4u
+                                                                             : 0u;
+                if (!bit) return true;
+                buttons_ = ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? (buttons_ | bit) : (buttons_ & ~bit);
+                flush(true);
+                return true;
+            }
+            case SDL_EVENT_MOUSE_MOTION:
+                if (captured_) {
+                    dx_ += ev.motion.xrel;
+                    dy_ += ev.motion.yrel;
+                }
+                return true;
+            case SDL_EVENT_KEY_DOWN:
+                if (captured_ && ev.key.scancode == SDL_SCANCODE_G && (ev.key.mod & SDL_KMOD_CTRL) &&
+                    (ev.key.mod & SDL_KMOD_ALT)) {
+                    set_captured(false);
+                    return true;
+                }
+                return false;
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                set_captured(false);
+                return false;
+            default: return false;
+        }
+    }
+
+    // Sends the motion gathered since the last call (or the buttons, if forced).
+    void flush(bool force = false) {
+        const int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
+        if (!force && x == 0 && y == 0) return;
+        dx_ -= static_cast<float>(x);
+        dy_ -= static_cast<float>(y);
+        machine_.ioc().kbc().mouse_motion(x, -y, buttons_);  // PS/2 counts up as positive
+    }
+
+private:
+    void set_captured(bool on) {
+        if (on == captured_) return;
+        captured_ = on;
+        SDL_SetWindowRelativeMouseMode(window_, on);
+        if (!on && buttons_) {
+            buttons_ = 0;
+            flush(true);
+        }
+        dx_ = dy_ = 0;
+        update_title();
+    }
+    void update_title() {
+        SDL_SetWindowTitle(window_, captured_ ? "SiliconGhost - Ctrl+Alt+G releases the mouse"
+                                              : "SiliconGhost - click to capture the mouse");
+    }
+
+    SDL_Window* window_;
+    ip22::Indy& machine_;
+    bool captured_ = false;
+    unsigned buttons_ = 0;
+    float dx_ = 0, dy_ = 0;
+};
+
 }  // namespace
 
 bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop) {
@@ -103,6 +181,7 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         return false;
     }
     SDL_SetRenderLogicalPresentation(renderer, 1280, 1024, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+    MouseCapture mouse(window, machine);
     SDL_Texture* texture = nullptr;
     unsigned tex_w = 0, tex_h = 0;
     std::vector<u32> pixels;
@@ -123,9 +202,11 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_EVENT_QUIT) stop = 1;
+            else if (mouse.handle(ev)) continue;
             else if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
                 send_key(machine, ev.key.scancode, ev.type == SDL_EVENT_KEY_DOWN);
         }
+        mouse.flush();
 
         unsigned w = 0, h = 0;
         const bool signal = machine.newport() && machine.newport()->render(pixels, w, h);

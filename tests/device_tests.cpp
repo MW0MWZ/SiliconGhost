@@ -8,6 +8,7 @@
 #include "core/scheduler.h"
 #include "devices/ds1386.h"
 #include "devices/eeprom93cxx.h"
+#include "devices/kbc8042.h"
 #include "devices/pit8254.h"
 #include "devices/scsi_disk.h"
 #include "devices/wd33c93.h"
@@ -555,4 +556,57 @@ TEST(ds1386_power_on_discards_saved_clock_registers) {
     rtc.write(Ds1386::kRegCommand, 0x80);
     CHECK_EQ(rtc.read(0xA), 0x83);  // 2023
     CHECK_EQ(rtc.read(0x4), 0x22);
+}
+
+namespace {
+// Sends a byte to the mouse through the controller and returns its replies.
+std::vector<u8> to_mouse(Kbc8042& k, u8 value) {
+    k.write_command(0xD4);
+    k.write_data(value);
+    std::vector<u8> out;
+    while (k.read_status() & 0x01) {
+        CHECK(k.read_status() & 0x20);  // from the auxiliary device
+        out.push_back(k.read_data());
+    }
+    return out;
+}
+}  // namespace
+
+TEST(kbc_mouse_reports_movement_only_when_enabled) {
+    Kbc8042 k;
+    bool irq = false;
+    k.set_irq_callback([&](bool a) { irq = a; });
+    k.write_command(0x60);
+    k.write_data(0x47);  // keyboard and mouse interrupts on
+    CHECK(to_mouse(k, 0xFF) == (std::vector<u8>{0xFA, 0xAA, 0x00}));
+    k.mouse_motion(5, 5, 0);
+    CHECK(!(k.read_status() & 0x01));  // reporting is off after reset
+    CHECK(to_mouse(k, 0xF4) == std::vector<u8>{0xFA});
+    k.mouse_motion(3, -2, 1);  // left button, right and down
+    CHECK(irq);
+    CHECK_EQ(k.read_data(), 0x08u | 0x01u | 0x20u);
+    CHECK_EQ(k.read_data(), 3u);
+    CHECK_EQ(k.read_data(), 0xFEu);
+    CHECK(!irq);
+    CHECK(to_mouse(k, 0xE9) == (std::vector<u8>{0xFA, 0x24, 0x02, 0x64}));  // enabled, left held
+    CHECK(to_mouse(k, 0xF5) == std::vector<u8>{0xFA});
+    k.mouse_motion(1, 1, 0);
+    CHECK(!(k.read_status() & 0x01));
+}
+
+TEST(kbc_mouse_splits_large_movements_into_packets) {
+    Kbc8042 k;
+    to_mouse(k, 0xF4);
+    k.mouse_motion(-300, 600, 4);
+    std::vector<u8> b;
+    while (k.read_status() & 0x01) b.push_back(k.read_data());
+    CHECK_EQ(b.size(), 9u);
+    int x = 0, y = 0;
+    for (std::size_t i = 0; i + 2 < b.size(); i += 3) {
+        CHECK_EQ(b[i] & 0x0Fu, 0x08u | 0x04u);
+        x += (b[i] & 0x10) ? static_cast<int>(b[i + 1]) - 256 : b[i + 1];
+        y += (b[i] & 0x20) ? static_cast<int>(b[i + 2]) - 256 : b[i + 2];
+    }
+    CHECK_EQ(x, -300);
+    CHECK_EQ(y, 600);
 }
