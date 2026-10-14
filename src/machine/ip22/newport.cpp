@@ -1109,7 +1109,12 @@ unsigned Newport::cursor_pixel(int x, int y) const {
 bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(vc2_.reg[kVc2Config] & 1) || !(dcr & kDcrVTiming) || !screen_size(width, height)) return false;
-    width = std::min(width, 2048u);
+    // The first pixel clocks of each active line fill the display pipeline;
+    // software allows for it by placing the screen that far into the
+    // framebuffer (XYWIN x = 0x1002), and the timing tables count them.
+    constexpr unsigned kPipelineDelay = 2;
+    if (width <= kPipelineDelay) return false;
+    width = std::min(width - kPipelineDelay, 2048u);
     height = std::min(height, 2048u);
     argb.assign(static_cast<std::size_t>(width) * height, 0xFF000000u);
     if (!(dcr & kDcrDisplay)) return true;  // blanked
@@ -1132,7 +1137,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
         u32* out = &argb[static_cast<std::size_t>(y) * width];
         std::size_t rec = 0;
         u8 did = 0;
-        for (unsigned x = 0; x < width; ++x) {
+        for (unsigned ox = 0; ox < width; ++ox) {
+            const unsigned x = ox + kPipelineDelay;  // scan-out position
             while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
             const u32 mode = xm.mode[did];
             const std::size_t idx = static_cast<std::size_t>(row) * kPitch + x;
@@ -1170,7 +1176,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                 rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
                       ramdac_.lut[2][rgb & 0xFF];
             }
-            out[x] = 0xFF000000u | rgb;
+            out[ox] = 0xFF000000u | rgb;
         }
     }
     return true;

@@ -108,8 +108,10 @@ TEST(newport_block_fill_and_host_read) {
 
 TEST(newport_scanout_through_vc2_xmap_cmap) {
     Rig t;
-    // 4x2 visible screen: frame table at 0x400 -> line sequence at 0 for 2 lines.
-    t.vc2_ram(0x000, {0x8280});        // EOL, 2 x 2 pixels visible, no second word
+    // 4x2 visible screen: frame table at 0x400 -> line sequence at 0 for 2
+    // lines of 6 active pixel clocks, the first two of which fill the
+    // display pipeline (so the screen starts at frame buffer column 2).
+    t.vc2_ram(0x000, {0x8380});        // EOL, 6 pixels visible, no second word
     t.vc2_ram(0x400, {0x000, 2, 0, 0});
     t.vc2_reg(0x1F, 1);                // release soft reset
     t.vc2_reg(0x00, 0x400);            // video entry
@@ -118,6 +120,8 @@ TEST(newport_scanout_through_vc2_xmap_cmap) {
     t.cmap_entry(0x42, 0x123456);
     t.w(kTopScan, 0x3FF);              // first displayed line is frame buffer row 0
     t.w(kXYWin, 0x10001000);
+    t.fill(0, 0, 1, 1, 0x17);          // the columns hidden by the pipeline
+    t.w(kXYWin, 0x10021000);           // as IRIX and the PROM set it
     t.fill(0, 0, 3, 1, 0x42);
     std::vector<u32> px;
     unsigned w = 0, h = 0;
