@@ -628,6 +628,10 @@ void Newport::store(int px, int py, u32 colour) {
         }
     }
     // Blending is not modelled yet: blended pixels are written as the source colour.
+    if ((drawmode1_ & kDm1Blend) && !warned_blend_) {
+        warned_blend_ = true;
+        SG_LOG(Debug, "newport", "blending requested (drawmode1 %08x); drawn unblended", drawmode1_);
+    }
     const u32 mask = wrmask_ & (opts_.xl24 ? 0xFFFFFFu : 0xFFu);
     dst = (dst & ~mask) | (v & mask);
 }
@@ -690,6 +694,10 @@ void Newport::draw_line() {
     // Integer Bresenham between the start and end points. Fractional (F_LINE)
     // and antialiased (A_LINE) lines use the integer endpoints for now.
     const u32 octant = (bresoctinc1_ >> 24) & 7;
+    if (((drawmode0_ >> 2) & 7) == 4 && !warned_aline_) {
+        warned_aline_ = true;
+        SG_LOG(Debug, "newport", "antialiased line requested; drawn as a plain line");
+    }
     const int x1 = int_part(xstart_), y1 = int_part(ystart_), x2 = int_part(xend_), y2 = int_part(yend_);
     const bool xmajor = octant & 4;
     const int sx_step = (octant & 2) ? -1 : 1, sy_step = (octant & 1) ? -1 : 1;
