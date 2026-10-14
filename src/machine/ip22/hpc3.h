@@ -84,6 +84,7 @@ private:
     // spaced by its time on a 10 Mbit/s wire.
     struct EnetDma {
         u32 cbp = 0, ndbp = 0, ctrl = 0;
+        u32 cdp = 0;  // descriptor last fetched (where receiving stopped)
         bool active = false;
     };
     void enet_receive(const u8* frame, std::size_t length);

@@ -59,6 +59,9 @@ constexpr u32 kPbusStatActive = 1u << 1;
 // Ethernet DMA (receive channel at 0x14000, transmit at 0x16000) and the
 // Seeq's registers on 4-byte strides
 constexpr u32 kEnetStart = 0x14000, kEnetEnd = 0x18000;
+// The receive channel's current descriptor: where receiving stopped (IRIX
+// restarts after it once the driver has caught up).
+constexpr u32 kEnetRxCurDesc = 0x18000;
 constexpr u32 kEnetRxCbp = 0x14000, kEnetRxNdbp = 0x14004, kEnetRxBcd = 0x15000, kEnetRxCtrl = 0x15004;
 constexpr u32 kEnetReset = 0x15014, kEnetDmaCfg = 0x15018, kEnetPioCfg = 0x1501C;
 constexpr u32 kEnetTxCbp = 0x16000, kEnetTxNdbp = 0x16004, kEnetTxBcd = 0x17000, kEnetTxCtrl = 0x17004;
@@ -112,7 +115,7 @@ void Hpc3::reset() {
     enet_reset();
     enet_loopback_ = false;
     enet_dconfig_ = enet_pconfig_ = 0;
-    enet_rx_.cbp = enet_rx_.ndbp = enet_tx_.cbp = enet_tx_.ndbp = 0;
+    enet_rx_.cbp = enet_rx_.ndbp = enet_rx_.cdp = enet_tx_.cbp = enet_tx_.ndbp = 0;
     if (net_) enet_poll_timer_->schedule_in(static_cast<u64>(cpu_hz_ / 1000));
 }
 
@@ -169,6 +172,7 @@ void Hpc3::enet_receive(const u8* frame, std::size_t length) {
     bool irq = false;
     for (int descs = 0; descs < 64; ++descs) {
         const u32 desc = enet_rx_.ndbp;
+        enet_rx_.cdp = desc;
         u32 pbuf = 0, cnt = 0, next = 0;
         bus_.read<u32>(desc, pbuf);
         bus_.read<u32>(desc + 4, cnt);
@@ -592,6 +596,7 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
 u32 Hpc3::read_word(u32 offset) {
     if (offset < kPbusDmaEnd) return pbus_read(offset);
     if (offset >= kEnetStart && offset < kEnetEnd) return enet_read(offset);
+    if (offset == kEnetRxCurDesc) return enet_rx_.cdp;
     if (offset >= kSeeqWindow && offset < kSeeqWindowEnd) return seeq_.read((offset - kSeeqWindow) >> 2);
     if (offset >= kHal2Window && offset < kHal2WindowEnd) return hal2_.read(offset - kHal2Window);
     switch (offset) {

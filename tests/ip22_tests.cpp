@@ -458,7 +458,8 @@ TEST(ip22_ethernet_receives_into_owned_descriptors_only) {
     t.m.bus().read<u8>(kBuf0 + 2 + 200, status);
     CHECK_EQ(status, 0x30u);  // good frame, end of frame
     CHECK_EQ(t.r32(kDesc + 20) & 0x3FFF, kSize - (2 + 60 + 1));
-    CHECK(!(t.r32(kEnetRxCtrl) & 0x200));  // stopped at the end of the ring
+    CHECK(!(t.r32(kEnetRxCtrl) & 0x200));  // stopped at the end of the ring...
+    CHECK_EQ(t.r32(0x1FB98000), kDesc + 16);  // ...at this descriptor, as the driver reads back to restart
     CHECK(t.enet_irq());
     // Restarted on a buffer the driver has not handed back: nothing is written.
     u32 before = t.r32(kBuf0 + 4);
