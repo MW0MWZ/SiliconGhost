@@ -6,6 +6,9 @@
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #elif defined(__APPLE__)
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
@@ -28,6 +31,23 @@ ExecBuffer::ExecBuffer(std::size_t size) : size_(size) {
     }
     write_ = static_cast<u8*>(w);
     exec_ = static_cast<u8*>(x);
+#elif defined(_WIN32)
+    // Windows: a section backed by the paging file, mapped twice like the
+    // Linux memfd.
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+                                        static_cast<DWORD>(static_cast<u64>(size) >> 32), static_cast<DWORD>(size),
+                                        nullptr);
+    if (!section) return;
+    void* w = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, size);
+    void* x = w ? MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, size) : nullptr;
+    if (!w || !x) {
+        if (w) UnmapViewOfFile(w);
+        CloseHandle(section);
+        return;
+    }
+    section_ = section;
+    write_ = static_cast<u8*>(w);
+    exec_ = static_cast<u8*>(x);
 #elif defined(__APPLE__)
     // macOS: one MAP_JIT mapping. On Apple silicon a thread sees it either
     // writable or executable, switched with pthread_jit_write_protect_np(),
@@ -43,6 +63,10 @@ ExecBuffer::~ExecBuffer() {
     if (write_) munmap(write_, size_);
     if (exec_) munmap(exec_, size_);
     if (fd_ >= 0) close(fd_);
+#elif defined(_WIN32)
+    if (write_) UnmapViewOfFile(write_);
+    if (exec_) UnmapViewOfFile(exec_);
+    if (section_) CloseHandle(section_);
 #elif defined(__APPLE__)
     if (exec_) munmap(exec_, size_);
 #endif
@@ -61,6 +85,9 @@ const void* ExecBuffer::add(const u8* code, std::size_t size) {
     pthread_jit_write_protect_np(1);  // and executable again
 #endif
     sys_icache_invalidate(exec_ + start, size);
+#elif defined(_WIN32)
+    std::memcpy(write_ + start, code, size);
+    FlushInstructionCache(GetCurrentProcess(), exec_ + start, size);
 #else
     std::memcpy(write_ + start, code, size);
 #if defined(__aarch64__)

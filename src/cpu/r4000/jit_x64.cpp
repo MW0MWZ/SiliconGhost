@@ -42,6 +42,19 @@ constexpr Reg kTlb = rbp;   // this mode's soft-TLB load table (fetch before it,
 // Host registers that hold guest registers; rax, rcx and rdx are scratch.
 constexpr Reg kCacheRegs[] = {rsi, rdi, r8, r9, r10, r11, r13, r15};
 
+// Calling convention. Windows (x64): arguments in rcx, rdx, r8; rsi and rdi
+// are callee-saved; every call needs 32 bytes of shadow space above the
+// return address, which the callee may use. System V: rdi, rsi, rdx.
+#if defined(_WIN32)
+constexpr Reg kArg0 = rcx, kArg1 = rdx, kArg2 = r8;
+constexpr s32 kShadow = 32;
+constexpr bool kSaveSiDi = true;
+#else
+constexpr Reg kArg0 = rdi, kArg1 = rsi, kArg2 = rdx;
+constexpr s32 kShadow = 0;
+constexpr bool kSaveSiDi = false;
+#endif
+
 inline unsigned f_rs(u32 i) { return (i >> 21) & 31; }
 inline unsigned f_rt(u32 i) { return (i >> 16) & 31; }
 inline unsigned f_rd(u32 i) { return (i >> 11) & 31; }
@@ -74,14 +87,17 @@ bool R4000::jit_compile(Block& b) {
     const Mem m_lo{kCpu, offset_of(this, &lo)};
     const Mem m_weight{kCpu, offset_of(this, &weight_)};
     const Mem m_asid_tag{kCpu, offset_of(this, &asid_tag_)};
-    const Mem m_entry_mode{rsp, 0};
+    const Mem m_entry_mode{rsp, kShadow};  // above the callees' shadow space
 
-    // Prologue (six pushes and 8 bytes keep calls 16-byte aligned).
+    // Prologue: the callee-saved registers used, then the entry-mode slot
+    // and any shadow space, keeping calls 16-byte aligned (six or eight
+    // pushes plus the return address, then 8 or 40 bytes).
     e.push(rbx), e.push(rbp), e.push(r12), e.push(r13), e.push(r14), e.push(r15);
-    e.sub_rsp(8);
-    e.mov(kCpu, rdi);
-    e.mov(kPc, rsi);
-    e.mov(kTime, rdx);
+    if (kSaveSiDi) e.push(rsi), e.push(rdi);
+    e.sub_rsp(8 + kShadow);
+    e.mov(kCpu, kArg0);
+    e.mov(kPc, kArg1);
+    e.mov(kTime, kArg2);
     e.mov(rax, m_mode, false);
     e.mov(m_entry_mode, rax, false);
     static_assert(sizeof(FastEntry) == 32 && kFastEntries == 1024);
@@ -170,8 +186,8 @@ bool R4000::jit_compile(Block& b) {
         e.alu_imm(Alu::Add, dst, static_cast<s32>(bytes));
     };
     auto call_handler = [&](const Op& op) {
-        e.mov(rdi, kCpu);
-        e.mov_imm64(rsi, reinterpret_cast<u64>(&op));
+        e.mov(kArg0, kCpu);
+        e.mov_imm64(kArg1, reinterpret_cast<u64>(&op));
         e.mov_imm64(rax, reinterpret_cast<u64>(op.fn));
         e.call(rax);
     };
@@ -536,8 +552,8 @@ bool R4000::jit_compile(Block& b) {
             e.mov(m_cur_pc, rax);
             set_time(i + 1);
             flush(dirty);  // the loop bookkeeping compares registers
-            e.mov(rdi, kCpu);
-            e.mov(rsi, rcx);
+            e.mov(kArg1, rcx);  // the target (before rcx may become the first argument)
+            e.mov(kArg0, kCpu);
             e.mov_imm64(rax, reinterpret_cast<u64>(&R4000::jit_backward_branch));
             e.call(rax);
             e.movzx8(rax, m_idle_ready);
@@ -750,7 +766,8 @@ bool R4000::jit_compile(Block& b) {
     e.mov_imm64(rcx, reinterpret_cast<u64>(&b));
     e.mov(Mem{kCpu, offset_of(this, &jit_block_)}, rcx);
     e.mov(Mem{kCpu, offset_of(this, &jit_entry_pc_)}, kPc);
-    e.add_rsp(8);
+    e.add_rsp(8 + kShadow);
+    if (kSaveSiDi) e.pop(rdi), e.pop(rsi);
     e.pop(r15), e.pop(r14), e.pop(r13), e.pop(r12), e.pop(rbp), e.pop(rbx);
     e.ret();
 
