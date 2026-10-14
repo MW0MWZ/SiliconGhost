@@ -116,7 +116,6 @@ void Hpc3::reset() {
     enet_loopback_ = false;
     enet_dconfig_ = enet_pconfig_ = 0;
     enet_rx_.cbp = enet_rx_.ndbp = enet_rx_.cdp = enet_tx_.cbp = enet_tx_.ndbp = 0;
-    if (net_) enet_poll_timer_->schedule_in(static_cast<u64>(cpu_hz_ / 1000));
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +125,10 @@ void Hpc3::reset() {
 void Hpc3::set_network(net::NetBackend* backend) {
     net_ = backend;
     enet_poll_timer_->cancel();
-    if (net_) enet_poll_timer_->schedule_in(static_cast<u64>(cpu_hz_ / 1000));
+}
+
+void Hpc3::poll_network() {
+    if (net_ && !enet_poll_timer_->active() && net_->pending()) enet_poll_timer_->schedule_in(1);
 }
 
 // Resets both channels and the Seeq (the interrupt is cleared as well).
@@ -145,17 +147,15 @@ void Hpc3::enet_interrupt() {
 }
 
 // Frames from the host arrive no faster than a 10 Mbit/s wire carries them
-// (with the preamble, FCS and gap between frames); the host is checked every
-// millisecond otherwise.
+// (with the preamble, FCS and gap between frames). When the host has none,
+// the poll stops until poll_network() sees more.
 void Hpc3::enet_poll() {
     std::vector<u8> frame;
     if (net_ && net_->receive(frame)) {
         enet_receive(frame.data(), frame.size());
         const std::size_t wire = std::max(frame.size(), kEnetMinFrame) + 24;
         enet_poll_timer_->schedule_in(std::max<u64>(1, static_cast<u64>(wire * 8 / 10e6 * cpu_hz_)));
-        return;
     }
-    enet_poll_timer_->schedule_in(static_cast<u64>(cpu_hz_ / 1000));
 }
 
 // The frame is written as two bytes of padding, the frame (padded to the

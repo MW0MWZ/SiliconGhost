@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -89,6 +90,7 @@ private:
     SerialOutput serial_out_;
     std::mutex serial_mutex_;
     std::deque<std::pair<unsigned, u8>> serial_in_;
+    std::atomic<bool> serial_pending_{false};  // input queued: run() starts the pump
     bool reset_pending_ = false;
     bool powered_off_ = false;
 };

@@ -44,6 +44,9 @@ public:
     Seeq8003& seeq() { return seeq_; }
     // Ethernet frames go to and come from `backend` (null: no cable).
     void set_network(net::NetBackend* backend);
+    // Called by the machine's run loop: starts taking in frames when the
+    // host has some (the poll then runs only while frames keep coming).
+    void poll_network();
 
     // Samples played by the HAL2 DAC (the top 16 bits of its 24-bit samples):
     // `frames` frames of `voices` interleaved samples at `rate` frames per

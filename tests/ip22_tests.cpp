@@ -470,3 +470,26 @@ TEST(ip22_ethernet_receives_into_owned_descriptors_only) {
     CHECK_EQ(t.r32(kBuf0 + 4), before);
     CHECK_EQ(t.r32(kDesc + 4), c0);
 }
+
+// Typed-ahead input is fed one byte at a time as the guest takes it; the
+// feeder only runs while something is queued, and starts again for input
+// that arrives later.
+TEST(ip22_serial_input_is_fed_in_order_and_on_demand) {
+    IndyRig t;
+    const u32 ctrl_b = ioc_addr(0x30), data_b = ioc_addr(0x34);
+    t.w8(ctrl_b, 3);
+    t.w8(ctrl_b, 0xC1);  // receiver on, 8 bits
+    for (char c : {'a', 'b', 'c'}) t.m.serial_input(1, static_cast<u8>(c));
+    std::string got;
+    for (int i = 0; i < 3; ++i) {
+        t.m.run(400000);  // a little over a millisecond at 150 MHz
+        if (t.r8(ctrl_b) & 1) got.push_back(static_cast<char>(t.r8(data_b)));
+    }
+    CHECK(got == "abc");
+    t.m.run(1000000);  // nothing queued
+    CHECK(!(t.r8(ctrl_b) & 1));
+    t.m.serial_input(1, 'd');
+    t.m.run(400000);
+    CHECK(t.r8(ctrl_b) & 1);
+    CHECK_EQ(t.r8(data_b), 'd');
+}

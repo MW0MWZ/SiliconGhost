@@ -140,7 +140,7 @@ void Indy::reset() {
     newport_.reset();
     cpu_.reset();
     for (unsigned line = 0; line < 5; ++line) cpu_.set_int_line(line, false);
-    serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
+    serial_timer_.cancel();  // run() starts it again while input is queued
     reset_pending_ = false;
     powered_off_ = false;
 }
@@ -154,6 +154,10 @@ u64 Indy::run(u64 cycles) {
             SG_LOG(Info, "indy", "system reset");
             reset();
         }
+        // Host input (serial bytes, Ethernet frames) is taken in by timers
+        // that run only while there is some.
+        if (serial_pending_.load(std::memory_order_acquire) && !serial_timer_.active()) serial_timer_.schedule_in(1);
+        hpc3_.poll_network();
         cpu_.run_until(end, scheduler_.next_event_ptr());
         scheduler_.run_due(cpu_.cycles());
         if (cpu_.stop_requested() && !reset_pending_) break;
@@ -164,11 +168,12 @@ u64 Indy::run(u64 cycles) {
 void Indy::serial_input(unsigned channel, u8 byte) {
     std::lock_guard<std::mutex> lock(serial_mutex_);
     serial_in_.emplace_back(channel, byte);
+    serial_pending_.store(true, std::memory_order_release);
 }
 
 // Feed queued input at most one byte per channel per millisecond of guest
 // time, and only into an enabled receiver with an empty FIFO, so typed-ahead
-// and pasted text is not lost.
+// and pasted text is not lost. The pump runs only while input is queued.
 void Indy::pump_serial_input() {
     {
         std::lock_guard<std::mutex> lock(serial_mutex_);
@@ -183,6 +188,10 @@ void Indy::pump_serial_input() {
                 fed[ch] = true;  // keep per-channel order
                 ++it;
             }
+        }
+        if (serial_in_.empty()) {
+            serial_pending_.store(false, std::memory_order_release);
+            return;
         }
     }
     serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
