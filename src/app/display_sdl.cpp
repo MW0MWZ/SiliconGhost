@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <optional>
 #include <vector>
 
 #include "core/log.h"
@@ -206,9 +207,60 @@ private:
     float dx_ = 0, dy_ = 0;
 };
 
+// Plays HAL2 DAC output. The stream follows the guest's sample rate and
+// voice count; when the guest runs ahead of real time (or the device stalls)
+// more than a quarter of a second, new samples are dropped rather than
+// letting the delay grow.
+class AudioOut {
+public:
+    explicit AudioOut(ip22::Indy& machine) : machine_(machine) {
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            SG_LOG(Warn, "audio", "no audio output: %s", SDL_GetError());
+            return;
+        }
+        ok_ = true;
+        machine_.hpc3().set_audio_sink([this](const s16* s, std::size_t frames, unsigned voices, double rate) {
+            play(s, frames, voices, rate);
+        });
+    }
+    ~AudioOut() {
+        machine_.hpc3().set_audio_sink(nullptr);
+        if (stream_) SDL_DestroyAudioStream(stream_);
+        if (ok_) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+    AudioOut(const AudioOut&) = delete;
+    AudioOut& operator=(const AudioOut&) = delete;
+
+private:
+    void play(const s16* samples, std::size_t frames, unsigned voices, double rate) {
+        const int freq = static_cast<int>(rate + 0.5);
+        if (!stream_ || freq != freq_ || static_cast<int>(voices) != voices_) {
+            if (stream_) SDL_DestroyAudioStream(stream_);
+            const SDL_AudioSpec spec{SDL_AUDIO_S16, static_cast<int>(voices), freq};
+            stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+            freq_ = freq;
+            voices_ = static_cast<int>(voices);
+            if (!stream_) {
+                SG_LOG(Warn, "audio", "cannot open audio output: %s", SDL_GetError());
+                return;
+            }
+            SDL_ResumeAudioStreamDevice(stream_);
+        }
+        if (!stream_) return;
+        const int bytes = static_cast<int>(frames * voices * sizeof(s16));
+        if (SDL_GetAudioStreamQueued(stream_) > freq_ * voices_ * static_cast<int>(sizeof(s16)) / 4) return;
+        SDL_PutAudioStreamData(stream_, samples, bytes);
+    }
+
+    ip22::Indy& machine_;
+    bool ok_ = false;
+    SDL_AudioStream* stream_ = nullptr;
+    int freq_ = 0, voices_ = 0;
+};
+
 }  // namespace
 
-bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop) {
+bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, bool audio) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SG_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
         return false;
@@ -222,6 +274,8 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
     }
     SDL_SetRenderLogicalPresentation(renderer, 1280, 1024, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     MouseCapture mouse(window, machine);
+    std::optional<AudioOut> sound;
+    if (audio) sound.emplace(machine);
     SDL_Texture* texture = nullptr;
     unsigned tex_w = 0, tex_h = 0;
     std::vector<u32> pixels;
@@ -268,6 +322,7 @@ bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomi
         SDL_RenderPresent(renderer);
     }
 
+    sound.reset();  // before SDL shuts down
     if (texture) SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);

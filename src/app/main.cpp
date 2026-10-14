@@ -61,6 +61,7 @@ void usage(const char* argv0) {
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "  --no-jit         run decoded blocks without translating them to host code\n"
+                 "  --no-audio       do not play the machine's audio output\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "Both serial ports are connected to this terminal; Ctrl-C quits.\n",
@@ -183,7 +184,7 @@ int main(int argc, char** argv) {
     std::string prom, nvram, screenshot;
     sg::ip22::IndyConfig config;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true;
+    bool trace = false, headless = false, idle_skip = true, block_cache = true, jit = true, audio = true;
     const char* timing = nullptr;
     double max_speed = 2.0;
     sg::log::set_level(sg::log::Level::Warn);
@@ -222,6 +223,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--no-idle-skip")) idle_skip = false;
         else if (!std::strcmp(a, "--no-block-cache")) block_cache = false;
         else if (!std::strcmp(a, "--no-jit")) jit = false;
+        else if (!std::strcmp(a, "--no-audio")) audio = false;
         else if (!std::strcmp(a, "--no-graphics")) config.graphics = false;
         else if (!std::strcmp(a, "--log")) {
             const std::string l = next();
@@ -288,10 +290,11 @@ int main(int argc, char** argv) {
         } else {
 #if defined(SG_HAVE_SDL3)
             const bool windowed = !headless && config.graphics && max_cycles == ~0ull;
-            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted))
+            if (!windowed || !sg::app::run_with_display(machine, pacer, g_interrupted, audio))
                 run_headless(machine, pacer, max_cycles);
 #else
             (void)headless;
+            (void)audio;
             run_headless(machine, pacer, max_cycles);
 #endif
         }
