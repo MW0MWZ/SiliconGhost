@@ -129,10 +129,12 @@ ifconfig ec0 10.0.2.15 netmask 255.255.255.0 up
 route add default 10.0.2.2 1
 ```
 
-To keep the address, put it in `/etc/hosts` under the system's name and set
-the gateway in `/etc/config/static-route.options`. Connections from the
-host reach the guest through forwarded ports, e.g. `--hostfwd tcp:2323:23`
-and `telnet localhost 2323`.
+To keep the address, put it in `/etc/hosts` under the system's name
+(`/etc/sys_id`); IRIX 5.3 takes static routes such as the default gateway
+from a script `/etc/init.d/network.local`, linked as `/etc/rc2.d/S31network`
+(see the comments in `/etc/init.d/network`). Connections from the host
+reach the guest through forwarded ports, e.g. `--hostfwd tcp:2323:23` and
+`telnet localhost 2323`.
 
 With `--net tap:NAME` frames go to an existing TAP interface (created with
 `ip tuntap add mode tap user $USER name tap0` and bridged or routed as your
