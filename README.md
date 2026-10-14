@@ -80,6 +80,19 @@ On **Fedora**:
 sudo dnf install gcc-c++ cmake ninja-build pkgconf-pkg-config SDL3-devel libslirp-devel
 ```
 
+On **macOS** (Apple silicon or Intel), with the Xcode command-line tools for
+the compiler and [Homebrew](https://brew.sh) for the rest:
+
+```sh
+xcode-select --install
+brew install cmake ninja pkgconf sdl3 libslirp
+```
+
+macOS builds are new and not yet widely tested. The recompiler is not
+available there yet (macOS needs a different way of allocating executable
+memory), so the block cache and interpreter run everything, more slowly;
+`--net tap:NAME` is Linux-only, while `--net user` works.
+
 Ubuntu 24.04 LTS and older releases do not package SDL3; build and install
 it from source first ([SDL's build instructions](https://github.com/libsdl-org/SDL/blob/main/docs/README-cmake.md)),
 or build without it for the serial console only. Distribution SDL3 packages
@@ -274,10 +287,10 @@ with performance layers on top that must give exactly the same results:
   console.
 - IRIX 5.3 and NetBSD 9.0 are the systems tested so far; IRIX 6.5 and Linux
   have not been tried.
-- The recompiler covers x86-64 and AArch64 hosts; on others the (slower)
-  block cache and interpreter run everything. Linux is the only host
-  built and tested so far; the AArch64 build has been tested under
-  emulation, not yet on Arm hardware.
+- The recompiler covers x86-64 and AArch64 hosts on Linux; on macOS and
+  other hosts the (slower) block cache and interpreter run everything.
+  Linux is the host built and tested most; the AArch64 build has been
+  tested under emulation, not yet on Arm hardware.
 
 ## Roadmap
 
