@@ -96,11 +96,15 @@ brew install cmake ninja pkgconf sdl3 libslirp
 On macOS the build makes `build/SiliconGhost.app`, a normal application
 with the menus in the system menu bar (`build/siliconghost` links to the
 program inside it, for running from the terminal). To make a copy that runs
-on its own, with the libraries it uses copied in and signed for this Mac:
+on its own, with the libraries it uses copied in and signed for this Mac,
+in the Applications folder:
 
 ```sh
-cmake --install build --prefix ~/Applications
+cmake --install build --prefix /Applications
 ```
+
+(The `install_name_tool` warnings about invalidated signatures are expected:
+the copy is signed again as the last step.)
 
 TAP networking is Linux-only; user-mode networking works everywhere.
 
