@@ -404,3 +404,24 @@ TEST(newport_antialiased_line_coverage) {
     CHECK_EQ(read24(t, 15, 40), 0x888888u);
     CHECK_EQ(read24(t, 15, 41), 0x888888u);
 }
+
+// LENGTH32 lines draw 32 pixels a GO, each GO carrying on from the next
+// pixel: with XOR every pixel of the line ends up drawn exactly once.
+TEST(newport_length32_line_draws_each_pixel_once) {
+    Rig t;
+    t.w(kDrawMode1, (6u << 28) | (1u << 3) | 1u);  // logicop XOR, 8bpp, RGB/CI planes
+    t.w(kWrMask, 0xFF);
+    t.w(kColorI, 1);
+    t.w(kXYStartI, (0u << 16) | 5u);
+    t.w(kXYEndI, (99u << 16) | 5u);
+    const u32 line = 2u | (2u << 2) | (1u << 8) | (1u << 15);  // DRAW I_LINE STOPX LENGTH32
+    t.w(kDrawMode0 | kGo, line | (1u << 5));                  // DOSETUP on the first GO
+    for (int go = 1; go < 4; ++go) t.w(kDrawMode0 | kGo, line);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);  // read back
+    for (u32 x = 0; x < 104; x += 4) {
+        t.w(kXYStartI, (x << 16) | 5u);
+        t.w(kXYEndI, ((x + 3) << 16) | 5u);
+        t.w(kDrawMode0 | kGo, 1u);
+        CHECK_EQ(t.r(kHostRw0), x < 100 ? 0x01010101u : 0u);
+    }
+}

@@ -851,12 +851,15 @@ void Newport::draw_line() {
         if (!(drawmode0_ & kDm0SkipFirst)) draw(x, y);
         step();
     } else {
-        int n = major;
-        if ((drawmode0_ & kDm0Length32) && n > 32) n = 32;
-        for (int i = 0; i <= n; ++i) {
-            const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (i == n && (drawmode0_ & kDm0SkipLast));
+        // LENGTH32 limits one GO to 32 pixels; the start is left on the
+        // next pixel, so the following GO carries on from there.
+        const bool cut = (drawmode0_ & kDm0Length32) && major >= 32;
+        const int pixels = cut ? 32 : major + 1;
+        for (int i = 0; i < pixels; ++i) {
+            const bool last = !cut && i == pixels - 1;
+            const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (last && (drawmode0_ & kDm0SkipLast));
             if (!skip) draw(x, y);
-            if (i < n) step();
+            if (!last) step();
         }
         reload_shade();
     }
@@ -934,7 +937,7 @@ void Newport::dcb_begin() {
     // for an acknowledge keeps the bus busy until it times out or the bus is
     // reset. IRIX probes for an Indy Presenter adapter this way (a few
     // back-to-back status reads); the PROM simply waits for the bus.
-    constexpr u32 kDcbSyncAck = 1u << 13, kDcbAsyncAck = 1u << 14;
+    constexpr u32 kDcbSyncAck = 1u << 11, kDcbAsyncAck = 1u << 12;
     constexpr double kAckTimeout = 10e-6;
     if (((dcbmode_ >> 7) & 0xF) >= 8 && (dcbmode_ & (kDcbSyncAck | kDcbAsyncAck)))
         dcb_busy_until_ = scheduler_.now() + static_cast<u64>(cpu_hz_ * kAckTimeout);
