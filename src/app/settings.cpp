@@ -9,6 +9,12 @@
 
 #include "core/log.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shlobj.h>
+#endif
+
 namespace sg::app {
 
 const std::vector<CpuModel>& cpu_models() {
@@ -158,6 +164,35 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     }
     if (!ok) error = "bad value for " + key + ": \"" + v + "\"";
     return ok;
+}
+
+std::string user_data_folder() {
+#if defined(_WIN32)
+    PWSTR documents = nullptr;
+    std::string folder;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents)))
+        folder = (std::filesystem::path(documents) / "SiliconGhost").string();
+    CoTaskMemFree(documents);
+    return folder;
+#else
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return {};
+#if defined(__APPLE__)
+    return (std::filesystem::path(home) / "Documents" / "SiliconGhost").string();
+#else
+    return (std::filesystem::path(home) / ".SiliconGhost").string();
+#endif
+#endif
+}
+
+void make_user_data_folders() {
+    const std::string base = user_data_folder();
+    if (base.empty()) return;
+    for (const char* sub : {"roms", "diskImages", "nvram"}) {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(base) / sub, ec);
+        if (ec) SG_LOG(Warn, "settings", "cannot make %s/%s: %s", base.c_str(), sub, ec.message().c_str());
+    }
 }
 
 bool load_settings(const std::string& path, Settings& s, std::string& error) {

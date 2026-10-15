@@ -54,6 +54,23 @@ std::string folder_of(const std::string& path) {
 
 std::string default_settings_path() { return user_file("settings.ini"); }
 
+// Where settings were kept before the SiliconGhost folder (SDL's preferences
+// folder, worked out here so that looking does not create it).
+std::string old_user_file(const std::string& name) {
+    namespace fs = std::filesystem;
+    fs::path dir;
+#if defined(_WIN32)
+    if (const char* appdata = std::getenv("APPDATA")) dir = appdata;
+#elif defined(__APPLE__)
+    if (const char* home = std::getenv("HOME")) dir = fs::path(home) / "Library" / "Application Support";
+#else
+    if (const char* data = std::getenv("XDG_DATA_HOME"); data && *data) dir = data;
+    else if (const char* home = std::getenv("HOME")) dir = fs::path(home) / ".local" / "share";
+#endif
+    if (dir.empty()) return name;
+    return (dir / "SiliconGhost" / "SiliconGhost" / name).string();
+}
+
 // What a file chooser was opened for.
 enum class Pick { Prom, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
 
@@ -198,6 +215,13 @@ int Gui::run() {
         return -1;
     }
     settings_path_ = options_.settings_file.empty() ? default_settings_path() : options_.settings_file;
+    {
+        // Settings saved before the SiliconGhost folder existed move into it.
+        std::error_code ec;
+        const std::string old = old_user_file("settings.ini");
+        if (old != settings_path_ && !std::filesystem::exists(settings_path_, ec) && std::filesystem::exists(old, ec))
+            std::filesystem::copy_file(old, settings_path_, ec);
+    }
     if (!options_.power_on && options_.settings_file.empty()) {
         Settings saved;
         std::string error;
@@ -1245,7 +1269,19 @@ void Gui::draw_popups() {
 // --- Files -------------------------------------------------------------------
 
 void Gui::choose(Pick what, const std::string& current) {
-    auto* req = new PickRequest{this, what, folder_of(current)};
+    // With nothing chosen yet, start in the matching folder of the user's
+    // SiliconGhost folder.
+    std::string start = folder_of(current);
+    if (start.empty() && !user_data_folder().empty()) {
+        const char* sub = what == Pick::Prom                          ? "roms"
+                          : what == Pick::Nvram || what == Pick::NewNvram ? "nvram"
+                          : what == Pick::OpenSettings || what == Pick::SaveSettings ? ""
+                                                                         : "diskImages";
+        const auto dir = std::filesystem::path(user_data_folder()) / sub;
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir, ec)) start = dir.string() + "/";
+    }
+    auto* req = new PickRequest{this, what, start};
     const char* location = req->location.empty() ? nullptr : req->location.c_str();
     switch (what) {
         case Pick::Prom: SDL_ShowOpenFileDialog(on_chosen, req, window_, kPromFilters, 2, location, false); break;
@@ -1318,11 +1354,10 @@ void Gui::apply_choice(const PickResult& r) {
 }  // namespace
 
 std::string user_file(const std::string& name) {
-    char* dir = SDL_GetPrefPath("SiliconGhost", "SiliconGhost");  // made if missing; no SDL_Init needed
-    if (!dir) return name;
-    std::string path = std::string(dir) + name;
-    SDL_free(dir);
-    return path;
+    const std::string base = user_data_folder();
+    if (base.empty()) return old_user_file(name);
+    make_user_data_folders();
+    return (std::filesystem::path(base) / name).string();
 }
 
 #if !defined(__APPLE__)

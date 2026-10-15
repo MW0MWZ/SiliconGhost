@@ -97,6 +97,9 @@ add_library(sg_app STATIC
   src/app/terminal.cpp
 )
 target_link_libraries(sg_app PUBLIC sg_emu PRIVATE sg_warnings)
+if(WIN32)
+  target_link_libraries(sg_app PRIVATE shell32 ole32)  # the Documents folder
+endif()
 
 add_executable(siliconghost src/app/main.cpp)
 target_link_libraries(siliconghost PRIVATE sg_app sg_warnings)

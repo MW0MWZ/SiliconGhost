@@ -62,6 +62,14 @@ void apply_log_level(const std::string& level);
 // key is unknown or the value malformed.
 bool set_option(Settings& s, const std::string& key, const std::string& value, std::string& error);
 
+// The user's folder for SiliconGhost: the settings, the log, and roms,
+// diskImages and nvram folders for machine files: Documents/SiliconGhost on
+// macOS and Windows, ~/.SiliconGhost elsewhere. Empty if the home folder is
+// unknown.
+std::string user_data_folder();
+// Makes the folder and its subfolders where they are missing.
+void make_user_data_folders();
+
 // The settings file: one "key=value" per line, repeated keys for lists.
 bool load_settings(const std::string& path, Settings& s, std::string& error);
 bool save_settings(const std::string& path, const Settings& s, std::string& error);

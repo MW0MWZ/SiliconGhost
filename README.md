@@ -103,6 +103,7 @@ in the Applications folder:
 cmake --install build --prefix /Applications
 ```
 
+No `sudo` is needed: an administrator account can write to /Applications.
 (The `install_name_tool` warnings about invalidated signatures are expected:
 the copy is signed again as the last step.)
 
@@ -168,13 +169,17 @@ Main options (`siliconghost --help` lists them all):
 
 ### The window
 
+SiliconGhost keeps its files in one folder, made on first start:
+`~/Documents/SiliconGhost` on macOS, `Documents\SiliconGhost` on Windows and
+`~/.SiliconGhost` on Linux. It holds `settings.ini`, the message log
+`siliconghost.log`, and `roms`, `diskImages` and `nvram` folders for PROM
+dumps, disk and CD-ROM images and NVRAM files, where the file choosers
+start. (Settings from an earlier version are copied in.)
+
 Started from a terminal, the window carries on in the background and the
-terminal is free again at once; its messages go to `siliconghost.log` in the
-settings folder (`~/.local/share/SiliconGhost/SiliconGhost/` on Linux,
-`~/Library/Application Support/SiliconGhost/SiliconGhost/` on macOS,
-`%APPDATA%\SiliconGhost\SiliconGhost\` on Windows; *Help > About* shows
-the path). `--foreground` or `--log` keeps them on the terminal, and
-`--headless` always runs there.
+terminal is free again at once; its messages go to `siliconghost.log`
+(*Help > About* shows the path). `--foreground` or `--log` keeps them on
+the terminal, and `--headless` always runs there.
 
 The Newport screen fills the window between a menu bar and a status bar;
 the window can be resized and made full screen. The machine's sound plays
