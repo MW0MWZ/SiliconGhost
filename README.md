@@ -30,6 +30,9 @@ SiliconGhost is under active development. What works today:
 - **NetBSD 9.0/sgimips:** finds and attaches every device of the machine,
   installs to disk with its own installer (over the network) and boots
   multi-user on the serial console, with networking and sound.
+- **OpenBSD 6.9/sgi:** boots its installer from the official install CD,
+  installs to disk (sets over the network) and boots multi-user on the
+  serial console or the Newport text console, with networking.
 - **Audio:** what the machine plays goes to the host's sound output, with or
   without the display window, at the volume the guest sets; with
   `--audio-in` it can also record from the host's audio input.
@@ -319,6 +322,35 @@ Without `OSLoadOptions auto`, NetBSD/sgimips stops in single-user mode
 NetBSD's audio driver starts with the output volume at zero, so nothing is
 heard until it is raised, e.g. `mixerctl -w outputs.master=200,200`.
 
+### Running OpenBSD
+
+OpenBSD/sgi 6.9 (`install69.iso`) starts its installer from the Command
+Monitor:
+
+```
+boot -f dksc(0,4,8)bootecof dksc(0,4,0)bsd.rd.IP22
+```
+
+(The volume header holds the loader as `bootecof`, names being limited to
+eight characters. The automatic boot picks a loader that does not fit an
+Indy's memory, as OpenBSD's own notes say.)
+Install the sets over the network (*http*, from an OpenBSD mirror's
+`pub/OpenBSD/6.9/sgi`): the installer does not read them from the CD on the
+emulated drive, which runs with 512-byte blocks as SGI's drives do, while
+the CD's file system is laid out in 2048-byte sectors. To boot the installed
+system:
+
+```
+setenv OSLoader boot
+setenv OSLoadFilename bsd
+setenv AutoLoad Yes
+```
+
+The console follows the NVRAM's `console` setting: the Newport text console
+(`g`) or the serial port (`d`). OpenBSD's X server does not run on the
+Newport (its driver offers no frame buffer to map). OpenBSD has no driver
+for the Indy's audio.
+
 ### Timing
 
 The CPU's cycle counter is the master clock for every timer in the machine,
@@ -368,8 +400,9 @@ with performance layers on top that must give exactly the same results:
   and 24-bit boards from a register read whose real-hardware result is not
   known yet, and on the emulated board it chooses 24-bit. Use the serial
   console.
-- IRIX 5.3, IRIX 6.5 and NetBSD 9.0 are the systems tested so far; Linux
-  has not been tried.
+- IRIX 5.3, IRIX 6.5, NetBSD 9.0 and OpenBSD 6.9 are the systems tested so
+  far; Linux has not been tried. (Current Debian releases no longer include
+  Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
 - The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
   Linux is the host tested most. macOS on Apple silicon has run the IRIX

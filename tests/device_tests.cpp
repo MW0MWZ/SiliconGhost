@@ -296,6 +296,38 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     CHECK_EQ(r.status, 0x02);  // write-protected medium
 }
 
+// MODE SELECT's block descriptor switches the CD-ROM to 2048-byte blocks
+// (as OpenBSD does); the disk stays at 512; a reset restores 512.
+TEST(scsi_mode_select_sets_the_cdrom_block_size) {
+    const TempImage image(16);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, image.path);
+    const u8 select6[6] = {0x15, 0x10, 0, 0, 12, 0};
+    std::vector<u8> params = {0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0x08, 0x00};  // header, descriptor: 2048
+    auto r = cd.command(select6, 6);
+    CHECK_EQ(r.data_out_length, 12u);
+    CHECK_EQ(cd.finish_data_out(select6, params), 0x00);
+    const u8 capacity[10] = {0x25};
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[3], 3);     // last LBA of four 2048-byte blocks
+    CHECK_EQ(r.data_in[6], 0x08);  // 2048-byte blocks
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0};
+    r = cd.command(read10, 10);
+    CHECK_EQ(r.data_in.size(), 2048u);
+    CHECK_EQ(r.data_in[0], 4);  // 512-byte block 4 starts 2048-byte block 1
+    const u8 sense6[6] = {0x1A, 0, 0, 0, 12, 0};
+    r = cd.command(sense6, 6);
+    CHECK_EQ(r.data_in[10], 0x08);  // the descriptor reports it
+    cd.reset();
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[6], 0x02);
+
+    const TempImage disk_image(16);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, disk_image.path);
+    disk.command(select6, 6);
+    CHECK_EQ(disk.finish_data_out(select6, params), 0x02);  // not supported
+    CHECK_EQ(disk.block_size(), 512u);
+}
+
 TEST(scsi_cdrom_eject_changes_disc_with_unit_attention) {
     const TempImage first(16), second(32);
     ScsiDisk cd(ScsiDisk::Kind::CdRom, first.path);
@@ -638,6 +670,34 @@ std::vector<u8> to_mouse(Kbc8042& k, u8 value) {
     return out;
 }
 }  // namespace
+
+// With the command byte's translate bit set (as OpenBSD sets it), set 2
+// codes from the keyboard reach the host as set 1, breaks as bit 7; with it
+// clear (IRIX), they pass unchanged.
+TEST(kbc_translates_set2_to_set1_when_asked) {
+    Kbc8042 kbc;
+    kbc.write_command(0x60);
+    kbc.write_data(0x44);   // translate, no interrupts
+    kbc.key_input(0x2D);    // R
+    kbc.key_input(0xF0);
+    kbc.key_input(0x2D);
+    kbc.key_input(0xE0);    // right Ctrl
+    kbc.key_input(0x14);
+    CHECK_EQ(kbc.read_data(), 0x13);
+    CHECK_EQ(kbc.read_data(), 0x93);
+    CHECK_EQ(kbc.read_data(), 0xE0);
+    CHECK_EQ(kbc.read_data(), 0x1D);
+    kbc.write_data(0xF2);  // identify: the ID's second byte is translated too
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK_EQ(kbc.read_data(), 0xAB);
+    CHECK_EQ(kbc.read_data(), 0x41);
+    kbc.write_command(0x60);
+    kbc.write_data(0x00);
+    kbc.key_input(0x2D);
+    kbc.key_input(0xF0);
+    CHECK_EQ(kbc.read_data(), 0x2D);
+    CHECK_EQ(kbc.read_data(), 0xF0);
+}
 
 TEST(kbc_mouse_reports_movement_only_when_enabled) {
     Kbc8042 k;

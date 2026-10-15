@@ -41,6 +41,7 @@ private:
     enum class Pending { None, CommandByte, ToAux, ToOutputKbd, ToOutputAux };
 
     void push(u8 byte, bool aux);
+    void push_keyboard(u8 byte);
     void keyboard_command(u8 value);
     void mouse_command(u8 value);
     void update_irq();
@@ -52,6 +53,7 @@ private:
     Pending pending_ = Pending::None;
     u8 kbd_arg_command_ = 0;    // keyboard command awaiting its argument byte
     unsigned scan_set_ = 2;
+    bool translate_break_ = false;  // translating: a break prefix was seen
     u8 mouse_arg_command_ = 0;  // mouse command awaiting its argument byte
     bool mouse_reporting_ = false;  // stream mode data reporting enabled (F4)
     unsigned mouse_buttons_ = 0;    // as last reported

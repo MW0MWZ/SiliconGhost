@@ -218,6 +218,8 @@ void Indy::apply_ethernet_address() {
 
 void Indy::reset() {
     apply_ethernet_address();
+    if (disk_) disk_->reset();
+    if (cdrom_) cdrom_->reset();
     mc_.reset();
     ioc_.reset();
     hpc3_.reset();
@@ -286,9 +288,12 @@ namespace {
 constexpr u32 kRex3InSlot = kNewportRex3 - kGioGfx, kRex3WindowSize = 0x10000;
 }  // namespace
 
+// The Newport's slot is pipelined: reads that no register answers do not
+// fault but return the width of the access in bytes (4, 2 or 1), as seen on
+// Indys and relied on by OpenBSD to tell a Newport from an empty slot.
 bool Indy::GfxSlot::read(u32 offset, unsigned size, u64& value) {
     if (offset - kRex3InSlot < kRex3WindowSize) return board_.read(offset - kRex3InSlot, size, value);
-    value = 0;
+    value = size;
     return true;
 }
 

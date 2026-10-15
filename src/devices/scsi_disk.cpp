@@ -19,7 +19,7 @@ constexpr u8 kSenseNone = 0x0, kSenseNotReady = 0x2, kSenseMediumError = 0x3, kS
 constexpr u8 kSenseUnitAttention = 0x6, kSenseDataProtect = 0x7;
 constexpr u8 kAscMediumChanged = 0x28, kAscMediumNotPresent = 0x3A, kAscRemovalPrevented = 0x53;
 constexpr u8 kAscInvalidOpcode = 0x20, kAscLbaOutOfRange = 0x21, kAscWriteProtected = 0x27;
-constexpr u8 kAscUnrecoveredRead = 0x11;
+constexpr u8 kAscUnrecoveredRead = 0x11, kAscInvalidParameter = 0x26;
 
 u32 be32(const u8* p) { return (u32{p[0]} << 24) | (u32{p[1]} << 16) | (u32{p[2]} << 8) | p[3]; }
 u16 be16(const u8* p) { return static_cast<u16>((p[0] << 8) | p[1]); }
@@ -41,7 +41,7 @@ ScsiDisk::ScsiDisk(Kind kind, const std::string& path) : kind_(kind), read_only_
 bool ScsiDisk::open(const std::string& path) {
     if (file_.is_open()) file_.close();
     file_.clear();
-    blocks_ = 0;
+    bytes_ = 0;
     read_only_ = kind_ == Kind::CdRom;
     file_.open(path, std::ios::binary | std::ios::in | (read_only_ ? std::ios::openmode{} : std::ios::out));
     if (!file_.is_open() && !read_only_) {  // fall back to read-only access
@@ -50,7 +50,7 @@ bool ScsiDisk::open(const std::string& path) {
     }
     if (file_.is_open()) {
         file_.seekg(0, std::ios::end);
-        blocks_ = static_cast<u64>(file_.tellg()) / kBlockSize;
+        bytes_ = static_cast<u64>(file_.tellg()) / kDefaultBlockSize * kDefaultBlockSize;
     }
     return file_.is_open();
 }
@@ -58,7 +58,7 @@ bool ScsiDisk::open(const std::string& path) {
 void ScsiDisk::eject() {
     if (!file_.is_open()) return;
     file_.close();
-    blocks_ = 0;
+    bytes_ = 0;
     prevent_removal_ = false;
     unit_attention_ = true;
 }
@@ -80,9 +80,9 @@ ScsiTarget::Result ScsiDisk::check_condition(u8 key, u8 asc, u8 ascq) {
 
 bool ScsiDisk::read_blocks(u64 lba, u32 count, std::vector<u8>& out) {
     ++activity_;
-    out.resize(static_cast<std::size_t>(count) * kBlockSize);
+    out.resize(static_cast<std::size_t>(count) * block_size_);
     file_.clear();
-    file_.seekg(static_cast<std::streamoff>(lba * kBlockSize));
+    file_.seekg(static_cast<std::streamoff>(lba * block_size_));
     return static_cast<bool>(file_.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size())));
 }
 
@@ -111,7 +111,7 @@ std::vector<u8> ScsiDisk::mode_sense(const u8* cdb, bool ten_byte) const {
         pages.push_back(static_cast<u8>(body.size()));
         pages.insert(pages.end(), body.begin(), body.end());
     };
-    const u32 cylinders = static_cast<u32>(std::max<u64>(1, blocks_ / (64 * 32)));
+    const u32 cylinders = static_cast<u32>(std::max<u64>(1, blocks() / (64 * 32)));
     if (page == 0x01 || page == 0x3F) add_page(0x01, {0, 8, 0, 0, 0, 0, 0, 0, 0, 0});        // error recovery
     if (page == 0x03 || page == 0x3F)                                                      // format: 64 sectors/track
         add_page(0x03, {0, 1, 0, 0, 0, 0, 0, 1, 0, 64, 2, 0, 0, 1, 0, 0, 0, 0, 0x40, 0, 0, 0});
@@ -123,9 +123,9 @@ std::vector<u8> ScsiDisk::mode_sense(const u8* cdb, bool ten_byte) const {
     std::vector<u8> block_descriptor;
     if (!no_block_descriptor) {
         block_descriptor.assign(8, 0);
-        put32(&block_descriptor[0], static_cast<u32>(std::min<u64>(blocks_, 0xFFFFFF)));
+        put32(&block_descriptor[0], static_cast<u32>(std::min<u64>(blocks(), 0xFFFFFF)));
         block_descriptor[0] = 0;  // density code
-        put32(&block_descriptor[4], kBlockSize);
+        put32(&block_descriptor[4], block_size_);
     }
     std::vector<u8> d;
     const u8 medium = 0x00;  // default medium type
@@ -175,7 +175,7 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
             if (kind_ == Kind::CdRom && (cdb[4] & 0x03) == 0x02) {  // LoEj, stop: eject
                 if (prevent_removal_) return check_condition(kSenseIllegalRequest, kAscRemovalPrevented);
                 file_.close();
-                blocks_ = 0;
+                bytes_ = 0;
                 if (eject_cb_) eject_cb_();
             }
             break;
@@ -217,8 +217,8 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
             return r;
         case 0x25: {  // READ CAPACITY(10)
             r.data_in.assign(8, 0);
-            put32(&r.data_in[0], static_cast<u32>(std::min<u64>(blocks_ ? blocks_ - 1 : 0, 0xFFFFFFFF)));
-            put32(&r.data_in[4], kBlockSize);
+            put32(&r.data_in[0], static_cast<u32>(std::min<u64>(blocks() ? blocks() - 1 : 0, 0xFFFFFFFF)));
+            put32(&r.data_in[4], block_size_);
             return r;
         }
         case 0x08:    // READ(6)
@@ -232,7 +232,7 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
                 lba = be32(&cdb[2]);
                 count = be16(&cdb[7]);
             }
-            if (lba + count > blocks_) return check_condition(kSenseIllegalRequest, kAscLbaOutOfRange);
+            if (lba + count > blocks()) return check_condition(kSenseIllegalRequest, kAscLbaOutOfRange);
             if (!read_blocks(lba, count, r.data_in)) return check_condition(kSenseMediumError, kAscUnrecoveredRead);
             return r;
         }
@@ -241,8 +241,8 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
             if (read_only_) return check_condition(kSenseDataProtect, kAscWriteProtected);
             const u32 count = op == 0x0A ? (cdb[4] ? cdb[4] : 256u) : be16(&cdb[7]);
             const u64 lba = op == 0x0A ? (((cdb[1] & 0x1F) << 16) | (cdb[2] << 8) | cdb[3]) : be32(&cdb[2]);
-            if (lba + count > blocks_) return check_condition(kSenseIllegalRequest, kAscLbaOutOfRange);
-            r.data_out_length = count * kBlockSize;
+            if (lba + count > blocks()) return check_condition(kSenseIllegalRequest, kAscLbaOutOfRange);
+            r.data_out_length = count * block_size_;
             return r;
         }
         case 0x43: {  // READ TOC: one data track
@@ -250,7 +250,7 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
             std::vector<u8> t = {0, 18, 1, 1,  // length, first and last track
                                  0, 0x14, 1, 0, 0, 0, 0, 0,          // track 1: data, LBA 0
                                  0, 0x14, 0xAA, 0, 0, 0, 0, 0};       // lead-out
-            put32(&t[16], static_cast<u32>(blocks_));
+            put32(&t[16], static_cast<u32>(blocks()));
             t.resize(std::min<std::size_t>(t.size(), be16(&cdb[7])));
             r.data_in = std::move(t);
             return r;
@@ -268,7 +268,7 @@ u8 ScsiDisk::finish_data_out(const u8* cdb, const std::vector<u8>& data) {
         const u64 lba = op == 0x0A ? (((cdb[1] & 0x1F) << 16) | (cdb[2] << 8) | cdb[3]) : be32(&cdb[2]);
         ++activity_;
         file_.clear();
-        file_.seekp(static_cast<std::streamoff>(lba * kBlockSize));
+        file_.seekp(static_cast<std::streamoff>(lba * block_size_));
         file_.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
         file_.flush();
         if (!file_) {
@@ -276,7 +276,23 @@ u8 ScsiDisk::finish_data_out(const u8* cdb, const std::vector<u8>& data) {
             return kCheckCondition;
         }
     }
-    return kGood;  // MODE SELECT parameters are accepted and ignored (block size stays 512)
+    if (op == 0x15 || op == 0x55) {
+        // The block descriptor's length selects the block size (0 keeps it):
+        // 512 or 2048 on the CD-ROM, 512 on the disk. Pages are accepted
+        // and ignored.
+        const std::size_t header = op == 0x15 ? 4 : 8;
+        const std::size_t descriptors = data.size() < header ? 0 : op == 0x15 ? data[3] : be16(&data[6]);
+        if (descriptors >= 8 && data.size() >= header + 8) {
+            const u32 size = (u32{data[header + 5]} << 16) | (u32{data[header + 6]} << 8) | data[header + 7];
+            const bool ok = size == 0 || size == kDefaultBlockSize || (kind_ == Kind::CdRom && size == 2048);
+            if (!ok) {
+                check_condition(kSenseIllegalRequest, kAscInvalidParameter);
+                return kCheckCondition;
+            }
+            if (size) block_size_ = size;
+        }
+    }
+    return kGood;
 }
 
 }  // namespace sg

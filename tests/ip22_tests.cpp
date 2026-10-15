@@ -701,7 +701,7 @@ TEST(indy_newport_answers_across_the_graphics_slot) {
     IndyRig t;
     u32 v = 1;
     CHECK(t.m.bus().read<u32>(0x1F000000, v));
-    CHECK_EQ(v, 0u);
+    CHECK_EQ(v, 4u);  // no fault: the access width (see below)
     CHECK(t.m.bus().write<u32>(0x1F0F0148, 0x12345678));  // XSTARTI
     CHECK_EQ(t.r32(0x1F0F0100), 0x02B3C000u);              // XSTART
     CHECK(t.m.bus().read<u32>(0x1F400000 - 4, v));
@@ -823,4 +823,16 @@ TEST(ip22_pit_latch_marks_cpu_timing) {
     CHECK(t.m.timing_cpu());
     t.m.run(static_cast<u64>(t.m.cycles_per_second()));
     CHECK(!t.m.timing_cpu());
+}
+
+// Reads in the graphics slot that no Newport register answers return the
+// access width, as OpenBSD's probe expects of the pipelined slot.
+TEST(ip22_gfx_slot_unclaimed_reads_return_the_access_width) {
+    IndyRig t;
+    CHECK_EQ(t.r32(0x1F000000), 4u);
+    u16 h = 0;
+    CHECK(t.m.bus().read<u16>(0x1F000002, h));
+    CHECK_EQ(h, 2u);
+    CHECK_EQ(t.r8(0x1F000003), 1u);
+    CHECK(t.r32(0x1F0F0000) != 4u || t.r32(0x1F0F0004) != 4u);  // REX3 registers answer
 }
