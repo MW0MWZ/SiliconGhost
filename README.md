@@ -295,7 +295,7 @@ network needs), and the Indy is configured like any machine on that network.
 | Newport (graphics) console | 9.0 and 11.0: no text shown; NetBSD-current: yes (8- and 24-bit boards) | yes, text console |
 | PS/2 keyboard | yes | yes |
 | PS/2 mouse | detected (not exercised without X) | detected (not exercised without X) |
-| X11 | not tried (no X sets for sgimips 9.0) | no (OpenBSD's Newport driver has no frame buffer for X) |
+| X11 | NetBSD-current: yes, on the 8-bit board (see below); 9.0: not tried | no (OpenBSD's Newport driver has no frame buffer for X) |
 | SCSI disk and CD-ROM | yes | yes |
 | Ethernet | yes | yes |
 | Audio playback | yes | no (no driver) |
@@ -304,7 +304,15 @@ network needs), and the Indy is configured like any machine on that network.
 
 NetBSD 11.0's installer boots the same way as 9.0's and attaches the same
 devices, its Newport console showing no text either; the rest of the table
-was checked on 9.0.
+was checked on 9.0, apart from what is marked NetBSD-current.
+
+X on NetBSD-current runs with its `newport` driver (twm, xterm, xclock and
+the like). Start it with `-depth 8` on the 8-bit board (the driver defaults
+to 24 and gives up otherwise), and give it a monitor section for 1280x1024
+(without one it picks 1024x768). The kernel points the XMAP9's cursor
+colour map at entries 0-3, so X's cursor colours overwrite palette entries 1
+and 2 and the default white pixel shows as the cursor's black: give clients
+explicit colours (`xterm -bg ... -fg ...`).
 
 ### Running NetBSD
 
