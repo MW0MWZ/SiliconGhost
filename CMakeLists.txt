@@ -126,6 +126,58 @@ if(SG_WITH_SDL3)
     )
     target_compile_definitions(siliconghost PRIVATE SG_HAVE_SDL3=1)
     target_link_libraries(siliconghost PRIVATE sg_imgui SDL3::SDL3)
+
+    if(APPLE)
+      # A macOS application: SiliconGhost.app, with the system menu bar and
+      # its icon (made from the 1024x1024 artwork with sips and iconutil).
+      # build/siliconghost links to the program inside, for the terminal.
+      # `cmake --install build --prefix DIR` makes a self-contained copy in
+      # DIR, with the libraries it uses (SDL3, libslirp, ...) inside it.
+      enable_language(OBJCXX)
+      target_sources(siliconghost PRIVATE src/app/menu_mac.mm)
+      set_source_files_properties(src/app/menu_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+      target_link_libraries(siliconghost PRIVATE "-framework Cocoa")
+
+      set(SG_ICON_PNG ${CMAKE_CURRENT_SOURCE_DIR}/graphics/SiliconGhost_icon_1024.png)
+      set(SG_ICONSET ${CMAKE_CURRENT_BINARY_DIR}/SiliconGhost.iconset)
+      set(SG_ICNS ${CMAKE_CURRENT_BINARY_DIR}/SiliconGhost.icns)
+      set(SG_ICON_COMMANDS)
+      foreach(size 16 32 128 256 512)
+        math(EXPR double "${size} * 2")
+        list(APPEND SG_ICON_COMMANDS
+          COMMAND sips -z ${size} ${size} ${SG_ICON_PNG} --out ${SG_ICONSET}/icon_${size}x${size}.png
+          COMMAND sips -z ${double} ${double} ${SG_ICON_PNG} --out ${SG_ICONSET}/icon_${size}x${size}@2x.png)
+      endforeach()
+      add_custom_command(OUTPUT ${SG_ICNS}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${SG_ICONSET}
+        ${SG_ICON_COMMANDS}
+        COMMAND iconutil -c icns ${SG_ICONSET} -o ${SG_ICNS}
+        DEPENDS ${SG_ICON_PNG}
+        COMMENT "Making the application icon"
+        VERBATIM)
+      target_sources(siliconghost PRIVATE ${SG_ICNS})
+      set_source_files_properties(${SG_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+
+      configure_file(cmake/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
+      set_target_properties(siliconghost PROPERTIES
+        MACOSX_BUNDLE TRUE
+        OUTPUT_NAME SiliconGhost
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
+      add_custom_command(TARGET siliconghost POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_BINARY_DIR}/siliconghost
+        COMMAND ${CMAKE_COMMAND} -E create_symlink SiliconGhost.app/Contents/MacOS/SiliconGhost
+                ${CMAKE_CURRENT_BINARY_DIR}/siliconghost
+        VERBATIM)
+
+      install(TARGETS siliconghost BUNDLE DESTINATION .)
+      install(CODE [[
+        include(BundleUtilities)
+        set(app "${CMAKE_INSTALL_PREFIX}/SiliconGhost.app")
+        fixup_bundle("${app}" "" "")
+        # Signed for this machine (ad hoc): copying the libraries in changed them.
+        execute_process(COMMAND codesign --force --deep --sign - "${app}" COMMAND_ERROR_IS_FATAL ANY)
+      ]])
+    endif()
   else()
     message(WARNING "SDL3 not found: building without a display window or sound")
   endif()

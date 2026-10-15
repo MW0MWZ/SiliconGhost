@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "app/display_sdl.h"
+#include "app/menu_model.h"
 #include "app/sdl_common.h"
 #include "app/session.h"
 #include "app/terminal.h"
@@ -116,6 +117,9 @@ private:
     // Drawing
     void frame();
     void draw_menu();
+    std::vector<MenuEntry> menus();
+    void draw_entries(const std::vector<MenuEntry>& entries);
+    void toggle_fullscreen();
     void draw_status_bar();
     void draw_settings();
     void draw_popups();
@@ -140,7 +144,8 @@ private:
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;
     ImGuiContext* ctx_ = nullptr;
-    float scale_ = 1.0f;
+    float scale_ = 1.0f;    // UI scale, in window coordinates
+    float density_ = 1.0f;  // pixels per window coordinate (2 on Retina)
     SDL_Texture* texture_ = nullptr;
     unsigned tex_w_ = 0, tex_h_ = 0;
     std::vector<u32> pixels_;
@@ -148,6 +153,8 @@ private:
     bool picture_ = false, picture_stale_ = true;
     SDL_FRect dest_{};  // where the picture is drawn, in window coordinates
     bool fullscreen_ = false, show_status_ = true;
+    bool native_menus_ = false;                   // macOS: the system menu bar has the menus
+    std::vector<std::function<void()>> posted_;  // actions chosen there, run from the main loop
     int pending_frames_ = 3;
 
     bool captured_ = false;
@@ -207,7 +214,8 @@ int Gui::run() {
         w *= fit;
         h = (h - bars) * fit + bars;
     }
-    window_ = SDL_CreateWindow("SiliconGhost", static_cast<int>(w), static_cast<int>(h), SDL_WINDOW_RESIZABLE);
+    window_ = SDL_CreateWindow("SiliconGhost", static_cast<int>(w), static_cast<int>(h),
+                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
     if (!renderer_) {
         SG_LOG(Error, "display", "cannot create window: %s", SDL_GetError());
@@ -215,6 +223,11 @@ int Gui::run() {
         SDL_Quit();
         return -1;
     }
+    // Sizes are in window coordinates, scaled for the desktop's UI scale; on
+    // a high-density screen (Retina) text is rasterised at the pixel density
+    // and drawn at the coordinate size, so it stays sharp.
+    density_ = std::max(1.0f, SDL_GetWindowPixelDensity(window_));
+    scale_ = std::clamp(SDL_GetWindowDisplayScale(window_) / density_, 1.0f, 4.0f);
     ctx_ = ImGui::CreateContext();
     ImGui::SetCurrentContext(ctx_);
     ImGuiIO& io = ImGui::GetIO();
@@ -222,10 +235,13 @@ int Gui::run() {
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(scale_);
     ImFontConfig font;
-    font.SizePixels = 13.0f * scale_;
+    font.SizePixels = 13.0f * scale_ * density_;
     io.Fonts->AddFontDefault(&font);
+    io.FontGlobalScale = 1.0f / density_;
     ImGui_ImplSDL3_InitForSDLRenderer(window_, renderer_);
     ImGui_ImplSDLRenderer3_Init(renderer_);
+    native_menus_ = install_native_menus([this] { return menus(); },
+                                         [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
 
     // Serial port 1 (the console, IRIX's ttyd1) is the SCC's channel B.
     static const char* const kPortNames[2] = {"Serial Port 1", "Serial Port 2"};
@@ -280,6 +296,12 @@ int Gui::run() {
         }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) handle_event(ev);
+        if (!posted_.empty()) {  // chosen from the system menu bar
+            auto actions = std::move(posted_);
+            posted_.clear();
+            for (auto& a : actions) a();
+            pending_frames_ = std::max(pending_frames_, 3);
+        }
         {
             std::deque<PickResult> picks;
             {
@@ -421,10 +443,7 @@ bool Gui::hotkey(const SDL_KeyboardEvent& key) {
             if (down && session_.on()) session_.machine()->request_next_disc();
             return true;
         case SDL_SCANCODE_F:
-            if (down) {
-                fullscreen_ = !fullscreen_;
-                SDL_SetWindowFullscreen(window_, fullscreen_);
-            }
+            if (down) toggle_fullscreen();
             return true;
         case SDL_SCANCODE_P:
             if (down) press_power_button();
@@ -592,8 +611,10 @@ void Gui::frame() {
     ImGuiIO& io = ImGui::GetIO();
     float top = 0, bottom = io.DisplaySize.y;
     if (!fullscreen_) {
-        draw_menu();
-        top = ImGui::GetFrameHeight();
+        if (!native_menus_) {
+            draw_menu();
+            top = ImGui::GetFrameHeight();
+        }
         if (show_status_) {
             bottom -= ImGui::GetFrameHeight();
             draw_status_bar();
@@ -627,99 +648,136 @@ void Gui::frame() {
     if (picture_ && texture_) {
         const ImVec2 fb = io.DisplayFramebufferScale;
         const SDL_FRect px{dest_.x * fb.x, dest_.y * fb.y, dest_.w * fb.x, dest_.h * fb.y};
+        // Whole-number scaling (1280x1024 doubled on Retina) stays sharp.
+        const float k = px.w / static_cast<float>(tex_w_);
+        SDL_SetTextureScaleMode(texture_, std::fabs(k - std::round(k)) < 0.01f ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
         SDL_RenderTexture(renderer_, texture_, nullptr, &px);
     }
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer_);
     SDL_RenderPresent(renderer_);
 }
 
+// The menus. Actions look the machine up when they run: on macOS they run
+// from the main loop after the menu closes, and may outlive the state the
+// menu was built from.
+std::vector<MenuEntry> Gui::menus() {
+    using E = MenuEntry;
+    auto* m = session_.machine();
+    std::vector<E> machine;
+    if (!m) {
+        machine.push_back(E::item("Power On", [this] { power_on(); }).key('P'));
+    } else {
+        machine.push_back(E::item("Power Button", [this] { press_power_button(); })
+                              .key('P')
+                              .tip("As the button on the front: the system shuts down and powers off"));
+        machine.push_back(E::item("Power Off Now", [this] { power_off(); })
+                              .tip("Cuts the power at once, without shutting down (the NVRAM is kept)"));
+        machine.push_back(E::item("Reset", [this] {
+                              if (auto* x = session_.machine()) x->reset();
+                          }).tip("Restarts the machine from the boot PROM at once"));
+        machine.push_back(E::separator());
+        machine.push_back(E::item("Volume Up", [this] { press_volume(ip22::Ioc2::PanelButton::VolumeUp); }));
+        machine.push_back(E::item("Volume Down", [this] { press_volume(ip22::Ioc2::PanelButton::VolumeDown); }));
+    }
+    machine.push_back(E::separator());
+    machine.push_back(E::item("Settings...", [this] { open_settings(); }).as(E::Role::Settings));
+    machine.push_back(E::item("Open Settings File...", [this] { choose(Pick::OpenSettings, settings_path_); }));
+    machine.push_back(E::item("Save Settings As...", [this] { choose(Pick::SaveSettings, settings_path_); }));
+    machine.push_back(E::separator());
+    machine.push_back(E::item("Quit", [this] {
+                          if (session_.on()) open_quit_ = true;
+                          else quit_ = true;
+                      }).as(E::Role::Quit));
+
+    std::vector<E> media;
+    const bool drive = m && m->has_cdrom_drive();
+    const bool loaded = drive && m->disc_in_drive() >= 0;
+    media.push_back(E::heading("CD-ROM (SCSI ID 4)"));
+    media.push_back(E::item("Eject", [this] { eject(); }, loaded));
+    media.push_back(E::item("Force Eject", [this] {
+                        if (auto* x = session_.machine()) {
+                            x->force_eject_disc();
+                            status("Disc ejected while the system had it locked in");
+                        }
+                    }, loaded).tip("As a paper clip in the drive's emergency eject hole: also when the system has locked the disc in"));
+    media.push_back(E::item("Insert Disc...", [this] { choose(Pick::InsertDisc, {}); }, drive));
+    media.push_back(E::item("Next Disc in Set", [this] {
+                        if (auto* x = session_.machine()) x->request_next_disc();
+                    }, drive && !m->discs().empty()).key('E'));
+    const std::vector<std::string>& discs = m ? m->discs() : session_.settings().cdroms;
+    if (!discs.empty()) media.push_back(E::separator());
+    for (std::size_t i = 0; i < discs.size(); ++i) {
+        const bool in = m && m->disc_in_drive() == static_cast<int>(i);
+        media.push_back(E::item(file_name(discs[i]), [this, i] {
+                            auto* x = session_.machine();
+                            if (!x || x->disc_in_drive() == static_cast<int>(i)) return;
+                            if (x->disc_in_drive() >= 0 && !x->eject_disc())
+                                status("The disc is locked in by the system; eject it from IRIX first");
+                            else
+                                x->select_disc(i);
+                        }, drive, in).tip(discs[i]));
+    }
+    media.push_back(E::separator());
+    media.push_back(E::heading("Hard disk (SCSI ID 1)"));
+    const std::string& disk = session_.settings().disk;
+    media.push_back(E::item(disk.empty() ? "(none)" : file_name(disk), nullptr, false));
+    media.push_back(E::item("Change Disk...", [this] { open_settings(); }, !m).tip(m ? "Power off first" : ""));
+
+    std::vector<E> view;
+    for (unsigned port = 0; port < 2; ++port) {
+        view.push_back(E::item(port == 0 ? "Serial Port 1 (console)" : "Serial Port 2", [this, port] {
+                           auto& w = *terminal_windows_[port];
+                           if (w.is_open()) w.close();
+                           else w.open();
+                       }, true, terminal_windows_[port]->is_open()));
+    }
+    view.push_back(E::separator());
+    view.push_back(E::item("Status Bar", [this] { show_status_ = !show_status_; }, true, show_status_));
+    view.push_back(E::item("Full Screen", [this] { toggle_fullscreen(); }, true, fullscreen_).key('F'));
+
+    std::vector<E> help;
+    help.push_back(E::item("Keyboard and Mouse", [this] { keys_open_ = true; }));
+    help.push_back(E::item("About SiliconGhost", [this] { about_open_ = true; }).as(E::Role::About));
+
+    return {E::submenu("Machine", std::move(machine)), E::submenu("Media", std::move(media)),
+            E::submenu("View", std::move(view)), E::submenu("Help", std::move(help))};
+}
+
+void Gui::draw_entries(const std::vector<MenuEntry>& entries) {
+    const std::string ctrl_alt = std::string("Ctrl+") + kAlt + "+";
+    int id = 0;
+    for (const MenuEntry& e : entries) {
+        ImGui::PushID(id++);
+        switch (e.kind) {
+            case MenuEntry::Kind::Separator: ImGui::Separator(); break;
+            case MenuEntry::Kind::Heading: ImGui::TextDisabled("%s", e.label.c_str()); break;
+            case MenuEntry::Kind::Submenu:
+                if (ImGui::BeginMenu(e.label.c_str(), e.enabled)) {
+                    draw_entries(e.children);
+                    ImGui::EndMenu();
+                }
+                break;
+            case MenuEntry::Kind::Item: {
+                const std::string keys = e.hotkey ? ctrl_alt + e.hotkey : std::string();
+                if (ImGui::MenuItem(e.label.c_str(), keys.empty() ? nullptr : keys.c_str(), e.checked, e.enabled) && e.action)
+                    e.action();
+                if (!e.tooltip.empty()) ImGui::SetItemTooltip("%s", e.tooltip.c_str());
+                break;
+            }
+        }
+        ImGui::PopID();
+    }
+}
+
 void Gui::draw_menu() {
     if (!ImGui::BeginMainMenuBar()) return;
-    auto* m = session_.machine();
-    const std::string ctrl_alt = std::string("Ctrl+") + kAlt + "+";
-    if (ImGui::BeginMenu("Machine")) {
-        if (!m) {
-            if (ImGui::MenuItem("Power On", (ctrl_alt + "P").c_str())) power_on();
-        } else {
-            if (ImGui::MenuItem("Power Button", (ctrl_alt + "P").c_str())) press_power_button();
-            ImGui::SetItemTooltip("As the button on the front: the system shuts down and powers off");
-            if (ImGui::MenuItem("Power Off Now")) power_off();
-            ImGui::SetItemTooltip("Cuts the power at once, without shutting down (the NVRAM is kept)");
-            if (ImGui::MenuItem("Reset")) m->reset();
-            ImGui::SetItemTooltip("Restarts the machine from the boot PROM at once");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Volume Up")) press_volume(ip22::Ioc2::PanelButton::VolumeUp);
-            if (ImGui::MenuItem("Volume Down")) press_volume(ip22::Ioc2::PanelButton::VolumeDown);
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Settings...")) open_settings();
-        if (ImGui::MenuItem("Open Settings File...")) choose(Pick::OpenSettings, settings_path_);
-        if (ImGui::MenuItem("Save Settings As...")) choose(Pick::SaveSettings, settings_path_);
-        ImGui::Separator();
-        if (ImGui::MenuItem("Quit")) {
-            if (m) open_quit_ = true;
-            else quit_ = true;
-        }
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("Media")) {
-        ImGui::TextDisabled("CD-ROM (SCSI ID 4)");
-        const bool drive = m && m->has_cdrom_drive();
-        if (ImGui::MenuItem("Eject", nullptr, false, drive && m->disc_in_drive() >= 0)) eject();
-        if (ImGui::MenuItem("Force Eject", nullptr, false, drive && m->disc_in_drive() >= 0)) {
-            m->force_eject_disc();
-            status("Disc ejected while the system had it locked in");
-        }
-        ImGui::SetItemTooltip("As a paper clip in the drive's emergency eject hole: also when the system has locked the disc in");
-        if (ImGui::MenuItem("Insert Disc...", nullptr, false, drive)) choose(Pick::InsertDisc, {});
-        if (ImGui::MenuItem("Next Disc in Set", (ctrl_alt + "E").c_str(), false, drive && !m->discs().empty()))
-            m->request_next_disc();
-        const std::vector<std::string>& discs = m ? m->discs() : session_.settings().cdroms;
-        if (!discs.empty()) {
-            ImGui::Separator();
-            for (std::size_t i = 0; i < discs.size(); ++i) {
-                const bool in = m && m->disc_in_drive() == static_cast<int>(i);
-                ImGui::PushID(static_cast<int>(i));
-                if (ImGui::MenuItem(file_name(discs[i]).c_str(), nullptr, in, drive) && !in) {
-                    if (m->disc_in_drive() >= 0 && !m->eject_disc())
-                        status("The disc is locked in by the system; eject it from IRIX first");
-                    else
-                        m->select_disc(i);
-                }
-                ImGui::SetItemTooltip("%s", discs[i].c_str());
-                ImGui::PopID();
-            }
-        }
-        ImGui::Separator();
-        ImGui::TextDisabled("Hard disk (SCSI ID 1)");
-        const std::string& disk = session_.settings().disk;
-        ImGui::MenuItem(disk.empty() ? "(none)" : file_name(disk).c_str(), nullptr, false, false);
-        if (ImGui::MenuItem("Change Disk...", nullptr, false, !m)) open_settings();
-        if (m) ImGui::SetItemTooltip("Power off first");
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("View")) {
-        for (unsigned port = 0; port < 2; ++port) {
-            const bool open = terminal_windows_[port]->is_open();
-            if (ImGui::MenuItem(port == 0 ? "Serial Port 1 (console)" : "Serial Port 2", nullptr, open)) {
-                if (open) terminal_windows_[port]->close();
-                else terminal_windows_[port]->open();
-            }
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Status Bar", nullptr, show_status_)) show_status_ = !show_status_;
-        if (ImGui::MenuItem("Full Screen", (ctrl_alt + "F").c_str(), fullscreen_)) {
-            fullscreen_ = !fullscreen_;
-            SDL_SetWindowFullscreen(window_, fullscreen_);
-        }
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("Help")) {
-        if (ImGui::MenuItem("Keyboard and Mouse")) keys_open_ = true;
-        if (ImGui::MenuItem("About SiliconGhost")) about_open_ = true;
-        ImGui::EndMenu();
-    }
+    draw_entries(menus());
     ImGui::EndMainMenuBar();
+}
+
+void Gui::toggle_fullscreen() {
+    fullscreen_ = !fullscreen_;
+    SDL_SetWindowFullscreen(window_, fullscreen_);
 }
 
 void Gui::draw_status_bar() {
@@ -1261,6 +1319,12 @@ std::string user_file(const std::string& name) {
     SDL_free(dir);
     return path;
 }
+
+#if !defined(__APPLE__)
+bool install_native_menus(std::function<std::vector<MenuEntry>()>, std::function<void(std::function<void()>)>) {
+    return false;
+}
+#endif
 
 int run_gui(Settings settings, const GuiOptions& options, volatile std::sig_atomic_t& stop,
             volatile std::sig_atomic_t& next_disc) {

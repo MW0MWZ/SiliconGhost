@@ -93,10 +93,16 @@ xcode-select --install
 brew install cmake ninja pkgconf sdl3 libslirp
 ```
 
-macOS builds are new and not yet widely tested. The recompiler is not
-available there yet (macOS needs a different way of allocating executable
-memory), so the block cache and interpreter run everything, more slowly;
-`--net tap:NAME` is Linux-only, while `--net user` works.
+On macOS the build makes `build/SiliconGhost.app`, a normal application
+with the menus in the system menu bar (`build/siliconghost` links to the
+program inside it, for running from the terminal). To make a copy that runs
+on its own, with the libraries it uses copied in and signed for this Mac:
+
+```sh
+cmake --install build --prefix ~/Applications
+```
+
+TAP networking is Linux-only; user-mode networking works everywhere.
 
 Ubuntu 24.04 LTS and older releases do not package SDL3; build and install
 it from source first ([SDL's build instructions](https://github.com/libsdl-org/SDL/blob/main/docs/README-cmake.md)),

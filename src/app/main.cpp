@@ -227,8 +227,13 @@ int main(int argc, char** argv) {
     bool trace = false, dump = false, headless = false, timing_given = false, foreground = false, log_given = false;
     sg::log::set_level(sg::log::Level::Warn);
 
+    // Finder on older macOS passes a process serial number: not an option.
+    int real_args = 0;
+    for (int i = 1; i < argc; ++i)
+        if (std::strncmp(argv[i], "-psn_", 5) != 0) ++real_args;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
+        if (!std::strncmp(a, "-psn_", 5)) continue;
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) {
                 usage(argv[0]);
@@ -320,7 +325,7 @@ int main(int argc, char** argv) {
     if (!headless) {
         sg::app::GuiOptions options;
         options.settings_file = settings_file;
-        options.power_on = argc > 1;  // started with a machine described: power it on
+        options.power_on = real_args > 0;  // started with a machine described: power it on
         options.screenshot = screenshot;
         options.log_file = log_file;
         const int rc = sg::app::run_gui(settings, options, g_interrupted, g_next_disc);

@@ -67,7 +67,7 @@ void TerminalWindow::open() {
         raise();
         return;
     }
-    window_ = SDL_CreateWindow(title_.c_str(), 640, 400, 0);
+    window_ = SDL_CreateWindow(title_.c_str(), 640, 400, SDL_WINDOW_HIGH_PIXEL_DENSITY);
     renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
     if (!renderer_) {
         if (window_) SDL_DestroyWindow(window_);
@@ -81,12 +81,15 @@ void TerminalWindow::open() {
         io.IniFilename = nullptr;
         ImGui::StyleColorsDark();
         ImGui::GetStyle().ScaleAllSizes(ui_scale_);
+        // Rasterised at the pixel density (Retina), drawn at coordinate size.
+        density_ = std::max(1.0f, SDL_GetWindowPixelDensity(window_));
         for (int z = 1; z <= 2; ++z) {
             ImFontConfig cfg;
-            cfg.SizePixels = kBaseFont * ui_scale_ * static_cast<float>(z);
+            cfg.SizePixels = kBaseFont * ui_scale_ * static_cast<float>(z) * density_;
             io.Fonts->AddFontDefault(&cfg);
         }
         io.Fonts->Build();
+        io.FontGlobalScale = 1.0f / density_;
         ImGui_ImplSDL3_InitForSDLRenderer(window_, renderer_);
         ImGui_ImplSDLRenderer3_Init(renderer_);
     }
@@ -120,9 +123,10 @@ void TerminalWindow::resize_for_font() {
     ContextScope scope(ctx_);
     const ImGuiStyle& style = ImGui::GetStyle();
     ImFont* font = ImGui::GetIO().Fonts->Fonts[zoom_ - 1];
-    const float cw = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, "M").x;
-    const float lh = font->FontSize;
-    const float menu = ImGui::GetIO().Fonts->Fonts[0]->FontSize + style.FramePadding.y * 2;
+    const float size = font->FontSize / density_;  // in window coordinates
+    const float cw = font->CalcTextSizeA(size, FLT_MAX, 0.0f, "M").x;
+    const float lh = size;
+    const float menu = ImGui::GetIO().Fonts->Fonts[0]->FontSize / density_ + style.FramePadding.y * 2;
     const int w = static_cast<int>(cw * Terminal::kCols + style.WindowPadding.x * 2 + 0.5f);
     const int h = static_cast<int>(lh * Terminal::kRows + menu + style.WindowPadding.y * 2 + 0.5f);
     SDL_SetWindowSize(window_, w, h);
@@ -275,8 +279,9 @@ void TerminalWindow::draw() {
 
     ImFont* font = io.Fonts->Fonts[zoom_ - 1];
     ImGui::PushFont(font);
-    const float cw = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, "M").x;
-    const float lh = font->FontSize;
+    const float fs = ImGui::GetFontSize();  // the font's size in window coordinates
+    const float cw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, "M").x;
+    const float lh = fs;
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -303,7 +308,7 @@ void TerminalWindow::draw() {
             ImU32 fg = attr & Terminal::kBold ? kBold : kFg, bg = kBg;
             if (attr & Terminal::kReverse) std::swap(fg, bg);
             if (bg != kBg) dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + lh), bg);
-            dl->AddText(font, font->FontSize, ImVec2(x0, y), fg, run.c_str());
+            dl->AddText(font, fs, ImVec2(x0, y), fg, run.c_str());
             if (attr & Terminal::kUnderline) dl->AddLine(ImVec2(x0, y + lh - 1), ImVec2(x1, y + lh - 1), fg);
             c = end;
         }
@@ -317,7 +322,7 @@ void TerminalWindow::draw() {
             dl->AddRectFilled(ImVec2(x, y), ImVec2(x + cw, y + lh), kFg);
             std::string ch;
             append_utf8(ch, terminal_.at(terminal_.cursor_row(), terminal_.cursor_col()).ch);
-            dl->AddText(font, font->FontSize, ImVec2(x, y), kBg, ch.c_str());
+            dl->AddText(font, fs, ImVec2(x, y), kBg, ch.c_str());
         } else {
             dl->AddRect(ImVec2(x, y), ImVec2(x + cw, y + lh), kFg);
         }

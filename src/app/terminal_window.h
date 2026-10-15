@@ -47,6 +47,7 @@ private:
     Terminal& terminal_;
     Send send_;
     float ui_scale_;
+    float density_ = 1.0f;  // pixels per window coordinate
     int zoom_ = 1;
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;
