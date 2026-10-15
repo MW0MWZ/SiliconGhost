@@ -171,7 +171,7 @@ private:
     ip22::Indy::Activity last_activity_{};
     u64 last_instructions_ = 0, meter_time_ns_ = 0, next_status_ns_ = 0;
     double cpu_load_ = 0, gfx_mpix_ = 0, speed_ = 0, mips_ = 0;
-    std::string status_text_;
+    std::string status_text_, status_shown_;
     u64 status_until_ns_ = 0;
 
     // Dialogs
@@ -569,9 +569,18 @@ void Gui::frame() {
     update_picture();
     if (session_.on()) {
         update_meters(now);
-        if (now >= next_status_ns_) {  // lights go out and meters move: 10 frames a second
+        // The status bar is looked at ten times a second, and redrawn only
+        // when what it shows has changed: an idle machine costs no frames.
+        if (now >= next_status_ns_) {
             next_status_ns_ = now + 100000000ull;
-            pending_frames_ = std::max(pending_frames_, 1);
+            auto* m = session_.machine();
+            char sig[96];
+            std::snprintf(sig, sizeof sig, "%d%d%d %d %3.0f %5.1f %3.0f", disk_light_.lit(now), cd_light_.lit(now),
+                          net_light_.lit(now), m->disc_in_drive(), cpu_load_ * 100, gfx_mpix_, speed_ * 100);
+            if (status_shown_ != sig) {
+                status_shown_ = sig;
+                pending_frames_ = std::max(pending_frames_, 1);
+            }
         }
     }
     if (status_until_ns_ && now >= status_until_ns_) {
