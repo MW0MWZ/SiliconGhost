@@ -368,7 +368,7 @@ u32 Mc::dma_translate(u32 vaddr) {
         if (!dma_tlb_hi_[i] && !dma_tlb_lo_[i]) continue;
         if ((vaddr & 0xFFC00000u) != (dma_tlb_hi_[i] & 0xFFC00000u)) continue;
         u32 pte = 0;
-        bus_.read<u32>(((dma_tlb_lo_[i] & 0x003FFFC0u) << 6) + (((vaddr >> 12) & 0x3FF) << 2), pte);
+        bus_.read<u32>(((dma_tlb_lo_[i] & 0x03FFFFC0u) << 6) + (((vaddr >> 12) & 0x3FF) << 2), pte);
         return ((pte & 0x03FFFFC0u) << 6) + (vaddr & 0xFFF);
     }
     return vaddr;

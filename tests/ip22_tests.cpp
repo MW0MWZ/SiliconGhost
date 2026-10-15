@@ -33,9 +33,13 @@ u32 ioc_addr(unsigned reg_offset) { return kIoc + reg_offset + 3; }
 
 // A machine whose PROM is an idle loop, so the CPU runs harmlessly.
 struct IndyRig {
-    Indy m{IndyConfig{}};
+    Indy m;
     std::string serial;
-    IndyRig() {
+    explicit IndyRig(unsigned ram_mb = 64) : m([ram_mb] {
+        IndyConfig c;
+        c.ram_mb = ram_mb;
+        return c;
+    }()) {
         std::vector<u8> prom(8);
         store_be<u32>(&prom[0], test::as::BEQ(0, 0, -1));
         store_be<u32>(&prom[4], test::as::NOP);
@@ -711,6 +715,36 @@ TEST(indy_newport_answers_across_the_graphics_slot) {
 // The MC's virtual DMA sends a memory rectangle to one GIO address, the
 // device's data port: here REX3's host data register with GO, drawing a
 // block of host-supplied pixels as IRIX's graphics library does.
+// The DMA TLB's page-table pointer reaches the whole low memory window: with
+// 256 MiB, IRIX keeps page tables above 0x10000000.
+TEST(ip22_mc_dma_page_table_in_high_memory) {
+    IndyRig t(256);
+    t.w32(kMcMemCfg0, 0x7F207F40u);  // 128 MiB at 0x08000000 and at 0x10000000
+    constexpr u32 kMc = 0x1FA00000, kTable = 0x14000000, kPage = 0x15000000, kRex3 = 0x1F0F0000, kGo = 0x800;
+    constexpr u32 kVirt = 0x00400000;  // a 4 MiB DMA segment
+    t.w32(kTable + 0, ((kPage >> 12) << 6) | 2);  // PTE for the segment's first page: PFN, valid
+    for (u32 i = 0; i < 8; ++i) t.w8(kPage + i, static_cast<u8>(0x40 + i));
+    t.w32(kMc + 0x184, kVirt);                  // DMA_TLB_HI_0
+    t.w32(kMc + 0x18C, (kTable >> 12) << 6);    // DMA_TLB_LO_0: the page table
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // 8-bit host pixels, 8 a word
+    t.w32(kRex3 + 0x220, 0xFF);
+    t.w32(kRex3 + 0x1328, 0x1E00);
+    t.w32(kRex3 + 0x150, 0);
+    t.w32(kRex3 + 0x154, (7u << 16) | 0u);
+    t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));
+    t.w32(kMc + 0x2004, kVirt);            // DMA_MEMADR (translated)
+    t.w32(kMc + 0x2014, (1u << 16) | 8u);  // 1 line of 8 bytes
+    t.w32(kMc + 0x201C, 1u << 16);
+    t.w32(kMc + 0x2034, 1u << 4);
+    t.w32(kMc + 0x202C, kRex3 + kGo + 0x230);
+    t.m.run(10000);
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w32(kRex3 + 0x150, 0);
+    t.w32(kRex3 + 0x154, 3u << 16);
+    t.w32(kRex3 + kGo + 0x004, 1u);
+    CHECK_EQ(t.r32(kRex3 + 0x230), 0x40414243u);
+}
+
 TEST(ip22_mc_dma_feeds_one_gio_address) {
     IndyRig t;
     t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
