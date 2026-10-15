@@ -292,7 +292,7 @@ network needs), and the Indy is configured like any machine on that network.
 | Installation over the network (HTTP/FTP) | yes | yes |
 | Installed system boots multi-user from disk | yes | yes |
 | Serial console | yes | yes |
-| Newport (graphics) console | no text shown; use the serial console | yes, text console |
+| Newport (graphics) console | 9.0 and 11.0: no text shown; NetBSD-current: yes (8- and 24-bit boards) | yes, text console |
 | PS/2 keyboard | yes | yes |
 | PS/2 mouse | detected (not exercised without X) | detected (not exercised without X) |
 | X11 | not tried (no X sets for sgimips 9.0) | no (OpenBSD's Newport driver has no frame buffer for X) |
@@ -414,12 +414,12 @@ with performance layers on top that must give exactly the same results:
   the CID planes to one code and clips windows with the screen masks. The
   order of the antialiased-line weight table's entries is assumed (the
   specification does not give it).
-- NetBSD's Newport console shows no text (9.0 and 11.0): these releases
+- NetBSD 9.0's and 11.0's Newport console shows no text: these releases
   read the board's revision just after a VC2 register access, a read whose
   result on real hardware is not known, and on the emulated board they take
-  it for a 24-bit board. NetBSD's development source reads the revision
-  directly, as OpenBSD does (OpenBSD's console works). Use the serial
-  console.
+  it for a 24-bit board. A NetBSD-current kernel (11.99), which reads the
+  revision directly, finds the board and runs its console on both the 8-bit
+  and the 24-bit board. With 9.0 or 11.0, use the serial console.
 - IRIX 5.3, IRIX 6.5, NetBSD 9.0 and 11.0 and OpenBSD 6.9 are the systems
   tested so far; Linux has not been tried. (Current Debian releases no longer include
   Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
