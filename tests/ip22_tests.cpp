@@ -725,8 +725,9 @@ TEST(ip22_mc_dma_page_table_in_high_memory) {
     constexpr u32 kVirt = 0x00400000;  // a 4 MiB DMA segment
     t.w32(kTable + 0, ((kPage >> 12) << 6) | 2);  // PTE for the segment's first page: PFN, valid
     for (u32 i = 0; i < 8; ++i) t.w8(kPage + i, static_cast<u8>(0x40 + i));
+    t.w32(kMc + 0x16C, 0x100);                  // DMA_CTL: Xlate
     t.w32(kMc + 0x184, kVirt);                  // DMA_TLB_HI_0
-    t.w32(kMc + 0x18C, (kTable >> 12) << 6);    // DMA_TLB_LO_0: the page table
+    t.w32(kMc + 0x18C, ((kTable >> 12) << 6) | 2);  // DMA_TLB_LO_0: the page table, valid
     t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // 8-bit host pixels, 8 a word
     t.w32(kRex3 + 0x220, 0xFF);
     t.w32(kRex3 + 0x1328, 0x1E00);
@@ -835,4 +836,36 @@ TEST(ip22_gfx_slot_unclaimed_reads_return_the_access_width) {
     CHECK_EQ(h, 2u);
     CHECK_EQ(t.r8(0x1F000003), 1u);
     CHECK(t.r32(0x1F0F0000) != 4u || t.r32(0x1F0F0004) != 4u);  // REX3 registers answer
+}
+
+// With Xlate set, a DMA through a segment no TLB entry maps stops with a
+// TLB miss (interrupting whatever the mask) and resumes from where it
+// stopped once the entry is loaded. MEMADRD loads the default descriptor.
+TEST(ip22_mc_dma_tlb_miss_faults_and_resumes) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);  // 64 MiB at 0x08000000
+    constexpr u32 kMc = 0x1FA00000, kTable = 0x08200000, kPage = 0x08300000;
+    constexpr u32 kVirt = 0x00400000;
+    t.w32(kTable, ((kPage >> 12) << 6) | 2 | 4);  // PTE: page, valid, dirty
+    t.w32(kMc + 0x16C, 0x100);                    // Xlate, completion interrupt masked
+    t.w32(kMc + 0x200C, kVirt);                   // MEMADRD: defaults
+    CHECK_EQ(t.r32(kMc + 0x2014), 0x0001000Cu);
+    CHECK_EQ(t.r32(kMc + 0x2034), 0x28u);
+    t.w32(kMc + 0x2014, (2u << 16) | 4u);         // 2 lines of 4 bytes
+    t.w32(kMc + 0x201C, 1u << 16);
+    t.w32(kMc + 0x2034, (1u << 4) | (1u << 3) | (1u << 1));  // increment, fill memory
+    t.w32(kMc + 0x202C, 0xA5A5A5A5u);             // the fill value; starts
+    t.m.run(10000);
+    CHECK_EQ(t.r32(kMc + 0x164) & 0xF, 0x2u);     // TLB miss
+    CHECK_EQ(t.r32(kMc + 0x204C), 0x2u);          // stopped, cause mirrored
+    CHECK_EQ(t.r32(kMc + 0x2014) >> 16, 2u);      // nothing done yet
+    t.w32(kMc + 0x184, kVirt);
+    t.w32(kMc + 0x18C, ((kTable >> 12) << 6) | 2);
+    t.w32(kMc + 0x164, 0);
+    t.w32(kMc + 0x2044, 1);                       // restart
+    t.m.run(10000);
+    CHECK_EQ(t.r32(kMc + 0x164) & 0xF, 0x8u);     // complete
+    CHECK_EQ(t.r32(kPage), 0xA5A5A5A5u);
+    CHECK_EQ(t.r32(kPage + 4), 0xA5A5A5A5u);
+    CHECK_EQ(t.r32(kPage + 8), 0u);
 }

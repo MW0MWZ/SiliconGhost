@@ -29,6 +29,16 @@ constexpr u32 kLowAliasSize = 0x80000;
 
 constexpr u32 kGioSpaceStart = 0x1F000000, kGioSpaceEnd = 0x1FA00000;
 
+// Virtual DMA
+constexpr u32 kDmaModeToMemory = 1u << 1;
+constexpr u32 kDmaModeFill = 1u << 3;
+constexpr u32 kDmaModeIncrement = 1u << 4;
+constexpr u32 kDmaRunActive = 1u << 6;
+constexpr u32 kDmaCtlPteSize8 = 1u << 0, kDmaCtlPage16K = 1u << 1, kDmaCtlIntEnable = 1u << 4, kDmaCtlXlate = 1u << 8;
+constexpr u32 kDmaCausePageFault = 1u << 0, kDmaCauseTlbMiss = 1u << 1, kDmaCauseClean = 1u << 2,
+              kDmaCauseDone = 1u << 3;
+constexpr u32 kTlbValid = 1u << 1, kPteValid = 1u << 1, kPteDirty = 1u << 2;
+
 }  // namespace
 
 Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz)
@@ -183,12 +193,16 @@ void Mc::write_reg(u32 reg, u32 value) {
             }
             return;
         case kDmaCause:
-            dma_cause_ = value;
+            dma_cause_ = value & 0xF;
+            dma_run_ = (dma_run_ & kDmaRunActive) | dma_cause_;
             if (dma_cause_ == 0 && dma_irq_cb_) dma_irq_cb_(false);
             return;
         case kDmaCtl: dma_ctl_ = value; return;
-        case kDmaMemAdr:
-        case kDmaMemAdrD: dma_mem_addr_ = value; return;
+        case kDmaMemAdr: dma_mem_addr_ = value; return;
+        case kDmaMemAdrD:
+            dma_mem_addr_ = value;
+            dma_load_defaults();
+            return;
         case kDmaSize:
             dma_size_ = value;
             dma_count_ = (dma_count_ & 0xFFFF0000u) | (value & 0xFFFF);
@@ -204,15 +218,16 @@ void Mc::write_reg(u32 reg, u32 value) {
             return;
         case kDmaMode: dma_mode_ = value; return;
         case kDmaCount: dma_count_ = value; return;
-        case kDmaStart:
+        case kDmaStart:  // 1 starts (or resumes) the transfer, 0 stops it
             if (value & 1) start_dma();
+            else if (dma_run_ & kDmaRunActive) {
+                dma_timer_.cancel();
+                dma_run_ &= ~kDmaRunActive;
+            }
             return;
-        case kDmaMemAdrDS:
-            dma_gio_addr_ = value;
-            dma_size_ = 0x0001000C;
-            dma_stride_ = 0x00010000;
-            dma_count_ = 0x0001000C;
-            dma_mode_ = 0x00000028;
+        case kDmaMemAdrDS:  // memory address, set defaults, start
+            dma_mem_addr_ = value;
+            dma_load_defaults();
             start_dma();
             return;
         case kSysId:
@@ -342,90 +357,117 @@ void Mc::update_irq() {
 }
 
 // ---------------------------------------------------------------------------
-// Virtual DMA: moves rectangular memory areas to or from a GIO64 address, or
-// fills memory with a constant. The GIO address stays fixed: it names a
-// device's data port (such as REX3's host data register with GO), which
-// takes every doubleword in turn. Memory may start at any byte; IRIX sets
-// the GIO address's low bits to match, but a doubleword on GIO64 has no
-// byte address, so the device sees the aligned address. Memory addresses go
-// through a 4-entry TLB of 4 MiB segments whose PTEs live in main memory;
-// addresses no entry covers are used as physical addresses (the boot PROM
-// clears memory this way).
+// Virtual DMA (MC VDMA specification): moves rectangular memory areas to or
+// from a GIO64 address, or fills memory with a constant. The GIO address
+// stays fixed: it names a device's data port (such as REX3's host data
+// register with GO), which takes every doubleword in turn. Memory may start
+// at any byte; IRIX sets the GIO address's low bits to match, but a
+// doubleword on GIO64 has no byte address, so the device sees the aligned
+// address. With Xlate set, memory addresses are virtual and go through a
+// 4-entry TLB, each entry naming the page table of a 4 MiB (16 MiB with 16
+// KiB pages) segment; a missing entry, an invalid page or a write to a clean
+// page stops the transfer with a fault the kernel services before restarting
+// it. The descriptor registers always hold the transfer's state, so a
+// stopped transfer resumes where it was.
 // ---------------------------------------------------------------------------
 
-namespace {
-constexpr u32 kDmaModeToHost = 1u << 1;
-constexpr u32 kDmaModeFill = 1u << 3;
-constexpr u32 kDmaModeIncrement = 1u << 4;
-constexpr u32 kDmaRunActive = 1u << 6;
-constexpr u32 kDmaRunDone = 1u << 3;
-constexpr u32 kDmaCtlIntEnable = 1u << 4;
-constexpr u32 kDmaCauseDone = 1u << 3;
-}  // namespace
 
-u32 Mc::dma_translate(u32 vaddr) {
+u32 Mc::dma_translate(u32 vaddr, bool to_memory, u32& fault) {
+    if (!(dma_ctl_ & kDmaCtlXlate)) return vaddr;  // physical
+    const unsigned page_shift = (dma_ctl_ & kDmaCtlPage16K) ? 14 : 12;
+    const u32 segment_mask = ~((1u << (page_shift + 10)) - 1);
+    const unsigned pte_bytes = (dma_ctl_ & kDmaCtlPteSize8) ? 8 : 4;
     for (unsigned i = 0; i < 4; ++i) {
-        if (!dma_tlb_hi_[i] && !dma_tlb_lo_[i]) continue;
-        if ((vaddr & 0xFFC00000u) != (dma_tlb_hi_[i] & 0xFFC00000u)) continue;
+        if (!(dma_tlb_lo_[i] & kTlbValid) || ((vaddr ^ dma_tlb_hi_[i]) & segment_mask)) continue;
         u32 pte = 0;
-        bus_.read<u32>(((dma_tlb_lo_[i] & 0x03FFFFC0u) << 6) + (((vaddr >> 12) & 0x3FF) << 2), pte);
-        return ((pte & 0x03FFFFC0u) << 6) + (vaddr & 0xFFF);
+        const u32 at = ((dma_tlb_lo_[i] & 0x03FFFFC0u) << 6) + ((vaddr >> page_shift) & 0x3FF) * pte_bytes;
+        bus_.read<u32>(at + (pte_bytes - 4), pte);  // an 8-byte entry keeps EntryLo in its low word
+        if (!(pte & kPteValid)) fault = kDmaCausePageFault;
+        else if (to_memory && !(pte & kPteDirty)) fault = kDmaCauseClean;
+        if (fault) return 0;
+        return ((pte & 0x03FFFFC0u) << 6) + (vaddr & ((1u << page_shift) - 1));
     }
-    return vaddr;
+    fault = kDmaCauseTlbMiss;
+    return 0;
+}
+
+// Writing MEMADRD (or MEMADRDS) loads the default descriptor: one line of
+// 12 bytes, zoom 1, stride 0, snooped fill (the vertex DMA set-up).
+void Mc::dma_load_defaults() {
+    dma_size_ = 0x0001000C;
+    dma_stride_ = 0x00010000;
+    dma_count_ = 0x0001000C;
+    dma_mode_ = 0x00000028;
 }
 
 // The transfer is timed as one 64-bit word per system clock and its effect
 // is applied when it completes.
 void Mc::start_dma() {
-    dma_run_ = (dma_run_ & ~kDmaRunDone) | kDmaRunActive;
-    const u64 lines = dma_size_ >> 16, width = dma_size_ & 0xFFFF, zoom = std::max<u64>(1, (dma_stride_ >> 16) & 0x3FF);
+    dma_run_ = kDmaRunActive;
+    const u64 lines = dma_size_ >> 16, width = dma_size_ & 0xFFFF, zoom = (dma_stride_ >> 16) & 0x3FF;
     const u64 words = std::max<u64>(1, lines * zoom * width / 8);
     dma_timer_.schedule_in(static_cast<u64>(static_cast<double>(words) * cycles_per_sysclk_) + 1);
 }
 
+// The data sheet's algorithm: LINE COUNT lines, each sent ZOOM times (the
+// zoom count and byte count fields of COUNT hold the progress through the
+// current line), then STRIDE added to the address. A fault stops it at the
+// start of the line, with the registers describing what is left.
 void Mc::finish_dma() {
-    const u32 lines = dma_size_ >> 16;
     const u32 width = dma_size_ & 0xFFFF;
     const u32 zoom = (dma_stride_ >> 16) & 0x3FF;
     const s32 stride = static_cast<s16>(dma_stride_);
-    const bool to_host = dma_mode_ & kDmaModeToHost, fill = dma_mode_ & kDmaModeFill;
+    const bool to_memory = dma_mode_ & kDmaModeToMemory, fill = dma_mode_ & kDmaModeFill;
     const s32 step = (dma_mode_ & kDmaModeIncrement) ? 1 : -1;
-    u32 addr = dma_mem_addr_;
-    const u64 gio = dma_gio_addr_ & ~u64{7};
-    for (u32 line = 0; line < lines; ++line) {
-        for (u32 z = 0; z < std::max(zoom, 1u); ++z) {
-            u32 a = addr;
-            if (fill && to_host) {
+    // The GIO address, through the protection mask: masked bits come from SUBST.
+    const u32 mask = regs_.count(kDmaGioMask) ? regs_[kDmaGioMask] : 0;
+    const u32 subst = regs_.count(kDmaGioSubst) ? regs_[kDmaGioSubst] : 0;
+    const u64 gio = ((dma_gio_addr_ & ~mask) | (subst & mask)) & ~u32{7};
+    u32 lines = dma_size_ >> 16;
+    u32 zoom_left = (dma_count_ >> 16) & 0x3FF;
+    u32 fault = 0;
+    while (lines > 0 && !fault) {
+        // Check the pages this line touches before moving any of it.
+        const u32 first = dma_mem_addr_, last = dma_mem_addr_ + static_cast<u32>(step * static_cast<s32>(width ? width - 1 : 0));
+        const unsigned page_shift = (dma_ctl_ & kDmaCtlPage16K) ? 14 : 12;
+        for (u32 p = std::min(first, last) >> page_shift; p <= std::max(first, last) >> page_shift && !fault; ++p)
+            dma_translate(std::max(std::min(first, last), p << page_shift), to_memory, fault);
+        if (fault) break;
+        for (; zoom_left > 0; --zoom_left) {
+            u32 a = dma_mem_addr_;
+            if (fill && to_memory) {
                 for (u32 n = 0; n < width; n += 4, a += static_cast<u32>(4 * step))
-                    bus_.write<u32>(dma_translate(a), dma_gio_addr_);
-            } else if (to_host) {
+                    bus_.write<u32>(dma_translate(a, true, fault), dma_gio_addr_);
+            } else if (to_memory) {
                 for (u32 n = 0; n < width; n += 8) {
                     u64 data = 0;
                     bus_.read<u64>(gio, data);
                     for (u32 b = 0; b < 8 && n + b < width; ++b, a += static_cast<u32>(step))
-                        bus_.write<u8>(dma_translate(a), static_cast<u8>(data >> (56 - 8 * b)));
+                        bus_.write<u8>(dma_translate(a, true, fault), static_cast<u8>(data >> (56 - 8 * b)));
                 }
             } else {
                 for (u32 n = 0; n < width; n += 8) {
                     u64 data = 0;
                     for (u32 b = 0; b < 8 && n + b < width; ++b, a += static_cast<u32>(step)) {
                         u8 v = 0;
-                        bus_.read<u8>(dma_translate(a), v);
+                        bus_.read<u8>(dma_translate(a, false, fault), v);
                         data |= u64{v} << (56 - 8 * b);
                     }
                     bus_.write<u64>(gio, data);
                 }
             }
-            if (z + 1 == std::max(zoom, 1u)) addr = a;
+            if (zoom_left == 1) dma_mem_addr_ = a;  // the last copy leaves the address after the line
         }
-        addr += static_cast<u32>(stride);
+        dma_mem_addr_ += static_cast<u32>(stride);
+        zoom_left = zoom;
+        --lines;
     }
-    dma_mem_addr_ = addr;
-    dma_run_ = (dma_run_ & ~kDmaRunActive) | kDmaRunDone;
-    if (dma_ctl_ & kDmaCtlIntEnable) {
-        dma_cause_ |= kDmaCauseDone;
-        if (dma_irq_cb_) dma_irq_cb_(true);
-    }
+    dma_size_ = (lines << 16) | width;
+    dma_count_ = (zoom_left << 16) | (lines ? width : 0);
+    dma_cause_ = (dma_cause_ & ~0xFu) | (fault ? fault : kDmaCauseDone);
+    dma_run_ = dma_cause_ & 0xF;
+    // Faults always interrupt; completion only when enabled.
+    if ((fault || (dma_ctl_ & kDmaCtlIntEnable)) && dma_irq_cb_) dma_irq_cb_(true);
 }
 
 }  // namespace sg::ip22
