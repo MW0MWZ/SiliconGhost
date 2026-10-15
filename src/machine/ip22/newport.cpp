@@ -549,14 +549,28 @@ u32 Newport::shaded_color(int x, int y) const {
     return pack(r, g, b, depth);
 }
 
+// Host values sit right-aligned in 8-bit fields (4- and 8-bit pixels),
+// 16-bit fields (12-bit) or 32-bit fields (ABGR), the leftmost first;
+// SWAPENDIAN reverses the bytes of 16- and 32-bit fields. Alpha comes from a
+// 32-bit pixel's top byte, or (ALPHAHOST without COLORHOST) from the 8-bit
+// field itself.
 u32 Newport::host_color(u32* alpha) {
     static constexpr int kWidths[4] = {8, 8, 16, 32};
     static constexpr u32 kMasks[4] = {0xF, 0xFF, 0xFFF, 0xFFFFFFFF};
     const unsigned hostdepth = (drawmode1_ >> 8) & 3;
     const int width = kWidths[hostdepth];
     if (host_shift_ < 0) host_shift_ = 64 - width;
-    u32 colour = static_cast<u32>(hostrw_ >> host_shift_) & kMasks[hostdepth];
-    if (alpha) *alpha = hostdepth == 3 ? colour >> 24 : 0xFF;  // only 32-bit host pixels carry alpha (ABGR)
+    u32 field = static_cast<u32>(hostrw_ >> host_shift_) & (width == 32 ? 0xFFFFFFFFu : (1u << width) - 1);
+    if (drawmode1_ & kDm1SwapEndian) {
+        if (width == 16) field = ((field & 0xFF) << 8) | (field >> 8);
+        else if (width == 32) field = byteswap(field);
+    }
+    u32 colour = field & kMasks[hostdepth];
+    if (alpha) {
+        if (hostdepth == 3) *alpha = colour >> 24;
+        else if (!(drawmode0_ & kDm0ColorHost) && width == 8) *alpha = field;
+        else *alpha = 0xFF;
+    }
     if (drawmode1_ & kDm1RwPacked) {
         if (((drawmode1_ & kDm1RwDouble) && host_shift_ > 0) || host_shift_ > 32) host_shift_ -= width;
         else host_shift_ = 64 - width;
@@ -568,7 +582,6 @@ u32 Newport::host_color(u32* alpha) {
         unpack(colour, hostdepth, r, g, b);
         colour = pack(r, g, b, depth);
     }
-    if (drawmode1_ & kDm1SwapEndian) colour = byteswap(colour);
     return colour;
 }
 
@@ -779,9 +792,11 @@ void Newport::draw_span_block(bool block) {
                 sy += dy;
             }
         }
-        // Host-supplied pixels come a data word per GO: a finished row
-        // waits for the next word rather than repeating this one.
-        if (!block || !row_done || !stop_y || sy == end_y || (drawmode0_ & kDm0ColorHost)) break;
+        // Packed host pixels come a data word per GO: a finished row waits
+        // for the next word. An unpacked host pixel fills the whole block
+        // (pixel zoom).
+        const bool host_packed = (drawmode0_ & kDm0ColorHost) && (drawmode1_ & kDm1RwPacked);
+        if (!block || !row_done || !stop_y || sy == end_y || host_packed) break;
     }
     write_x_start(static_cast<u32>(sx) << 11);
     if (block) write_y_start(static_cast<u32>(sy) << 11);
@@ -922,14 +937,17 @@ void Newport::scr2scr() {
     write_y_start(static_cast<u32>(sy) << 11);
 }
 
+// Reads pixels into HOSTRW in the host field layout (see host_color()): as
+// many as a word holds with RWPACKED, otherwise one, in the leftmost field.
 void Newport::pixel_read() {
-    static constexpr int kPerWord[4][2] = {{8, 16}, {4, 8}, {2, 4}, {1, 2}};
-    static constexpr int kStart[4] = {60, 56, 48, 32};
-    static constexpr int kStep[4] = {4, 8, 16, 32};
+    static constexpr int kPerWord[4][2] = {{4, 8}, {4, 8}, {2, 4}, {1, 2}};
+    static constexpr int kStart[4] = {56, 56, 48, 32};
+    static constexpr int kStep[4] = {8, 8, 16, 32};
     const unsigned hostdepth = (drawmode1_ >> 8) & 3, depth = (drawmode1_ >> 3) & 3, planes = drawmode1_ & 7;
     int sx = int_part(xstart_), sy = int_part(ystart_);
     const int ex = int_part(xend_), ey = int_part(yend_);
-    const int width = std::min(ex - sx + 1, kPerWord[hostdepth][(drawmode1_ & kDm1RwDouble) ? 1 : 0]);
+    const int per_word = (drawmode1_ & kDm1RwPacked) ? kPerWord[hostdepth][(drawmode1_ & kDm1RwDouble) ? 1 : 0] : 1;
+    const int width = std::min(ex - sx + 1, per_word);
     const int xwin = static_cast<s16>(xywin_ >> 16) - 0x1000, ywin = static_cast<s16>(xywin_) - 0x1000;
     u64 result = 0;
     int shift = kStart[hostdepth];
@@ -941,8 +959,13 @@ void Newport::pixel_read() {
             unpack(v, depth, r, g, b);
             v = pack(r, g, b, hostdepth);
         }
-        const u64 mask = hostdepth == 3 ? 0xFFFFFFFFull : (u64{1} << kStep[hostdepth]) - 1;
-        result |= (u64{v} & mask) << shift;
+        static constexpr u64 kPixelMask[4] = {0xF, 0xFF, 0xFFF, 0xFFFFFFFF};  // the value, right-aligned in its field
+        v &= static_cast<u32>(kPixelMask[hostdepth]);
+        if (drawmode1_ & kDm1SwapEndian) {  // the bytes of 16- and 32-bit fields
+            if (hostdepth == 2) v = ((v & 0xFF) << 8) | (v >> 8);
+            else if (hostdepth == 3) v = byteswap(v);
+        }
+        result |= u64{v} << shift;
         shift -= kStep[hostdepth];
         if (++sx > ex) {
             sy += ey < sy ? -1 : 1;

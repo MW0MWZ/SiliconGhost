@@ -740,7 +740,7 @@ TEST(ip22_mc_dma_page_table_in_high_memory) {
     t.w32(kMc + 0x2034, 1u << 4);
     t.w32(kMc + 0x202C, kRex3 + kGo + 0x230);
     t.m.run(10000);
-    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u);  // 8-bit host pixels, packed
     t.w32(kRex3 + 0x150, 0);
     t.w32(kRex3 + 0x154, 3u << 16);
     t.w32(kRex3 + kGo + 0x004, 1u);
@@ -768,7 +768,7 @@ TEST(ip22_mc_dma_feeds_one_gio_address) {
     t.m.run(10000);
     CHECK(t.r32(kMc + 0x204C) & (1u << 3));  // DMA_RUN: done
     // Read both lines back.
-    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u);  // 8-bit host pixels, packed
     for (u32 y = 0; y < 2; ++y) {
         for (u32 x = 0; x < 8; x += 4) {
             t.w32(kRex3 + 0x150, (x << 16) | y);
@@ -803,7 +803,7 @@ TEST(ip22_mc_dma_from_unaligned_memory_feeds_the_aligned_data_port) {
     t.m.run(10000);
     CHECK(t.r32(kMc + 0x204C) & (1u << 3));  // DMA_RUN: done
     // Read both lines back.
-    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u);  // 8-bit host pixels, packed
     for (u32 y = 0; y < 2; ++y) {
         for (u32 x = 0; x < 8; x += 4) {
             t.w32(kRex3 + 0x150, (x << 16) | y);

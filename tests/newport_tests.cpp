@@ -95,8 +95,8 @@ TEST(newport_dcb_vc2_ram_and_cmap_revision) {
 TEST(newport_block_fill_and_host_read) {
     Rig t;
     t.fill(10, 20, 13, 21, 0x42);
-    // Read back four 8-bit pixels of the first row.
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    // Read back four 8-bit pixels of the first row (packed).
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u);
     t.w(kXYStartI, (10u << 16) | 20u);
     t.w(kXYEndI, (13u << 16) | 20u);
     t.w(kDrawMode0 | kGo, 1u);
@@ -144,7 +144,7 @@ TEST(newport_host_pixels_advance_per_go) {
     t.w(kXYEndI, (103u << 16) | 50u);
     t.w(kDrawMode0, 2u | (1u << 6));  // DRAW SPAN, COLORHOST, one pixel per GO
     for (u32 c : {0x11u, 0x22u, 0x33u}) t.w(kHostRw0 | kGo, c << 24);
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u);
     t.w(kXYStartI, (100u << 16) | 50u);
     t.w(kDrawMode0 | kGo, 1u);
     CHECK_EQ(t.r(kHostRw0), 0x11223300u);
@@ -187,7 +187,7 @@ TEST(newport_zpattern_rows_draw_opaque_glyph) {
     t.w(kWrMask, 0xFF);
     t.w(kZPattern | kGo, 0xA0000000u);
     t.w(kZPattern | kGo, 0x50000000u);
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u);
     t.w(kXYStartI, (8u << 16) | 16u);
     t.w(kXYEndI, (11u << 16) | 16u);
     t.w(kDrawMode0 | kGo, 1u);
@@ -209,7 +209,7 @@ TEST(newport_host_pixels_fill_a_block_row_by_row) {
     t.w(kDrawMode0, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));
     CHECK(t.np.write(kHostRw0 | kGo, 8, 0x1011121314151617ull));
     CHECK(t.np.write(kHostRw0 | kGo, 8, 0x18191a1b1c1d1e1full));
-    t.w(kDrawMode1, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w(kDrawMode1, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u);
     t.w(kXYStartI, (0u << 16) | 1u);
     t.w(kXYEndI, (3u << 16) | 1u);
     t.w(kDrawMode0 | kGo, 1u);
@@ -419,7 +419,7 @@ TEST(newport_length32_line_draws_each_pixel_once) {
     const u32 line = 2u | (2u << 2) | (1u << 8) | (1u << 15);  // DRAW I_LINE STOPX LENGTH32
     t.w(kDrawMode0 | kGo, line | (1u << 5));                  // DOSETUP on the first GO
     for (int go = 1; go < 4; ++go) t.w(kDrawMode0 | kGo, line);
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);  // read back
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u);  // read back
     for (u32 x = 0; x < 104; x += 4) {
         t.w(kXYStartI, (x << 16) | 5u);
         t.w(kXYEndI, ((x + 3) << 16) | 5u);
@@ -480,4 +480,20 @@ TEST(newport_overlay_and_underlay_layers) {
     t.xmap_mode(0, (1u << 19) | (2u << 16) | 0x000404);
     CHECK(t.np.render(px, w, h));
     if (px.size() == 4) CHECK_EQ(px[0], 0xFF00FF00u);
+}
+
+// Without RWPACKED a read returns one pixel, in the leftmost 8-bit field;
+// 4-bit pixels use 8-bit fields too.
+TEST(newport_host_read_fields) {
+    Rig t;
+    t.fill(10, 20, 13, 20, 0x42);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);  // 8-bit host, not packed
+    t.w(kXYStartI, (10u << 16) | 20u);
+    t.w(kXYEndI, (13u << 16) | 20u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0x42000000u);
+    t.w(kDrawMode1, (3u << 28) | (0u << 8) | (1u << 7) | (1u << 3) | 1u);  // 4-bit host, packed
+    t.w(kXYStartI, (10u << 16) | 20u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0x02020202u);  // the low 4 bits of each pixel, a byte each
 }
