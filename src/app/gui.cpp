@@ -239,8 +239,15 @@ int Gui::run() {
 
     const SDL_DisplayID display = SDL_GetPrimaryDisplay();
     scale_ = std::clamp(SDL_GetDisplayContentScale(display), 1.0f, 4.0f);
-    // Room for a 1280x1024 picture with the bars, shrunk to fit the screen.
-    const float bars = 2 * (13.0f + 6.0f) * scale_;
+    // Room for a 1280x1024 picture with the bars, shrunk to fit the screen:
+    // the status bar, and the menu bar except on macOS (whose menus are in
+    // the system menu bar).
+#if defined(__APPLE__)
+    constexpr float kBars = 1;
+#else
+    constexpr float kBars = 2;
+#endif
+    const float bars = kBars * (13.0f + 6.0f) * scale_;
     float w = 1280, h = 1024 + bars;
     SDL_Rect usable;
     if (SDL_GetDisplayUsableBounds(display, &usable)) {
