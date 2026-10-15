@@ -131,7 +131,7 @@ bool install_native_menus(std::function<std::vector<MenuEntry>()> menus,
     g_controller = [[SGMenuController alloc] init];
     g_controller->menus = std::move(menus);
     g_controller->post = std::move(post);
-    NSString* name = @"SiliconGhost";
+    NSString* name = @"Silicon Ghost";
     NSMenu* bar = [[NSMenu alloc] init];
 
     // Application menu

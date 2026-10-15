@@ -128,7 +128,7 @@ if(SG_WITH_SDL3)
     target_link_libraries(siliconghost PRIVATE sg_imgui SDL3::SDL3)
 
     if(APPLE)
-      # A macOS application: SiliconGhost.app, with the system menu bar and
+      # A macOS application: "Silicon Ghost.app", with the system menu bar and
       # its icon (made from the 1024x1024 artwork with sips and iconutil).
       # build/siliconghost links to the program inside, for the terminal.
       # `cmake --install build --prefix DIR` makes a self-contained copy in
@@ -161,22 +161,22 @@ if(SG_WITH_SDL3)
       configure_file(cmake/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
       set_target_properties(siliconghost PROPERTIES
         MACOSX_BUNDLE TRUE
-        OUTPUT_NAME SiliconGhost
+        OUTPUT_NAME "Silicon Ghost"
         MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
       add_custom_command(TARGET siliconghost POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_BINARY_DIR}/siliconghost
-        COMMAND ${CMAKE_COMMAND} -E create_symlink SiliconGhost.app/Contents/MacOS/SiliconGhost
+        COMMAND ${CMAKE_COMMAND} -E create_symlink "Silicon Ghost.app/Contents/MacOS/Silicon Ghost"
                 ${CMAKE_CURRENT_BINARY_DIR}/siliconghost
         VERBATIM)
 
       install(TARGETS siliconghost BUNDLE DESTINATION .)
       # The Info.plist is installed explicitly as well, and the libraries are
       # gathered from the program's own path, so neither depends on the other.
-      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/Info.plist DESTINATION SiliconGhost.app/Contents)
+      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/Info.plist DESTINATION "Silicon Ghost.app/Contents")
       install(CODE [[
         include(BundleUtilities)
-        set(app "${CMAKE_INSTALL_PREFIX}/SiliconGhost.app")
-        fixup_bundle("${app}/Contents/MacOS/SiliconGhost" "" "")
+        set(app "${CMAKE_INSTALL_PREFIX}/Silicon Ghost.app")
+        fixup_bundle("${app}/Contents/MacOS/Silicon Ghost" "" "")
         # Signed for this machine (ad hoc): copying the libraries in changed them.
         execute_process(COMMAND codesign --force --deep --sign - "${app}" COMMAND_ERROR_IS_FATAL ANY)
         execute_process(COMMAND codesign --verify --deep --strict "${app}" COMMAND_ERROR_IS_FATAL ANY)

@@ -35,8 +35,10 @@ namespace {
 
 #if defined(__APPLE__)
 constexpr const char* kAlt = "Option";
+constexpr const char* kAppName = "Silicon Ghost";  // as macOS shows the application
 #else
 constexpr const char* kAlt = "Alt";
+constexpr const char* kAppName = "SiliconGhost";
 #endif
 
 std::string file_name(const std::string& path) {
@@ -214,7 +216,7 @@ int Gui::run() {
         w *= fit;
         h = (h - bars) * fit + bars;
     }
-    window_ = SDL_CreateWindow("SiliconGhost", static_cast<int>(w), static_cast<int>(h),
+    window_ = SDL_CreateWindow(kAppName, static_cast<int>(w), static_cast<int>(h),
                                SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     renderer_ = window_ ? SDL_CreateRenderer(window_, nullptr) : nullptr;
     if (!renderer_) {
@@ -240,8 +242,6 @@ int Gui::run() {
     io.FontGlobalScale = 1.0f / density_;
     ImGui_ImplSDL3_InitForSDLRenderer(window_, renderer_);
     ImGui_ImplSDLRenderer3_Init(renderer_);
-    native_menus_ = install_native_menus([this] { return menus(); },
-                                         [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
 
     // Serial port 1 (the console, IRIX's ttyd1) is the SCC's channel B.
     static const char* const kPortNames[2] = {"Serial Port 1", "Serial Port 2"};
@@ -252,7 +252,7 @@ int Gui::run() {
                 for (char c : s) m->serial_input(ch, static_cast<u8>(c));
         });
         terminal_windows_[port] = std::make_unique<TerminalWindow>(
-            std::string("SiliconGhost - ") + kPortNames[port], terminals_[port],
+            std::string(kAppName) + " - " + kPortNames[port], terminals_[port],
             [this, ch](const std::string& s) {
                 if (auto* m = session_.machine())
                     for (char c : s) m->serial_input(ch, static_cast<u8>(c));
@@ -262,6 +262,9 @@ int Gui::run() {
     session_.set_serial_output([this](unsigned ch, u8 byte) {
         if (ch < 2) terminals_[ch == 1 ? 0 : 1].feed(byte);
     });
+    // After everything the menus describe exists.
+    native_menus_ = install_native_menus([this] { return menus(); },
+                                         [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
 
     if (options_.power_on) power_on();
     else if (session_.settings().prom.empty()) open_settings();
@@ -404,7 +407,7 @@ void Gui::eject() {
 // --- Input -------------------------------------------------------------------
 
 void Gui::update_title() {
-    std::string title = "SiliconGhost";
+    std::string title = kAppName;
     if (!session_.on()) title += " - powered off";
     else if (captured_) title += std::string(" - Ctrl+") + kAlt + "+G releases the mouse";
     else if (picture_) title += " - click the screen to capture the mouse";
@@ -725,11 +728,13 @@ std::vector<MenuEntry> Gui::menus() {
 
     std::vector<E> view;
     for (unsigned port = 0; port < 2; ++port) {
+        auto* w = terminal_windows_[port].get();
         view.push_back(E::item(port == 0 ? "Serial Port 1 (console)" : "Serial Port 2", [this, port] {
-                           auto& w = *terminal_windows_[port];
-                           if (w.is_open()) w.close();
-                           else w.open();
-                       }, true, terminal_windows_[port]->is_open()));
+                           auto* t = terminal_windows_[port].get();
+                           if (!t) return;
+                           if (t->is_open()) t->close();
+                           else t->open();
+                       }, w != nullptr, w && w->is_open()));
     }
     view.push_back(E::separator());
     view.push_back(E::item("Status Bar", [this] { show_status_ = !show_status_; }, true, show_status_));
@@ -737,7 +742,7 @@ std::vector<MenuEntry> Gui::menus() {
 
     std::vector<E> help;
     help.push_back(E::item("Keyboard and Mouse", [this] { keys_open_ = true; }));
-    help.push_back(E::item("About SiliconGhost", [this] { about_open_ = true; }).as(E::Role::About));
+    help.push_back(E::item(std::string("About ") + kAppName, [this] { about_open_ = true; }).as(E::Role::About));
 
     return {E::submenu("Machine", std::move(machine)), E::submenu("Media", std::move(media)),
             E::submenu("View", std::move(view)), E::submenu("Help", std::move(help))};
@@ -1153,15 +1158,15 @@ void Gui::draw_popups() {
     ImGuiIO& io = ImGui::GetIO();
     const ImVec2 centre(io.DisplaySize.x / 2, io.DisplaySize.y / 2);
     if (open_message_) {
-        ImGui::OpenPopup("SiliconGhost##message");
+        ImGui::OpenPopup((std::string(kAppName) + "##message").c_str());
         open_message_ = false;
     }
     if (open_quit_) {
-        ImGui::OpenPopup("Quit SiliconGhost?");
+        ImGui::OpenPopup("Quit?##quit");
         open_quit_ = false;
     }
     if (about_open_) {
-        ImGui::OpenPopup("About SiliconGhost");
+        ImGui::OpenPopup("About##about");
         about_open_ = false;
     }
     if (keys_open_) {
@@ -1170,7 +1175,7 @@ void Gui::draw_popups() {
     }
     const auto flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings;
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("SiliconGhost##message", nullptr, flags)) {
+    if (ImGui::BeginPopupModal((std::string(kAppName) + "##message").c_str(), nullptr, flags)) {
         ImGui::PushTextWrapPos(480 * scale_);
         ImGui::TextUnformatted(message_.c_str());
         ImGui::PopTextWrapPos();
@@ -1178,7 +1183,7 @@ void Gui::draw_popups() {
         ImGui::EndPopup();
     }
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("Quit SiliconGhost?", nullptr, flags)) {
+    if (ImGui::BeginPopupModal("Quit?##quit", nullptr, flags)) {
         ImGui::TextUnformatted("The Indy is still on.");
         ImGui::TextUnformatted("Pressing its power button lets the system shut down first.");
         ImGui::Spacing();
@@ -1197,8 +1202,8 @@ void Gui::draw_popups() {
         ImGui::EndPopup();
     }
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("About SiliconGhost", nullptr, flags)) {
-        ImGui::TextUnformatted("SiliconGhost: an SGI Indy (IP22) emulator");
+    if (ImGui::BeginPopupModal("About##about", nullptr, flags)) {
+        ImGui::Text("%s: an SGI Indy (IP22) emulator", kAppName);
         ImGui::TextUnformatted("Copyright (C) 2026 Andy Taylor");
         ImGui::TextUnformatted("GNU General Public License, version 2 or later");
         ImGui::Spacing();

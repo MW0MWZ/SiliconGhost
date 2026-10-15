@@ -93,7 +93,7 @@ xcode-select --install
 brew install cmake ninja pkgconf sdl3 libslirp
 ```
 
-On macOS the build makes `build/SiliconGhost.app`, a normal application
+On macOS the build makes `build/Silicon Ghost.app`, a normal application
 with the menus in the system menu bar (`build/siliconghost` links to the
 program inside it, for running from the terminal). To make a copy that runs
 on its own, with the libraries it uses copied in and signed for this Mac,
