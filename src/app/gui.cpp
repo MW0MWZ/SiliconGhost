@@ -1139,6 +1139,7 @@ void Gui::draw_popups() {
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About SiliconGhost", nullptr, flags)) {
         ImGui::TextUnformatted("SiliconGhost: an SGI Indy (IP22) emulator");
+        ImGui::TextUnformatted("Copyright (C) 2026 Andy Taylor");
         ImGui::TextUnformatted("GNU General Public License, version 2 or later");
         ImGui::Spacing();
         ImGui::TextDisabled("Menus and dialogs: Dear ImGui (MIT licence)");

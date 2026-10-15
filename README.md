@@ -357,6 +357,8 @@ with performance layers on top that must give exactly the same results:
 
 ## Legal
 
+Copyright (C) 2026 Andy Taylor.
+
 SiliconGhost is free software, licensed under the GNU General Public License,
 version 2 or (at your option) any later version; see [LICENSE](LICENSE).
 
