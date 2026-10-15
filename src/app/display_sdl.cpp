@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "app/display_sdl.h"
+#include "app/sdl_common.h"
 
 #include <SDL3/SDL.h>
 
@@ -99,6 +100,8 @@ KeyCodes key_codes(SDL_Scancode sc) {
     }
 }
 
+}  // namespace
+
 void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
     auto& kbc = m.ioc().kbc();
     // Print Screen and Pause are sequences in set 2 (Pause has no break).
@@ -129,94 +132,7 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
     kbc.key_input(k.set2);
 }
 
-// PS/2 mouse fed from the window: a click captures the pointer (relative
-// mode), Ctrl+Alt+G or losing focus releases it. Motion is gathered per
-// frame, in guest pixels whatever the window's scale, and sent as one
-// movement; button changes are sent at once.
-class MouseCapture {
-public:
-    MouseCapture(SDL_Window* window, SDL_Renderer* renderer, ip22::Indy& machine)
-        : window_(window), renderer_(renderer), machine_(machine) {
-        update_title();
-    }
-
-    // True if the event was consumed.
-    bool handle(SDL_Event ev) {
-        switch (ev.type) {
-            case SDL_EVENT_MOUSE_BUTTON_DOWN:
-            case SDL_EVENT_MOUSE_BUTTON_UP: {
-                if (!captured_) {
-                    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) set_captured(true);
-                    return true;
-                }
-                const unsigned bit = ev.button.button == SDL_BUTTON_LEFT    ? 1u
-                                     : ev.button.button == SDL_BUTTON_RIGHT ? 2u
-                                     : ev.button.button == SDL_BUTTON_MIDDLE ? 4u
-                                                                             : 0u;
-                if (!bit) return true;
-                buttons_ = ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? (buttons_ | bit) : (buttons_ & ~bit);
-                flush(true);
-                return true;
-            }
-            case SDL_EVENT_MOUSE_MOTION:
-                if (captured_) {
-                    SDL_ConvertEventToRenderCoordinates(renderer_, &ev);
-                    dx_ += ev.motion.xrel;
-                    dy_ += ev.motion.yrel;
-                }
-                return true;
-            case SDL_EVENT_KEY_DOWN:
-                if (captured_ && ev.key.scancode == SDL_SCANCODE_G && (ev.key.mod & SDL_KMOD_CTRL) &&
-                    (ev.key.mod & SDL_KMOD_ALT)) {
-                    set_captured(false);
-                    return true;
-                }
-                return false;
-            case SDL_EVENT_WINDOW_FOCUS_LOST:
-                set_captured(false);
-                return false;
-            default: return false;
-        }
-    }
-
-    // Sends the motion gathered since the last call (or the buttons, if forced).
-    void flush(bool force = false) {
-        const int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
-        if (!force && x == 0 && y == 0) return;
-        dx_ -= static_cast<float>(x);
-        dy_ -= static_cast<float>(y);
-        machine_.ioc().kbc().mouse_motion(x, -y, buttons_);  // PS/2 counts up as positive
-    }
-
-private:
-    void set_captured(bool on) {
-        if (on == captured_) return;
-        captured_ = on;
-        SDL_SetWindowRelativeMouseMode(window_, on);
-        if (!on && buttons_) {
-            buttons_ = 0;
-            flush(true);
-        }
-        dx_ = dy_ = 0;
-        update_title();
-    }
-    void update_title() {
-        // The release keys as the keyboard labels them (Alt is Option on a Mac).
-#if defined(__APPLE__)
-        constexpr const char* kCaptured = "SiliconGhost - Ctrl+Option+G releases the mouse";
-#else
-        constexpr const char* kCaptured = "SiliconGhost - Ctrl+Alt+G releases the mouse";
-#endif
-        SDL_SetWindowTitle(window_, captured_ ? kCaptured : "SiliconGhost - click to capture the mouse");
-    }
-
-    SDL_Window* window_;
-    SDL_Renderer* renderer_;
-    ip22::Indy& machine_;
-    bool captured_ = false;
-    unsigned buttons_ = 0;
-    float dx_ = 0, dy_ = 0;
-};
+namespace {
 
 // Plays HAL2 DAC output. The stream follows the guest's sample rate and
 // voice count; when the guest runs ahead of real time (or the device stalls)
@@ -316,102 +232,6 @@ private:
 
 std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine, AudioOptions options) {
     return std::make_unique<AudioOut>(machine, options);
-}
-
-bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, AudioOptions audio,
-                      const std::function<void()>& periodic) {
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        SG_LOG(Error, "display", "SDL_Init failed: %s", SDL_GetError());
-        return false;
-    }
-    SDL_Window* window = SDL_CreateWindow("SiliconGhost", 1280, 1024, SDL_WINDOW_RESIZABLE);
-    SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
-    if (!renderer) {
-        SG_LOG(Error, "display", "cannot create window: %s", SDL_GetError());
-        SDL_Quit();
-        return false;
-    }
-    SDL_SetRenderLogicalPresentation(renderer, 1280, 1024, SDL_LOGICAL_PRESENTATION_LETTERBOX);
-    MouseCapture mouse(window, renderer, machine);
-    std::optional<AudioOut> sound;
-    if (audio.output || audio.input) sound.emplace(machine, audio);
-    SDL_Texture* texture = nullptr;
-    unsigned tex_w = 0, tex_h = 0;
-    std::vector<u32> pixels;
-
-    constexpr u64 kFrameNs = 1000000000ull / 60;
-    const u64 slice = static_cast<u64>(machine.cycles_per_second() / 1000);  // 1 ms of guest time
-    auto& cpu = machine.cpu();
-    pacer.update(cpu.cycles(), cpu.instructions());
-    u64 next_frame_ns = SDL_GetTicksNS();
-    u64 next_periodic_ns = next_frame_ns + 1000000000ull;
-    // The picture is converted and presented only when the Newport has
-    // changed it, or the window needs redrawing: an idle desktop costs next
-    // to nothing.
-    u64 shown_version = 0;
-    bool shown = false, signal = false, redraw = true;
-
-    while (!stop && !machine.powered_off()) {
-        machine.run(slice);
-        cpu.set_cycles_per_instruction(pacer.update(cpu.cycles(), cpu.instructions()));
-        const u64 now_ns = SDL_GetTicksNS();
-        if (now_ns < next_frame_ns) continue;
-        next_frame_ns = std::max(next_frame_ns + kFrameNs, now_ns);
-        if (now_ns >= next_periodic_ns) {
-            next_periodic_ns = now_ns + 1000000000ull;
-            periodic();
-        }
-
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_EVENT_QUIT) stop = 1;
-            else if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST) redraw = true;
-            if (mouse.handle(ev)) continue;
-            // Ctrl+Alt+E: put the next CD-ROM disc in the drive.
-            if ((ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) && ev.key.scancode == SDL_SCANCODE_E &&
-                (ev.key.mod & SDL_KMOD_CTRL) && (ev.key.mod & SDL_KMOD_ALT)) {
-                if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) machine.request_next_disc();
-                continue;
-            }
-            if ((ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) || ev.type == SDL_EVENT_KEY_UP)
-                send_key(machine, ev.key.scancode, ev.type == SDL_EVENT_KEY_DOWN);
-        }
-        mouse.flush();
-
-        const ip22::Newport* newport = machine.newport();
-        const bool changed = !shown || (newport && newport->display_version() != shown_version);
-        if (!changed && !redraw) continue;
-        unsigned w = 0, h = 0;
-        if (changed) {
-            shown = true;
-            shown_version = newport ? newport->display_version() : 0;
-            signal = newport && machine.newport()->render(pixels, w, h);
-        }
-        if (changed && signal) {
-            if (!texture || w != tex_w || h != tex_h) {
-                if (texture) SDL_DestroyTexture(texture);
-                texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-                                            static_cast<int>(w), static_cast<int>(h));
-                tex_w = w;
-                tex_h = h;
-                SDL_SetRenderLogicalPresentation(renderer, static_cast<int>(w), static_cast<int>(h),
-                                                 SDL_LOGICAL_PRESENTATION_LETTERBOX);
-            }
-            SDL_UpdateTexture(texture, nullptr, pixels.data(), static_cast<int>(w * sizeof(u32)));
-        }
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-        if (signal && texture) SDL_RenderTexture(renderer, texture, nullptr, nullptr);
-        SDL_RenderPresent(renderer);
-        redraw = false;
-    }
-
-    sound.reset();  // before SDL shuts down
-    if (texture) SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return true;
 }
 
 }  // namespace sg::app

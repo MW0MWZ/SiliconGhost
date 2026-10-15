@@ -119,6 +119,11 @@ Check the configure output: it says if SDL3 or libslirp was not found.
 SiliconGhost does not include any SGI software. You need your own dump of
 the Indy boot PROM and, for IRIX, your own installation media.
 
+Started with no arguments, SiliconGhost opens its window with the machine
+powered off: choose the PROM, NVRAM, disk and CD-ROM images and the rest in
+*Machine > Settings*, then power on. The settings are kept for next time.
+Given options on the command line, it powers on at once with them:
+
 ```sh
 # The PROM, with the serial console on the terminal
 build/siliconghost --prom ip24prom.bin --nvram indy.nvram --no-graphics --headless
@@ -128,7 +133,7 @@ build/siliconghost --prom ip24prom.bin --nvram indy.nvram \
     --disk irix.img --cdrom irix53.img --cpu-mhz 175
 ```
 
-Main options (run `siliconghost` with no arguments for the full list):
+Main options (`siliconghost --help` lists them all):
 
 | Option | Meaning |
 |---|---|
@@ -136,8 +141,11 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
 | `--ram MB` | memory size, 16 to 256 (default 64) |
+| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
-| `--no-graphics`, `--headless` | serial console only / no display window |
+| `--no-graphics` | no graphics board: the console is on the first serial port |
+| `--headless` | no window: both serial ports use the terminal |
+| `--settings FILE` | start from a settings file saved by the window |
 | `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
 | `--no-audio` | do not play the machine's audio |
@@ -147,22 +155,40 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
 
-### The display window
+### The window
 
-Without `--headless`, the Newport screen appears in a window that can be
-resized. The machine's sound plays with or without the window (unless
-`--no-audio` is given).
+The Newport screen fills the window between a menu bar and a status bar;
+the window can be resized and made full screen. The machine's sound plays
+with or without the window (unless turned off).
 
 If no window appears, check the start-up messages: a build made without
 SDL3 says so (CMake also warns when it cannot find SDL3), and SDL reports
 why it could not open a window.
 
+- **Machine menu:** power on; the front-panel power button (the system
+  shuts down and powers off, as on a real Indy); power off at once; reset;
+  the volume buttons; the Settings dialog, and opening or saving a
+  settings file. Settings cover everything the command-line options do.
+  New blank NVRAM and disk images can be made from the dialog.
+- **Media menu:** the CD-ROM drive's eject button (refused while the system
+  has the disc locked in; *Force Eject* works anyway), inserting another
+  disc, and the discs of the set. Ejecting from the guest (`eject` in IRIX)
+  puts the next disc of the set in; Ctrl+Alt+E, or `kill -USR1` to the
+  emulator, does the same.
+- **View menu:** a terminal window for each serial port (the first is the
+  console, IRIX's `ttyd1`), the status bar and full screen. The terminals
+  are VT100s with history (Shift+PgUp, the mouse wheel) and copy and paste
+  (Ctrl+Shift+C/V, Cmd+C/V on a Mac). Without a graphics board the first
+  one opens by itself. Only `--headless` connects the serial ports to the
+  terminal SiliconGhost was started from.
+- **Status bar:** power, disk, CD-ROM and network activity, the CPU's load
+  (the time it is not idle), the pixels the Newport draws per second, and
+  the emulation speed against real time.
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G
   (Ctrl+Option+G on a Mac), or switching to another window, releases it.
   All three buttons work.
-- **CD-ROM:** with several `--cdrom` discs, ejecting from the guest
-  (`eject` in IRIX) puts the next one in; Ctrl+Alt+E in the window, or
-  `kill -USR1` to the emulator, does the same.
+- **Keys kept by the window:** Ctrl+Alt+G (release the mouse), Ctrl+Alt+P
+  (power button), Ctrl+Alt+E (next disc), Ctrl+Alt+F (full screen).
 - **Keyboard:** keys are sent by position as a PS/2 keyboard would send
   them, including the numeric keypad and the UK keys `#~` and `\|`; IRIX's
   keyboard layout setting decides what they produce.
