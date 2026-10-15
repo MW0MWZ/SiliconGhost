@@ -75,6 +75,7 @@ private:
     void write_y_end(u32 v) { yend_ = v & 0x07FFFF80u; }
     static int int_part(u32 v) { return static_cast<s16>(v >> 11); }
     void set_color_index(u32 v);
+    u32 ci_index() const;  // the colour index COLORRED holds
 
     u32 source_color(int x, int y);
     u32 host_color(u32* alpha = nullptr);
@@ -158,7 +159,8 @@ private:
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
-    bool zfail_next_ = false, zfail_ = false;  // STEPZ: the next GO's first pixel fails the Z test
+    bool zfail_next_ = false, zfail_ = false;
+    bool fastclear_ = false;  // the primitive running writes COLORVRAM (fast clear)  // STEPZ: the next GO's first pixel fails the Z test
     int host_shift_ = 0;
     u32 dcbmode_ = 0;
     unsigned dcb_crs_ = 0;  // the DCB's register select, stepped by ENCRSINC until DCBMODE is written
