@@ -58,6 +58,11 @@ public:
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+    // True while software is timing the CPU against the 8254 (the PROM and
+    // the kernels calibrate their delay loops at boot by latching counter 2),
+    // and for half a second of guest time after its last latch. Each such
+    // stretch starts by ending run(), so the CPU's speed can be fixed first.
+    bool timing_cpu() const { return cpu_.cycles() < timing_cpu_until_; }
 
     // Thread-safe: put the next CD-ROM disc in the drive (after the last,
     // the first again), as if the operator had swapped it.
@@ -147,6 +152,7 @@ private:
     std::atomic<bool> disc_change_{false};  // host asked for the next disc
     bool reset_pending_ = false;
     bool powered_off_ = false;
+    u64 timing_cpu_until_ = 0;
 };
 
 }  // namespace sg::ip22

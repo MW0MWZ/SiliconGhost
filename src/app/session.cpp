@@ -112,7 +112,7 @@ void Session::run(u64 cycles) {
     if (!machine_) return;
     machine_->run(cycles);
     auto& cpu = machine_->cpu();
-    cpu.set_cycles_per_instruction(pacer_->update(cpu.cycles(), cpu.instructions()));
+    cpu.set_cycles_per_instruction(pacer_->update(cpu.cycles(), cpu.instructions(), machine_->timing_cpu()));
 }
 
 void Session::periodic() {

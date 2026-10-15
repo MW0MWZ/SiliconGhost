@@ -68,6 +68,10 @@ Indy::Indy(const IndyConfig& config)
         reset_pending_ = true;
         cpu_.request_stop();
     });
+    ioc_.pit().set_latch_callback([this] {
+        if (!timing_cpu()) cpu_.request_stop();
+        timing_cpu_until_ = cpu_.cycles() + static_cast<u64>(config_.cpu_hz / 2);
+    });
     ioc_.set_power_off_callback([this] {
         powered_off_ = true;
         cpu_.request_stop();

@@ -247,6 +247,7 @@ void Pit8254::write(unsigned reg, u8 value) {
     if (reg == 3) {
         const unsigned sc = value >> 6;
         if (sc == 3) {  // read-back command
+            if (!(value & 0x20) && on_latch_) on_latch_();
             for (unsigned c = 0; c < 3; ++c) {
                 if (!(value & (2u << c))) continue;
                 Counter& k = counters_[c];
@@ -265,6 +266,7 @@ void Pit8254::write(unsigned reg, u8 value) {
         Counter& k = counters_[sc];
         const unsigned rw = (value >> 4) & 3;
         if (rw == 0) {  // counter latch command
+            if (on_latch_) on_latch_();
             if (!k.latched) {
                 k.latch = current_count(sc);
                 k.latched = true;

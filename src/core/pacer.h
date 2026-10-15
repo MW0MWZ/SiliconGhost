@@ -16,6 +16,12 @@
 //             on a CPU much faster than real (seen: 350 million instructions
 //             a second boots, 360 does not). Beyond the cap the guest is
 //             simply ahead of the wall clock and waits, as in Cycle mode.
+//             While the guest times the CPU (calibrating its delay loops at
+//             boot) the CPU runs at that cap, so it is never faster later
+//             and a calibrated delay never runs short. When the host falls
+//             behind (a busy stretch, a stall) the guest catches up by
+//             charging more per instruction; only beyond 10 s (the host
+//             was suspended) is the lost time given up.
 //   Max       No waiting and one cycle per instruction: as fast as possible,
 //             with guest time running ahead of the wall clock.
 #pragma once
@@ -40,8 +46,9 @@ public:
 
     // Call after each slice of emulation with the CPU's counters. Waits if the
     // guest is ahead of the wall clock and returns the cycles per instruction
-    // to charge from now on.
-    double update(u64 guest_cycles, u64 instructions);
+    // to charge from now on. `timing_cpu`: the guest is measuring the CPU's
+    // speed (Realtime mode then holds it at the cap).
+    double update(u64 guest_cycles, u64 instructions, bool timing_cpu = false);
 
     Mode mode() const { return mode_; }
     // Realtime mode: the most the guest CPU may be sped up, as a multiple of

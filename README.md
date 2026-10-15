@@ -326,6 +326,10 @@ so guest clocks always agree with each other.
   against its timers at boot and fails on a CPU much faster than real: keep
   the clock times the limit at about 350 MHz or less (175 MHz x 2 boots,
   200 MHz x 1.8 does not). IRIX 6.5 boots at 250 MHz x 1.8.
+  While the PROM or a kernel times the CPU at boot, the CPU runs at the
+  cap, so delays calibrated then never run short later. If the host falls
+  behind (a busy start, a stall), guest time catches up afterwards; only a
+  gap of more than 10 seconds, such as the host sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
 - **max**: as fast as possible, with guest time running ahead of the wall
   clock.
