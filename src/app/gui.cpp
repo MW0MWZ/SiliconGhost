@@ -1292,7 +1292,7 @@ void Gui::draw_settings() {
                 const double fastest = edit_.cpu_mhz * edit_.max_speed;
                 const bool too_fast = fastest > 350;
                 ImGui::TextColored(too_fast ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
-                                   too_fast ? "up to %.0f MHz, too fast for IRIX 5.3" : "up to %.0f MHz", fastest);
+                                   too_fast ? "%.0f MHz: too fast for IRIX 5.3" : "up to %.0f MHz", fastest);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("IRIX 5.3 times the CPU at boot and fails beyond about 350 MHz (clock x limit)");
             }
