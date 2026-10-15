@@ -213,7 +213,8 @@ why it could not open a window.
   All three buttons work. Where the system draws its pointer with the
   Newport's hardware cursor (the IRIX desktop does), simply moving onto the
   screen captures the mouse, with the system's pointer jumping to where the
-  host pointer entered (View > Capture Mouse on Entry turns this off), and
+  host pointer entered (Settings > Mouse, or View > Capture Mouse on Entry,
+  sets this to capture on a click only), and
   pushing it against an edge of the screen releases the mouse there, as
   virtual machines do. A click captures it anywhere, with the pointer
   brought to where you clicked.

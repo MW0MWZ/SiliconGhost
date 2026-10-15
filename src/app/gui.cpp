@@ -1317,6 +1317,16 @@ void Gui::draw_settings() {
             ImGui::Checkbox("Let the machine record from the host's audio input", &edit_.audio_in);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Mouse")) {
+            label("Capture");
+            ImGui::SetNextItemWidth(-1);
+            int capture = edit_.mouse_auto_capture ? 0 : 1;
+            ImGui::Combo("##capture", &capture, "When the pointer moves onto the screen\0When the screen is clicked\0");
+            edit_.mouse_auto_capture = capture == 0;
+            ImGui::TextDisabled("Moving onto the screen captures the mouse once the system shows its pointer");
+            ImGui::TextDisabled("(the IRIX desktop); a click always captures it. Ctrl+%s+G releases it.", kAlt);
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
