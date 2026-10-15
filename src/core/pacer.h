@@ -12,10 +12,10 @@
 //             instruction adapts, so a fast host behaves like a faster CPU and a
 //             slow one like a slower CPU, while a guest second stays a second.
 //             The speed-up is capped (set_max_speed): guest software measures
-//             the CPU against its timers at boot, and IRIX 5.3 divides by zero
-//             if a 1024-instruction loop takes under 2 us (about 2.9x a real
-//             175 MHz R4400). Beyond the cap the guest is simply ahead of the
-//             wall clock and waits, as in Cycle mode.
+//             the CPU against its timers at boot, and IRIX 5.3 fails to boot
+//             on a CPU much faster than real (seen: 350 million instructions
+//             a second boots, 360 does not). Beyond the cap the guest is
+//             simply ahead of the wall clock and waits, as in Cycle mode.
 //   Max       No waiting and one cycle per instruction: as fast as possible,
 //             with guest time running ahead of the wall clock.
 #pragma once

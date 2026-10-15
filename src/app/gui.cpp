@@ -227,6 +227,8 @@ int Gui::run() {
         std::string error;
         if (std::filesystem::exists(settings_path_) && load_settings(settings_path_, saved, error))
             session_.set_settings(saved);
+        else if (!std::filesystem::exists(settings_path_))
+            session_.set_settings(first_run_settings());
     }
 
     const SDL_DisplayID display = SDL_GetPrimaryDisplay();
@@ -1134,7 +1136,9 @@ void Gui::draw_settings() {
                 ImGui::SliderFloat("##maxspeed", &limit, 1.0f, 4.0f, "%.1fx the real CPU");
                 edit_.max_speed = limit;
                 ImGui::SameLine();
-                ImGui::TextDisabled("(IRIX 5.3 fails to boot beyond about 2.9)");
+                const double fastest = edit_.cpu_mhz * edit_.max_speed;
+                ImGui::TextColored(fastest > 350 ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
+                                   "at most %.0f MHz (IRIX 5.3 boots up to about 350)", fastest);
             }
             ImGui::Spacing();
             ImGui::Checkbox("Skip idle loops", &edit_.idle_skip);

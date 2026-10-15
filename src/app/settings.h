@@ -48,6 +48,12 @@ struct Settings {
     ip22::IndyConfig indy_config() const;
 };
 
+// What the window offers on first start, with no settings file yet: the
+// best-equipped Indy (256 MiB, the 24-bit board, a 250 MHz CPU). The speed
+// limit keeps the CPU at most 1.2x as fast, 300 MHz in all: IRIX 5.3 does
+// not boot beyond about 350.
+Settings first_run_settings();
+
 // Text forms shared by the command line and the settings file.
 const char* timing_name(Pacer::Mode mode);
 const char* graphics_name(const Settings& s);  // xl8, xl24 or none

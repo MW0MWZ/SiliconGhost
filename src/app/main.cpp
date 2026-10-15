@@ -92,7 +92,7 @@ void usage(const char* argv0) {
                  "                   cycle:    one cycle per instruction, reproducible; waits when ahead\n"
                  "                   max:      no waiting; guest time runs ahead (default with --max)\n"
                  "  --max-speed X    realtime: run the CPU at most X times as fast as the real one\n"
-                 "                   (default 2; IRIX 5.3 fails to boot beyond about 2.9)\n"
+                 "                   (default 2; IRIX 5.3 boots with clock x X up to about 350 MHz)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "%s"

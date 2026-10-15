@@ -320,7 +320,9 @@ so guest clocks always agree with each other.
 - **realtime** (default): guest time follows the wall clock. A fast host
   makes the CPU look faster, while a guest second stays a second. The
   speed-up is capped by `--max-speed`, because IRIX 5.3 times the CPU
-  against its timers at boot and fails on a CPU much faster than real.
+  against its timers at boot and fails on a CPU much faster than real: keep
+  the clock times the limit at about 350 MHz or less (175 MHz x 2 boots,
+  200 MHz x 1.8 does not). IRIX 6.5 boots at 250 MHz x 1.8.
 - **cycle**: one cycle per instruction, reproducible from run to run.
 - **max**: as fast as possible, with guest time running ahead of the wall
   clock.

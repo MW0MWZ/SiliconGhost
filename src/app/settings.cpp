@@ -51,6 +51,15 @@ ip22::IndyConfig Settings::indy_config() const {
     return c;
 }
 
+Settings first_run_settings() {
+    Settings s;
+    s.ram_mb = 256;
+    s.xl24 = true;
+    s.cpu_mhz = 250;
+    s.max_speed = 1.2;
+    return s;
+}
+
 const char* graphics_name(const Settings& s) { return !s.graphics ? "none" : s.xl24 ? "xl24" : "xl8"; }
 
 const char* timing_name(Pacer::Mode mode) {
