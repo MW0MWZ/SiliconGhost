@@ -43,7 +43,7 @@ constexpr u32 kDm0AlphaHost = 1u << 7;
 // DRAWMODE1
 constexpr u32 kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
 constexpr u32 kDm1RgbMode = 1u << 15, kDm1Dither = 1u << 16, kDm1FastClear = 1u << 17, kDm1Blend = 1u << 18;
-constexpr u32 kDm1BackBlend = 1u << 25, kDm1BlendAlpha = 1u << 27;
+constexpr u32 kDm1BackBlend = 1u << 25;
 constexpr unsigned kDm1SFactorShift = 19, kDm1DFactorShift = 22;
 
 constexpr u32 kStatusVersion = 3;
@@ -575,6 +575,8 @@ u32 Newport::source_color(int x, int y) {
 // Cb = Cs * Fs + Cd * Fd for each channel, the destination being the frame
 // buffer or COLORBACK; factors are normalised as (v + msb) / 256, so 0xFF is
 // 1.0. Blending works on RGB pixels; the result replaces the logic op.
+// BLENDALPHA only changes how alpha itself is blended, and no destination
+// alpha is kept, so it is not consulted.
 u32 Newport::blend(u32 src, int px, int py) const {
     const unsigned depth = (drawmode1_ >> 3) & 3;
     u32 sr, sg, sb, dr, dg, db;
