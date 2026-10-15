@@ -321,9 +321,11 @@ with performance layers on top that must give exactly the same results:
 - Only the 8-bit Newport (XL8) is emulated. Blending and antialiased lines
   are drawn without the effect, which most of the desktop and the demos tried
   so far do not use.
-- Audio recording takes the host's default input as is: the codec's input
-  gain and its microphone/line selection are not applied, and the digital
-  (AES) input records silence. NetBSD's driver plays but does not record.
+- Audio recording uses the host's default input, with the codec's input
+  gain applied. The host has one input, so the microphone and line jacks
+  both hear it (at the host's level), and the digital (AES) input records
+  silence, as with nothing plugged in. NetBSD's driver plays but does not
+  record.
 - NetBSD's Newport console shows no text: NetBSD decides between the 8-bit
   and 24-bit boards from a register read whose real-hardware result is not
   known yet, and on the emulated board it chooses 24-bit. Use the serial

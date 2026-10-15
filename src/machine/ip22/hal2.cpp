@@ -21,7 +21,9 @@ constexpr u32 kIarRead = 0x80;
 constexpr u32 kIarRegMask = 0xFF0C;
 
 // Indirect registers
-constexpr u32 kAesRxC = 0x1204, kAesTxC = 0x1304, kDacC1 = 0x1404, kAdcC1 = 0x1504, kDacC2 = 0x1408;
+constexpr u32 kAesRxC = 0x1204, kAesTxC = 0x1304, kDacC1 = 0x1404, kAdcC1 = 0x1504, kDacC2 = 0x1408, kAdcC2 = 0x1508;
+// ADC_C2: left/right input gain (4 bits each); bits 9 and 8 select mic rather than line
+constexpr u32 kC2LeftGainShift = 4, kC2RightGainShift = 0, kC2GainMask = 0xF;
 // DAC_C2: mute and right/left output attenuation (5 bits each)
 constexpr u32 kC2Mute = 0x400, kC2RightAttShift = 18, kC2LeftAttShift = 23, kC2AttMask = 0x1F;
 // Volume window (PBUS PIO channel 2): 8-bit output levels, 0 silent. The PROM
@@ -111,6 +113,13 @@ void Hal2::output_gain(double& left, double& right) const {
     };
     left = factor((c2 >> kC2LeftAttShift) & kC2AttMask) * level(kVolLeft);
     right = factor((c2 >> kC2RightAttShift) & kC2AttMask) * level(kVolRight);
+}
+
+void Hal2::input_gain(double& left, double& right) const {
+    const u32 c2 = indirect(kAdcC2);
+    auto factor = [](u32 steps) { return std::pow(10.0, 1.5 * steps / 20.0); };
+    left = factor((c2 >> kC2LeftGainShift) & kC2GainMask);
+    right = factor((c2 >> kC2RightGainShift) & kC2GainMask);
 }
 
 Hal2::PortConfig Hal2::port(Port p) const {

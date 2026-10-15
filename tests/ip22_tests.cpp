@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // IP22 chipset tests: MC, HPC3, IOC2/INT3 accessed at their physical addresses.
+#include <cmath>
 #include <array>
 #include <string>
 #include <vector>
@@ -449,6 +450,39 @@ TEST(ip22_hal2_adc_records_from_the_audio_source) {
             else same &= static_cast<s16>(t.r32(kBuf + 4 * (i / 2)) >> (i % 2 ? 0 : 16)) == want;
         }
         CHECK(same);
+    }
+}
+
+// ADC_C2 amplifies each side in 1.5 dB steps, clipping at full scale.
+TEST(ip22_hal2_adc_input_gain) {
+    for (const bool ds16 : {false, true}) {
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        t.m.hpc3().set_audio_source([&](s16* s, std::size_t frames, unsigned voices, double) {
+            for (std::size_t i = 0; i < frames * voices; ++i) s[i] = i % 2 ? 3000 : 1000;
+        });
+        const u32 size = ds16 ? 4 : 2;
+        constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000;
+        const u32 bytes = 8 * 2 * size;  // 8 stereo frames
+        t.w32(kDesc + 0, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | bytes);
+        t.w32(kDesc + 8, 0);
+        t.w32(kPbusCfg0 + 0x200, ds16 ? 0x08248844 : 0x08208844);
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2104, 0);
+        hal2_write(t, 0x2108, 0xFFFF0004);  // 48 kHz
+        hal2_write(t, 0x1504, 0x209);       // ADC: PBUS channel 1, clock 1, stereo
+        hal2_write(t, 0x1508, 0x34F);       // ADC_C2: left +6 dB, right +22.5 dB, mic selected
+        hal2_write(t, 0x9104, 0x10);
+        t.w32(kPbus0 + 0x2000 + 4, kDesc);
+        t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 20 / 48000));
+        if (ds16) {
+            CHECK_EQ(t.r32(kBuf), static_cast<u32>(std::lround(1000 * 256 * std::pow(10.0, 6.0 / 20))));
+            CHECK_EQ(t.r32(kBuf + 4), 0x7FFFFFu);  // clipped
+        } else {
+            CHECK_EQ(t.r32(kBuf), (static_cast<u32>(std::lround(1000 * std::pow(10.0, 6.0 / 20))) << 16) | 0x7FFFu);
+        }
     }
 }
 

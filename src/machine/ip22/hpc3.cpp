@@ -436,9 +436,19 @@ void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
         std::vector<s16> samples(n / frame * in.voices, 0);
         audio_source_(samples.data(), samples.size() / in.voices, in.voices, in.rate);
         const bool little = in.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
+        double gain[2];
+        hal2_.input_gain(gain[0], gain[1]);
+        const bool unity = gain[0] == 1.0 && gain[1] == 1.0;
         for (std::size_t i = 0; i < samples.size(); ++i) {
-            // As played: a 24-bit value in a 32-bit word (DS16) or a packed 16-bit sample.
-            const u32 v = size == 4 ? static_cast<u32>(static_cast<s32>(samples[i]) * 256) : static_cast<u16>(samples[i]);
+            // The codec's input gain (left on even samples), clipping at full scale; then as
+            // played: a 24-bit value in a 32-bit word (DS16) or a packed 16-bit sample.
+            s32 s = static_cast<s32>(samples[i]) * (size == 4 ? 256 : 1);
+            if (!unity) {
+                const double g = gain[in.voices >= 2 ? i % 2 : 0];
+                const double full = size == 4 ? 8388607.0 : 32767.0;
+                s = static_cast<s32>(std::lround(std::clamp(s * g, -full - 1, full)));
+            }
+            const u32 v = size == 4 ? static_cast<u32>(s) : static_cast<u16>(s);
             for (unsigned k = 0; k < size; ++k) bytes[i * size + k] = static_cast<u8>(v >> (8 * (little ? k : size - 1 - k)));
         }
     }

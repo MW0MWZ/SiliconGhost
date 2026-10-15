@@ -39,6 +39,10 @@ public:
     // The DAC's output level as amplitude factors: DAC_C2 mute and
     // attenuators (1.5 dB a step), and the 8-bit volume levels.
     void output_gain(double& left, double& right) const;
+    // The ADC's input gain as amplitude factors: ADC_C2's gain fields (1.5 dB
+    // a step, 0 to 22.5 dB). Its line/mic select picks a jack; the host has
+    // one recording input, which feeds whichever is selected at its level.
+    void input_gain(double& left, double& right) const;
     // Called whenever a port's configuration may have changed.
     void set_change_callback(std::function<void()> cb) { changed_ = std::move(cb); }
 
