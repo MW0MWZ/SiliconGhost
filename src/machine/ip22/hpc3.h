@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 HPC3 peripheral controller at 0x1FB80000 (512 KiB window): PBUS,
 // SCSI and Ethernet DMA channels, interrupt status, the serial EEPROM, the
 // PBUS device windows (IOC2 on channel 6) and the DS1386 RTC/NVRAM.
@@ -44,6 +45,9 @@ public:
     Seeq8003& seeq() { return seeq_; }
     // Ethernet frames go to and come from `backend` (null: no cable).
     void set_network(net::NetBackend* backend);
+    // Frames sent and received on the Ethernet port (for activity lights).
+    u64 enet_tx_frames() const { return enet_tx_frames_; }
+    u64 enet_rx_frames() const { return enet_rx_frames_; }
     // Called by the machine's run loop: starts taking in frames when the
     // host has some (the poll then runs only while frames keep coming).
     void poll_network();
@@ -128,11 +132,14 @@ private:
     Seeq8003 seeq_;
     EnetDma enet_rx_, enet_tx_;
     bool enet_irq_ = false, enet_loopback_ = false;
+    bool enet_held_ = true;  // channel reset bit: set at power-on, holds the channel and the Seeq in reset
     u32 enet_dconfig_ = 0, enet_pconfig_ = 0;
     net::NetBackend* net_ = nullptr;
+    u64 enet_tx_frames_ = 0, enet_rx_frames_ = 0;
     std::unique_ptr<Timer> enet_tx_timer_, enet_poll_timer_;
     u32 eeprom_reg_ = 0;
     std::unordered_map<u32, u32> regs_;  // registers without behaviour yet
+    std::unordered_map<u32, u32> written_;  // last word written by sub-word writes, per register
 };
 
 }  // namespace sg::ip22

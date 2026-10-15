@@ -23,9 +23,16 @@ SiliconGhost is under active development. What works today:
   to the graphical login and the IRIX desktop (4Dwm, Toolchest, winterm) on
   Newport, with the PS/2 keyboard and mouse. IRIS GL programs run, such as
   the flight simulator and the atlantis and ideas demos.
+- **IRIX 6.5 (June 1998):** installs from its CD set (Installation Tools,
+  Foundation 1 and 2, Applications, ONC3/NFS, Development Foundation and
+  Libraries) onto an XFS disk, changing discs as the installer asks, and
+  boots to the graphical login on Newport.
 - **NetBSD 9.0/sgimips:** finds and attaches every device of the machine,
   installs to disk with its own installer (over the network) and boots
   multi-user on the serial console, with networking and sound.
+- **OpenBSD 6.9/sgi:** boots its installer from the official install CD,
+  installs to disk (sets over the network) and boots multi-user on the
+  serial console or the Newport text console, with networking.
 - **Audio:** what the machine plays goes to the host's sound output, with or
   without the display window, at the volume the guest sets; with
   `--audio-in` it can also record from the host's audio input.
@@ -52,10 +59,10 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | Serial | Zilog 85230 SCC (two ports) | working |
 | Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved as it changes |
 | SCSI | WD33C93 with disk and CD-ROM targets | working |
-| Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit board) |
+| Graphics | Newport XL8 and XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit and 24-bit boards) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
-| Audio | HAL2 | playback and recording (codec); digital input silent |
+| Audio | HAL2 | working (playback and recording) |
 
 ## Building
 
@@ -89,10 +96,21 @@ xcode-select --install
 brew install cmake ninja pkgconf sdl3 libslirp
 ```
 
-macOS builds are new and not yet widely tested. The recompiler is not
-available there yet (macOS needs a different way of allocating executable
-memory), so the block cache and interpreter run everything, more slowly;
-`--net tap:NAME` is Linux-only, while `--net user` works.
+On macOS the build makes `build/Silicon Ghost.app`, a normal application
+with the menus in the system menu bar (`build/siliconghost` links to the
+program inside it, for running from the terminal). To make a copy that runs
+on its own, with the libraries it uses copied in and signed for this Mac,
+in the Applications folder:
+
+```sh
+cmake --install build --prefix /Applications
+```
+
+No `sudo` is needed: an administrator account can write to /Applications.
+(The `install_name_tool` warnings about invalidated signatures are expected:
+the copy is signed again as the last step.)
+
+TAP networking is Linux-only; user-mode networking works everywhere.
 
 Ubuntu 24.04 LTS and older releases do not package SDL3; build and install
 it from source first ([SDL's build instructions](https://github.com/libsdl-org/SDL/blob/main/docs/README-cmake.md)),
@@ -115,6 +133,11 @@ Check the configure output: it says if SDL3 or libslirp was not found.
 SiliconGhost does not include any SGI software. You need your own dump of
 the Indy boot PROM and, for IRIX, your own installation media.
 
+Started with no arguments, SiliconGhost opens its window with the machine
+powered off: choose the PROM, NVRAM, disk and CD-ROM images and the rest in
+*Machine > Settings*, then power on. The settings are kept for next time.
+Given options on the command line, it powers on at once with them:
+
 ```sh
 # The PROM, with the serial console on the terminal
 build/siliconghost --prom ip24prom.bin --nvram indy.nvram --no-graphics --headless
@@ -124,16 +147,20 @@ build/siliconghost --prom ip24prom.bin --nvram indy.nvram \
     --disk irix.img --cdrom irix53.img --cpu-mhz 175
 ```
 
-Main options (run `siliconghost` with no arguments for the full list):
+Main options (`siliconghost --help` lists them all):
 
 | Option | Meaning |
 |---|---|
 | `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
 | `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
-| `--ram MB` | memory size, 16 to 256 (default 64) |
+| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64) |
+| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
-| `--no-graphics`, `--headless` | serial console only / no display window |
+| `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
+| `--headless` | no window: both serial ports use the terminal |
+| `--foreground` | keep the window's messages on the terminal instead of in the background |
+| `--settings FILE` | start from a settings file saved by the window |
 | `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
 | `--no-audio` | do not play the machine's audio |
@@ -143,22 +170,59 @@ Main options (run `siliconghost` with no arguments for the full list):
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
 
-### The display window
+### The window
 
-Without `--headless`, the Newport screen appears in a window that can be
-resized. The machine's sound plays with or without the window (unless
-`--no-audio` is given).
+SiliconGhost keeps its files in one folder, made on first start:
+`~/Documents/SiliconGhost` on macOS, `Documents\SiliconGhost` on Windows and
+`~/.SiliconGhost` on Linux. It holds `settings.ini`, the message log
+`siliconghost.log`, and `roms`, `diskImages` and `nvram` folders for PROM
+dumps, disk and CD-ROM images and NVRAM files, where the file choosers
+start. (Settings from an earlier version are copied in.)
+
+Started from a terminal, the window carries on in the background and the
+terminal is free again at once; its messages go to `siliconghost.log`
+(*Help > About* shows the path). `--foreground` or `--log` keeps them on
+the terminal, and `--headless` always runs there.
+
+The Newport screen fills the window between a menu bar and a status bar;
+the window can be resized and made full screen. The machine's sound plays
+with or without the window (unless turned off).
 
 If no window appears, check the start-up messages: a build made without
 SDL3 says so (CMake also warns when it cannot find SDL3), and SDL reports
 why it could not open a window.
 
+- **Machine menu:** power on; the front-panel power button (the system
+  shuts down and powers off, as on a real Indy); power off at once; reset;
+  the volume buttons; the Settings dialog, and opening or saving a
+  settings file. Settings cover everything the command-line options do.
+  New blank NVRAM and disk images can be made from the dialog.
+- **Media menu:** the CD-ROM drive's eject button (refused while the system
+  has the disc locked in; *Force Eject* works anyway), inserting another
+  disc, and the discs of the set. Ejecting from the guest (`eject` in IRIX)
+  puts the next disc of the set in; Ctrl+Alt+E, or `kill -USR1` to the
+  emulator, does the same.
+- **View menu:** a terminal window for each serial port (the first is the
+  console, IRIX's `ttyd1`), the status bar and full screen. The terminals
+  are VT100s with history (Shift+PgUp, the mouse wheel) and copy and paste
+  (Ctrl+Shift+C/V, Cmd+C/V on a Mac). Without a graphics board the first
+  one opens by itself. Only `--headless` connects the serial ports to the
+  terminal SiliconGhost was started from.
+- **Status bar:** power, disk, CD-ROM and network activity, the CPU's load
+  (the time it is not idle), the pixels the Newport draws per second, and
+  the emulation speed against real time.
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G
   (Ctrl+Option+G on a Mac), or switching to another window, releases it.
-  All three buttons work.
-- **CD-ROM:** with several `--cdrom` discs, ejecting from the guest
-  (`eject` in IRIX) puts the next one in; Ctrl+Alt+E in the window, or
-  `kill -USR1` to the emulator, does the same.
+  All three buttons work. Where the system draws its pointer with the
+  Newport's hardware cursor (the IRIX desktop does), simply moving onto the
+  screen captures the mouse, with the system's pointer jumping to where the
+  host pointer entered (Settings > Mouse, or View > Capture Mouse on Entry,
+  sets this to capture on a click only), and
+  pushing it against an edge of the screen releases the mouse there, as
+  virtual machines do. A click captures it anywhere, with the pointer
+  brought to where you clicked.
+- **Keys kept by the window:** Ctrl+Alt+G (release the mouse), Ctrl+Alt+P
+  (power button), Ctrl+Alt+E (next disc), Ctrl+Alt+F (full screen).
 - **Keyboard:** keys are sent by position as a PS/2 keyboard would send
   them, including the numeric keypad and the UK keys `#~` and `\|`; IRIX's
   keyboard layout setting decides what they produce.
@@ -177,6 +241,13 @@ ISO 9660, so a raw dump of the disc is used as it is. To install:
    `repartition/rootdrive` and `label/sync`.
 3. Choose *Install System Software* from the maintenance menu and install
    from the CD-ROM as on a real Indy.
+
+For a set of discs, such as IRIX 6.5, give `--cdrom` once for each disc, in
+the order the installer reads them (Installation Tools first). When the
+installer asks for another disc, press Ctrl+Alt+E (or send `SIGUSR1`) until
+it is in the drive; the start-up messages (`--log info`) name each disc as
+it goes in. The IRIX 6.5 Base Documentation disc is a plain ISO 9660 disc to
+browse, not an installer distribution, so the installer cannot open it.
 
 Install with the graphics board present (no `--no-graphics`): IRIX only
 installs the Newport kernel driver and X server on a machine where it finds
@@ -211,6 +282,37 @@ reach the guest through forwarded ports, e.g. `--hostfwd tcp:2323:23` and
 With `--net tap:NAME` frames go to an existing TAP interface (created with
 `ip tuntap add mode tap user $USER name tap0` and bridged or routed as your
 network needs), and the Indy is configured like any machine on that network.
+
+### The BSDs at a glance
+
+| | NetBSD 9.0/sgimips | OpenBSD 6.9/sgi |
+|---|---|---|
+| Installer boots from the CD | yes (from the Command Monitor) | yes (from the Command Monitor) |
+| Installation sets read from the CD | no (see below) | yes |
+| Installation over the network (HTTP/FTP) | yes | yes |
+| Installed system boots multi-user from disk | yes | yes |
+| Serial console | yes | yes |
+| Newport (graphics) console | 9.0 and 11.0: no text shown; NetBSD-current: yes (8- and 24-bit boards) | yes, text console |
+| PS/2 keyboard | yes | yes |
+| PS/2 mouse | detected (not exercised without X) | detected (not exercised without X) |
+| X11 | NetBSD-current: yes, on the 8-bit board (see below); 9.0: not tried | no (OpenBSD's Newport driver has no frame buffer for X) |
+| SCSI disk and CD-ROM | yes | yes |
+| Ethernet | yes | yes |
+| Audio playback | yes | no (no driver) |
+| Audio recording | no (not supported by NetBSD's driver) | no (no driver) |
+| Real-time clock and NVRAM | yes | yes |
+
+NetBSD 11.0's installer boots the same way as 9.0's and attaches the same
+devices, its Newport console showing no text either; the rest of the table
+was checked on 9.0, apart from what is marked NetBSD-current.
+
+X on NetBSD-current runs with its `newport` driver (twm, xterm, xclock and
+the like). Start it with `-depth 8` on the 8-bit board (the driver defaults
+to 24 and gives up otherwise), and give it a monitor section for 1280x1024
+(without one it picks 1024x768). The kernel points the XMAP9's cursor
+colour map at entries 0-3, so X's cursor colours overwrite palette entries 1
+and 2 and the default white pixel shows as the cursor's black: give clients
+explicit colours (`xterm -bg ... -fg ...`).
 
 ### Running NetBSD
 
@@ -251,6 +353,33 @@ Without `OSLoadOptions auto`, NetBSD/sgimips stops in single-user mode
 NetBSD's audio driver starts with the output volume at zero, so nothing is
 heard until it is raised, e.g. `mixerctl -w outputs.master=200,200`.
 
+### Running OpenBSD
+
+OpenBSD/sgi 6.9 (`install69.iso`) starts its installer from the Command
+Monitor:
+
+```
+boot -f dksc(0,4,8)bootecof dksc(0,4,0)bsd.rd.IP22
+```
+
+(The volume header holds the loader as `bootecof`, names being limited to
+eight characters. The automatic boot picks a loader that does not fit an
+Indy's memory, as OpenBSD's own notes say.)
+The installer reads its sets from the CD (*cd0*, directory `6.9/sgi`), or
+over the network (*http*, from an OpenBSD mirror's `pub/OpenBSD/6.9/sgi`).
+To boot the installed system:
+
+```
+setenv OSLoader boot
+setenv OSLoadFilename bsd
+setenv AutoLoad Yes
+```
+
+The console follows the NVRAM's `console` setting: the Newport text console
+(`g`) or the serial port (`d`). OpenBSD's X server does not run on the
+Newport (its driver offers no frame buffer to map). OpenBSD has no driver
+for the Indy's audio.
+
 ### Timing
 
 The CPU's cycle counter is the master clock for every timer in the machine,
@@ -259,7 +388,13 @@ so guest clocks always agree with each other.
 - **realtime** (default): guest time follows the wall clock. A fast host
   makes the CPU look faster, while a guest second stays a second. The
   speed-up is capped by `--max-speed`, because IRIX 5.3 times the CPU
-  against its timers at boot and fails on a CPU much faster than real.
+  against its timers at boot and fails on a CPU much faster than real: keep
+  the clock times the limit at about 350 MHz or less (175 MHz x 2 boots,
+  200 MHz x 1.8 does not). IRIX 6.5 boots at 250 MHz x 1.8.
+  While the PROM or a kernel times the CPU at boot, the CPU runs at the
+  cap, so delays calibrated then never run short later. If the host falls
+  behind (a busy start, a stall), guest time catches up afterwards; only a
+  gap of more than 10 seconds, such as the host sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
 - **max**: as fast as possible, with guest time running ahead of the wall
   clock.
@@ -281,18 +416,19 @@ with performance layers on top that must give exactly the same results:
 
 ## Known limitations
 
-- Only the 8-bit Newport (XL8) is emulated. Blending and antialiased lines
-  are drawn without the effect, which most of the desktop and the demos tried
-  so far do not use.
-- Audio recording takes the host's default input as is: the codec's input
-  gain and its microphone/line selection are not applied, and the digital
-  (AES) input records silence. NetBSD's driver plays but does not record.
-- NetBSD's Newport console shows no text: NetBSD decides between the 8-bit
-  and 24-bit boards from a register read whose real-hardware result is not
-  known yet, and on the emulated board it chooses 24-bit. Use the serial
-  console.
-- IRIX 5.3 and NetBSD 9.0 are the systems tested so far; IRIX 6.5 and Linux
-  have not been tried.
+- Newport: CID checking (CLIPMODE's CIDMATCH) is not applied; IRIX clears
+  the CID planes to one code and clips windows with the screen masks. The
+  order of the antialiased-line weight table's entries is assumed (the
+  specification does not give it).
+- NetBSD 9.0's and 11.0's Newport console shows no text: these releases
+  read the board's revision just after a VC2 register access, a read whose
+  result on real hardware is not known, and on the emulated board they take
+  it for a 24-bit board. A NetBSD-current kernel (11.99), which reads the
+  revision directly, finds the board and runs its console on both the 8-bit
+  and the 24-bit board. With 9.0 or 11.0, use the serial console.
+- IRIX 5.3, IRIX 6.5, NetBSD 9.0 and 11.0 and OpenBSD 6.9 are the systems
+  tested so far; Linux has not been tried. (Current Debian releases no longer include
+  Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
 - The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
   Linux is the host tested most. macOS on Apple silicon has run the IRIX
@@ -302,12 +438,13 @@ with performance layers on top that must give exactly the same results:
 
 ## Roadmap
 
-- Newport 24-bit boards (XL24) and the remaining raster operations
-- IRIX 6.5; Linux/mips; NetBSD on the graphics console
+- Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
 - Indigo² (IP22 "Fullhouse") machine profile
 
 ## Legal
+
+Copyright (C) 2026 Andy Taylor.
 
 SiliconGhost is free software, licensed under the GNU General Public License,
 version 2 or (at your option) any later version; see [LICENSE](LICENSE).

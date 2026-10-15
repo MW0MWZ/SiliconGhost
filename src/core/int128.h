@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // 64x64->128 multiply helpers (DMULT/DMULTU) with a portable fallback for
 // compilers without __int128 (MSVC).
 #pragma once

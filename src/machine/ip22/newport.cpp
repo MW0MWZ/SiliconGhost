@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: SGI REX3, VC2, XMAP9, CMAP and RB2 datasheets; Linux
 // include/video/newport.h and newport_con.c; NetBSD sys/arch/sgimips/gio/
 // newport.c; X.org xf86-video-newport.
 #include "machine/ip22/newport.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 #include "core/endian.h"
@@ -35,11 +37,15 @@ enum Rex3 : u32 {
 // DRAWMODE0
 constexpr u32 kDm0DoSetup = 1u << 5, kDm0ColorHost = 1u << 6, kDm0StopOnX = 1u << 8, kDm0StopOnY = 1u << 9;
 constexpr u32 kDm0SkipFirst = 1u << 10, kDm0SkipLast = 1u << 11, kDm0EnZPattern = 1u << 12;
-constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
-constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0CiClamp = 1u << 21;
+constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0LsAdvLast = 1u << 14, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
+constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0XyOffset = 1u << 20;
+constexpr u32 kDm0CiClamp = 1u << 21, kDm0YStride = 1u << 23;
+constexpr u32 kDm0AlphaHost = 1u << 7;
 // DRAWMODE1
-constexpr u32 kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
+constexpr u32 kDm1YFlip = 1u << 6, kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
 constexpr u32 kDm1RgbMode = 1u << 15, kDm1Dither = 1u << 16, kDm1FastClear = 1u << 17, kDm1Blend = 1u << 18;
+constexpr u32 kDm1BackBlend = 1u << 25;
+constexpr unsigned kDm1SFactorShift = 19, kDm1DFactorShift = 22;
 
 constexpr u32 kStatusVersion = 3;
 constexpr u32 kStatusBackBusy = 1u << 4;  // the display control bus is busy
@@ -64,10 +70,12 @@ constexpr int kBayer[4][4] = {{0, 12, 3, 15}, {8, 4, 11, 7}, {2, 14, 1, 13}, {10
 
 s32 sext(u32 v, unsigned bits) { return static_cast<s32>(v << (32 - bits)) >> (32 - bits); }
 
-// Slopes are written sign-magnitude (sign in bit 31) and held as two's complement.
+// Slopes are written sign-magnitude (sign in bit 31) and held as two's
+// complement. Minus zero is zero: IRIX writes it for flat alpha.
 u32 sign_magnitude(u32 data, u32 magnitude_mask, u32 result_sign) {
-    if (data & 0x80000000u) return ((result_sign - (data & magnitude_mask)) & (result_sign | magnitude_mask)) | result_sign;
-    return data & magnitude_mask;
+    const u32 magnitude = data & magnitude_mask;
+    if ((data & 0x80000000u) && magnitude) return ((result_sign - magnitude) & (result_sign | magnitude_mask)) | result_sign;
+    return magnitude;
 }
 
 // Logical BGR formats <-> 8-bit channels.
@@ -196,7 +204,7 @@ bool Newport::write(u32 offset, unsigned size, u64 value) {
     u32 reg;
     bool go;
     if (!decode(offset, reg, go)) return false;
-    const u32 word = reg & ~3u;
+    const u32 word = reg & (size == 8 ? ~7u : ~3u);  // a doubleword is a register pair
     if (word == kDcbData0 || word == kDcbData1) {
         dcb_write(size, value);
     } else if (size == 8) {
@@ -259,10 +267,12 @@ u32 Newport::rex3_read(u32 reg) {
             return (static_cast<u32>(static_cast<u16>(int_part(xend_))) << 16) | static_cast<u16>(int_part(yend_));
         case kXStartEndI:
             return (static_cast<u32>(static_cast<u16>(int_part(xstart_))) << 16) | static_cast<u16>(int_part(xend_));
-        case kColorRed: return colorred_;
-        case kColorAlpha: return coloralpha_;
-        case kColorGrn: return colorgrn_;
-        case kColorBlue: return colorblue_;
+        // The colour registers are the shading iterators: reads return where
+        // the last primitive left them.
+        case kColorRed: return static_cast<u32>(curr_red_) & 0xFFFFFF;
+        case kColorAlpha: return static_cast<u32>(curr_alpha_) & 0xFFFFF;
+        case kColorGrn: return static_cast<u32>(curr_grn_) & 0xFFFFF;
+        case kColorBlue: return static_cast<u32>(curr_blue_) & 0xFFFFF;
         case kSlopeRed:
         case kSlopeRed1: return slopered_;
         case kSlopeAlpha: return slopealpha_;
@@ -273,7 +283,7 @@ u32 Newport::rex3_read(u32 reg) {
         case kColorX: return colorx_;
         case kHostRw0: return static_cast<u32>(hostrw_ >> 32);
         case kHostRw1: return static_cast<u32>(hostrw_);
-        case kDcbMode: return dcbmode_;
+        case kDcbMode: return (dcbmode_ & ~0x70u) | (dcb_crs_ << 4);
         case kTopScan: return topscan_;
         case kXYWin: return xywin_;
         case kClipMode: return clipmode_;
@@ -288,14 +298,26 @@ u32 Newport::rex3_read(u32 reg) {
     }
 }
 
+// Colour index mode takes its index from COLORRED, where it sits 11 bits up
+// (9 for 12-bit indexes): COLORI writes it there, and shading steps it.
+static constexpr unsigned kCiShift[4] = {11, 11, 9, 11};
+
+u32 Newport::ci_index() const {
+    const unsigned depth = (drawmode1_ >> 3) & 3;
+    return (static_cast<u32>(curr_red_) >> kCiShift[depth]) & depth_mask(depth);
+}
+
 void Newport::set_color_index(u32 v) {
     colori_ = v;
     if (drawmode1_ & kDm1RgbMode) {
         colorred_ = (v & 0xFF) << 11;
         colorgrn_ = (v & 0xFF00) << 3;
         colorblue_ = (v & 0xFF0000) >> 5;
-        reload_shade();
+    } else {
+        const unsigned depth = (drawmode1_ >> 3) & 3;
+        colorred_ = ((v & depth_mask(depth)) << kCiShift[depth]) & 0xFFFFFF;
     }
+    reload_shade();
 }
 
 void Newport::rex3_write(u32 reg, u32 v) {
@@ -317,10 +339,16 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kSmask0X: smask0x_ = v; return;
         case kSmask0Y: smask0y_ = v; return;
         case kSetup: do_setup(); return;
-        case kLsRestore: lspattern_ = lspatsave_; return;
-        case kLsSave: lspatsave_ = lspattern_; return;
+        case kLsRestore:  // pattern and repeat count from the saved copies
+            lspattern_ = lspatsave_;
+            lsmode_ = (lsmode_ & ~0xFFu) | ((lsmode_ >> 16) & 0xFF);
+            return;
+        case kLsSave:
+            lspatsave_ = lspattern_;
+            lsmode_ = (lsmode_ & ~0xFF0000u) | ((lsmode_ & 0xFF) << 16);
+            return;
+        case kStepZ: zfail_next_ = true; return;  // with GO: the current pixel fails the Z test
         case kStall0:
-        case kStepZ:
         case kStall1: return;
         case kXStart:
         case kXStartF:
@@ -368,10 +396,7 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kColorRed:
             colorred_ = v & 0xFFFFFF;
             curr_red_ = static_cast<s32>(colorred_);
-            if (!(drawmode1_ & kDm1RgbMode)) {
-                static constexpr unsigned kCiShift[4] = {11, 11, 9, 11};
-                colori_ = (v >> kCiShift[depth]) & depth_mask(depth);
-            }
+            if (!(drawmode1_ & kDm1RgbMode)) colori_ = (v >> kCiShift[depth]) & depth_mask(depth);
             return;
         case kColorAlpha:
             coloralpha_ = v & 0xFFFFF;
@@ -405,7 +430,10 @@ void Newport::rex3_write(u32 reg, u32 v) {
             hostrw_ = (hostrw_ & 0xFFFFFFFF00000000ull) | v;
             host_shift_ = -1;
             return;
-        case kDcbMode: dcbmode_ = v & 0x1FFFFFFF; return;
+        case kDcbMode:
+            dcbmode_ = v & 0x1FFFFFFF;
+            dcb_crs_ = (dcbmode_ >> 4) & 7;
+            return;
         case kTopScan:
             topscan_ = v & 0x3FF;
             picture_changed();
@@ -413,7 +441,9 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kXYWin: xywin_ = v; return;
         case kClipMode: clipmode_ = v & 0x1FFF; return;
         case kConfig: config_ = v & 0x1FFFFF; return;
-        case kDcbReset:
+        case kDcbReset:  // the DCB state machine, DCBMODE included
+            dcbmode_ = 0x780;
+            dcb_crs_ = 0;
             dcb_busy_until_ = 0;
             vc2_.ram_hi_pending = vc2_.ram_read_hi = true;
             for (auto& x : xmap_) x.mode_count = 0;
@@ -429,6 +459,11 @@ void Newport::rex3_write(u32 reg, u32 v) {
 // ---------------------------------------------------------------------------
 
 void Newport::execute() {
+    // FASTCLEAR applies to span and block DRAWs without host colour only.
+    fastclear_ = (drawmode1_ & kDm1FastClear) && (drawmode0_ & 3) == 2 && ((drawmode0_ >> 2) & 7) <= 1 &&
+                 !(drawmode0_ & kDm0ColorHost);
+    zfail_ = zfail_next_;
+    zfail_next_ = false;
     if (drawmode0_ & kDm0DoSetup) do_setup();
     switch (drawmode0_ & 3) {
         case 0: return;  // NOOP
@@ -438,8 +473,8 @@ void Newport::execute() {
                 case 0: draw_span_block(false); return;
                 case 1: draw_span_block(true); return;
                 case 2:
-                case 3:
-                case 4: draw_line(); return;
+                case 3: draw_line(); return;
+                case 4: draw_aline(); return;
                 default: SG_LOG(Debug, "newport", "invalid address mode %u", (drawmode0_ >> 2) & 7); return;
             }
         case 3: scr2scr(); return;
@@ -452,6 +487,8 @@ void Newport::do_setup() {
     const s32 dx = std::abs(x1 - x2), dy = std::abs(y1 - y2);
     const u32 octant = (y1 > y2 ? 1u : 0u) | (x1 > x2 ? 2u : 0u) | (dx > dy ? 4u : 0u);
     bresoctinc1_ = (bresoctinc1_ & ~0x07000000u) | (octant << 24);
+    const unsigned adrmode = (drawmode0_ >> 2) & 7;
+    if (adrmode == 2 || adrmode == 3) line_setup(adrmode == 3);
 }
 
 void Newport::reload_shade() {
@@ -478,12 +515,12 @@ void Newport::iterate_shade() {
 
 u32 Newport::default_color(u32 src) const {
     const unsigned depth = (drawmode1_ >> 3) & 3;
-    u32 c = (drawmode1_ & kDm1FastClear) ? colorvram_ : src;
+    u32 c = fastclear_ ? colorvram_ : src;
     switch (depth) {
         case 0: return (c & 0xF) * 0x11111111u;
         case 1: return (c & 0xFF) * 0x01010101u;
         case 2:
-            if ((drawmode1_ & kDm1RgbMode) && (drawmode1_ & kDm1FastClear))
+            if ((drawmode1_ & kDm1RgbMode) && fastclear_)
                 c = ((colorvram_ & 0xF00000) >> 12) | ((colorvram_ & 0xF000) >> 8) | ((colorvram_ & 0xF0) >> 4);
             c &= 0xFFF;
             return c | (c << 12);
@@ -493,7 +530,7 @@ u32 Newport::default_color(u32 src) const {
 
 u32 Newport::shaded_color(int x, int y) const {
     const unsigned depth = (drawmode1_ >> 3) & 3;
-    if (!(drawmode1_ & kDm1RgbMode)) return default_color(static_cast<u32>(curr_red_ >> 11));
+    if (!(drawmode1_ & kDm1RgbMode)) return default_color(ci_index());
     auto channel = [](s32 v) -> u32 {
         const u32 c = (static_cast<u32>(v) >> 11) & 0x1FF;
         if (c >= 0x180 || v < 0) return 0;
@@ -521,13 +558,28 @@ u32 Newport::shaded_color(int x, int y) const {
     return pack(r, g, b, depth);
 }
 
-u32 Newport::host_color() {
+// Host values sit right-aligned in 8-bit fields (4- and 8-bit pixels),
+// 16-bit fields (12-bit) or 32-bit fields (ABGR), the leftmost first;
+// SWAPENDIAN reverses the bytes of 16- and 32-bit fields. Alpha comes from a
+// 32-bit pixel's top byte, or (ALPHAHOST without COLORHOST) from the 8-bit
+// field itself.
+u32 Newport::host_color(u32* alpha) {
     static constexpr int kWidths[4] = {8, 8, 16, 32};
     static constexpr u32 kMasks[4] = {0xF, 0xFF, 0xFFF, 0xFFFFFFFF};
     const unsigned hostdepth = (drawmode1_ >> 8) & 3;
     const int width = kWidths[hostdepth];
     if (host_shift_ < 0) host_shift_ = 64 - width;
-    u32 colour = static_cast<u32>(hostrw_ >> host_shift_) & kMasks[hostdepth];
+    u32 field = static_cast<u32>(hostrw_ >> host_shift_) & (width == 32 ? 0xFFFFFFFFu : (1u << width) - 1);
+    if (drawmode1_ & kDm1SwapEndian) {
+        if (width == 16) field = ((field & 0xFF) << 8) | (field >> 8);
+        else if (width == 32) field = byteswap(field);
+    }
+    u32 colour = field & kMasks[hostdepth];
+    if (alpha) {
+        if (hostdepth == 3) *alpha = colour >> 24;
+        else if (!(drawmode0_ & kDm0ColorHost) && width == 8) *alpha = field;
+        else *alpha = 0xFF;
+    }
     if (drawmode1_ & kDm1RwPacked) {
         if (((drawmode1_ & kDm1RwDouble) && host_shift_ > 0) || host_shift_ > 32) host_shift_ -= width;
         else host_shift_ = 64 - width;
@@ -539,25 +591,82 @@ u32 Newport::host_color() {
         unpack(colour, hostdepth, r, g, b);
         colour = pack(r, g, b, depth);
     }
-    if (drawmode1_ & kDm1SwapEndian) colour = byteswap(colour);
     return colour;
 }
 
+// The pixel's colour, and its alpha for blending (src_alpha_): from the
+// alpha iterator, or from the host data with ALPHAHOST (which may also be
+// set without COLORHOST, to blend iterated colours by host alphas).
 u32 Newport::source_color(int x, int y) {
-    if (drawmode1_ & kDm1FastClear) return default_color(colorvram_);
-    if (drawmode0_ & kDm0ColorHost) return host_color();
-    if ((drawmode0_ & kDm0Shade) || (drawmode1_ & kDm1RgbMode)) return shaded_color(x, y);
-    return default_color(colori_);
+    if (fastclear_) return default_color(colorvram_);
+    u32 host_alpha = 0xFF, colour;
+    if (drawmode0_ & kDm0ColorHost) colour = host_color(&host_alpha);
+    else if ((drawmode0_ & kDm0Shade) || (drawmode1_ & kDm1RgbMode)) colour = shaded_color(x, y);
+    else colour = default_color(ci_index());
+    if ((drawmode1_ & kDm1Blend) || ((drawmode1_ >> 12) & 7) != 7) {  // blending or the alpha test need it
+        if (drawmode0_ & kDm0AlphaHost) {
+            if (!(drawmode0_ & kDm0ColorHost)) host_color(&host_alpha);
+            src_alpha_ = host_alpha;
+        } else {
+            const u32 a = (static_cast<u32>(curr_alpha_) >> 11) & 0x1FF;
+            src_alpha_ = (a >= 0x180 || curr_alpha_ < 0) ? 0 : std::min<u32>(a, 0xFF);
+        }
+    }
+    return colour;
 }
 
+// Cb = Cs * Fs + Cd * Fd for each channel, the destination being the frame
+// buffer or COLORBACK; factors are normalised as (v + msb) / 256, so 0xFF is
+// 1.0. Blending works on RGB pixels; the result replaces the logic op.
+// BLENDALPHA only changes how alpha itself is blended, and no destination
+// alpha is kept, so it is not consulted.
+u32 Newport::blend(u32 src, int px, int py) const {
+    const unsigned depth = (drawmode1_ >> 3) & 3;
+    u32 sr, sg, sb, dr, dg, db;
+    unpack(src & depth_mask(depth), depth, sr, sg, sb);
+    unpack((drawmode1_ & kDm1BackBlend) ? colorback_ & depth_mask(depth) : fetch(px, py), depth, dr, dg, db);
+    auto norm = [](u32 v) { return v + (v >> 7); };
+    const u32 sa = norm(src_alpha_);
+    const unsigned sf = (drawmode1_ >> kDm1SFactorShift) & 7, df = (drawmode1_ >> kDm1DFactorShift) & 7;
+    auto channel = [&](u32 s, u32 d) {
+        static constexpr u32 kOne = 256;
+        u32 fs = 0, fd = 0;
+        switch (sf) {
+            case 1: fs = kOne; break;
+            case 2: fs = norm(d); break;
+            case 3: fs = kOne - norm(d); break;
+            case 4: fs = sa; break;
+            case 5: fs = kOne - sa; break;
+            default: break;
+        }
+        switch (df) {
+            case 1: fd = kOne; break;
+            case 2: fd = norm(s); break;
+            case 3: fd = kOne - norm(s); break;
+            case 4: fd = sa; break;
+            case 5: fd = kOne - sa; break;
+            default: break;
+        }
+        return std::min<u32>(0xFF, (s * fs + d * fd) >> 8);
+    };
+    return pack(channel(sr, dr), channel(sg, dg), channel(sb, db), depth);
+}
+
+// Window-relative coordinates to frame buffer: XYOFFSET adds XYMOVE (for
+// writes, which is all that come here); YFLIP puts the origin at the lower
+// left (GL), the screen row then XYWIN.y less the coordinate.
 bool Newport::clip(int x, int y, int& px, int& py) const {
+    if (drawmode0_ & kDm0XyOffset) {
+        x += xmove_;
+        y += ymove_;
+    }
     if (clipmode_ & 1) {
         if (x < static_cast<s16>(smask0x_ >> 16) || x > static_cast<s16>(smask0x_) ||
             y < static_cast<s16>(smask0y_ >> 16) || y > static_cast<s16>(smask0y_))
             return false;
     }
     px = x + static_cast<s16>(xywin_ >> 16) - 0x1000;
-    py = y + static_cast<s16>(xywin_) - 0x1000;
+    py = (drawmode1_ & kDm1YFlip) ? static_cast<s16>(xywin_) - 0x2000 - y : y + static_cast<s16>(xywin_) - 0x1000;
     if (clipmode_ & 0x1E) {
         bool inside = false;
         for (unsigned m = 0; m < 4 && !inside; ++m) {
@@ -595,8 +704,12 @@ u32 Newport::fetch(int px, int py) const {
 }
 
 void Newport::store(int px, int py, u32 colour) {
+    ++pixels_drawn_;
     const unsigned planes = drawmode1_ & 7, depth = (drawmode1_ >> 3) & 3;
     if (planes == kPlanesNone || planes == 3 || planes == 7) return;
+    if (!fastclear_ && (drawmode1_ & (kDm1Blend | kDm1RgbMode)) == (kDm1Blend | kDm1RgbMode) &&
+        (planes == kPlanesRgb || planes == kPlanesRgba))
+        colour = blend(colour, px, py);
     // Replicate the value into every buffer lane, then move aux values into place.
     u32 v;
     switch (depth) {
@@ -610,7 +723,7 @@ void Newport::store(int px, int py, u32 colour) {
 
     u32& dst = (planes == kPlanesRgb || planes == kPlanesRgba ? rgbci_ : cidaux_)
         [static_cast<std::size_t>(py) * kPitch + static_cast<std::size_t>(px)];
-    if (!(drawmode1_ & (kDm1FastClear | kDm1Blend))) {
+    if (!fastclear_ && !(drawmode1_ & kDm1Blend)) {
         const u32 s = v, d = dst;
         switch (drawmode1_ >> 28) {
             case 0: v = 0; break;
@@ -631,11 +744,6 @@ void Newport::store(int px, int py, u32 colour) {
             default: v = ~0u; break;
         }
     }
-    // Blending is not modelled yet: blended pixels are written as the source colour.
-    if ((drawmode1_ & kDm1Blend) && !warned_blend_) {
-        warned_blend_ = true;
-        SG_LOG(Debug, "newport", "blending requested (drawmode1 %08x); drawn unblended", drawmode1_);
-    }
     const u32 mask = wrmask_ & (opts_.xl24 ? 0xFFFFFFu : 0xFFu);
     const u32 updated = (dst & ~mask) | (v & mask);
     if (updated != dst) {
@@ -645,9 +753,35 @@ void Newport::store(int px, int py, u32 colour) {
     }
 }
 
+// CID checking is not applied: IRIX 6.5 clears the CID planes to one code
+// for the whole screen, then draws visible GL windows with CIDMATCH 0 (no
+// code selected) and clips them with the screen masks, so on the real
+// board such writes cannot be blocked as the REX3 specification reads.
 void Newport::plot(int x, int y, u32 colour) {
     int px, py;
     if (clip(x, y, px, py)) store(px, py, colour);
+}
+
+// A source pixel, subject to DRAWMODE1 COMPARE (conditions OR'ed; all three
+// is no test): in RGB mode the alpha test, source alpha against ALPHAREF;
+// in colour index mode a comparison of source and destination indexes.
+void Newport::plot_source(int x, int y, u32 colour) {
+    int px, py;
+    if (!clip(x, y, px, py)) return;
+    const unsigned cmp = (drawmode1_ >> 12) & 7;
+    if (cmp != 7) {
+        u32 s, d;
+        if (drawmode1_ & kDm1RgbMode) {
+            s = src_alpha_;
+            d = alpharef_;
+        } else {
+            const u32 mask = depth_mask((drawmode1_ >> 3) & 3);
+            s = colour & mask;
+            d = fetch(px, py) & mask;
+        }
+        if (!(((cmp & 4) && s > d) || ((cmp & 2) && s == d) || ((cmp & 1) && s < d))) return;
+    }
+    store(px, py, colour);
 }
 
 void Newport::draw_span_block(bool block) {
@@ -661,7 +795,7 @@ void Newport::draw_span_block(bool block) {
                         : (drawmode0_ & kDm0EnLsPattern) ? lspattern_
                                                          : ~0u;
     const bool opaque = drawmode0_ & (kDm0ZpOpaque | kDm0LsOpaque);
-    const bool fastclear = drawmode1_ & kDm1FastClear;
+    const bool fastclear = fastclear_;
 
     int prim_limit = 0x10000;
     if (drawmode0_ & kDm0Length32) prim_limit = 32;
@@ -677,9 +811,13 @@ void Newport::draw_span_block(bool block) {
         const bool lr_abort = (drawmode0_ & kDm0LrOnly) && dx < 0;
         if (!lr_abort) {
             do {
+                // Each pixel is drawn in the current colour, then the
+                // iterators step (shading runs on across rows and GOs). A
+                // pixel failing the Z test (STEPZ) draws COLORBACK if ZPOPAQUE.
+                const bool zfail = zfail_ && drawn == 0;
+                if (!zfail && ((pattern >> bit) & 1)) plot_source(sx, sy, source_color(sx, sy));
+                else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(sx, sy, default_color(colorback_));
                 if ((drawmode0_ & kDm0Shade) && !fastclear) iterate_shade();
-                if ((pattern >> bit) & 1) plot(sx, sy, source_color(sx, sy));
-                else if (opaque) plot(sx, sy, default_color(colorback_));
                 bit = (bit - 1) & 31;
                 sx += dx;
                 ++drawn;
@@ -687,68 +825,181 @@ void Newport::draw_span_block(bool block) {
         }
         const bool row_done = sx == end_x || lr_abort;
         if (row_done) {
-            reload_shade();
-            if (block) {
+            if (block) {  // YSTRIDE steps two rows (the video option's fields)
                 sx = xsave_;
-                sy += dy;
+                sy += (drawmode0_ & kDm0YStride) ? 2 * dy : dy;
             }
         }
-        // Host-supplied pixels come a data word per GO: a finished row
-        // waits for the next word rather than repeating this one.
-        if (!block || !row_done || !stop_y || sy == end_y || (drawmode0_ & kDm0ColorHost)) break;
+        // Packed host pixels come a data word per GO: a finished row waits
+        // for the next word. An unpacked host pixel fills the whole block
+        // (pixel zoom).
+        const bool host_packed = (drawmode0_ & kDm0ColorHost) && (drawmode1_ & kDm1RwPacked);
+        const bool past_end = dy > 0 ? sy >= end_y : sy <= end_y;  // YSTRIDE may step over the end row
+        if (!block || !row_done || !stop_y || past_end || host_packed) break;
     }
     write_x_start(static_cast<u32>(sx) << 11);
     if (block) write_y_start(static_cast<u32>(sy) << 11);
 }
 
-void Newport::draw_line() {
-    // Integer Bresenham between the start and end points. Fractional (F_LINE)
-    // and antialiased (A_LINE) lines use the integer endpoints for now.
+// Antialiased line (A_LINE): at each step along the major axis, the two
+// pixels either side of the exact line (subpixel endpoints) are drawn, each
+// with a coverage from the 16-entry AWEIGHT table: the far pixel's indexed by
+// the line's fractional distance into it, the near pixel's by the rest. In
+// RGB the coverage is the source alpha (software blends with SA, 1-SA); in
+// colour index it replaces the index's low four bits. The order of the
+// table's 4-bit entries in AWEIGHT0/1 is not in the specification: entry 0
+// is taken from the low bits of AWEIGHT0 (UNVERIFIED).
+void Newport::draw_aline() {
     const u32 octant = (bresoctinc1_ >> 24) & 7;
-    if (((drawmode0_ >> 2) & 7) == 4 && !warned_aline_) {
-        warned_aline_ = true;
-        SG_LOG(Debug, "newport", "antialiased line requested; drawn as a plain line");
+    const bool xmajor = octant & 4;
+    // 16.4 fixed point endpoints
+    const double x1 = sext(xstart_ >> 7, 20) / 16.0, y1 = sext(ystart_ >> 7, 20) / 16.0;
+    const double x2 = sext(xend_ >> 7, 20) / 16.0, y2 = sext(yend_ >> 7, 20) / 16.0;
+    const double m1 = xmajor ? x1 : y1, m2 = xmajor ? x2 : y2, n1 = xmajor ? y1 : x1, n2 = xmajor ? y2 : x2;
+    const int step = m2 >= m1 ? 1 : -1;
+    const double slope = m2 != m1 ? (n2 - n1) / (m2 - m1) : 0.0;
+    const int first = static_cast<int>(std::lround(m1)), last = static_cast<int>(std::lround(m2));
+    auto weight = [this](double c) {
+        const unsigned i = std::min(15u, static_cast<unsigned>(c * 16));
+        return ((i < 8 ? aweight0_ : aweight1_) >> (4 * (i & 7))) & 0xF;
+    };
+    const bool rgb = drawmode1_ & kDm1RgbMode;
+    auto draw = [&](int m, int n, unsigned coverage) {
+        if (!coverage) return;
+        const int px = xmajor ? m : n, py = xmajor ? n : m;
+        u32 colour = source_color(px, py);
+        if (rgb) src_alpha_ = coverage * 0x11;
+        else colour = (colour & ~0xFu) | coverage;
+        plot_source(px, py, colour);
+    };
+    const bool one = !(drawmode0_ & (kDm0StopOnX | kDm0StopOnY));  // one step per GO
+    for (int m = first;; m += step) {
+        const bool skip = (m == first && (drawmode0_ & kDm0SkipFirst)) || (m == last && (drawmode0_ & kDm0SkipLast));
+        if (!skip) {
+            const double n = n1 + (m - m1) * slope;
+            const double lower = std::floor(n), f = n - lower;
+            draw(m, static_cast<int>(lower), weight(1.0 - f));
+            draw(m, static_cast<int>(lower) + 1, weight(f));
+        }
+        if (drawmode0_ & kDm0Shade) iterate_shade();
+        if (one || m == last) {
+            // Carry on from the next step (one point per GO) or rest at the end.
+            const double nm = one && m != last ? m + step : m2, nn = one && m != last ? n1 + (nm - m1) * slope : n2;
+            const auto fixed = [](double v) { return static_cast<u32>(static_cast<s32>(std::lround(v * 16))) << 7; };
+            write_x_start(fixed(xmajor ? nm : nn));
+            write_y_start(fixed(xmajor ? nn : nm));
+            break;
+        }
     }
-    const int x1 = int_part(xstart_), y1 = int_part(ystart_), x2 = int_part(xend_), y2 = int_part(yend_);
+}
+
+// Lines follow the REX3 specification's Bresenham (section 3.6.1): SETUP
+// (or DOSETUP) finds the octant and the error terms, which live in BRESD,
+// BRESOCTINC1 and BRESRNDINC2 (19.8, 17.3 and 18.3 fixed point), and every
+// GO carries on from them, so a line drawn a point or 32 pixels at a time
+// follows the same pixels as one drawn whole. I_LINE has integer end
+// points and draws both; F_LINE has 16.4 end points (the error term
+// starts at 3dy - 2dx + 2(dx*yfract - dy*xfract), fractions flipped in the
+// octants left of and below the start) and stops short of the end point.
+// The error terms here are in 1/256 of a pixel.
+void Newport::line_setup(bool fractional) {
+    const u32 octant = (bresoctinc1_ >> 24) & 7;
+    const bool xmajor = octant & 4, xdec = octant & 2, ydec = octant & 1;
+    s64 d, inc1, inc2;
+    if (!fractional) {
+        const int dx = std::abs(int_part(xend_) - int_part(xstart_)), dy = std::abs(int_part(yend_) - int_part(ystart_));
+        const s64 major = xmajor ? dx : dy, minor = xmajor ? dy : dx;
+        d = 256 * (2 * minor - major);
+        inc1 = 512 * minor;
+        inc2 = 512 * (minor - major);
+    } else {
+        const s32 x1 = sext(xstart_ >> 7, 20), y1 = sext(ystart_ >> 7, 20);  // 16.4
+        const s32 x2 = sext(xend_ >> 7, 20), y2 = sext(yend_ >> 7, 20);
+        const s64 dx = std::abs(x1 - x2), dy = std::abs(y1 - y2);
+        const s64 xf = xdec ? 16 - (x1 & 0xF) : (x1 & 0xF), yf = ydec ? 16 - (y1 & 0xF) : (y1 & 0xF);
+        const s64 major = xmajor ? dx : dy, minor = xmajor ? dy : dx;
+        const s64 major_fract = xmajor ? xf : yf, minor_fract = xmajor ? yf : xf;
+        d = 48 * minor - 32 * major + 2 * (major * minor_fract - minor * major_fract);
+        inc1 = 32 * minor;
+        inc2 = 32 * (minor - major);
+    }
+    bresd_ = static_cast<u32>(d) & 0x7FFFFFF;
+    bresoctinc1_ = (bresoctinc1_ & 0x07000000u) | (static_cast<u32>(inc1 >> 5) & 0xFFFFF);
+    bresrndinc2_ = (bresrndinc2_ & 0xFF000000u) | (static_cast<u32>(inc2 >> 5) & 0x1FFFFF);
+}
+
+// One step of the line stipple: LSPATTERN's top LSLENGTH bits rotate one
+// place each LSREPEAT pixels (LSRCOUNT counting them down).
+void Newport::advance_line_stipple() {
+    u32 count = lsmode_ & 0xFF;
+    if (count == 0 || --count == 0) {
+        const unsigned length = ((lsmode_ >> 24) & 0xF) + 17, low = 32 - length;
+        const u32 top = ~0u << low;
+        lspattern_ = ((lspattern_ << 1) & top) | ((lspattern_ >> 31) << low) | (lspattern_ & ~top);
+        count = (lsmode_ >> 8) & 0xFF;
+    }
+    lsmode_ = (lsmode_ & ~0xFFu) | count;
+}
+
+void Newport::draw_line() {
+    const u32 octant = (bresoctinc1_ >> 24) & 7;
+    const bool fractional = ((drawmode0_ >> 2) & 7) == 3;
     const bool xmajor = octant & 4;
     const int sx_step = (octant & 2) ? -1 : 1, sy_step = (octant & 1) ? -1 : 1;
-    const int dx = std::abs(x2 - x1), dy = std::abs(y2 - y1);
-    const int major = xmajor ? dx : dy, minor = xmajor ? dy : dx;
-    int d = 2 * minor - major;
-    int x = x1, y = y1;
+    s64 d = sext(bresd_, 27);
+    const s64 inc1 = static_cast<s64>(bresoctinc1_ & 0xFFFFF) << 5, inc2 = static_cast<s64>(sext(bresrndinc2_ & 0x1FFFFF, 21)) << 5;
+    int x = int_part(xstart_), y = int_part(ystart_);
+    const int remaining = (xmajor ? std::abs(int_part(xend_) - x) : std::abs(int_part(yend_) - y)) + (fractional ? 0 : 1);
     auto step = [&] {
-        if (d >= 0) {
+        if (d < 0) {
+            d += inc1;
+        } else {
             if (xmajor) y += sy_step;
             else x += sx_step;
-            d -= 2 * major;
+            d += inc2;
         }
         if (xmajor) x += sx_step;
         else y += sy_step;
-        d += 2 * minor;
     };
-    const u32 pattern = (drawmode0_ & kDm0EnLsPattern) ? lspattern_ : ~0u;
-    const bool opaque = drawmode0_ & kDm0LsOpaque;
-    unsigned bit = 31;
-    auto draw = [&](int px, int py) {
+    // Patterns: the line stipple (rotating) and ZPATTERN (from its msb each
+    // GO). A pixel takes the source colour if both enabled patterns allow,
+    // otherwise COLORBACK where an opaque pattern says so.
+    const bool ls_en = drawmode0_ & kDm0EnLsPattern, zp_en = drawmode0_ & kDm0EnZPattern;
+    const bool ls_opaque = drawmode0_ & kDm0LsOpaque, zp_opaque = drawmode0_ & kDm0ZpOpaque;
+    unsigned zbit = 31;
+    bool first = true;
+    auto draw = [&](int px, int py, bool skipped, bool last) {
+        const bool zfail = zfail_ && first;
+        first = false;
+        const bool ls = !ls_en || (lspattern_ >> 31), zs = (!zp_en || ((zpattern_ >> zbit) & 1)) && !zfail;
+        if (!skipped) {
+            if (ls && zs) plot_source(px, py, source_color(px, py));
+            else if ((ls || ls_opaque) && (zs || zp_opaque || (zfail && zp_opaque))) plot(px, py, default_color(colorback_));
+        }
         if (drawmode0_ & kDm0Shade) iterate_shade();
-        if ((pattern >> bit) & 1) plot(px, py, source_color(px, py));
-        else if (opaque) plot(px, py, default_color(colorback_));
-        bit = (bit - 1) & 31;
+        zbit = (zbit - 1) & 31;
+        if (ls_en && (!last || (drawmode0_ & kDm0LsAdvLast))) advance_line_stipple();
     };
 
-    if (!(drawmode0_ & (kDm0StopOnX | kDm0StopOnY))) {  // one point per GO
-        if (!(drawmode0_ & kDm0SkipFirst)) draw(x, y);
-        step();
-    } else {
-        int n = major;
-        if ((drawmode0_ & kDm0Length32) && n > 32) n = 32;
-        for (int i = 0; i <= n; ++i) {
-            const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (i == n && (drawmode0_ & kDm0SkipLast));
-            if (!skip) draw(x, y);
-            if (i < n) step();
+    if (remaining > 0) {
+        if (!(drawmode0_ & (kDm0StopOnX | kDm0StopOnY))) {  // one point per GO
+            draw(x, y, drawmode0_ & kDm0SkipFirst, remaining == 1);
+            step();
+        } else {
+            // LENGTH32 limits one GO to 32 pixels, the next GO carrying on.
+            // At the end the iterators rest on the end point with SKIPLAST
+            // (for the next connected line), else just past it.
+            const bool cut = (drawmode0_ & kDm0Length32) && remaining > 32;
+            const int pixels = cut ? 32 : remaining;
+            for (int i = 0; i < pixels; ++i) {
+                const bool last = !cut && i == pixels - 1;
+                const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (last && (drawmode0_ & kDm0SkipLast));
+                draw(x, y, skip, last);
+                if (!last || !(drawmode0_ & kDm0SkipLast)) step();
+            }
         }
-        reload_shade();
     }
+    bresd_ = static_cast<u32>(d) & 0x7FFFFFF;
     write_x_start(static_cast<u32>(x) << 11);
     write_y_start(static_cast<u32>(y) << 11);
 }
@@ -781,14 +1032,17 @@ void Newport::scr2scr() {
     write_y_start(static_cast<u32>(sy) << 11);
 }
 
+// Reads pixels into HOSTRW in the host field layout (see host_color()): as
+// many as a word holds with RWPACKED, otherwise one, in the leftmost field.
 void Newport::pixel_read() {
-    static constexpr int kPerWord[4][2] = {{8, 16}, {4, 8}, {2, 4}, {1, 2}};
-    static constexpr int kStart[4] = {60, 56, 48, 32};
-    static constexpr int kStep[4] = {4, 8, 16, 32};
+    static constexpr int kPerWord[4][2] = {{4, 8}, {4, 8}, {2, 4}, {1, 2}};
+    static constexpr int kStart[4] = {56, 56, 48, 32};
+    static constexpr int kStep[4] = {8, 8, 16, 32};
     const unsigned hostdepth = (drawmode1_ >> 8) & 3, depth = (drawmode1_ >> 3) & 3, planes = drawmode1_ & 7;
     int sx = int_part(xstart_), sy = int_part(ystart_);
     const int ex = int_part(xend_), ey = int_part(yend_);
-    const int width = std::min(ex - sx + 1, kPerWord[hostdepth][(drawmode1_ & kDm1RwDouble) ? 1 : 0]);
+    const int per_word = (drawmode1_ & kDm1RwPacked) ? kPerWord[hostdepth][(drawmode1_ & kDm1RwDouble) ? 1 : 0] : 1;
+    const int width = std::min(ex - sx + 1, per_word);
     const int xwin = static_cast<s16>(xywin_ >> 16) - 0x1000, ywin = static_cast<s16>(xywin_) - 0x1000;
     u64 result = 0;
     int shift = kStart[hostdepth];
@@ -800,8 +1054,13 @@ void Newport::pixel_read() {
             unpack(v, depth, r, g, b);
             v = pack(r, g, b, hostdepth);
         }
-        const u64 mask = hostdepth == 3 ? 0xFFFFFFFFull : (u64{1} << kStep[hostdepth]) - 1;
-        result |= (u64{v} & mask) << shift;
+        static constexpr u64 kPixelMask[4] = {0xF, 0xFF, 0xFFF, 0xFFFFFFFF};  // the value, right-aligned in its field
+        v &= static_cast<u32>(kPixelMask[hostdepth]);
+        if (drawmode1_ & kDm1SwapEndian) {  // the bytes of 16- and 32-bit fields
+            if (hostdepth == 2) v = ((v & 0xFF) << 8) | (v >> 8);
+            else if (hostdepth == 3) v = byteswap(v);
+        }
+        result |= u64{v} << shift;
         shift -= kStep[hostdepth];
         if (++sx > ex) {
             sy += ey < sy ? -1 : 1;
@@ -823,7 +1082,7 @@ void Newport::dcb_begin() {
     // for an acknowledge keeps the bus busy until it times out or the bus is
     // reset. IRIX probes for an Indy Presenter adapter this way (a few
     // back-to-back status reads); the PROM simply waits for the bus.
-    constexpr u32 kDcbSyncAck = 1u << 13, kDcbAsyncAck = 1u << 14;
+    constexpr u32 kDcbSyncAck = 1u << 11, kDcbAsyncAck = 1u << 12;
     constexpr double kAckTimeout = 10e-6;
     if (((dcbmode_ >> 7) & 0xF) >= 8 && (dcbmode_ & (kDcbSyncAck | kDcbAsyncAck)))
         dcb_busy_until_ = scheduler_.now() + static_cast<u64>(cpu_hz_ * kAckTimeout);
@@ -831,46 +1090,63 @@ void Newport::dcb_begin() {
 
 bool Newport::dcb_stalled() const { return scheduler_.now() < dcb_busy_until_; }
 
-void Newport::dcb_write(unsigned size, u64 value) {
-    dcb_begin();
-    // The bytes of the CPU access in address order (most significant first).
-    u8 bytes[8];
-    unsigned n = 0;
-    if (size == 8) {
-        for (int i = 7; i >= 0; --i) bytes[n++] = static_cast<u8>(value >> (8 * i));
-    } else {
-        for (int i = static_cast<int>(size) - 1; i >= 0; --i) bytes[n++] = static_cast<u8>(value >> (8 * i));
-    }
+// A DCBDATA access moves DATAWIDTH bytes of each 32-bit word addressed
+// (DCBDATA0 first; a doubleword access covers both), or every addressed
+// byte with ENDATAPACK. SWAPENDIAN reverses 2- and 4-byte transfers. With
+// ENCRSINC the register select steps after each byte, and goes on from
+// there in the next access until DCBMODE is written again.
+namespace {
+constexpr u32 kDcbDataPack = 1u << 2, kDcbCrsInc = 1u << 3, kDcbSwapEndian = 1u << 28;
+}
+
+unsigned Newport::dcb_width(unsigned size) const {
     unsigned width = dcbmode_ & 3;
     if (width == 0) width = 4;
-    n = std::min(n, width);
-    if (dcbmode_ & (1u << 28)) std::reverse(bytes, bytes + n);  // SWAPENDIAN
+    return (dcbmode_ & kDcbDataPack) ? size : width;
+}
+
+void Newport::dcb_write(unsigned size, u64 value) {
+    dcb_begin();
+    const unsigned words = size == 8 ? 2 : 1, word_size = size == 8 ? 4 : size;
     const unsigned addr = (dcbmode_ >> 7) & 0xF;
-    unsigned crs = (dcbmode_ >> 4) & 7;
-    for (unsigned i = 0; i < n; ++i) {
-        dcb_write_byte(addr, crs, bytes[i]);
-        if (dcbmode_ & 8) crs = (crs + 1) & 7;
+    for (unsigned w = 0; w < words; ++w) {
+        const u64 word = size == 8 ? (value >> (32 * (1 - w))) & 0xFFFFFFFFu : value;
+        u8 bytes[4];
+        unsigned n = 0;
+        for (int i = static_cast<int>(word_size) - 1; i >= 0; --i) bytes[n++] = static_cast<u8>(word >> (8 * i));
+        n = std::min(n, dcb_width(word_size));
+        if ((dcbmode_ & kDcbSwapEndian) && (n == 2 || n == 4)) std::reverse(bytes, bytes + n);
+        for (unsigned i = 0; i < n; ++i) {
+            dcb_write_byte(addr, dcb_crs_, bytes[i]);
+            if (dcbmode_ & kDcbCrsInc) dcb_crs_ = (dcb_crs_ + 1) & 7;
+        }
     }
 }
 
 u64 Newport::dcb_read(u32 reg, unsigned size) {
     dcb_begin();
-    unsigned width = dcbmode_ & 3;
-    if (width == 0) width = 4;
     const unsigned addr = (dcbmode_ >> 7) & 0xF;
-    unsigned crs = (dcbmode_ >> 4) & 7;
-    u8 bytes[4] = {0, 0, 0, 0};
-    for (unsigned i = 0; i < width; ++i) {
-        bytes[i] = dcb_read_byte(addr, crs);
-        if (dcbmode_ & 8) crs = (crs + 1) & 7;
+    auto read_word = [&](unsigned word_size) {
+        const unsigned width = std::min(dcb_width(word_size), 4u);
+        u8 bytes[4] = {0, 0, 0, 0};
+        for (unsigned i = 0; i < width; ++i) {
+            bytes[i] = dcb_read_byte(addr, dcb_crs_);
+            if (dcbmode_ & kDcbCrsInc) dcb_crs_ = (dcb_crs_ + 1) & 7;
+        }
+        if ((dcbmode_ & kDcbSwapEndian) && (width == 2 || width == 4)) std::reverse(bytes, bytes + width);
+        // Data is left-justified in the word and replicated into the lower
+        // lanes for 1- and 2-byte transfers, so narrow and full-word loads
+        // both see it.
+        u32 v = (u32{bytes[0]} << 24) | (u32{bytes[1]} << 16) | (u32{bytes[2]} << 8) | bytes[3];
+        if (width == 1) v = bytes[0] * 0x01010101u;
+        else if (width == 2) v = ((u32{bytes[0]} << 8) | bytes[1]) * 0x00010001u;
+        return v;
+    };
+    if (size == 8) {
+        const u32 hi = read_word(4);
+        return (u64{hi} << 32) | read_word(4);
     }
-    if (dcbmode_ & (1u << 28)) std::reverse(bytes, bytes + width);
-    // Data is left-justified in the word and replicated into the lower lanes
-    // for 1- and 2-byte transfers, so narrow and full-word loads both see it.
-    u32 v = (u32{bytes[0]} << 24) | (u32{bytes[1]} << 16) | (u32{bytes[2]} << 8) | bytes[3];
-    if (width == 1) v = bytes[0] * 0x01010101u;
-    else if (width == 2) v = ((u32{bytes[0]} << 8) | bytes[1]) * 0x00010001u;
-    if (size == 8) return u64{v} << 32;
+    const u32 v = read_word(4);
     if (size == 4) return v;
     return (v >> ((4 - size - (reg & 3)) * 8)) & ((1u << (size * 8)) - 1);
 }
@@ -909,8 +1185,9 @@ u8 Newport::dcb_read_byte(unsigned addr, unsigned crs) {
     }
 }
 
+// The VC2 decodes CRS bits 1:0 only.
 void Newport::vc2_write(unsigned crs, u8 b) {
-    switch (crs) {
+    switch (crs & 3) {
         case 0: vc2_.index = b & 0x1F; break;
         case 1: vc2_.data_hi = b; break;
         case 2: {
@@ -953,10 +1230,14 @@ u8 Newport::vc2_read(unsigned crs) {
         }
         return vc2_.reg[i];
     };
-    switch (crs) {
+    switch (crs & 3) {
         case 0: return static_cast<u8>(vc2_.index);
-        case 1: return static_cast<u8>(reg(vc2_.index) >> 8);
-        case 2: return static_cast<u8>(reg(vc2_.index));
+        case 1: {  // fetches the whole register; CRS 2 then reads its low byte
+            const u16 v = reg(vc2_.index);
+            vc2_.reg_lo_latch = static_cast<u8>(v);
+            return static_cast<u8>(v >> 8);
+        }
+        case 2: return vc2_.index == kVc2Config ? static_cast<u8>(reg(kVc2Config)) : vc2_.reg_lo_latch;
         case 3: {
             u16& addr = vc2_.reg[kVc2RamAddr];
             const u16 w = vc2_.ram[addr & 0x7FFF];
@@ -995,7 +1276,7 @@ void Newport::xmap_write(unsigned which, unsigned crs, u8 b) {
 u8 Newport::xmap_read(unsigned which, unsigned crs) {
     const Xmap& x = xmap_[which];
     switch (crs) {
-        case 0: return static_cast<u8>(x.config | (opts_.xl24 ? 0 : 0x04));
+        case 0: return x.config;  // as written: the chip never changes it
         case 1: return opts_.xl24 ? 3 : 1;
         case 2: return 0x02;  // FIFO empty: all entries available
         case 3: return x.cursor_msb;
@@ -1132,13 +1413,22 @@ u8 Newport::did_at(const std::vector<std::pair<int, u8>>& records, int x) const 
     return did;
 }
 
+// The glyph's origin is pixel 31 for both sizes. Horizontally the cursor
+// comes out of the VC2 at HPOS time and runs through the XMAP9's longer
+// cursor pipeline; with SGI's timing tables that puts the glyph's left edge
+// at screen column CURX - 29 (frame buffer column CURX - 27), as IRIX and
+// Linux allow for. Rows: CURY - 31.
+constexpr int kCursorScreenX = 29, kCursorScreenY = 31, kScanDelay = 2;
+constexpr u8 kXmapPupEnable = 0x01;  // XMAP9 config: pop-up planes shown
+constexpr u8 kXmapEightBit = 0x04;   // XMAP9 config: 8-bit system (the XL8)
+
 unsigned Newport::cursor_pixel(int x, int y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return 0;
     const bool large = dcr & kDcrLargeCursor;
     const int size = large ? 64 : 32;
-    const int col = x - (static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (size - 1));
-    const int row = y - (static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1));
+    const int col = x - (static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay);
+    const int row = y - (static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY);
     if (col < 0 || col >= size || row < 0 || row >= size) return 0;
     const unsigned entry = vc2_.reg[kVc2CursorEntry];
     const unsigned bit = 15 - (col & 15);
@@ -1147,10 +1437,18 @@ unsigned Newport::cursor_pixel(int x, int y) const {
     return ((vc2_.ram[word & 0x7FFF] >> bit) & 1) | (((vc2_.ram[(word + 64) & 0x7FFF] >> bit) & 1) << 1);
 }
 
+bool Newport::cursor_position(int& x, int& y) const {
+    const u16 dcr = vc2_.reg[kVc2Control];
+    if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return false;
+    x = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX;  // screen (picture) coordinates
+    y = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
+    return true;
+}
+
 void Newport::cursor_moving() {
     ++display_version_;
     const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
-    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1);
+    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
     if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
         full_redraw_ = true;
         cursor_rows_.clear();
@@ -1212,14 +1510,107 @@ u32 Newport::direct_colour(u32 mode, u32 pix) const {
     return 0xFF000000u | rgb;
 }
 
-u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
-    const Xmap& xm = xmap_[0];
+// A pixel's value in the buffer and size its display mode reads.
+static u32 pixel_value(u32 mode, u32 pix) {
+    const unsigned pix_size = (mode >> 10) & 3, buf = mode & 1;
+    switch (pix_size) {
+        case 0: return (pix >> (buf ? 4 : 0)) & 0xF;
+        case 1: return pix & 0xFF;
+        case 2: return (pix >> (buf ? 12 : 0)) & 0xFFF;
+        default: return pix & 0xFFFFFF;
+    }
+}
+
+bool Newport::pixel_value_nonzero(u32 mode, u32 pix) const { return pixel_value(mode, pix) != 0; }
+
+// The pixel's own colour: colour index through the CMAP (MSB_CMAP above it),
+// or RGB through CMAP map 0..2, then the RAMDAC's gamma unless bypassed.
+u32 Newport::pixel_colour(u32 mode, u32 pix) const {
     const std::vector<u32>& pal = cmap_[0].palette;
+    const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3;
+    const u32 v = pixel_value(mode, pix);
     u32 rgb;
-    if (cursor) rgb = pal[((xm.cursor_msb << 5) | cursor) & 0x1FFF];
-    else if (const unsigned pup = (aux >> 2) & 3) rgb = pal[((xm.pup_msb << 5) | pup) & 0x1FFF];
-    else if (((mode >> 16) & 7) == 2 && ((aux >> 8) & 0xFF)) rgb = pal[((mode >> 11) & 0x1F00) | ((aux >> 8) & 0xFF)];
-    else return direct_colour(mode, pix);  // not reached for table modes
+    if (pix_mode == 0) {
+        const u32 ci_msb = (mode & 0xF8) << 5;
+        rgb = pal[(pix_size == 2 ? (ci_msb & 0x1000) | v : ci_msb | v) & 0x1FFF];
+    } else {
+        u32 r, g, b;
+        unpack(v, pix_size, r, g, b);
+        const u32 base = 0x1C00 + pix_mode * 0x100;
+        rgb = (pal[base + r] & 0xFF0000) | (pal[base + g] & 0xFF00) | (pal[base + b] & 0xFF);
+    }
+    if (!(mode & 4))
+        rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
+              ramdac_.lut[2][rgb & 0xFF];
+    return 0xFF000000u | rgb;
+}
+
+// The XMAP9's choice among the layers (XMAP9 spec 3.4.3-3.4.5): cursor,
+// pop-up, a non-zero overlay, a non-zero pixel, the underlay, the pixel.
+// Overlay and underlay are colour index, their top 5 address bits from the
+// mode's AUX_MSB_CMAP. A 24-bit system has 8 aux bits per buffer (the
+// overlay bytes), used as an 8-bit underlay or overlay, double-buffered
+// 4-bit overlays, or a 4-bit overlay over a 4-bit underlay; an 8-bit system
+// has only the 2 pop-up bits, which are pop-ups or, with pop-ups disabled,
+// the same modes at 2 and 1 bits. Returns false when the pixel shows.
+bool Newport::aux_layer(u32 mode, bool pixel_nonzero, u32 aux, unsigned cursor, u32& addr) const {
+    const Xmap& xm = xmap_[0];
+    if (cursor) {
+        addr = ((xm.cursor_msb << 5) | cursor) & 0x1FFF;
+        return true;
+    }
+    const bool pup_en = xm.config & kXmapPupEnable, eight_bit = xm.config & kXmapEightBit;
+    if (pup_en) {
+        if (const unsigned pup = (aux >> 2) & 3) {
+            addr = ((xm.pup_msb << 5) | pup) & 0x1FFF;
+            return true;
+        }
+        if (eight_bit) return false;  // the pop-up bits are all the aux planes there are
+    }
+    const unsigned aux_mode = (mode >> 16) & 7;
+    const unsigned bits = eight_bit ? (aux >> 2) & 3 : (aux >> 8) & 0xFF;
+    const unsigned half = eight_bit ? 1 : 4, low = (1u << half) - 1;
+    int overlay = -1, underlay = -1;
+    switch (aux_mode) {
+        case 1: underlay = static_cast<int>(bits); break;
+        case 2: overlay = static_cast<int>(bits); break;
+        case 6:  // double buffered: OVL_Buf_Sel picks the buffer
+            overlay = eight_bit ? static_cast<int>((aux >> ((mode & 2) ? 3 : 2)) & 1)
+                                : static_cast<int>((aux >> ((mode & 2) ? 16 : 8)) & 0xF);
+            break;
+        case 7:
+            overlay = static_cast<int>(bits & low);
+            underlay = static_cast<int>(bits >> half);
+            break;
+        default: return false;
+    }
+    const u32 base = ((mode >> 19) & 0x1F) << 8;
+    if (overlay > 0) {
+        addr = base | static_cast<u32>(overlay);
+        return true;
+    }
+    if (pixel_nonzero || underlay < 0) return false;
+    addr = base | static_cast<u32>(underlay);
+    return true;
+}
+
+// The aux bits that can make aux_layer() take over a pixel in this mode,
+// and whether an underlay is shown (behind zero pixels).
+u32 Newport::aux_mask(u32 mode, bool& underlay) const {
+    const Xmap& xm = xmap_[0];
+    const bool pup_en = xm.config & kXmapPupEnable, eight_bit = xm.config & kXmapEightBit;
+    const unsigned aux_mode = (mode >> 16) & 7;
+    underlay = !(pup_en && eight_bit) && (aux_mode == 1 || aux_mode == 7);
+    u32 mask = pup_en ? 0x0Cu : 0u;
+    if (!(pup_en && eight_bit) && aux_mode) mask |= eight_bit ? 0x0Cu : (aux_mode == 6 ? 0x0F0F00u : 0xFF00u);
+    return mask;
+}
+
+u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
+    const std::vector<u32>& pal = cmap_[0].palette;
+    u32 addr = 0;
+    if (!aux_layer(mode, pixel_value_nonzero(mode, pix), aux, cursor, addr)) return pixel_colour(mode, pix);
+    u32 rgb = pal[addr];
     if (!(mode & 4))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
@@ -1250,8 +1641,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
     // The cursor's rows and columns (scan-out coordinates).
     const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible) && !(dcr & kDcrCrosshair);
     const int cursor_size = (dcr & kDcrLargeCursor) ? 64 : 32;
-    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (cursor_size - 1);
-    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - (cursor_size - 1);
+    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay;  // frame buffer column
+    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
 
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
@@ -1279,14 +1670,18 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
         unsigned x = kPipelineDelay;  // scan-out position
         const unsigned end = width + kPipelineDelay;
         while (x < end) {
-            while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
+            // DID records give screen columns; x here is the frame buffer column.
+            while (rec < records.size() && records[rec].first + static_cast<int>(kPipelineDelay) <= static_cast<int>(x))
+                did = records[rec++].second;
             // A run of one display mode: up to the next DID change.
             unsigned stop = end;
-            if (rec < records.size()) stop = std::min<unsigned>(stop, static_cast<unsigned>(std::max(records[rec].first, 0)));
+            if (rec < records.size())
+                stop = std::min<unsigned>(stop, static_cast<unsigned>(std::max(records[rec].first + static_cast<int>(kPipelineDelay), 0)));
             if (stop <= x) stop = x + 1;
             const ModeTable& t = mode_table(did);
             const u32 mode = t.mode;
-            const u32 special = ((mode >> 16) & 7) == 2 ? 0xFF0Cu : 0x0Cu;  // aux bits that override: PUP, overlay
+            bool underlay = false;
+            const u32 special = aux_mask(mode, underlay);  // aux bits that can override the pixel
             for (; x < stop; ++x) {
                 const bool inside = x < static_cast<unsigned>(kPitch);
                 const u32 pix = inside ? pix_row[x] : 0;
@@ -1295,7 +1690,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                                         ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
                                         : 0;
                 u32& o = out[x - kPipelineDelay];
-                if (cp || (aux & special)) o = special_colour(mode, pix, aux, cp);
+                if (cp || (aux & special) || underlay) o = special_colour(mode, pix, aux, cp);
                 else if (t.direct) o = direct_colour(mode, pix);
                 else o = t.lut[(pix >> t.shift) & t.mask];
             }
@@ -1321,7 +1716,6 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
     if (!(dcr & kDcrDisplay)) return true;  // blanked
 
     const Xmap& xm = xmap_[0];
-    const std::vector<u32>& pal = cmap_[0].palette;
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
         records.clear();
@@ -1339,45 +1733,13 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
         std::size_t rec = 0;
         u8 did = 0;
         for (unsigned ox = 0; ox < width; ++ox) {
-            const unsigned x = ox + kPipelineDelay;  // scan-out position
-            while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
+            const unsigned x = ox + kPipelineDelay;  // frame buffer column; DID records give screen columns
+            while (rec < records.size() && records[rec].first <= static_cast<int>(ox)) did = records[rec++].second;
             const u32 mode = xm.mode[did];
             const std::size_t idx = static_cast<std::size_t>(row) * kPitch + x;
             const u32 pix = x < static_cast<unsigned>(kPitch) && row < static_cast<unsigned>(kRows) ? rgbci_[idx] : 0;
             const u32 aux = x < static_cast<unsigned>(kPitch) && row < static_cast<unsigned>(kRows) ? cidaux_[idx] : 0;
-            u32 rgb;
-            if (const unsigned cp = cursor_pixel(static_cast<int>(x), static_cast<int>(y))) {
-                rgb = pal[((xm.cursor_msb << 5) | cp) & 0x1FFF];
-            } else if (const unsigned pup = (aux >> 2) & 3) {
-                rgb = pal[((xm.pup_msb << 5) | pup) & 0x1FFF];
-            } else if (((mode >> 16) & 7) == 2 && ((aux >> 8) & 0xFF)) {  // 8-bit overlay
-                rgb = pal[((mode >> 11) & 0x1F00) | ((aux >> 8) & 0xFF)];
-            } else {
-                const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3, buf = mode & 1;
-                if (pix_mode == 0) {  // colour index
-                    const u32 ci_msb = (mode & 0xF8) << 5;
-                    u32 ci;
-                    switch (pix_size) {
-                        case 0: ci = ci_msb | ((pix >> (buf ? 4 : 0)) & 0xF); break;
-                        case 2: ci = (ci_msb & 0x1000) | ((pix >> (buf ? 12 : 0)) & 0xFFF); break;
-                        default: ci = ci_msb | (pix & 0xFF); break;
-                    }
-                    rgb = pal[ci & 0x1FFF];
-                } else {  // RGB through CMAP map 0..2
-                    u32 v = pix;
-                    if (pix_size == 0) v >>= buf ? 4 : 0;
-                    else if (pix_size == 2) v >>= buf ? 12 : 0;
-                    u32 r, g, b;
-                    unpack(v & depth_mask(pix_size), pix_size, r, g, b);
-                    const u32 base = 0x1C00 + pix_mode * 0x100;
-                    rgb = (pal[base + r] & 0xFF0000) | (pal[base + g] & 0xFF00) | (pal[base + b] & 0xFF);
-                }
-            }
-            if (!(mode & 4)) {  // gamma correction in the RAMDAC unless bypassed
-                rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
-                      ramdac_.lut[2][rgb & 0xFF];
-            }
-            out[ox] = 0xFF000000u | rgb;
+            out[ox] = special_colour(mode, pix, aux, cursor_pixel(static_cast<int>(x), static_cast<int>(y)));
         }
     }
     return true;

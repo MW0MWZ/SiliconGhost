@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 IOC2 (Indy "Guinness"): Z85230 serial, 8042 keyboard/mouse, front
 // panel, system ID, and the INT3 interrupt controller with its 8254 timers.
 // Sits on HPC3 PBUS channel 6 at 0x1FBD9800; every register is one byte on
@@ -42,8 +43,15 @@ public:
     void set_cpu_line_callback(CpuLineCallback cb) { cpu_line_ = std::move(cb); }
     void set_power_off_callback(std::function<void()> cb) { power_off_ = std::move(cb); }
 
+    // The Indy's front-panel buttons. Each press raises the panel interrupt;
+    // the volume buttons also read as held until released.
+    enum class PanelButton { Power, VolumeDown, VolumeUp };
+    void panel_button(PanelButton button, bool pressed);
+
     Z85230& scc() { return scc_; }
     Kbc8042& kbc() { return kbc_; }
+    // The MC's bus error line: recorded in the error status register (bit 1).
+    void set_mc_bus_error(bool level) { err_stat_ = static_cast<u8>(level ? (err_stat_ | 0x02) : (err_stat_ & ~0x02)); }
     Pit8254& pit() { return pit_; }
 
 private:

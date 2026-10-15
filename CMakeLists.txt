@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
 project(SiliconGhost VERSION 0.1.0 DESCRIPTION "SGI IP22 (Indy) emulator" LANGUAGES CXX)
 
@@ -87,16 +89,102 @@ else()
   set_source_files_properties(src/cpu/r4000/fpu.cpp PROPERTIES COMPILE_OPTIONS "-frounding-math;-ffp-contract=off")
 endif()
 
+# Front-end pieces without a window: settings, power control, terminal screen
+add_library(sg_app STATIC
+  src/app/detach.cpp
+  src/app/session.cpp
+  src/app/settings.cpp
+  src/app/terminal.cpp
+)
+target_link_libraries(sg_app PUBLIC sg_emu PRIVATE sg_warnings)
+if(WIN32)
+  target_link_libraries(sg_app PRIVATE shell32 ole32)  # the Documents folder
+endif()
+
 add_executable(siliconghost src/app/main.cpp)
-target_link_libraries(siliconghost PRIVATE sg_emu sg_warnings)
+target_link_libraries(siliconghost PRIVATE sg_app sg_warnings)
 
 option(SG_WITH_SDL3 "Build the SDL3 display front end" ON)
 if(SG_WITH_SDL3)
   find_package(SDL3 CONFIG QUIET)
   if(SDL3_FOUND)
-    target_sources(siliconghost PRIVATE src/app/display_sdl.cpp)
+    # Dear ImGui, for the window's menus, dialogs and status bar
+    add_library(sg_imgui STATIC
+      third_party/imgui/imgui.cpp
+      third_party/imgui/imgui_draw.cpp
+      third_party/imgui/imgui_tables.cpp
+      third_party/imgui/imgui_widgets.cpp
+      third_party/imgui/misc/cpp/imgui_stdlib.cpp
+      third_party/imgui/backends/imgui_impl_sdl3.cpp
+      third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp
+    )
+    target_include_directories(sg_imgui PUBLIC third_party/imgui)
+    target_compile_definitions(sg_imgui PUBLIC IMGUI_DISABLE_DEMO_WINDOWS IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+    target_link_libraries(sg_imgui PUBLIC SDL3::SDL3)
+
+    target_sources(siliconghost PRIVATE
+      src/app/display_sdl.cpp
+      src/app/gui.cpp
+      src/app/terminal_window.cpp
+    )
     target_compile_definitions(siliconghost PRIVATE SG_HAVE_SDL3=1)
-    target_link_libraries(siliconghost PRIVATE SDL3::SDL3)
+    target_link_libraries(siliconghost PRIVATE sg_imgui SDL3::SDL3)
+
+    if(APPLE)
+      # A macOS application: "Silicon Ghost.app", with the system menu bar and
+      # its icon (made from the 1024x1024 artwork with sips and iconutil).
+      # build/siliconghost links to the program inside, for the terminal.
+      # `cmake --install build --prefix DIR` makes a self-contained copy in
+      # DIR, with the libraries it uses (SDL3, libslirp, ...) inside it.
+      enable_language(OBJCXX)
+      target_sources(siliconghost PRIVATE src/app/menu_mac.mm)
+      set_source_files_properties(src/app/menu_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+      target_link_libraries(siliconghost PRIVATE "-framework Cocoa")
+
+      set(SG_ICON_PNG ${CMAKE_CURRENT_SOURCE_DIR}/graphics/SiliconGhost_icon_1024.png)
+      set(SG_ICONSET ${CMAKE_CURRENT_BINARY_DIR}/SiliconGhost.iconset)
+      set(SG_ICNS ${CMAKE_CURRENT_BINARY_DIR}/SiliconGhost.icns)
+      set(SG_ICON_COMMANDS)
+      foreach(size 16 32 128 256 512)
+        math(EXPR double "${size} * 2")
+        list(APPEND SG_ICON_COMMANDS
+          COMMAND sips -z ${size} ${size} ${SG_ICON_PNG} --out ${SG_ICONSET}/icon_${size}x${size}.png
+          COMMAND sips -z ${double} ${double} ${SG_ICON_PNG} --out ${SG_ICONSET}/icon_${size}x${size}@2x.png)
+      endforeach()
+      add_custom_command(OUTPUT ${SG_ICNS}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${SG_ICONSET}
+        ${SG_ICON_COMMANDS}
+        COMMAND iconutil -c icns ${SG_ICONSET} -o ${SG_ICNS}
+        DEPENDS ${SG_ICON_PNG}
+        COMMENT "Making the application icon"
+        VERBATIM)
+      target_sources(siliconghost PRIVATE ${SG_ICNS})
+      set_source_files_properties(${SG_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+
+      configure_file(cmake/Info.plist.in ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
+      set_target_properties(siliconghost PROPERTIES
+        MACOSX_BUNDLE TRUE
+        OUTPUT_NAME "Silicon Ghost"
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
+      add_custom_command(TARGET siliconghost POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${CMAKE_CURRENT_BINARY_DIR}/siliconghost
+        COMMAND ${CMAKE_COMMAND} -E create_symlink "Silicon Ghost.app/Contents/MacOS/Silicon Ghost"
+                ${CMAKE_CURRENT_BINARY_DIR}/siliconghost
+        VERBATIM)
+
+      install(TARGETS siliconghost BUNDLE DESTINATION .)
+      # The Info.plist is installed explicitly as well, and the libraries are
+      # gathered from the program's own path, so neither depends on the other.
+      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/Info.plist DESTINATION "Silicon Ghost.app/Contents")
+      install(CODE [[
+        include(BundleUtilities)
+        set(app "${CMAKE_INSTALL_PREFIX}/Silicon Ghost.app")
+        fixup_bundle("${app}/Contents/MacOS/Silicon Ghost" "" "")
+        # Signed for this machine (ad hoc): copying the libraries in changed them.
+        execute_process(COMMAND codesign --force --deep --sign - "${app}" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND codesign --verify --deep --strict "${app}" COMMAND_ERROR_IS_FATAL ANY)
+      ]])
+    endif()
   else()
     message(WARNING "SDL3 not found: building without a display window or sound")
   endif()
@@ -112,7 +200,8 @@ if(SG_BUILD_TESTS)
     tests/fpu_cache_tests.cpp
     tests/ip22_tests.cpp
     tests/newport_tests.cpp
+    tests/app_tests.cpp
   )
-  target_link_libraries(sg_tests PRIVATE sg_emu sg_warnings)
+  target_link_libraries(sg_tests PRIVATE sg_app sg_warnings)
   add_test(NAME sg_tests COMMAND sg_tests)
 endif()

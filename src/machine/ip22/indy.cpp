@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 #include "machine/ip22/indy.h"
 
 #include <algorithm>
@@ -17,12 +18,27 @@ namespace {
 mips::R4000::Options cpu_options(const IndyConfig& c) {
     mips::R4000::Options o;
     o.prid = c.prid;
+    o.config = c.cpu_config;
+    o.scache_bytes = c.scache_bytes;
     return o;
 }
 
+}  // namespace
+
+// An Indy has two memory banks, each empty or holding 16, 32, 64 or 128 MiB
+// (four SIMMs of 4, 8, 16 or 32 MiB); the PROM sizes those two banks.
+bool ram_size_fits(unsigned mb) {
+    for (unsigned a : {16u, 32u, 64u, 128u})
+        for (unsigned b : {0u, 16u, 32u, 64u, 128u})
+            if (b <= a && a + b == mb) return true;
+    return false;
+}
+
+namespace {
+
 u64 checked_ram_bytes(const IndyConfig& c) {
-    if (c.ram_mb < 16 || c.ram_mb > 256 || c.ram_mb % 16 != 0)
-        throw std::invalid_argument("Indy RAM must be 16..256 MiB in steps of 16");
+    if (!ram_size_fits(c.ram_mb))
+        throw std::invalid_argument("Indy RAM must be one or two banks of 16, 32, 64 or 128 MiB (16-256 MiB, not 112, 176, 208, 224 or 240)");
     return u64{c.ram_mb} << 20;
 }
 
@@ -40,7 +56,7 @@ Indy::Indy(const IndyConfig& config)
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
       hpc3_(bus_, ioc_, scheduler_, config.cpu_hz),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
-      newport_(scheduler_, config.cpu_hz, Newport::Options{}),
+      newport_(scheduler_, config.cpu_hz, Newport::Options{config.xl24}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
     std::memset(ram_.get(), 0, checked_ram_bytes(config));
     std::memset(prom_.get(), 0xFF, kPromMaxSize);
@@ -58,12 +74,19 @@ Indy::Indy(const IndyConfig& config)
     // Interrupt routing: INT3 LOCAL0/LOCAL1 and 8254 timers 0/1 drive
     // IP2..IP5; the MC bus error interrupt drives IP6.
     ioc_.set_cpu_line_callback([this](unsigned line, bool level) { cpu_.set_int_line(line, level); });
-    mc_.set_irq_callback([this](bool level) { cpu_.set_int_line(4, level); });
+    mc_.set_irq_callback([this](bool level) {
+        ioc_.set_mc_bus_error(level);
+        cpu_.set_int_line(4, level);
+    });
     mc_.set_dma_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0McDma, level); });
     newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
     mc_.set_reset_callback([this] {
         reset_pending_ = true;
         cpu_.request_stop();
+    });
+    ioc_.pit().set_latch_callback([this] {
+        if (!timing_cpu()) cpu_.request_stop();
+        timing_cpu_until_ = cpu_.cycles() + static_cast<u64>(config_.cpu_hz / 2);
     });
     ioc_.set_power_off_callback([this] {
         powered_off_ = true;
@@ -83,8 +106,12 @@ Indy::Indy(const IndyConfig& config)
         for (const auto& path : config_.cdrom_images)
             if (!std::ifstream(path, std::ios::binary)) throw std::runtime_error("cannot open " + path);
         attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_images.front(), 4);
-        cdrom_->set_eject_callback([this] { next_disc(); });
+        disc_loaded_ = true;
+    } else if (config_.cdrom_drive) {
+        cdrom_ = std::make_unique<ScsiDisk>(ScsiDisk::Kind::CdRom, std::string());  // empty drive
+        hpc3_.scsi0().attach(4, cdrom_.get());
     }
+    if (cdrom_) cdrom_->set_eject_callback([this] { next_disc(); });
 
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
@@ -106,14 +133,67 @@ void Indy::request_next_disc() {
     cpu_.request_stop();
 }
 
+// Guest eject (or the host's "next disc"): the next disc of the set goes in,
+// after the last the first again. With no set the drive stays empty.
 void Indy::next_disc() {
     if (!cdrom_) return;
-    disc_ = (disc_ + 1) % config_.cdrom_images.size();
+    if (config_.cdrom_images.empty()) {
+        cdrom_->eject();
+        disc_loaded_ = false;
+        return;
+    }
+    select_disc((disc_ + (disc_loaded_ ? 1 : 0)) % config_.cdrom_images.size());
+}
+
+int Indy::disc_in_drive() const {
+    return cdrom_ && disc_loaded_ && cdrom_->loaded() ? static_cast<int>(disc_) : -1;
+}
+
+bool Indy::eject_disc() {
+    if (!cdrom_ || cdrom_->removal_prevented()) return false;
+    cdrom_->eject();
+    disc_loaded_ = false;
+    SG_LOG(Info, "indy", "CD-ROM: ejected");
+    return true;
+}
+
+void Indy::force_eject_disc() {
+    if (!cdrom_) return;
+    cdrom_->eject();
+    disc_loaded_ = false;
+    SG_LOG(Info, "indy", "CD-ROM: ejected (forced)");
+}
+
+bool Indy::select_disc(std::size_t index) {
+    if (!cdrom_ || index >= config_.cdrom_images.size()) return false;
+    disc_ = index;
     const std::string& path = config_.cdrom_images[disc_];
-    if (cdrom_->change_medium(path))
+    disc_loaded_ = cdrom_->change_medium(path);
+    if (disc_loaded_)
         SG_LOG(Info, "indy", "CD-ROM: %s (%llu blocks)", path.c_str(), static_cast<unsigned long long>(cdrom_->blocks()));
     else
         SG_LOG(Warn, "indy", "CD-ROM: cannot open %s, drive empty", path.c_str());
+    return disc_loaded_;
+}
+
+bool Indy::insert_disc(const std::string& path) {
+    if (!cdrom_) return false;
+    auto& set = config_.cdrom_images;
+    auto it = std::find(set.begin(), set.end(), path);
+    if (it == set.end()) it = set.insert(set.end(), path);
+    return select_disc(static_cast<std::size_t>(it - set.begin()));
+}
+
+Indy::Activity Indy::activity() const {
+    Activity a;
+    a.disk = disk_ ? disk_->activity() : 0;
+    a.cdrom = cdrom_ ? cdrom_->activity() : 0;
+    a.net_tx = hpc3_.enet_tx_frames();
+    a.net_rx = hpc3_.enet_rx_frames();
+    a.cycles = cpu_.cycles();
+    a.idle_cycles = cpu_.idle_skipped_cycles();
+    a.pixels = newport_.pixels_drawn();
+    return a;
 }
 
 bool Indy::load_prom(const std::string& path, std::string& error) {
@@ -154,6 +234,8 @@ void Indy::apply_ethernet_address() {
 
 void Indy::reset() {
     apply_ethernet_address();
+    if (disk_) disk_->reset();
+    if (cdrom_) cdrom_->reset();
     mc_.reset();
     ioc_.reset();
     hpc3_.reset();
@@ -222,9 +304,12 @@ namespace {
 constexpr u32 kRex3InSlot = kNewportRex3 - kGioGfx, kRex3WindowSize = 0x10000;
 }  // namespace
 
+// The Newport's slot is pipelined: reads that no register answers do not
+// fault but return the width of the access in bytes (4, 2 or 1), as seen on
+// Indys and relied on by OpenBSD to tell a Newport from an empty slot.
 bool Indy::GfxSlot::read(u32 offset, unsigned size, u64& value) {
     if (offset - kRex3InSlot < kRex3WindowSize) return board_.read(offset - kRex3InSlot, size, value);
-    value = 0;
+    value = size;
     return true;
 }
 

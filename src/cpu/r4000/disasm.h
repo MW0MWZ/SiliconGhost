@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // MIPS III disassembler (integer, COP0 and COP1 moves) for tracing and debugging.
 #pragma once
 

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // MIPS R4000/R4400 CPU - reference interpreter.
 //
 // This interpreter is the correctness baseline for the whole project: the
@@ -189,6 +190,8 @@ public:
     u64 jit_compiles() const { return jit_compiles_; }
     u64 jit_reuses() const { return jit_reuses_; }
     void set_jit(bool enabled);
+    // Whether this build can translate to host code (x86-64 and AArch64).
+    static bool jit_available() { return jit_compile_supported(); }
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
     u64 change_epoch() const { return change_epoch_; }

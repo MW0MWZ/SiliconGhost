@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Newport graphics tests, driven through the REX3 register window.
 #include <vector>
 
@@ -27,7 +28,8 @@ struct Rig {
     u64 now = 0;
     Scheduler sched;
     Newport np;
-    Rig() : np((sched.set_clock([this] { return now; }), sched), 150.0e6, Newport::Options{}) {}
+    // CLIPMODE resets with no CID codes selected: allow them all, as drivers do.
+    explicit Rig(Newport::Options o = {}) : np((sched.set_clock([this] { return now; }), sched), 150.0e6, o) { w(0x1328, 0x1E00); }
     void w(u32 off, u32 v) { CHECK(np.write(off, 4, v)); }
     u32 r(u32 off) {
         u64 v = 0;
@@ -55,7 +57,7 @@ struct Rig {
     }
     // 8-bit colour-index block fill of the inclusive rectangle.
     void fill(int x0, int y0, int x1, int y1, u32 ci) {
-        w(kDrawMode1, (3u << 28) | (1u << 3) | 1u);  // logicop SRC, 8bpp, RGB/CI planes
+        w(kDrawMode1, (3u << 28) | (1u << 3) | 1u | 0x7000u);  // logicop SRC, 8bpp, RGB/CI planes
         w(kWrMask, 0xFF);
         w(kColorI, ci);
         w(kXYStartI, (static_cast<u32>(x0) << 16) | static_cast<u32>(y0));
@@ -93,8 +95,8 @@ TEST(newport_dcb_vc2_ram_and_cmap_revision) {
 TEST(newport_block_fill_and_host_read) {
     Rig t;
     t.fill(10, 20, 13, 21, 0x42);
-    // Read back four 8-bit pixels of the first row.
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    // Read back four 8-bit pixels of the first row (packed).
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u | 0x7000u);
     t.w(kXYStartI, (10u << 16) | 20u);
     t.w(kXYEndI, (13u << 16) | 20u);
     t.w(kDrawMode0 | kGo, 1u);
@@ -136,13 +138,13 @@ TEST(newport_scanout_through_vc2_xmap_cmap) {
 
 TEST(newport_host_pixels_advance_per_go) {
     Rig t;
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);  // 8bpp host and draw depth
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u | 0x7000u);  // 8bpp host and draw depth
     t.w(kWrMask, 0xFF);
     t.w(kXYStartI, (100u << 16) | 50u);
     t.w(kXYEndI, (103u << 16) | 50u);
     t.w(kDrawMode0, 2u | (1u << 6));  // DRAW SPAN, COLORHOST, one pixel per GO
     for (u32 c : {0x11u, 0x22u, 0x33u}) t.w(kHostRw0 | kGo, c << 24);
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u | 0x7000u);
     t.w(kXYStartI, (100u << 16) | 50u);
     t.w(kDrawMode0 | kGo, 1u);
     CHECK_EQ(t.r(kHostRw0), 0x11223300u);
@@ -153,16 +155,18 @@ TEST(newport_host_pixels_advance_per_go) {
 // times out.
 TEST(newport_dcb_access_to_an_absent_slave_stays_busy_until_reset_or_timeout) {
     Rig t;
-    constexpr u32 kBackBusy = 1u << 4, kSyncAck = 1u << 13, kDcbReset = 0x1340;
+    constexpr u32 kBackBusy = 1u << 4, kSyncAck = 1u << 11, kDcbReset = 0x1340;
     t.w(kDcbMode, width(1) | slave(0) | kSyncAck);
     t.w(kDcbData0, 0);  // VC2 answers
     CHECK(!(t.r(kUStatus) & kBackBusy));
-    t.w(kDcbMode, 0x0099b601);  // the probe's mode: slave 12, synchronous acknowledge
+    t.w(kDcbMode, 0x0099b601);  // the probe's mode: slave 12, acknowledge awaited
     t.w(kDcbData0, 0);
     CHECK(t.r(kUStatus) & kBackBusy);
     CHECK(t.r(kUStatus) & kBackBusy);
-    t.w(kDcbReset, 0);
+    t.w(kDcbReset, 0);  // also returns DCBMODE to its reset value
     CHECK(!(t.r(kUStatus) & kBackBusy));
+    CHECK_EQ(t.r(kDcbMode), 0x780u);
+    t.w(kDcbMode, 0x0099b601);
     t.w(kDcbData0, 0);
     CHECK(t.r(kUStatus) & kBackBusy);
     t.now += 150 * 20;  // 20 us at 150 MHz
@@ -183,7 +187,7 @@ TEST(newport_zpattern_rows_draw_opaque_glyph) {
     t.w(kWrMask, 0xFF);
     t.w(kZPattern | kGo, 0xA0000000u);
     t.w(kZPattern | kGo, 0x50000000u);
-    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u | 0x7000u);
     t.w(kXYStartI, (8u << 16) | 16u);
     t.w(kXYEndI, (11u << 16) | 16u);
     t.w(kDrawMode0 | kGo, 1u);
@@ -198,14 +202,14 @@ TEST(newport_zpattern_rows_draw_opaque_glyph) {
 // word that ends a row moves on to the next row without drawing it.
 TEST(newport_host_pixels_fill_a_block_row_by_row) {
     Rig t;
-    t.w(kDrawMode1, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);
+    t.w(kDrawMode1, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);
     t.w(kWrMask, 0xFF);
     t.w(kXYStartI, 0);
     t.w(kXYEndI, (7u << 16) | 1u);
     t.w(kDrawMode0, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));
     CHECK(t.np.write(kHostRw0 | kGo, 8, 0x1011121314151617ull));
     CHECK(t.np.write(kHostRw0 | kGo, 8, 0x18191a1b1c1d1e1full));
-    t.w(kDrawMode1, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w(kDrawMode1, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);
     t.w(kXYStartI, (0u << 16) | 1u);
     t.w(kXYEndI, (3u << 16) | 1u);
     t.w(kDrawMode0 | kGo, 1u);
@@ -288,7 +292,7 @@ TEST(newport_render_matches_the_reference_conversion) {
             for (int i = 0; i < n; ++i) {
                 static constexpr u32 kPlanes[] = {1, 1, 1, 4, 5, 6};
                 const u32 planes = kPlanes[rnd(6)], depth = rnd(4);
-                t.w(kDrawMode1, (3u << 28) | (depth << 3) | planes);
+                t.w(kDrawMode1, (3u << 28) | (depth << 3) | planes | 0x7000u);
                 t.w(kWrMask, 0xFFFFFF);
                 t.w(kColorI, rnd(0x1000000));
                 const u32 x0 = rnd(kW + 4), y0 = rnd(kH), x1 = x0 + rnd(20), y1 = y0 + rnd(10);
@@ -319,4 +323,243 @@ TEST(newport_render_matches_the_reference_conversion) {
             compare();
         }
     }
+}
+
+namespace {
+
+// 24-bit RGB pixels on an XL24: one point per GO, and reading one back.
+constexpr u32 kRgb24 = (3u << 28) | 0x7000u | (1u << 15) | (3u << 3) | 1u;  // logicop SRC, compare always, RGBMODE, 24bpp, RGB planes
+void point24(Rig& t, int x, int y, u32 bgr, u32 dm1 = kRgb24, u32 dm0_extra = 0) {
+    t.w(kDrawMode1, dm1);
+    t.w(kWrMask, 0xFFFFFF);
+    t.w(kColorI, bgr);
+    t.w(kXYStartI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kXYEndI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kDrawMode0 | kGo, 2u | (1u << 5) | dm0_extra);  // DRAW SPAN DOSETUP: one pixel
+}
+u32 read24(Rig& t, int x, int y) {
+    t.w(kDrawMode1, kRgb24 | (3u << 8));  // 32-bit host pixels
+    t.w(kXYStartI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kXYEndI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kDrawMode0 | kGo, 1u);
+    return t.r(kHostRw0) & 0xFFFFFF;
+}
+constexpr u32 kBlend = 1u << 18, kBackBlend = 1u << 25;
+constexpr u32 factors(u32 s, u32 d) { return (s << 19) | (d << 22); }
+constexpr u32 kSa = 4, kMsa = 5;
+
+}  // namespace
+
+// Cb = Cs*Fs + Cd*Fd, factors normalised as (v + msb)/256.
+TEST(newport_blend_source_alpha_over_frame_buffer_and_colorback) {
+    Rig t(Newport::Options{true, 0xA});
+    point24(t, 10, 10, 0x0000FF);  // red
+    t.w(0x204, 0x80u << 11);       // COLORALPHA 128
+    point24(t, 10, 10, 0xFF0000, kRgb24 | kBlend | factors(kSa, kMsa));  // blue at alpha 128
+    CHECK_EQ(read24(t, 10, 10), (128u << 16) | 126u);
+    // BACKBLEND: the destination is COLORBACK (green) whatever is stored.
+    t.w(0x018, 0x00FF00);
+    point24(t, 11, 10, 0xFF0000, kRgb24 | kBlend | kBackBlend | factors(kSa, kMsa));
+    CHECK_EQ(read24(t, 11, 10), (128u << 16) | (126u << 8));
+    // ONE, ONE adds and clamps.
+    point24(t, 12, 10, 0x8080FF);
+    point24(t, 12, 10, 0x80C001, kRgb24 | kBlend | factors(1, 1));
+    CHECK_EQ(read24(t, 12, 10), 0xFFFFFFu);
+}
+
+// A slope written as minus zero leaves the iterator where it is.
+TEST(newport_minus_zero_slope_keeps_alpha) {
+    Rig t(Newport::Options{true, 0xA});
+    for (int x = 20; x < 24; ++x) point24(t, x, 5, 0x0000FF);
+    t.w(0x204, 0x80u << 11);  // COLORALPHA 128
+    t.w(0x214, 0x80000000u);  // SLOPEALPHA -0
+    t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
+    t.w(kColorI, 0xFF0000);
+    t.w(kXYStartI, (20u << 16) | 5u);
+    t.w(kXYEndI, (23u << 16) | 5u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 5) | (1u << 8) | (1u << 18));  // DRAW SPAN DOSETUP STOPX SHADE
+    for (int x = 20; x < 24; ++x) CHECK_EQ(read24(t, x, 5), (128u << 16) | 126u);
+}
+
+// A_LINE: the two pixels across the exact line, weighted from AWEIGHT and
+// blended by coverage.
+TEST(newport_antialiased_line_coverage) {
+    Rig t(Newport::Options{true, 0xA});
+    auto line = [&](double x1, double y1, double x2, double y2) {
+        auto fixed = [](double v) { return static_cast<u32>(static_cast<s32>(v * 16)) << 7; };
+        t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
+        t.w(kWrMask, 0xFFFFFF);
+        t.w(kColorI, 0xFFFFFF);
+        t.w(0x130, 0x76543210);  // AWEIGHT: entry i = i
+        t.w(0x134, 0xFEDCBA98);
+        t.w(0x100, fixed(x1));
+        t.w(0x104, fixed(y1));
+        t.w(0x108, fixed(x2));
+        t.w(0x10C, fixed(y2));
+        t.w(kDrawMode0 | kGo, 2u | (4u << 2) | (1u << 5) | (1u << 8));  // DRAW A_LINE DOSETUP STOPX
+    };
+    line(10, 20, 20, 20);  // on the pixel row: full coverage there, none above
+    CHECK_EQ(read24(t, 15, 20), 0xFFFFFFu);
+    CHECK_EQ(read24(t, 15, 21), 0u);
+    line(10, 40.5, 20, 40.5);  // between two rows: half each (entry 8 -> alpha 0x88)
+    CHECK_EQ(t.r(0x100) >> 11, 20u);  // XSTART rests at the end point
+    CHECK_EQ(read24(t, 15, 40), 0x888888u);
+    CHECK_EQ(read24(t, 15, 41), 0x888888u);
+}
+
+// LENGTH32 lines draw 32 pixels a GO, each GO carrying on from the next
+// pixel: with XOR every pixel of the line ends up drawn exactly once.
+TEST(newport_length32_line_draws_each_pixel_once) {
+    Rig t;
+    t.w(kDrawMode1, (6u << 28) | (1u << 3) | 1u | 0x7000u);  // logicop XOR, 8bpp, RGB/CI planes
+    t.w(kWrMask, 0xFF);
+    t.w(kColorI, 1);
+    t.w(kXYStartI, (0u << 16) | 5u);
+    t.w(kXYEndI, (99u << 16) | 5u);
+    const u32 line = 2u | (2u << 2) | (1u << 8) | (1u << 15);  // DRAW I_LINE STOPX LENGTH32
+    t.w(kDrawMode0 | kGo, line | (1u << 5));                  // DOSETUP on the first GO
+    for (int go = 1; go < 4; ++go) t.w(kDrawMode0 | kGo, line);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 7) | (1u << 3) | 1u | 0x7000u);  // read back
+    for (u32 x = 0; x < 104; x += 4) {
+        t.w(kXYStartI, (x << 16) | 5u);
+        t.w(kXYEndI, ((x + 3) << 16) | 5u);
+        t.w(kDrawMode0 | kGo, 1u);
+        CHECK_EQ(t.r(kHostRw0), x < 100 ? 0x01010101u : 0u);
+    }
+}
+
+// The register select stepped by ENCRSINC carries on into the next access
+// until DCBMODE is written; the VC2 decodes CRS bits 1:0, and CRS 2 reads the
+// low byte a CRS 1 read fetched.
+TEST(newport_dcb_crs_increment_persists) {
+    Rig t;
+    t.vc2_reg(0x05, 0x1234);  // DID entry
+    t.w(kDcbMode, width(1) | kCrsInc | crs(0) | slave(0));
+    t.w(kDcbData0, 0x05u << 24);  // index 5; CRS now 1
+    CHECK_EQ((t.r(kDcbMode) >> 4) & 7, 1u);
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0x12u);  // CRS 1: high byte (and the low one latched)
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0x34u);  // CRS 2: the latched low byte
+    t.w(kDcbMode, width(1) | crs(5) | slave(0));  // CRS 5 = CRS 1 on the VC2
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0x12u);
+}
+
+// The XMAP9 picks among the layers: a non-zero overlay over the pixel, the
+// pixel over the underlay, the underlay behind zero pixels.
+TEST(newport_overlay_and_underlay_layers) {
+    Rig t(Newport::Options{true});  // the XL24: 8 overlay bits per buffer
+    t.vc2_ram(0x000, {0x8380});
+    t.vc2_ram(0x400, {0x000, 1, 0, 0});
+    t.vc2_reg(0x1F, 1);
+    t.vc2_reg(0x00, 0x400);
+    t.vc2_reg(0x10, 0x0006);
+    t.w(kDcbMode, width(1) | crs(0) | slave(4));
+    t.w(kDcbData0, 0x00);  // XMAP config: 24-bit system, pop-ups off
+    // Mode 0: 8bpp CI over an 8-bit underlay with AUX_MSB_CMAP 1 (0x100 up).
+    t.xmap_mode(0, (1u << 19) | (1u << 16) | 0x000404);
+    t.cmap_entry(0x42, 0x123456);   // the pixel
+    t.cmap_entry(0x105, 0x00FF00);  // underlay value 5
+    t.cmap_entry(0x0, 0x000000);
+    t.w(kTopScan, 0x3FF);
+    t.w(kXYWin, 0x10021000);
+    t.fill(0, 0, 0, 0, 0x42);       // screen column 0: a pixel; 1-3 stay 0
+    // Underlay value 5 in every column (overlay planes, 8 bits).
+    t.w(kDrawMode1, (3u << 28) | (1u << 3) | 4u | 0x7000u);  // SRC, 8bpp, overlay planes
+    t.w(kWrMask, 0xFFFFFF);
+    t.w(kColorI, 5);
+    t.w(kXYStartI, 0);
+    t.w(kXYEndI, 3u << 16);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9));
+    std::vector<u32> px;
+    unsigned w = 0, h = 0;
+    CHECK(t.np.render(px, w, h));
+    if (px.size() == 4) {
+        CHECK_EQ(px[0], 0xFF123456u);  // the pixel is non-zero: it shows
+        CHECK_EQ(px[1], 0xFF00FF00u);  // zero pixel: the underlay
+    }
+    // As an overlay instead (mode 2), the non-zero overlay covers the pixel.
+    t.xmap_mode(0, (1u << 19) | (2u << 16) | 0x000404);
+    CHECK(t.np.render(px, w, h));
+    if (px.size() == 4) CHECK_EQ(px[0], 0xFF00FF00u);
+}
+
+// Without RWPACKED a read returns one pixel, in the leftmost 8-bit field;
+// 4-bit pixels use 8-bit fields too.
+TEST(newport_host_read_fields) {
+    Rig t;
+    t.fill(10, 20, 13, 20, 0x42);
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u | 0x7000u);  // 8-bit host, not packed
+    t.w(kXYStartI, (10u << 16) | 20u);
+    t.w(kXYEndI, (13u << 16) | 20u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0x42000000u);
+    t.w(kDrawMode1, (3u << 28) | (0u << 8) | (1u << 7) | (1u << 3) | 1u | 0x7000u);  // 4-bit host, packed
+    t.w(kXYStartI, (10u << 16) | 20u);
+    t.w(kDrawMode0 | kGo, 1u);
+    CHECK_EQ(t.r(kHostRw0), 0x02020202u);  // the low 4 bits of each pixel, a byte each
+}
+
+namespace {
+u32 pixel8(Rig& t, int x, int y) {
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u | 0x7000u);  // 8-bit host, one pixel
+    t.w(kXYStartI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kXYEndI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kDrawMode0 | kGo, 1u);
+    return t.r(kHostRw0) >> 24;
+}
+void line_mode(Rig& t, u32 ci) {
+    t.w(kDrawMode1, (3u << 28) | (1u << 3) | 1u | 0x7000u);
+    t.w(kWrMask, 0xFF);
+    t.w(kColorI, ci);
+}
+}  // namespace
+
+// A line drawn a point per GO (after one SETUP) follows the same pixels as
+// the line drawn whole: the Bresenham error term carries from GO to GO.
+TEST(newport_line_points_follow_the_whole_line) {
+    Rig a, b;
+    for (Rig* t : {&a, &b}) {
+        line_mode(*t, 7);
+        t->w(kXYStartI, (3u << 16) | 2u);
+        t->w(kXYEndI, (40u << 16) | 13u);
+    }
+    a.w(kDrawMode0 | kGo, 2u | (2u << 2) | (1u << 5) | (1u << 8) | (1u << 9));  // I_LINE, DOSETUP, whole
+    b.w(kDrawMode0 | 0, 2u | (2u << 2));
+    b.w(0x030, 0);                                                           // SETUP
+    for (int i = 0; i < 38; ++i) b.w(kDrawMode0 | kGo, 2u | (2u << 2));     // a point per GO
+    for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 44; ++x) CHECK_EQ(pixel8(a, x, y), pixel8(b, x, y));
+    CHECK_EQ(pixel8(a, 40, 13), 7u);
+    CHECK_EQ(pixel8(a, 3, 2), 7u);
+}
+
+// The line stipple repeats each bit LSREPEAT times and wraps after LSLENGTH
+// bits (17 here), most significant first.
+TEST(newport_line_stipple_repeat_and_length) {
+    Rig t;
+    line_mode(t, 9);
+    t.w(0x008, (0u << 24) | (2u << 8) | 2u);  // LSMODE: length 17, repeat 2, count 2
+    t.w(0x00C, 0xA0000000u);                  // LSPATTERN: 1 0 1 0 0 ...
+    t.w(kXYStartI, (0u << 16) | 4u);
+    t.w(kXYEndI, (39u << 16) | 4u);
+    t.w(kDrawMode0 | kGo, 2u | (2u << 2) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 13));  // ENLSPATTERN
+    const char* expect = "1100110000000000000000000000000000110011";  // 2 x 17 = 34 pixels per cycle
+    for (int x = 0; x < 40; ++x) CHECK_EQ(pixel8(t, x, 4), expect[x] == '1' ? 9u : 0u);
+}
+
+// XYOFFSET adds XYMOVE to drawn coordinates; YSTRIDE steps block rows by 2.
+TEST(newport_xyoffset_and_ystride) {
+    Rig t;
+    t.w(0x114, (5u << 16) | 3u);  // XYMOVE
+    t.w(kDrawMode1, (3u << 28) | 0x7000u | (1u << 3) | 1u);
+    t.w(kWrMask, 0xFF);
+    t.w(kColorI, 0x33);
+    t.w(kXYStartI, (1u << 16) | 1u);
+    t.w(kXYEndI, (1u << 16) | 1u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 20));  // block, XYOFFSET
+    CHECK_EQ(pixel8(t, 6, 4), 0x33u);
+    CHECK_EQ(pixel8(t, 1, 1), 0u);
+    t.w(kXYStartI, (20u << 16) | 10u);
+    t.w(kXYEndI, (20u << 16) | 15u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 23));  // block, YSTRIDE
+    for (int y = 10; y <= 16; ++y) CHECK_EQ(pixel8(t, 20, y), (y % 2 == 0 && y <= 15) ? 0x33u : 0u);
 }

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 #include "core/pacer.h"
 
 #include <algorithm>
@@ -12,7 +13,7 @@ namespace {
 
 // Beyond this much lag the guest stops trying to catch up (the host was
 // suspended, or is simply too slow for Cycle mode) and time is re-based.
-constexpr double kMaxLagRealtime = 0.25;  // seconds
+constexpr double kMaxLagRealtime = 10.0;  // seconds
 constexpr double kMaxLagCycle = 1.0;
 // Waits shorter than this are not worth a sleep.
 constexpr u64 kMinSleepNs = 500000;
@@ -38,7 +39,7 @@ void Pacer::rebase(u64 now_ns, u64 guest_cycles) {
     epoch_cycles_ = guest_cycles;
 }
 
-double Pacer::update(u64 guest_cycles, u64 instructions) {
+double Pacer::update(u64 guest_cycles, u64 instructions, bool timing_cpu) {
     u64 now = clock_.now_ns();
     if (!started_) {
         started_ = true;
@@ -75,7 +76,9 @@ double Pacer::update(u64 guest_cycles, u64 instructions) {
         }
     }
 
-    if (mode_ == Mode::Realtime && rate_ > 0) {
+    if (mode_ == Mode::Realtime && timing_cpu) {
+        cpi_ = std::min(min_cpi_, kMaxCpi);
+    } else if (mode_ == Mode::Realtime && rate_ > 0) {
         // Charge each instruction so that the host's speed covers one guest
         // second per wall second, plus a little extra while catching up.
         double cpi = hz_ / rate_;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 chipset tests: MC, HPC3, IOC2/INT3 accessed at their physical addresses.
+#include <cmath>
 #include <array>
 #include <string>
 #include <vector>
@@ -31,9 +33,13 @@ u32 ioc_addr(unsigned reg_offset) { return kIoc + reg_offset + 3; }
 
 // A machine whose PROM is an idle loop, so the CPU runs harmlessly.
 struct IndyRig {
-    Indy m{IndyConfig{}};
+    Indy m;
     std::string serial;
-    IndyRig() {
+    explicit IndyRig(unsigned ram_mb = 64) : m([ram_mb] {
+        IndyConfig c;
+        c.ram_mb = ram_mb;
+        return c;
+    }()) {
         std::vector<u8> prom(8);
         store_be<u32>(&prom[0], test::as::BEQ(0, 0, -1));
         store_be<u32>(&prom[4], test::as::NOP);
@@ -127,7 +133,21 @@ TEST(ip22_rpss_counts_100ns) {
 TEST(ip22_ioc_identity_and_panel) {
     IndyRig t;
     CHECK_EQ(t.r8(ioc_addr(0x58)), 0x26);  // sysid: Indy
-    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xA1);  // panel: power on, buttons released
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF3);  // panel: power on, nothing pending, buttons released
+}
+
+TEST(ip22_panel_buttons_are_active_low) {
+    IndyRig t;
+    t.m.ioc().panel_button(ip22::Ioc2::PanelButton::Power, true);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF1);  // power interrupt pending
+    t.w8(ioc_addr(0x50), 0x03);            // acknowledged, as Linux does
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF3);
+    t.m.ioc().panel_button(ip22::Ioc2::PanelButton::VolumeUp, true);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0x33);  // volume-up interrupt pending, button held
+    t.w8(ioc_addr(0x50), 0x41);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0x73);  // acknowledged, still held
+    t.m.ioc().panel_button(ip22::Ioc2::PanelButton::VolumeUp, false);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF3);
 }
 
 TEST(ip22_pit_counts_microseconds) {
@@ -438,6 +458,56 @@ TEST(ip22_hal2_adc_records_from_the_audio_source) {
     }
 }
 
+// The rate generators' 16-bit increment and modulus count 0 as 65536: IRIX
+// sets 44.1 kHz as 44.1 kHz * 0/0, Linux as 44.1 kHz * 4/4.
+TEST(ip22_hal2_rate_fields_of_zero_mean_65536) {
+    for (const u32 c2 : {0xFFFF0000u, 0xFFFF0004u}) {
+        IndyRig t;
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2204, 1);    // generator 2: the 44.1 kHz master
+        hal2_write(t, 0x2208, c2);   // inc - mod - 1 = -1, inc = 0 (or 4)
+        hal2_write(t, 0x1404, 0x110);  // DAC: PBUS channel 0, clock 2, mono
+        hal2_write(t, 0x9104, 0x08);   // codec transmit DMA port on
+        const auto port = t.m.hpc3().hal2().port(Hal2::kDac);
+        CHECK(port.enabled);
+        CHECK(port.rate == 44100.0);
+    }
+}
+
+// ADC_C2 amplifies each side in 1.5 dB steps, clipping at full scale; a mic
+// side starts 9 dB down.
+TEST(ip22_hal2_adc_input_gain) {
+    for (const bool ds16 : {false, true}) {
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        t.m.hpc3().set_audio_source([&](s16* s, std::size_t frames, unsigned voices, double) {
+            for (std::size_t i = 0; i < frames * voices; ++i) s[i] = i % 2 ? 3000 : 1000;
+        });
+        const u32 size = ds16 ? 4 : 2;
+        constexpr u32 kDesc = 0x08100000, kBuf = 0x08101000;
+        const u32 bytes = 8 * 2 * size;  // 8 stereo frames
+        t.w32(kDesc + 0, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | bytes);
+        t.w32(kDesc + 8, 0);
+        t.w32(kPbusCfg0 + 0x200, ds16 ? 0x08248844 : 0x08208844);
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2104, 0);
+        hal2_write(t, 0x2108, 0xFFFF0004);  // 48 kHz
+        hal2_write(t, 0x1504, 0x209);       // ADC: PBUS channel 1, clock 1, stereo
+        hal2_write(t, 0x1508, 0x24F);       // ADC_C2: left +6 dB on mic (-9 dB trim), right +22.5 dB on line
+        hal2_write(t, 0x9104, 0x10);
+        t.w32(kPbus0 + 0x2000 + 4, kDesc);
+        t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() * 20 / 48000));
+        if (ds16) {
+            CHECK_EQ(t.r32(kBuf), static_cast<u32>(std::lround(1000 * 256 * std::pow(10.0, -3.0 / 20))));
+            CHECK_EQ(t.r32(kBuf + 4), 0x7FFFFFu);  // clipped
+        } else {
+            CHECK_EQ(t.r32(kBuf), (static_cast<u32>(std::lround(1000 * std::pow(10.0, -3.0 / 20))) << 16) | 0x7FFFu);
+        }
+    }
+}
+
 // DAC_C2 attenuates each side in 1.5 dB steps, or mutes both; the volume
 // registers (8-bit levels, 0 silent) scale the result.
 TEST(ip22_hal2_dac_attenuation_mute_and_volume) {
@@ -631,7 +701,7 @@ TEST(indy_newport_answers_across_the_graphics_slot) {
     IndyRig t;
     u32 v = 1;
     CHECK(t.m.bus().read<u32>(0x1F000000, v));
-    CHECK_EQ(v, 0u);
+    CHECK_EQ(v, 4u);  // no fault: the access width (see below)
     CHECK(t.m.bus().write<u32>(0x1F0F0148, 0x12345678));  // XSTARTI
     CHECK_EQ(t.r32(0x1F0F0100), 0x02B3C000u);              // XSTART
     CHECK(t.m.bus().read<u32>(0x1F400000 - 4, v));
@@ -646,6 +716,37 @@ TEST(indy_newport_answers_across_the_graphics_slot) {
 // The MC's virtual DMA sends a memory rectangle to one GIO address, the
 // device's data port: here REX3's host data register with GO, drawing a
 // block of host-supplied pixels as IRIX's graphics library does.
+// The DMA TLB's page-table pointer reaches the whole low memory window: with
+// 256 MiB, IRIX keeps page tables above 0x10000000.
+TEST(ip22_mc_dma_page_table_in_high_memory) {
+    IndyRig t(256);
+    t.w32(kMcMemCfg0, 0x7F207F40u);  // 128 MiB at 0x08000000 and at 0x10000000
+    constexpr u32 kMc = 0x1FA00000, kTable = 0x14000000, kPage = 0x15000000, kRex3 = 0x1F0F0000, kGo = 0x800;
+    constexpr u32 kVirt = 0x00400000;  // a 4 MiB DMA segment
+    t.w32(kTable + 0, ((kPage >> 12) << 6) | 2);  // PTE for the segment's first page: PFN, valid
+    for (u32 i = 0; i < 8; ++i) t.w8(kPage + i, static_cast<u8>(0x40 + i));
+    t.w32(kMc + 0x16C, 0x100);                  // DMA_CTL: Xlate
+    t.w32(kMc + 0x184, kVirt);                  // DMA_TLB_HI_0
+    t.w32(kMc + 0x18C, ((kTable >> 12) << 6) | 2);  // DMA_TLB_LO_0: the page table, valid
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);  // 8-bit host pixels, 8 a word
+    t.w32(kRex3 + 0x220, 0xFF);
+    t.w32(kRex3 + 0x1328, 0x1E00);
+    t.w32(kRex3 + 0x150, 0);
+    t.w32(kRex3 + 0x154, (7u << 16) | 0u);
+    t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));
+    t.w32(kMc + 0x2004, kVirt);            // DMA_MEMADR (translated)
+    t.w32(kMc + 0x2014, (1u << 16) | 8u);  // 1 line of 8 bytes
+    t.w32(kMc + 0x201C, 1u << 16);
+    t.w32(kMc + 0x2034, 1u << 4);
+    t.w32(kMc + 0x202C, kRex3 + kGo + 0x230);
+    t.m.run(10000);
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);  // 8-bit host pixels, packed
+    t.w32(kRex3 + 0x150, 0);
+    t.w32(kRex3 + 0x154, 3u << 16);
+    t.w32(kRex3 + kGo + 0x004, 1u);
+    CHECK_EQ(t.r32(kRex3 + 0x230), 0x40414243u);
+}
+
 TEST(ip22_mc_dma_feeds_one_gio_address) {
     IndyRig t;
     t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
@@ -653,8 +754,9 @@ TEST(ip22_mc_dma_feeds_one_gio_address) {
     constexpr u32 kMc = 0x1FA00000, kSrc = 0x08100000;
     for (u32 i = 0; i < 16; ++i) t.w8(kSrc + i, static_cast<u8>(0x10 + i));  // 2 lines of 8 pixels
     // 8-bit pixels from the host, eight per doubleword, into the block (0,0)-(7,1)
-    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
     t.w32(kRex3 + 0x220, 0xFF);                                                  // WRMASK
+    t.w32(kRex3 + 0x1328, 0x1E00);                                               // CLIPMODE: all CID codes
     t.w32(kRex3 + 0x150, 0);                                                     // XYSTARTI (0,0)
     t.w32(kRex3 + 0x154, (7u << 16) | 1u);                                       // XYENDI (7,1)
     t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));   // DRAW BLOCK COLORHOST STOPX STOPY
@@ -666,7 +768,7 @@ TEST(ip22_mc_dma_feeds_one_gio_address) {
     t.m.run(10000);
     CHECK(t.r32(kMc + 0x204C) & (1u << 3));  // DMA_RUN: done
     // Read both lines back.
-    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);  // 8-bit host pixels, packed
     for (u32 y = 0; y < 2; ++y) {
         for (u32 x = 0; x < 8; x += 4) {
             t.w32(kRex3 + 0x150, (x << 16) | y);
@@ -676,4 +778,100 @@ TEST(ip22_mc_dma_feeds_one_gio_address) {
             CHECK_EQ(t.r32(kRex3 + 0x230), (base << 24) | ((base + 1) << 16) | ((base + 2) << 8) | (base + 3));
         }
     }
+}
+
+TEST(ip22_mc_dma_from_unaligned_memory_feeds_the_aligned_data_port) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    constexpr u32 kRex3 = 0x1F0F0000, kGo = 0x800;
+    constexpr u32 kMc = 0x1FA00000, kSrc = 0x08100000;
+    // 2 lines of 8 pixels starting 5 bytes into a doubleword; IRIX sets the
+    // GIO address's low bits to match.
+    for (u32 i = 0; i < 16; ++i) t.w8(kSrc + 5 + i, static_cast<u8>(0x10 + i));
+    // 8-bit pixels from the host, eight per doubleword, into the block (0,0)-(7,1)
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
+    t.w32(kRex3 + 0x220, 0xFF);                                                  // WRMASK
+    t.w32(kRex3 + 0x1328, 0x1E00);                                               // CLIPMODE: all CID codes
+    t.w32(kRex3 + 0x150, 0);                                                     // XYSTARTI (0,0)
+    t.w32(kRex3 + 0x154, (7u << 16) | 1u);                                       // XYENDI (7,1)
+    t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));   // DRAW BLOCK COLORHOST STOPX STOPY
+    t.w32(kMc + 0x2004, kSrc + 5);          // DMA_MEMADR
+    t.w32(kMc + 0x2014, (2u << 16) | 8u);   // DMA_SIZE: 2 lines of 8 bytes
+    t.w32(kMc + 0x201C, 1u << 16);          // DMA_STRIDE: zoom 1, no gap
+    t.w32(kMc + 0x2034, 1u << 4);           // DMA_MODE: memory to GIO, incrementing
+    t.w32(kMc + 0x202C, kRex3 + kGo + 0x235);  // DMA_GIO_ADR, and start
+    t.m.run(10000);
+    CHECK(t.r32(kMc + 0x204C) & (1u << 3));  // DMA_RUN: done
+    // Read both lines back.
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x80u | 0x8u | 1u | 0x7000u);  // 8-bit host pixels, packed
+    for (u32 y = 0; y < 2; ++y) {
+        for (u32 x = 0; x < 8; x += 4) {
+            t.w32(kRex3 + 0x150, (x << 16) | y);
+            t.w32(kRex3 + 0x154, ((x + 3) << 16) | y);
+            t.w32(kRex3 + kGo + 0x004, 1u);  // READ
+            const u32 base = 0x10 + y * 8 + x;
+            CHECK_EQ(t.r32(kRex3 + 0x230), (base << 24) | ((base + 1) << 16) | ((base + 2) << 8) | (base + 3));
+        }
+    }
+}
+
+// Latching an 8254 count (as boot code does to time the CPU) ends run() and
+// marks the next half second of guest time as timing the CPU.
+TEST(ip22_pit_latch_marks_cpu_timing) {
+    IndyRig t;
+    CHECK(!t.m.timing_cpu());
+    t.w8(ioc_addr(0xBC), 0x80);  // latch counter 2
+    CHECK(t.m.timing_cpu());
+    t.m.run(static_cast<u64>(t.m.cycles_per_second()));
+    CHECK(!t.m.timing_cpu());
+}
+
+// Reads in the graphics slot that no Newport register answers return the
+// access width, as OpenBSD's probe expects of the pipelined slot.
+TEST(ip22_gfx_slot_unclaimed_reads_return_the_access_width) {
+    IndyRig t;
+    CHECK_EQ(t.r32(0x1F000000), 4u);
+    u16 h = 0;
+    CHECK(t.m.bus().read<u16>(0x1F000002, h));
+    CHECK_EQ(h, 2u);
+    CHECK_EQ(t.r8(0x1F000003), 1u);
+    CHECK(t.r32(0x1F0F0000) != 4u || t.r32(0x1F0F0004) != 4u);  // REX3 registers answer
+}
+
+// With Xlate set, a DMA through a segment no TLB entry maps stops with a
+// TLB miss (interrupting whatever the mask) and resumes from where it
+// stopped once the entry is loaded. MEMADRD loads the default descriptor.
+TEST(ip22_mc_dma_tlb_miss_faults_and_resumes) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);  // 64 MiB at 0x08000000
+    constexpr u32 kMc = 0x1FA00000, kTable = 0x08200000, kPage = 0x08300000;
+    constexpr u32 kVirt = 0x00400000;
+    t.w32(kTable, ((kPage >> 12) << 6) | 2 | 4);  // PTE: page, valid, dirty
+    t.w32(kMc + 0x16C, 0x100);                    // Xlate, completion interrupt masked
+    t.w32(kMc + 0x200C, kVirt);                   // MEMADRD: defaults
+    CHECK_EQ(t.r32(kMc + 0x2014), 0x0001000Cu);
+    CHECK_EQ(t.r32(kMc + 0x2034), 0x28u);
+    t.w32(kMc + 0x2014, (2u << 16) | 4u);         // 2 lines of 4 bytes
+    t.w32(kMc + 0x201C, 1u << 16);
+    t.w32(kMc + 0x2034, (1u << 4) | (1u << 3) | (1u << 1));  // increment, fill memory
+    t.w32(kMc + 0x202C, 0xA5A5A5A5u);             // the fill value; starts
+    t.m.run(10000);
+    CHECK_EQ(t.r32(kMc + 0x164) & 0xF, 0x2u);     // TLB miss
+    CHECK_EQ(t.r32(kMc + 0x204C), 0x2u);          // stopped, cause mirrored
+    CHECK_EQ(t.r32(kMc + 0x2014) >> 16, 2u);      // nothing done yet
+    t.w32(kMc + 0x184, kVirt);
+    t.w32(kMc + 0x18C, ((kTable >> 12) << 6) | 2);
+    t.w32(kMc + 0x164, 0);
+    t.w32(kMc + 0x2044, 1);                       // restart
+    t.m.run(10000);
+    CHECK_EQ(t.r32(kMc + 0x164) & 0xF, 0x8u);     // complete
+    CHECK_EQ(t.r32(kPage), 0xA5A5A5A5u);
+    CHECK_EQ(t.r32(kPage + 4), 0xA5A5A5A5u);
+    CHECK_EQ(t.r32(kPage + 8), 0u);
+}
+
+// Only sizes two banks of 16, 32, 64 or 128 MiB can make are accepted.
+TEST(ip22_ram_sizes_two_banks) {
+    for (unsigned mb : {16u, 32u, 48u, 64u, 80u, 96u, 128u, 144u, 160u, 192u, 256u}) CHECK(ram_size_fits(mb));
+    for (unsigned mb : {0u, 8u, 112u, 176u, 208u, 224u, 240u, 272u}) CHECK(!ram_size_fits(mb));
 }

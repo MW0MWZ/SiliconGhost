@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Zilog Z85230 ESCC (dual serial controller), asynchronous mode only.
 // Interface: per-channel control and data ports (channel 0 = A, 1 = B).
 // Transmitted bytes go to a sink callback (host console, file, pty...);

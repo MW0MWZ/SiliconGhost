@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // A Linux TAP interface: the guest's frames appear on a host network device
 // (set up beforehand, e.g. `ip tuntap add mode tap user $USER name tap0`,
 // then bridged or routed as the host's network needs).

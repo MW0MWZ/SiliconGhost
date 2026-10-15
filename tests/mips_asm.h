@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Minimal MIPS instruction encoders for writing CPU tests by hand.
 #pragma once
 

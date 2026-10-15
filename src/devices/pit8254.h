@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Intel 8254 programmable interval timer.
 //
 // Counters are evaluated lazily from the scheduler clock (CPU cycles) rather
@@ -32,6 +33,9 @@ public:
     // Frequency of a counter's OUT pin when it runs periodically (modes 2/3), else 0.
     double output_frequency(unsigned counter) const;
     void set_output_callback(OutputCallback cb) { on_output_ = std::move(cb); }
+    // Called when software latches a count to read it (as it does when it
+    // times something against a counter).
+    void set_latch_callback(std::function<void()> cb) { on_latch_ = std::move(cb); }
 
 private:
     struct Counter {
@@ -71,6 +75,7 @@ private:
     std::array<double, 3> clock_hz_;
     std::array<Counter, 3> counters_;
     OutputCallback on_output_;
+    std::function<void()> on_latch_;
 };
 
 }  // namespace sg

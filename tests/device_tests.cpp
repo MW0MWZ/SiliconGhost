@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Tests for the generic peripheral chips (PIT, RTC, EEPROM, SCC).
 #include <filesystem>
 #include <fstream>
@@ -215,9 +216,7 @@ TEST(wd33c93_reset_and_selection_timeout) {
     bool irq = false;
     wd.set_irq_callback([&](bool a) { irq = a; });
     wd.write_address(0x00);
-    wd.write_data(0x08 | 7);  // own ID 7, advanced features
-    wd.write_address(0x02);
-    wd.write_data(0x20);      // selection timeout period
+    wd.write_data(0x80 | 0x08 | 7);  // 20 MHz input clock, advanced features, own ID 7
     wd.write_address(0x18);
     wd.write_data(0x00);      // RESET
     CHECK(wd.read_aux_status() & 0x10);
@@ -226,24 +225,30 @@ TEST(wd33c93_reset_and_selection_timeout) {
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x01);  // reset with advanced features
     CHECK(!irq);
+    wd.write_address(0x02);
+    wd.write_data(0x20);     // selection timeout period (RESET cleared it): 32 x 80 / 20 = 128 ms
     wd.write_address(0x15);
     wd.write_data(3);        // destination ID
     wd.write_address(0x18);
     wd.write_data(0x07);     // SELECT without ATN
     CHECK(wd.read_aux_status() & 0x20);
-    clk.advance_to(100000 + 150000 * 20);  // ~13 ms timeout at 20 MHz
+    clk.advance_to(100000 + 150000 * 120);
+    CHECK(!irq);
+    clk.advance_to(100000 + 150000 * 130);
     CHECK(irq);
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x42);  // selection timeout
     wd.write_address(0x18);
     wd.write_data(0x04);  // DISCONNECT while not connected: no interrupt
-    clk.advance_to(100000 + 150000 * 40);
+    clk.advance_to(100000 + 150000 * 140);
     CHECK(!irq);
 }
 
 namespace {
 std::string make_image(unsigned blocks) {
-    const std::string path = (std::filesystem::temp_directory_path() / "sg_scsi_test.img").string();
+    static unsigned serial = 0;  // a name per image, so a test can have several
+    const std::string path =
+        (std::filesystem::temp_directory_path() / ("sg_scsi_test" + std::to_string(serial++) + ".img")).string();
     std::ofstream f(path, std::ios::binary);
     for (unsigned b = 0; b < blocks; ++b) {
         std::vector<char> block(512, static_cast<char>(b));
@@ -281,16 +286,58 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     CHECK_EQ(r.data_in[0], 0x05);  // CD-ROM
     const u8 capacity[10] = {0x25};
     r = cd.command(capacity, 10);
-    CHECK_EQ(r.data_in[3], 15);    // last LBA
-    CHECK_EQ(r.data_in[6], 0x02);  // 512-byte blocks
-    const u8 read10[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 2, 0};
+    CHECK_EQ(r.data_in[3], 3);     // last LBA: 2048-byte blocks at power-on
+    CHECK_EQ(r.data_in[6], 0x08);
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 1, 0, 0, 2, 0};
     r = cd.command(read10, 10);
-    CHECK_EQ(r.data_in.size(), 1024u);
-    CHECK_EQ(r.data_in[0], 3);
-    CHECK_EQ(r.data_in[600], 4);
+    CHECK_EQ(r.data_in.size(), 4096u);
+    CHECK_EQ(r.data_in[0], 4);      // 512-byte block 4 starts 2048-byte block 1
+    CHECK_EQ(r.data_in[2648], 9);   // 2048 + 600 bytes in: 512-byte block 9
     const u8 write10[10] = {0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0};
     r = cd.command(write10, 10);
     CHECK_EQ(r.status, 0x02);  // write-protected medium
+}
+
+// MODE SELECT's block descriptor switches the CD-ROM to 2048-byte blocks
+// (as OpenBSD does); the disk stays at 512; a reset restores 512.
+// MODE SELECT's block descriptor switches the CD-ROM between 2048-byte
+// blocks (its power-on size) and 512 (as the PROM and IRIX select); a bus
+// reset restores 2048 and reports UNIT ATTENTION. The disk stays at 512.
+TEST(scsi_mode_select_sets_the_cdrom_block_size) {
+    const TempImage image(16);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, image.path);
+    const u8 select6[6] = {0x15, 0x10, 0, 0, 12, 0};
+    std::vector<u8> params = {0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0x02, 0x00};  // header, descriptor: 512
+    auto r = cd.command(select6, 6);
+    CHECK_EQ(r.data_out_length, 12u);
+    CHECK_EQ(cd.finish_data_out(select6, params), 0x00);
+    const u8 capacity[10] = {0x25};
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[3], 15);    // last LBA of sixteen 512-byte blocks
+    CHECK_EQ(r.data_in[6], 0x02);
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0};
+    r = cd.command(read10, 10);
+    CHECK_EQ(r.data_in.size(), 512u);
+    CHECK_EQ(r.data_in[0], 3);
+    const u8 sense6[6] = {0x1A, 0, 0, 0, 12, 0};
+    r = cd.command(sense6, 6);
+    CHECK_EQ(r.data_in[10], 0x02);  // the descriptor reports it
+    cd.bus_reset();
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.status, 0x02);  // UNIT ATTENTION first
+    const u8 sense[6] = {0x03, 0, 0, 0, 18, 0};
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x06);
+    CHECK_EQ(r.data_in[12], 0x29);  // power on or reset
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[6], 0x08);
+
+    const TempImage disk_image(16);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, disk_image.path);
+    params[10] = 0x08;
+    disk.command(select6, 6);
+    CHECK_EQ(disk.finish_data_out(select6, params), 0x02);  // 2048 not supported
+    CHECK_EQ(disk.block_size(), 512u);
 }
 
 TEST(scsi_cdrom_eject_changes_disc_with_unit_attention) {
@@ -316,7 +363,7 @@ TEST(scsi_cdrom_eject_changes_disc_with_unit_attention) {
     CHECK_EQ(r.status, 0x00);
     const u8 capacity[10] = {0x25};
     r = cd.command(capacity, 10);
-    CHECK_EQ(r.data_in[3], 31);  // the new disc
+    CHECK_EQ(r.data_in[3], 7);  // the new disc: 32 x 512 bytes in 2048-byte blocks
     // Ejected with nothing put back: not ready, medium not present.
     cd.set_eject_callback({});
     cd.command(eject, 6);
@@ -636,6 +683,34 @@ std::vector<u8> to_mouse(Kbc8042& k, u8 value) {
 }
 }  // namespace
 
+// With the command byte's translate bit set (as OpenBSD sets it), set 2
+// codes from the keyboard reach the host as set 1, breaks as bit 7; with it
+// clear (IRIX), they pass unchanged.
+TEST(kbc_translates_set2_to_set1_when_asked) {
+    Kbc8042 kbc;
+    kbc.write_command(0x60);
+    kbc.write_data(0x44);   // translate, no interrupts
+    kbc.key_input(0x2D);    // R
+    kbc.key_input(0xF0);
+    kbc.key_input(0x2D);
+    kbc.key_input(0xE0);    // right Ctrl
+    kbc.key_input(0x14);
+    CHECK_EQ(kbc.read_data(), 0x13);
+    CHECK_EQ(kbc.read_data(), 0x93);
+    CHECK_EQ(kbc.read_data(), 0xE0);
+    CHECK_EQ(kbc.read_data(), 0x1D);
+    kbc.write_data(0xF2);  // identify: the ID's second byte is translated too
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK_EQ(kbc.read_data(), 0xAB);
+    CHECK_EQ(kbc.read_data(), 0x41);
+    kbc.write_command(0x60);
+    kbc.write_data(0x00);
+    kbc.key_input(0x2D);
+    kbc.key_input(0xF0);
+    CHECK_EQ(kbc.read_data(), 0x2D);
+    CHECK_EQ(kbc.read_data(), 0xF0);
+}
+
 TEST(kbc_mouse_reports_movement_only_when_enabled) {
     Kbc8042 k;
     bool irq = false;
@@ -763,4 +838,33 @@ TEST(wd33c93_dma_transfer_waits_for_the_host_channel) {
     if (!memory.empty()) CHECK_EQ(memory[0], 3);
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);
+}
+
+// Set 3 per-key modes: FB/FC/FD take a list of keys ended by the next
+// command, F7-FA set every key; all keys start typematic with breaks.
+TEST(kbc_set3_key_modes) {
+    Kbc8042 kbc;
+    CHECK(kbc.repeats(0x1C) && kbc.sends_break(0x1C));
+    kbc.write_data(0xFC);  // make/break only for...
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0x14);  // Caps Lock
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0x76);  // Num Lock
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0xED);  // the next command ends the list
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0x00);
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK(!kbc.repeats(0x14) && kbc.sends_break(0x14));
+    CHECK(!kbc.repeats(0x76));
+    CHECK(kbc.repeats(0x1C));
+    kbc.write_data(0xF8);  // every key make/break (as X sets it)
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK(!kbc.repeats(0x1C) && kbc.sends_break(0x1C));
+    kbc.write_data(0xF6);  // defaults
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK(kbc.repeats(0x14));
+    kbc.write_command(0xD1);  // write output port: its byte is taken, not sent to the keyboard
+    kbc.write_data(0xDF);
+    CHECK(!(kbc.read_status() & 1));
 }

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: Linux arch/mips/include/asm/sgi/hpc3.h, ip22-nvram.c;
 // NetBSD sys/arch/sgimips/hpc/hpcreg.h.
 #include "machine/ip22/hpc3.h"
@@ -69,7 +70,7 @@ constexpr u32 kEnetRxCbp = 0x14000, kEnetRxNdbp = 0x14004, kEnetRxBcd = 0x15000,
 constexpr u32 kEnetReset = 0x15014, kEnetDmaCfg = 0x15018, kEnetPioCfg = 0x1501C;
 constexpr u32 kEnetTxCbp = 0x16000, kEnetTxNdbp = 0x16004, kEnetTxBcd = 0x17000, kEnetTxCtrl = 0x17004;
 constexpr u32 kSeeqWindow = 0x54000, kSeeqWindowEnd = 0x54500;
-constexpr u32 kEnetCtrlEndian = 1u << 8, kEnetCtrlActive = 1u << 9;
+constexpr u32 kEnetCtrlEndian = 1u << 8, kEnetCtrlActive = 1u << 9, kEnetCtrlActiveMask = 1u << 10;
 constexpr u32 kEnetResetChannel = 1u << 0, kEnetResetClearIrq = 1u << 1, kEnetResetLoopback = 1u << 2;
 // Ethernet descriptor count word
 constexpr u32 kEnetDescEnd = 1u << 31;        // end of chain (transmit) / ring (receive)
@@ -105,10 +106,12 @@ Hpc3::Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz)
 
 void Hpc3::reset() {
     regs_.clear();
+    written_.clear();
     eeprom_reg_ = 0;
     eeprom_.set_lines(false, false, false);
     scsi0_.reset();
     scsi_dma_ = ScsiDma{};
+    scsi_dma_.in_reset = true;  // the channel reset bit is set at power-on
     for (unsigned ch = 0; ch < kPbusChannels; ++ch) {
         pbus_timer_[ch]->cancel();
         pbus_[ch] = PbusChannel{};
@@ -116,6 +119,7 @@ void Hpc3::reset() {
     hal2_.reset();
     update_dma_irq();
     enet_reset();
+    enet_held_ = true;
     enet_loopback_ = false;
     enet_dconfig_ = enet_pconfig_ = 0;
     enet_rx_.cbp = enet_rx_.ndbp = enet_rx_.cdp = enet_tx_.cbp = enet_tx_.ndbp = 0;
@@ -167,6 +171,7 @@ void Hpc3::enet_poll() {
 // OWN and leaves the unused byte count in each one it fills.
 void Hpc3::enet_receive(const u8* frame, std::size_t length) {
     if (!seeq_.accepts(frame, length) || length > kEnetMaxFrame) return;
+    ++enet_rx_frames_;
     if (!enet_rx_.active) return;  // no buffers: the frame is lost
     std::vector<u8> data(2 + std::max(length, kEnetMinFrame) + 1, 0);
     std::memcpy(&data[2], frame, length);
@@ -180,8 +185,12 @@ void Hpc3::enet_receive(const u8* frame, std::size_t length) {
         bus_.read<u32>(desc, pbuf);
         bus_.read<u32>(desc + 4, cnt);
         bus_.read<u32>(desc + 8, next);
-        if (!(cnt & kEnetDescOwn)) {  // the driver has not handed this buffer back yet
-            if (done == 0) return;  // no room: the frame is lost
+        if (!(cnt & kEnetDescOwn)) {
+            // The driver has not handed this buffer back yet (OWN is the
+            // drivers' convention; the HPC3 itself only stops at EOX). The
+            // frame is dropped rather than written over a buffer still in
+            // use, and the channel stays ready for the next one.
+            if (done == 0) return;
             status = Seeq8003::kRxOverflow;
             break;
         }
@@ -233,6 +242,7 @@ void Hpc3::enet_transmit() {
         enet_tx_.ndbp = next;
     }
     if (frame.size() < kEnetMinFrame) frame.resize(kEnetMinFrame, 0);
+    ++enet_tx_frames_;
     if (enet_loopback_) enet_receive(frame.data(), frame.size());
     else if (net_) net_->send(frame.data(), frame.size());
     irq |= seeq_.transmitted(end_of_packet ? Seeq8003::kTxDone : Seeq8003::kTxUnderflow);
@@ -247,7 +257,9 @@ u32 Hpc3::enet_read(u32 offset) {
         case kEnetRxNdbp: return enet_rx_.ndbp;
         case kEnetRxCtrl:
             return seeq_.rx_status() | (enet_rx_.ctrl & kEnetCtrlEndian) | (enet_rx_.active ? kEnetCtrlActive : 0);
-        case kEnetReset: return (enet_irq_ ? kEnetResetClearIrq : 0) | (enet_loopback_ ? kEnetResetLoopback : 0);
+        case kEnetReset:
+            return (enet_held_ ? kEnetResetChannel : 0) | (enet_irq_ ? kEnetResetClearIrq : 0) |
+                   (enet_loopback_ ? kEnetResetLoopback : 0);
         case kEnetDmaCfg: return enet_dconfig_;
         case kEnetPioCfg: return enet_pconfig_;
         case kEnetTxCbp: return enet_tx_.cbp;
@@ -266,10 +278,11 @@ void Hpc3::enet_write(u32 offset, u32 value) {
         case kEnetRxNdbp: enet_rx_.ndbp = value; return;
         case kEnetRxCtrl:
             enet_rx_.ctrl = value;
-            enet_rx_.active = value & kEnetCtrlActive;
+            if (!(value & kEnetCtrlActiveMask)) enet_rx_.active = (value & kEnetCtrlActive) && !enet_held_;
             return;
         case kEnetReset:
-            if (value & kEnetResetChannel) enet_reset();
+            enet_held_ = value & kEnetResetChannel;
+            if (enet_held_) enet_reset();
             if (value & kEnetResetClearIrq) {
                 enet_irq_ = false;
                 ioc_.set_local0(Ioc2::kL0Ethernet, false);
@@ -282,8 +295,10 @@ void Hpc3::enet_write(u32 offset, u32 value) {
         case kEnetTxNdbp: enet_tx_.ndbp = value; return;
         case kEnetTxCtrl: {
             enet_tx_.ctrl = value;
-            const bool start = (value & kEnetCtrlActive) && !enet_tx_.active;
-            enet_tx_.active = value & kEnetCtrlActive;
+            if (value & kEnetCtrlActiveMask) return;
+            const bool active = (value & kEnetCtrlActive) && !enet_held_;
+            const bool start = active && !enet_tx_.active;
+            enet_tx_.active = active;
             if (start) enet_tx_timer_->schedule_in(static_cast<u64>(cpu_hz_ * 2e-6));  // after a short setup
             if (!enet_tx_.active) enet_tx_timer_->cancel();
             return;
@@ -434,9 +449,19 @@ void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
         std::vector<s16> samples(n / frame * in.voices, 0);
         audio_source_(samples.data(), samples.size() / in.voices, in.voices, in.rate);
         const bool little = in.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
+        double gain[2];
+        hal2_.input_gain(gain[0], gain[1]);
+        const bool unity = gain[0] == 1.0 && gain[1] == 1.0;
         for (std::size_t i = 0; i < samples.size(); ++i) {
-            // As played: a 24-bit value in a 32-bit word (DS16) or a packed 16-bit sample.
-            const u32 v = size == 4 ? static_cast<u32>(static_cast<s32>(samples[i]) * 256) : static_cast<u16>(samples[i]);
+            // The codec's input gain (left on even samples), clipping at full scale; then as
+            // played: a 24-bit value in a 32-bit word (DS16) or a packed 16-bit sample.
+            s32 s = static_cast<s32>(samples[i]) * (size == 4 ? 256 : 1);
+            if (!unity) {
+                const double g = gain[in.voices >= 2 ? i % 2 : 0];
+                const double full = size == 4 ? 8388607.0 : 32767.0;
+                s = static_cast<s32>(std::lround(std::clamp(s * g, -full - 1, full)));
+            }
+            const u32 v = size == 4 ? static_cast<u32>(s) : static_cast<u16>(s);
             for (unsigned k = 0; k < size; ++k) bytes[i * size + k] = static_cast<u8>(v >> (8 * (little ? k : size - 1 - k)));
         }
     }
@@ -555,6 +580,7 @@ u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
             d.irq = true;
             update_dma_irq();
         }
+        if (d.bc == 0 && (d.flags & kDescEox)) d.active = false;  // end of the chain
     }
     if (moved < length) SG_LOG(Debug, "hpc3", "SCSI DMA chain ended after %u of %u bytes", moved, length);
     return moved;
@@ -653,7 +679,12 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
         const u32 word = offset & ~3u;
         const unsigned shift = (4 - size - (offset & 3)) * 8;
         const u32 mask = ((1u << (size * 8)) - 1) << shift;
-        write_word(word, (read_word(word) & ~mask) | ((static_cast<u32>(value) << shift) & mask));
+        // A PIO access is always a whole word on the HPC3's side, and a write
+        // never reads: the other lanes are taken from the last word written,
+        // so a byte at lane 3 reaches an 8-bit device as is.
+        u32& last = written_[word];
+        last = (last & ~mask) | ((static_cast<u32>(value) << shift) & mask);
+        write_word(word, last);
     }
     return true;
 }
@@ -676,8 +707,9 @@ u32 Hpc3::read_word(u32 offset) {
         case kScsi0Ndbp: return scsi_dma_.ndbp;
         case kScsi0Bc: return (scsi_dma_.flags & ~kDescCountMask) | scsi_dma_.bc;
         case kScsi0Ctrl: {
-            const u32 v = (scsi_dma_.ctrl & (kScsiCtrlEndian | kScsiCtrlDir)) | (scsi_dma_.active ? kScsiCtrlActive : 0) |
-                          (scsi_dma_.irq ? kScsiCtrlIrq : 0);
+            const u32 v = (scsi_dma_.ctrl & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush)) |
+                          (scsi_dma_.active ? kScsiCtrlActive : 0) | (scsi_dma_.irq ? kScsiCtrlIrq : 0) |
+                          (scsi_dma_.in_reset ? kScsiCtrlReset : 0);
             scsi_dma_.irq = false;  // reading the control register acknowledges the interrupt
             update_dma_irq();
             return v;
@@ -709,14 +741,17 @@ void Hpc3::write_word(u32 offset, u32 value) {
             eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut);
             return;
         case kGioMisc: regs_[offset] = value & 3; return;
-        case kScsi0Ndbp:
+        case kScsi0Ndbp:  // the descriptor in use, if any, is finished first
             scsi_dma_.ndbp = value;
-            scsi_dma_.bc = 0;
-            scsi_dma_.loaded = false;
+            if (!scsi_dma_.active) {
+                scsi_dma_.bc = 0;
+                scsi_dma_.loaded = false;
+            }
             return;
         case kScsi0Ctrl: {
             ScsiDma& d = scsi_dma_;
-            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset
+            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset, and resets the bus
+                if (!d.in_reset) scsi0_.bus_reset();
                 scsi0_.reset();
                 d = ScsiDma{};
                 d.in_reset = true;
@@ -727,7 +762,7 @@ void Hpc3::write_word(u32 offset, u32 value) {
                 d.in_reset = false;
                 scsi0_.reset_released();
             }
-            d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir);
+            d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush);
             if (!(value & kScsiCtrlActiveMask)) {
                 const bool start = (value & kScsiCtrlActive) && !d.active;
                 d.active = value & kScsiCtrlActive;

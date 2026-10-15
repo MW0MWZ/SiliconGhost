@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// SDL3 window for the Newport display, with PS/2 keyboard and mouse input and
-// HAL2 audio output.
+// Copyright (C) 2026 Andy Taylor
+// The SDL3 front end: a window showing the Newport display, with menus for
+// the machine's switches and media, a settings dialog, a status bar, serial
+// terminal windows, PS/2 keyboard and mouse input and HAL2 audio.
 #pragma once
 
 #include <csignal>
-#include <functional>
 #include <memory>
+#include <string>
 
-#include "core/pacer.h"
+#include "app/settings.h"
 #include "machine/ip22/indy.h"
 
 namespace sg::app {
@@ -25,12 +27,22 @@ public:
 };
 std::unique_ptr<AudioOutput> start_audio(ip22::Indy& machine, AudioOptions options);
 
-// Runs the machine with a window, paced by `pacer`, until the window is
-// closed, the machine powers off, or `stop` becomes set. The display is
-// refreshed at 60 Hz of host time, and audio connected as `audio` says.
-// `periodic` is called about once a second. Returns false if SDL could not
-// be initialised.
-bool run_with_display(ip22::Indy& machine, Pacer& pacer, volatile std::sig_atomic_t& stop, AudioOptions audio,
-                      const std::function<void()>& periodic);
+struct GuiOptions {
+    // Where the Settings dialog saves; empty: the user's settings file, which
+    // is also loaded when `power_on` is false.
+    std::string settings_file;
+    bool power_on = false;  // power the machine on at once
+    std::string screenshot;  // saved when the window closes
+    std::string log_file;    // where messages go when not on a terminal (shown in About)
+};
+
+// A file in the user's SiliconGhost folder (where the settings live).
+std::string user_file(const std::string& name);
+
+// Runs the window until it is closed or `stop` becomes set. `next_disc` is
+// a request (from a signal) to change to the next CD-ROM disc. Returns the
+// exit status, or -1 if no window could be opened.
+int run_gui(Settings settings, const GuiOptions& options, volatile std::sig_atomic_t& stop,
+            volatile std::sig_atomic_t& next_disc);
 
 }  // namespace sg::app

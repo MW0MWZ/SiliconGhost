@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Dallas DS1386 watchdog timekeeper: BCD real-time clock + battery-backed SRAM.
 // Register interface is by byte index (0x00..size-1); time registers are 0x0-0xD,
 // the rest is NVRAM. The clock runs from a time source (normally host wall

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 MC (memory controller): CPU/GIO control, SIMM bank decode, bus error
 // reporting, RPSS counter and semaphores. Mapped at 0x1FA00000 (128 KiB).
 //
@@ -42,6 +43,8 @@ public:
         kSysSemaphore = 0x104,
         kLockMemory = 0x10C,
         kEisaLock = 0x114,
+        kDmaGioMask = 0x154,
+        kDmaGioSubst = 0x15C,
         kDmaCause = 0x164,
         kDmaCtl = 0x16C,
         kDmaTlbHi0 = 0x184,  // + n * 0x10; LO at +8
@@ -97,7 +100,10 @@ private:
     void update_irq();
     void start_dma();
     void finish_dma();
-    u32 dma_translate(u32 vaddr);
+    // Physical address for a DMA memory address, or 0 with `fault` set to
+    // the cause bit (TLB miss, page fault, clean page written).
+    u32 dma_translate(u32 vaddr, bool to_memory, u32& fault);
+    void dma_load_defaults();
 
     // A bank that is configured valid but has no SIMMs fitted: the MC still
     // decodes it, so accesses complete (reads see an undriven bus, here zero)

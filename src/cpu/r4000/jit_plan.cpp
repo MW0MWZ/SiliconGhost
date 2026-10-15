@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Register planning shared by the recompiler back ends: which guest
 // registers a translation keeps in host registers, and in which of the
 // eight cache slots; each back end maps the slots to its host registers.

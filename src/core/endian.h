@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Byte-order helpers. Guest memory is kept in guest (big-endian) byte order so
 // that DMA, PROM images and disk images need no conversion; values are swapped
 // on access, which is a single instruction (bswap/rev/movbe) on every host.

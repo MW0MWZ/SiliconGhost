@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Newport (XL8/XL24) graphics for the IP22 GFX slot: REX3 raster engine,
 // RB2 frame buffer, the display control bus (DCB) with VC2 video timing and
 // cursor, XMAP9 pixel-mode mapping, CMAP colour maps and the Bt445 RAMDAC.
@@ -51,6 +52,11 @@ public:
     // (screenshots; render() is checked against it).
     bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
     u64 frames() const { return frames_; }
+    // Where the VC2 shows the hardware cursor: the top left of its glyph in
+    // screen coordinates. False while the cursor is off.
+    bool cursor_position(int& x, int& y) const;
+    // Pixels the REX3 has drawn (a measure of how busy the board is).
+    u64 pixels_drawn() const { return pixels_drawn_; }
 
 private:
     // ---- REX3 ----
@@ -59,7 +65,10 @@ private:
     void execute();
     void do_setup();
     void draw_span_block(bool block);
+    void line_setup(bool fractional);
+    void advance_line_stipple();
     void draw_line();
+    void draw_aline();
     void scr2scr();
     void pixel_read();
     void write_x_start(u32 v) { xstart_ = v & 0x07FFFF80u; }
@@ -68,13 +77,16 @@ private:
     void write_y_end(u32 v) { yend_ = v & 0x07FFFF80u; }
     static int int_part(u32 v) { return static_cast<s16>(v >> 11); }
     void set_color_index(u32 v);
+    u32 ci_index() const;  // the colour index COLORRED holds
 
     u32 source_color(int x, int y);
-    u32 host_color();
+    u32 host_color(u32* alpha = nullptr);
+    u32 blend(u32 src, int px, int py) const;
     u32 default_color(u32 colour) const;
     u32 shaded_color(int x, int y) const;
     void iterate_shade();
     void reload_shade();
+    void plot_source(int x, int y, u32 colour);
     void plot(int x, int y, u32 colour);
     bool clip(int x, int y, int& px, int& py) const;
     void store(int px, int py, u32 colour);
@@ -84,6 +96,7 @@ private:
     // ---- DCB ----
     // DCBDATA accesses: the bytes of the CPU access, in address order and
     // limited to DCBMODE.DATAWIDTH, are transferred one by one.
+    unsigned dcb_width(unsigned size) const;
     void dcb_write(unsigned size, u64 value);
     u64 dcb_read(u32 reg, unsigned size);
     void dcb_begin();
@@ -119,7 +132,11 @@ private:
     };
     const ModeTable& mode_table(unsigned did);
     u32 direct_colour(u32 mode, u32 pix) const;
-    u32 special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const;  // cursor, PUP, overlay
+    u32 special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const;  // cursor, PUP, overlay, underlay or pixel
+    bool aux_layer(u32 mode, bool pixel_nonzero, u32 aux, unsigned cursor, u32& addr) const;
+    u32 aux_mask(u32 mode, bool& underlay) const;
+    bool pixel_value_nonzero(u32 mode, u32 pix) const;
+    u32 pixel_colour(u32 mode, u32 pix) const;
     u8 did_at(const std::vector<std::pair<int, u8>>& records, int x) const;
     unsigned cursor_pixel(int x, int y) const;
     void retrace();
@@ -131,6 +148,7 @@ private:
     Timer retrace_timer_;
     std::function<void(bool)> retrace_cb_;
     u64 frames_ = 0;
+    u64 pixels_drawn_ = 0;
 
     // REX3 state
     u32 drawmode0_ = 0, drawmode1_ = 0;
@@ -144,15 +162,18 @@ private:
     u32 aweight0_ = 0, aweight1_ = 0;
     u32 colorred_ = 0, coloralpha_ = 0, colorgrn_ = 0, colorblue_ = 0;
     s32 curr_red_ = 0, curr_alpha_ = 0, curr_grn_ = 0, curr_blue_ = 0;
+    u32 src_alpha_ = 0xFF;  // alpha of the pixel being drawn, for blending
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
+    bool zfail_next_ = false, zfail_ = false;
+    bool fastclear_ = false;  // the primitive running writes COLORVRAM (fast clear)  // STEPZ: the next GO's first pixel fails the Z test
     int host_shift_ = 0;
     u32 dcbmode_ = 0;
+    unsigned dcb_crs_ = 0;  // the DCB's register select, stepped by ENCRSINC until DCBMODE is written
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
-    u64 dcb_busy_until_ = 0;
-    bool warned_blend_ = false, warned_aline_ = false;  // unmodelled features, reported once  // an access to an absent slave is waiting for its acknowledge
+    u64 dcb_busy_until_ = 0;  // an access to an absent slave is waiting for its acknowledge
 
     u64 display_version_ = 0;
     bool full_redraw_ = true;
@@ -169,6 +190,7 @@ private:
         u8 data_hi = 0;
         bool ram_hi_pending = true;  // next RAM byte written is the high byte
         u8 ram_lo_latch = 0;
+        u8 reg_lo_latch = 0;  // low byte of the register a CRS 1 read fetched
         bool ram_read_hi = true;
     } vc2_;
     struct Xmap {

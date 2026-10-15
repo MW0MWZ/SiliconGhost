@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 #include "devices/seeq8003.h"
 
 #include <algorithm>
@@ -12,7 +13,7 @@ constexpr u8 kTxBankMask = 0x60;  // 80C03 register bank for registers 0-5
 
 void Seeq8003::reset() {
     rx_command_ = tx_command_ = 0;
-    rx_status_ = tx_status_ = 0;
+    rx_status_ = tx_status_ = kStatusOld;  // no new status yet
     update_irq();
 }
 

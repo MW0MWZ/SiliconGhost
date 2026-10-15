@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Host side of an emulated Ethernet interface. Frames the guest sends go to
 // send() (called on the emulation thread); a backend queues frames for the
 // guest from any thread with deliver(), and the emulation thread collects

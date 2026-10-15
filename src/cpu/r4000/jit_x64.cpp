@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // R4000 dynamic recompiler, x86-64 back end.
 //
 // A hot decoded block is translated into one host function that runs the

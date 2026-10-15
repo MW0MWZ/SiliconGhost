@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // FPU (COP1) and CACHE instruction tests.
 #include <cstring>
 #include <initializer_list>

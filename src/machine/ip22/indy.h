@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // SGI Indy (IP22) machine: owns the bus, memory, CPU and devices.
 #pragma once
 
@@ -22,16 +23,24 @@
 
 namespace sg::ip22 {
 
+// Whether `mb` MiB of RAM can be fitted: one or two banks of 16, 32, 64
+// or 128 MiB.
+bool ram_size_fits(unsigned mb);
+
 struct IndyConfig {
     unsigned ram_mb = 64;       // 16..256, multiple of 16
     double cpu_hz = 150.0e6;    // pipeline clock
     double sysclk_hz = 50.0e6;  // SysAD bus clock
     u32 prid = 0x00000450;      // R4400 revision 5.0
-    bool graphics = true;       // Newport XL8 in the GFX slot
+    u32 cpu_config = mips::R4000::kDefaultConfig;  // Config register at reset (cache geometry)
+    u32 scache_bytes = 1u << 20;                    // secondary cache; 0 for a PC module
+    bool graphics = true;       // a Newport board in the GFX slot
+    bool xl24 = false;          // the 24-bit board (XL24) rather than the 8-bit XL8
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
     // SCSI CD-ROM (ID 4) discs, raw 512-byte blocks (IRIX media layout). The
     // first is in the drive at power-on; ejecting moves on to the next.
     std::vector<std::string> cdrom_images;
+    bool cdrom_drive = true;  // fit the drive even with no disc in it
     // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
     // use a default when the NVRAM has none (IRIX requires one).
     std::optional<std::array<u8, 6>> mac;
@@ -53,10 +62,37 @@ public:
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+    // True while software is timing the CPU against the 8254 (the PROM and
+    // the kernels calibrate their delay loops at boot by latching counter 2),
+    // and for half a second of guest time after its last latch. Each such
+    // stretch starts by ending run(), so the CPU's speed can be fixed first.
+    bool timing_cpu() const { return cpu_.cycles() < timing_cpu_until_; }
 
     // Thread-safe: put the next CD-ROM disc in the drive (after the last,
     // the first again), as if the operator had swapped it.
     void request_next_disc();
+
+    // The CD-ROM drive as the operator sees it (call between run() calls).
+    // The discs given at start-up form a set; insert_disc() adds to it.
+    const std::vector<std::string>& discs() const { return config_.cdrom_images; }
+    // Index of the disc in the drive, or -1 if it is empty (or there is no drive).
+    int disc_in_drive() const;
+    bool has_cdrom_drive() const { return cdrom_ != nullptr; }
+    // The drive's eject button: false if the guest has locked the disc in.
+    bool eject_disc();
+    // Ejects even a locked disc (a real drive's emergency eject hole).
+    void force_eject_disc();
+    bool insert_disc(const std::string& path);
+    bool select_disc(std::size_t index);
+
+    // Counters for activity lights and load meters.
+    struct Activity {
+        u64 disk = 0, cdrom = 0;          // medium reads and writes
+        u64 net_tx = 0, net_rx = 0;       // Ethernet frames
+        u64 cycles = 0, idle_cycles = 0;  // CPU cycles, and those idle-skipped
+        u64 pixels = 0;                   // pixels drawn by the REX3
+    };
+    Activity activity() const;
     double cycles_per_second() const { return config_.cpu_hz; }
 
     void set_serial_output(SerialOutput out) { serial_out_ = std::move(out); }
@@ -116,9 +152,11 @@ private:
     std::deque<std::pair<unsigned, u8>> serial_in_;
     std::atomic<bool> serial_pending_{false};  // input queued: run() starts the pump
     std::size_t disc_ = 0;                   // index into config_.cdrom_images
+    bool disc_loaded_ = false;
     std::atomic<bool> disc_change_{false};  // host asked for the next disc
     bool reset_pending_ = false;
     bool powered_off_ = false;
+    u64 timing_cpu_until_ = 0;
 };
 
 }  // namespace sg::ip22

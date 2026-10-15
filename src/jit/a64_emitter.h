@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Minimal AArch64 machine-code emitter for the recompiler: the integer
 // instructions it uses, encoded into a byte buffer. Helpers that take any
 // immediate or offset fall back to building the value in x16 or x17, which
