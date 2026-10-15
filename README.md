@@ -283,6 +283,25 @@ With `--net tap:NAME` frames go to an existing TAP interface (created with
 `ip tuntap add mode tap user $USER name tap0` and bridged or routed as your
 network needs), and the Indy is configured like any machine on that network.
 
+### The BSDs at a glance
+
+| | NetBSD 9.0/sgimips | OpenBSD 6.9/sgi |
+|---|---|---|
+| Installer boots from the CD | yes (from the Command Monitor) | yes (from the Command Monitor) |
+| Installation sets read from the CD | no (see below) | no (see below) |
+| Installation over the network (HTTP/FTP) | yes | yes |
+| Installed system boots multi-user from disk | yes | yes |
+| Serial console | yes | yes |
+| Newport (graphics) console | no text shown; use the serial console | yes, text console |
+| PS/2 keyboard | yes | yes |
+| PS/2 mouse | detected (not exercised without X) | detected (not exercised without X) |
+| X11 | not tried (no X sets for sgimips 9.0) | no (OpenBSD's Newport driver has no frame buffer for X) |
+| SCSI disk and CD-ROM | yes | yes |
+| Ethernet | yes | yes |
+| Audio playback | yes | no (no driver) |
+| Audio recording | no (not supported by NetBSD's driver) | no (no driver) |
+| Real-time clock and NVRAM | yes | yes |
+
 ### Running NetBSD
 
 NetBSD/sgimips 9.0 runs on the serial console (start with `--no-graphics`
