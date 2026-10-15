@@ -24,6 +24,8 @@
 #include "core/log.h"
 #include "imgui.h"
 #include "misc/cpp/imgui_stdlib.h"
+#include "net/slirp_backend.h"
+#include "net/tap_backend.h"
 
 namespace sg::app {
 
@@ -793,6 +795,8 @@ void Gui::open_settings() {
     if (auto* m = session_.machine()) edit_.cdroms = m->discs();
     net_mode_ = edit_.net == "none" ? 2 : edit_.net.rfind("tap:", 0) == 0 ? 1 : 0;
     tap_name_ = net_mode_ == 1 ? edit_.net.substr(4) : std::string();
+    // A connection this build or host lacks (a file from another machine) shows as none.
+    if ((net_mode_ == 0 && !net::slirp_available()) || (net_mode_ == 1 && !net::tap_available())) net_mode_ = 2;
     mac_text_ = edit_.mac ? mac_text(*edit_.mac) : std::string();
     forward_texts_.clear();
     for (const auto& f : edit_.forwards) forward_texts_.push_back(forward_text(f));
@@ -977,7 +981,19 @@ void Gui::draw_settings() {
         if (ImGui::BeginTabItem("Network")) {
             label("Connection");
             ImGui::SetNextItemWidth(-1);
-            ImGui::Combo("##net", &net_mode_, "User-mode NAT through the host\0TAP interface (Linux)\0Not connected\0");
+            // Only the connections this build and host can make.
+            std::vector<std::pair<int, const char*>> modes;
+            if (net::slirp_available()) modes.emplace_back(0, "User-mode NAT through the host");
+            if (net::tap_available()) modes.emplace_back(1, "TAP interface");
+            modes.emplace_back(2, "Not connected");
+            const char* current = "Not connected";
+            for (const auto& [mode, text] : modes)
+                if (mode == net_mode_) current = text;
+            if (ImGui::BeginCombo("##net", current)) {
+                for (const auto& [mode, text] : modes)
+                    if (ImGui::Selectable(text, mode == net_mode_)) net_mode_ = mode;
+                ImGui::EndCombo();
+            }
             if (net_mode_ == 0) {
                 ImGui::SetCursorPosX(label_w);
                 ImGui::TextDisabled("The guest is 10.0.2.15; the host and gateway 10.0.2.2, DNS 10.0.2.3");
@@ -1030,7 +1046,8 @@ void Gui::draw_settings() {
             }
             ImGui::Spacing();
             ImGui::Checkbox("Skip idle loops", &edit_.idle_skip);
-            ImGui::Checkbox("Recompiler (translate guest code to host code)", &edit_.jit);
+            if (mips::R4000::jit_available())
+                ImGui::Checkbox("Recompiler (translate guest code to host code)", &edit_.jit);
             ImGui::Checkbox("Block cache (decode guest code once)", &edit_.block_cache);
             ImGui::Spacing();
             label("Log level");

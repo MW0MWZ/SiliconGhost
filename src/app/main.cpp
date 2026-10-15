@@ -17,6 +17,8 @@
 #include "app/settings.h"
 #include "core/log.h"
 #include "cpu/r4000/disasm.h"
+#include "net/slirp_backend.h"
+#include "net/tap_backend.h"
 
 #if defined(SG_HAVE_SDL3)
 #include "app/display_sdl.h"
@@ -48,18 +50,31 @@ void usage(const char* argv0) {
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media; give it\n"
                  "                   more than once for a set of discs: ejecting one inserts the next\n"
+#if defined(SIGUSR1)
                  "                   (as do Ctrl+Alt+E in the window and SIGUSR1)\n"
+#else
+                 "                   (as does Ctrl+Alt+E in the window)\n"
+#endif
                  "  --settings FILE  start from a settings file saved by the window (options after it\n"
                  "                   override it)\n"
-                 "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n"
-                 "  --net MODE       user:     NAT through the host, no privileges needed (the default;\n"
-                 "                             the guest is 10.0.2.15, the host and gateway 10.0.2.2,\n"
-                 "                             DNS 10.0.2.3)\n"
-                 "                   tap:NAME: an existing Linux TAP interface\n"
-                 "                   none:     no cable\n"
-                 "  --hostfwd tcp|udp:HOSTPORT:GUESTPORT\n"
-                 "                   with --net user, forward a port on the host's loopback\n"
-                 "                   interface to the guest (may be repeated)\n"
+                 "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n",
+                 argv0);
+    // Only the network connections this build and host can make.
+    const bool user = sg::net::slirp_available(), tap = sg::net::tap_available();
+    std::fputs("  --net MODE       ", stderr);
+    if (user)
+        std::fputs("user:     NAT through the host, no privileges needed (the default;\n"
+                   "                             the guest is 10.0.2.15, the host and gateway 10.0.2.2,\n"
+                   "                             DNS 10.0.2.3)\n                   ",
+                   stderr);
+    if (tap) std::fputs("tap:NAME: an existing TAP interface\n                   ", stderr);
+    std::fputs("none:     no cable\n", stderr);
+    if (user)
+        std::fputs("  --hostfwd tcp|udp:HOSTPORT:GUESTPORT\n"
+                   "                   with --net user, forward a port on the host's loopback\n"
+                   "                   interface to the guest (may be repeated)\n",
+                   stderr);
+    std::fprintf(stderr,
                  "  --ram MB         memory size, 16..256 (default 64)\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc or r4000pc\n"
                  "  --cpu-mhz N      pipeline clock (default 150)\n"
@@ -75,14 +90,16 @@ void usage(const char* argv0) {
                  "                   (default 2; IRIX 5.3 fails to boot beyond about 2.9)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
-                 "  --no-jit         run decoded blocks without translating them to host code\n"
+                 "%s"
                  "  --no-audio       do not play the machine's audio output\n"
                  "  --audio-in       let the machine record from the host's audio input\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --dump-state     print the CPU registers when the emulator stops\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "In the window, the Machine and Media menus hold the same choices; Ctrl-C quits.\n",
-                 argv0);
+                 sg::mips::R4000::jit_available()
+                     ? "  --no-jit         run decoded blocks without translating them to host code\n"
+                     : "");
 }
 
 void dump_state(sg::mips::R4000& cpu) {
