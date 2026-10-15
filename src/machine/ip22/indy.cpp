@@ -43,7 +43,7 @@ Indy::Indy(const IndyConfig& config)
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
       hpc3_(bus_, ioc_, scheduler_, config.cpu_hz),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
-      newport_(scheduler_, config.cpu_hz, Newport::Options{}),
+      newport_(scheduler_, config.cpu_hz, Newport::Options{config.xl24}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
     std::memset(ram_.get(), 0, checked_ram_bytes(config));
     std::memset(prom_.get(), 0xFF, kPromMaxSize);

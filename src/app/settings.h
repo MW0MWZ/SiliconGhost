@@ -34,7 +34,8 @@ struct Settings {
     std::string cpu = "r4400sc";
     double cpu_mhz = 150.0;
     unsigned ram_mb = 64;
-    bool graphics = true;
+    bool graphics = true;  // a Newport board fitted
+    bool xl24 = false;     // and it is the 24-bit XL24
     std::optional<std::array<u8, 6>> mac;
     std::string net = "user";  // user | tap:NAME | none
     std::vector<net::PortForward> forwards;
@@ -49,6 +50,7 @@ struct Settings {
 
 // Text forms shared by the command line and the settings file.
 const char* timing_name(Pacer::Mode mode);
+const char* graphics_name(const Settings& s);  // xl8, xl24 or none
 bool parse_timing(const std::string& text, Pacer::Mode& mode);
 std::string mac_text(const std::array<u8, 6>& mac);
 bool parse_mac(const std::string& text, std::array<u8, 6>& mac);

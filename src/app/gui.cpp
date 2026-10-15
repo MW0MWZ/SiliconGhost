@@ -917,9 +917,10 @@ void Gui::draw_settings() {
             }
             label("Graphics");
             ImGui::SetNextItemWidth(-1);
-            int gfx = edit_.graphics ? 0 : 1;
-            ImGui::Combo("##gfx", &gfx, "Newport XL8 (8-bit)\0None (serial console only)\0");
-            edit_.graphics = gfx == 0;
+            int gfx = !edit_.graphics ? 2 : edit_.xl24 ? 1 : 0;
+            ImGui::Combo("##gfx", &gfx, "Newport XL8 (8-bit)\0Newport XL24 (24-bit)\0None (serial console only)\0");
+            edit_.graphics = gfx != 2;
+            edit_.xl24 = gfx == 1;
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Storage")) {

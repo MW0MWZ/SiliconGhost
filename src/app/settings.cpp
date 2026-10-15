@@ -38,11 +38,14 @@ ip22::IndyConfig Settings::indy_config() const {
         c.scache_bytes = m->scache_bytes;
     }
     c.graphics = graphics;
+    c.xl24 = xl24;
     c.disk_image = disk;
     c.cdrom_images = cdroms;
     c.mac = mac;
     return c;
 }
+
+const char* graphics_name(const Settings& s) { return !s.graphics ? "none" : s.xl24 ? "xl24" : "xl8"; }
 
 const char* timing_name(Pacer::Mode mode) {
     switch (mode) {
@@ -126,7 +129,13 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 1000 && (s.cpu_mhz = n, true);
     else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 256 && static_cast<unsigned>(n) % 16 == 0 &&
                                   (s.ram_mb = static_cast<unsigned>(n), true);
-    else if (key == "graphics") ok = parse_bool(v, s.graphics);
+    else if (key == "graphics") {
+        // xl8, xl24 or none (1 and 0 from older files: XL8, none)
+        bool on = false;
+        if (v == "xl8" || v == "xl24" || v == "none") s.graphics = v != "none", s.xl24 = v == "xl24";
+        else if (parse_bool(v, on)) s.graphics = on, s.xl24 = false;
+        else ok = false;
+    }
     else if (key == "mac") {
         std::array<u8, 6> mac{};
         if (v.empty()) s.mac.reset();
@@ -183,7 +192,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         f << "# SiliconGhost settings\n";
         f << "prom=" << s.prom << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
-        f << "cpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << (s.graphics ? 1 : 0)
+        f << "cpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
           << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nmax_speed=" << s.max_speed << "\nidle_skip=" << (s.idle_skip ? 1 : 0)

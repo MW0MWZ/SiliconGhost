@@ -56,7 +56,7 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | Serial | Zilog 85230 SCC (two ports) | working |
 | Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved as it changes |
 | SCSI | WD33C93 with disk and CD-ROM targets | working |
-| Graphics | Newport XL8 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit board) |
+| Graphics | Newport XL8 and XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit and 24-bit boards) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
 | Audio | HAL2 | playback and recording (codec); digital input silent |
@@ -143,7 +143,7 @@ Main options (`siliconghost --help` lists them all):
 | `--ram MB` | memory size, 16 to 256 (default 64) |
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
-| `--no-graphics` | no graphics board: the console is on the first serial port |
+| `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
@@ -327,9 +327,10 @@ with performance layers on top that must give exactly the same results:
 
 ## Known limitations
 
-- Only the 8-bit Newport (XL8) is emulated. Blending and antialiased lines
-  are drawn without the effect, which most of the desktop and the demos tried
-  so far do not use.
+- Newport: CID checking (CLIPMODE's CIDMATCH) is not applied; IRIX clears
+  the CID planes to one code and clips windows with the screen masks. The
+  order of the antialiased-line weight table's entries is assumed (the
+  specification does not give it).
 - Audio recording uses the host's default input, with the codec's input
   gain applied. The host has one input, so the microphone and line jacks
   both hear it (at the host's level), and the digital (AES) input records
@@ -350,7 +351,6 @@ with performance layers on top that must give exactly the same results:
 
 ## Roadmap
 
-- Newport 24-bit boards (XL24) and the remaining raster operations
 - Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
 - Indigo² (IP22 "Fullhouse") machine profile

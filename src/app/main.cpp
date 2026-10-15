@@ -80,7 +80,8 @@ void usage(const char* argv0) {
                  "  --ram MB         memory size, 16..256 (default 64)\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc or r4000pc\n"
                  "  --cpu-mhz N      pipeline clock (default 150)\n"
-                 "  --no-graphics    leave the GFX slot empty (serial console only)\n"
+                 "  --graphics BOARD xl8 (8-bit Newport, the default), xl24 (24-bit) or none\n"
+                 "  --no-graphics    leave the GFX slot empty (serial console only), as --graphics none\n"
                  "  --headless       no window: both serial ports use this terminal\n"
                  "  --foreground     keep the window's messages on this terminal (the window otherwise\n"
                  "                   runs in the background, writing them to siliconghost.log)\n"
@@ -242,7 +243,7 @@ int main(int argc, char** argv) {
         } kValued[] = {{"--prom", "prom"},   {"--nvram", "nvram"},     {"--disk", "disk"},
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},
-                       {"--cpu-mhz", "cpu_mhz"}, {"--timing", "timing"}, {"--max-speed", "max_speed"},
+                       {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"}, {"--timing", "timing"}, {"--max-speed", "max_speed"},
                        {"--log", "log"}};
         static const struct {
             const char* flag;
