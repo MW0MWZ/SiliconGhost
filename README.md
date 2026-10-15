@@ -62,7 +62,7 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | Graphics | Newport XL8 and XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit and 24-bit boards) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
-| Audio | HAL2 | playback and recording (codec); digital input silent |
+| Audio | HAL2 | working (playback and recording) |
 
 ## Building
 
@@ -302,6 +302,10 @@ network needs), and the Indy is configured like any machine on that network.
 | Audio recording | no (not supported by NetBSD's driver) | no (no driver) |
 | Real-time clock and NVRAM | yes | yes |
 
+NetBSD 11.0's installer boots the same way as 9.0's and attaches the same
+devices, its Newport console showing no text either; the rest of the table
+was checked on 9.0.
+
 ### Running NetBSD
 
 NetBSD/sgimips 9.0 runs on the serial console (start with `--no-graphics`
@@ -410,17 +414,14 @@ with performance layers on top that must give exactly the same results:
   the CID planes to one code and clips windows with the screen masks. The
   order of the antialiased-line weight table's entries is assumed (the
   specification does not give it).
-- Audio recording uses the host's default input, with the codec's input
-  gain applied. The host has one input, so the microphone and line jacks
-  both hear it (at the host's level), and the digital (AES) input records
-  silence, as with nothing plugged in. NetBSD's driver plays but does not
-  record.
-- NetBSD's Newport console shows no text: NetBSD decides between the 8-bit
-  and 24-bit boards from a register read whose real-hardware result is not
-  known yet, and on the emulated board it chooses 24-bit. Use the serial
+- NetBSD's Newport console shows no text (9.0 and 11.0): these releases
+  read the board's revision just after a VC2 register access, a read whose
+  result on real hardware is not known, and on the emulated board they take
+  it for a 24-bit board. NetBSD's development source reads the revision
+  directly, as OpenBSD does (OpenBSD's console works). Use the serial
   console.
-- IRIX 5.3, IRIX 6.5, NetBSD 9.0 and OpenBSD 6.9 are the systems tested so
-  far; Linux has not been tried. (Current Debian releases no longer include
+- IRIX 5.3, IRIX 6.5, NetBSD 9.0 and 11.0 and OpenBSD 6.9 are the systems
+  tested so far; Linux has not been tried. (Current Debian releases no longer include
   Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
 - The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
