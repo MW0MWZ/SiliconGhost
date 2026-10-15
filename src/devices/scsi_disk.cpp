@@ -17,7 +17,7 @@ constexpr u8 kCheckCondition = 0x02;
 
 constexpr u8 kSenseNone = 0x0, kSenseNotReady = 0x2, kSenseMediumError = 0x3, kSenseIllegalRequest = 0x5;
 constexpr u8 kSenseUnitAttention = 0x6, kSenseDataProtect = 0x7;
-constexpr u8 kAscMediumChanged = 0x28, kAscMediumNotPresent = 0x3A, kAscRemovalPrevented = 0x53;
+constexpr u8 kAscMediumChanged = 0x28, kAscPowerOnReset = 0x29, kAscMediumNotPresent = 0x3A, kAscRemovalPrevented = 0x53;
 constexpr u8 kAscInvalidOpcode = 0x20, kAscLbaOutOfRange = 0x21, kAscWriteProtected = 0x27;
 constexpr u8 kAscUnrecoveredRead = 0x11, kAscInvalidParameter = 0x26;
 
@@ -36,7 +36,17 @@ void put_padded(u8* p, const char* s, std::size_t n) {
 
 }  // namespace
 
-ScsiDisk::ScsiDisk(Kind kind, const std::string& path) : kind_(kind), read_only_(kind == Kind::CdRom) { open(path); }
+ScsiDisk::ScsiDisk(Kind kind, const std::string& path) : kind_(kind), read_only_(kind == Kind::CdRom) {
+    block_size_ = default_block_size();
+    open(path);
+}
+
+void ScsiDisk::reset() {
+    block_size_ = default_block_size();
+    prevent_removal_ = false;
+    unit_attention_ = true;
+    attention_asc_ = kAscPowerOnReset;
+}
 
 bool ScsiDisk::open(const std::string& path) {
     if (file_.is_open()) file_.close();
@@ -50,7 +60,7 @@ bool ScsiDisk::open(const std::string& path) {
     }
     if (file_.is_open()) {
         file_.seekg(0, std::ios::end);
-        bytes_ = static_cast<u64>(file_.tellg()) / kDefaultBlockSize * kDefaultBlockSize;
+        bytes_ = static_cast<u64>(file_.tellg()) / kDiskBlockSize * kDiskBlockSize;
     }
     return file_.is_open();
 }
@@ -61,11 +71,13 @@ void ScsiDisk::eject() {
     bytes_ = 0;
     prevent_removal_ = false;
     unit_attention_ = true;
+    attention_asc_ = kAscMediumChanged;
 }
 
 bool ScsiDisk::change_medium(const std::string& path) {
     prevent_removal_ = false;
     unit_attention_ = true;
+    attention_asc_ = kAscMediumChanged;
     return open(path);
 }
 
@@ -153,7 +165,7 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
     if (op != 0x03 && op != 0x12) {
         if (unit_attention_) {
             unit_attention_ = false;
-            return check_condition(kSenseUnitAttention, kAscMediumChanged);
+            return check_condition(kSenseUnitAttention, attention_asc_ ? attention_asc_ : kAscMediumChanged);
         }
         if (!file_.is_open() && op != 0x1B && op != 0x1E) return check_condition(kSenseNotReady, kAscMediumNotPresent);
     }
@@ -284,7 +296,7 @@ u8 ScsiDisk::finish_data_out(const u8* cdb, const std::vector<u8>& data) {
         const std::size_t descriptors = data.size() < header ? 0 : op == 0x15 ? data[3] : be16(&data[6]);
         if (descriptors >= 8 && data.size() >= header + 8) {
             const u32 size = (u32{data[header + 5]} << 16) | (u32{data[header + 6]} << 8) | data[header + 7];
-            const bool ok = size == 0 || size == kDefaultBlockSize || (kind_ == Kind::CdRom && size == 2048);
+            const bool ok = size == 0 || size == kDiskBlockSize || (kind_ == Kind::CdRom && size == kCdBlockSize);
             if (!ok) {
                 check_condition(kSenseIllegalRequest, kAscInvalidParameter);
                 return kCheckCondition;

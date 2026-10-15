@@ -30,6 +30,9 @@ constexpr u8 kStatusSelectDone = 0x11;
 constexpr u8 kStatusSelectTransferDone = 0x16;
 constexpr u8 kStatusTransferDone = 0x18;     // Transfer Info done | phase now requested
 constexpr u8 kStatusMessageInPaused = 0x20;  // message byte received, ACK still asserted
+constexpr u8 kStatusSelectAborted = 0x22;
+constexpr u8 kStatusTransferAborted = 0x28;  // | phase requested
+constexpr u8 kStatusInvalidCommand = 0x40;
 constexpr u8 kStatusSelectionTimeout = 0x42;
 constexpr u8 kStatusUnexpectedPhase = 0x48;  // | phase requested
 constexpr u8 kStatusDisconnect = 0x85;
@@ -49,6 +52,10 @@ constexpr u8 kMsgMessageReject = 0x07;
 
 // Approximate bus throughput for completion timing: 5 MB/s.
 constexpr double kBytesPerMs = 5000.0;
+// From the end of the command phase to STATUS: a target takes a while to
+// act on a command, and drivers count on not seeing the status interrupt
+// at once (OpenBSD's frees the request it is still looking at).
+constexpr double kCommandMs = 0.2;
 
 constexpr u8 kOwnIdAdvancedFeatures = 0x08;
 
@@ -121,14 +128,17 @@ void Wd33c93::finish_in(u8 status, double ms) {
 void Wd33c93::select(ScsiTarget& target, bool atn) {
     release_bus();
     target_ = &target;
+    lun_ = regs_[kTargetLun] & 7;
     bus_phase_ = atn ? kBusMessageOut : kBusCommand;
 }
 
 // The target has the whole CDB: it executes the command and asks for the
-// data phase, if any, or goes straight to status.
+// data phase, if any, or goes straight to status. The LUN addressed goes to
+// the target in the CDB's LUN field (it serves LUN 0 only).
 void Wd33c93::issue_command(const u8* cdb, unsigned length) {
     std::fill(std::begin(cdb_), std::end(cdb_), u8{0});
     std::copy(cdb, cdb + std::min<unsigned>(length, sizeof cdb_), cdb_);
+    if (lun_) cdb_[1] = static_cast<u8>((cdb_[1] & 0x1F) | (lun_ << 5));
     ScsiTarget::Result r = target_->command(cdb_, length);
     SG_LOG(Debug, "wd33c93", "cdb %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x: count %u, in %zu, out %u, status %02x",
            cdb_[0], cdb_[1], cdb_[2], cdb_[3], cdb_[4], cdb_[5], cdb_[6], cdb_[7], cdb_[8], cdb_[9], transfer_count(),
@@ -156,6 +166,7 @@ bool Wd33c93::receive_messages(const std::vector<u8>& m) {
     for (std::size_t i = 0; i < m.size();) {
         const u8 b = m[i];
         if (b & 0x80) {  // IDENTIFY
+            lun_ = b & 7;
             ++i;
         } else if (b == 0x01 && i + 1 < m.size()) {  // extended message
             const std::size_t len = m[i + 1];
@@ -167,6 +178,7 @@ bool Wd33c93::receive_messages(const std::vector<u8>& m) {
             }
             i += 2 + len;
         } else if (b == 0x06 || b == 0x0C) {  // ABORT / BUS DEVICE RESET
+            if (b == 0x0C && target_) target_->bus_reset();
             return false;
         } else {
             if (b != 0x08) msg_in_.push_back(kMsgMessageReject);  // all but NO OPERATION
@@ -220,7 +232,7 @@ void Wd33c93::sat_complete(u32 moved) {
     regs_[kTargetLun] = target_status_;
     regs_[kCommandPhase] = kPhaseCommandComplete;
     release_bus();
-    finish_in(kStatusSelectTransferDone, 0.05 + moved / kBytesPerMs);
+    finish_in(kStatusSelectTransferDone, kCommandMs + moved / kBytesPerMs);
 }
 
 // TRANSFER INFO in a data phase, by DMA (waiting for the host's channel if
@@ -330,11 +342,13 @@ void Wd33c93::end_pio_out() {
             return;
         }
         bus_phase_ = msg_in_.empty() ? kBusCommand : kBusMessageIn;
-    } else {  // COMMAND
-        issue_command(pio_.data(), static_cast<unsigned>(pio_.size()));
+        pio_.clear();
+        finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.01);
+        return;
     }
+    issue_command(pio_.data(), static_cast<unsigned>(pio_.size()));  // COMMAND
     pio_.clear();
-    finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.01);
+    finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), kCommandMs);
 }
 
 // The host took an inbound byte from the data register.
@@ -371,12 +385,23 @@ void Wd33c93::negate_ack() {
     }
 }
 
-// Nothing answers: selection times out after the programmed period
-// (timeout register x 8192 input clocks; 20 MHz).
+// Nothing answers: selection times out after the programmed period, value x
+// 80 / input clock (MHz) milliseconds, the clock given by the Own ID
+// register's frequency select (20 MHz on the Indy); 0 never times out.
 void Wd33c93::selection_timeout() {
-    const unsigned period = regs_[kTimeout] ? regs_[kTimeout] : 1;
     SG_LOG(Debug, "wd33c93", "select target %u: no device", regs_[kDestinationId] & 7);
-    finish_in(kStatusSelectionTimeout, period * 8192.0 / 20000.0);
+    regs_[kCommandPhase] = 0;
+    if (!regs_[kTimeout]) {
+        aux_status_ |= kAuxBusy;  // selecting for ever
+        return;
+    }
+    static constexpr double kClockMhz[4] = {10.0, 15.0, 20.0, 20.0};
+    finish_in(kStatusSelectionTimeout, regs_[kTimeout] * 80.0 / kClockMhz[regs_[kOwnId] >> 6]);
+}
+
+void Wd33c93::bus_reset() {
+    for (ScsiTarget* t : targets_)
+        if (t) t->bus_reset();
 }
 
 // --- host interface ------------------------------------------------------------
@@ -454,25 +479,50 @@ void Wd33c93::write_data(u8 value) {
     advance_address();
 }
 
+// Level I commands (reset, abort, ATN, ACK, disconnect) are taken while a
+// Level II command is still running (busy, but not yet interpreting the
+// last command). Anything written while an interrupt is pending is ignored.
 void Wd33c93::command(u8 cmd) {
-    if (aux_status_ & (kAuxBusy | kAuxCip)) {
-        aux_status_ |= kAuxLci;  // a command is still executing: ignored
+    const u8 code = cmd & 0x7F;
+    const bool level1 = code <= kCmdDisconnect;
+    if ((aux_status_ & kAuxCip) || ((aux_status_ & kAuxBusy) && !level1) || ((aux_status_ & kAuxInt) && code != kCmdReset)) {
+        aux_status_ |= kAuxLci;
         return;
     }
     aux_status_ &= static_cast<u8>(~kAuxLci);
     single_byte_ = (cmd & 0x80) != 0;  // SBT
     SG_LOG(Debug, "wd33c93", "command %02x (dest %u, phase %02x)", cmd, regs_[kDestinationId] & 7, regs_[kCommandPhase]);
     ScsiTarget* const dest = targets_[regs_[kDestinationId] & 7];
-    switch (cmd & 0x7F) {
+    switch (code) {
         case kCmdReset: {
+            // Registers 0x01-0x16 clear; the Own ID register keeps its value.
+            timer_->cancel();
             const u8 own_id = regs_[kOwnId];
-            const u8 timeout = regs_[kTimeout];
             regs_.fill(0);
             regs_[kOwnId] = own_id;
-            regs_[kTimeout] = timeout;
             release_bus();
-            aux_status_ |= kAuxCip;
+            queued_status_ = 0;
+            aux_status_ = kAuxCip;
+            if (irq_cb_) irq_cb_(false);
             finish_in((own_id & kOwnIdAdvancedFeatures) ? kStatusResetAdvanced : kStatusReset, 0.01);
+            return;
+        }
+        case kCmdAbort: {
+            // A selection being attempted is given up (and the bus left
+            // free); a transfer stops, the count holding what was not moved,
+            // and the target stays connected.
+            const bool busy = aux_status_ & kAuxBusy;
+            timer_->cancel();
+            dma_wait_ = DmaWait::None;
+            aux_status_ &= static_cast<u8>(~(kAuxBusy | kAuxDbr));
+            queued_status_ = 0;
+            if (target_ && (busy || bus_phase_ != kBusCommand)) {
+                pio_.clear();
+                finish_in(static_cast<u8>(kStatusTransferAborted | bus_phase_), 0.01);
+            } else {
+                release_bus();
+                finish_in(kStatusSelectAborted, 0.01);
+            }
             return;
         }
         case kCmdSelectAtnTransfer:
@@ -503,12 +553,17 @@ void Wd33c93::command(u8 cmd) {
             else aux_status_ |= kAuxLci;
             return;
         case kCmdNegateAck: negate_ack(); return;
-        case kCmdAbort:
-        case kCmdDisconnect: release_bus(); return;  // drops off the bus; no interrupt
+        case kCmdDisconnect:  // drops off the bus; no interrupt
+            timer_->cancel();
+            aux_status_ &= static_cast<u8>(~(kAuxBusy | kAuxDbr));
+            release_bus();
+            return;
         case kCmdAssertAtn: return;
         default:
-            SG_LOG(Debug, "wd33c93", "command %02x ignored", cmd);
-            aux_status_ |= kAuxLci;
+            if (level1) return;
+            // Target-role and other commands the initiator cannot run here.
+            SG_LOG(Debug, "wd33c93", "command %02x invalid", cmd);
+            finish_in(kStatusInvalidCommand, 0.01);
             return;
     }
 }

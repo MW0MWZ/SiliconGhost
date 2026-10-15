@@ -288,7 +288,7 @@ network needs), and the Indy is configured like any machine on that network.
 | | NetBSD 9.0/sgimips | OpenBSD 6.9/sgi |
 |---|---|---|
 | Installer boots from the CD | yes (from the Command Monitor) | yes (from the Command Monitor) |
-| Installation sets read from the CD | no (see below) | no (see below) |
+| Installation sets read from the CD | no (see below) | yes |
 | Installation over the network (HTTP/FTP) | yes | yes |
 | Installed system boots multi-user from disk | yes | yes |
 | Serial console | yes | yes |
@@ -365,11 +365,9 @@ boot -f dksc(0,4,8)bootecof dksc(0,4,0)bsd.rd.IP22
 (The volume header holds the loader as `bootecof`, names being limited to
 eight characters. The automatic boot picks a loader that does not fit an
 Indy's memory, as OpenBSD's own notes say.)
-Install the sets over the network (*http*, from an OpenBSD mirror's
-`pub/OpenBSD/6.9/sgi`): the installer does not read them from the CD on the
-emulated drive, which runs with 512-byte blocks as SGI's drives do, while
-the CD's file system is laid out in 2048-byte sectors. To boot the installed
-system:
+The installer reads its sets from the CD (*cd0*, directory `6.9/sgi`), or
+over the network (*http*, from an OpenBSD mirror's `pub/OpenBSD/6.9/sgi`).
+To boot the installed system:
 
 ```
 setenv OSLoader boot

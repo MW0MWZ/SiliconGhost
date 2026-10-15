@@ -110,6 +110,7 @@ void Hpc3::reset() {
     eeprom_.set_lines(false, false, false);
     scsi0_.reset();
     scsi_dma_ = ScsiDma{};
+    scsi_dma_.in_reset = true;  // the channel reset bit is set at power-on
     for (unsigned ch = 0; ch < kPbusChannels; ++ch) {
         pbus_timer_[ch]->cancel();
         pbus_[ch] = PbusChannel{};
@@ -568,6 +569,7 @@ u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
             d.irq = true;
             update_dma_irq();
         }
+        if (d.bc == 0 && (d.flags & kDescEox)) d.active = false;  // end of the chain
     }
     if (moved < length) SG_LOG(Debug, "hpc3", "SCSI DMA chain ended after %u of %u bytes", moved, length);
     return moved;
@@ -689,8 +691,9 @@ u32 Hpc3::read_word(u32 offset) {
         case kScsi0Ndbp: return scsi_dma_.ndbp;
         case kScsi0Bc: return (scsi_dma_.flags & ~kDescCountMask) | scsi_dma_.bc;
         case kScsi0Ctrl: {
-            const u32 v = (scsi_dma_.ctrl & (kScsiCtrlEndian | kScsiCtrlDir)) | (scsi_dma_.active ? kScsiCtrlActive : 0) |
-                          (scsi_dma_.irq ? kScsiCtrlIrq : 0);
+            const u32 v = (scsi_dma_.ctrl & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush)) |
+                          (scsi_dma_.active ? kScsiCtrlActive : 0) | (scsi_dma_.irq ? kScsiCtrlIrq : 0) |
+                          (scsi_dma_.in_reset ? kScsiCtrlReset : 0);
             scsi_dma_.irq = false;  // reading the control register acknowledges the interrupt
             update_dma_irq();
             return v;
@@ -722,14 +725,17 @@ void Hpc3::write_word(u32 offset, u32 value) {
             eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut);
             return;
         case kGioMisc: regs_[offset] = value & 3; return;
-        case kScsi0Ndbp:
+        case kScsi0Ndbp:  // the descriptor in use, if any, is finished first
             scsi_dma_.ndbp = value;
-            scsi_dma_.bc = 0;
-            scsi_dma_.loaded = false;
+            if (!scsi_dma_.active) {
+                scsi_dma_.bc = 0;
+                scsi_dma_.loaded = false;
+            }
             return;
         case kScsi0Ctrl: {
             ScsiDma& d = scsi_dma_;
-            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset
+            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset, and resets the bus
+                if (!d.in_reset) scsi0_.bus_reset();
                 scsi0_.reset();
                 d = ScsiDma{};
                 d.in_reset = true;
@@ -740,7 +746,7 @@ void Hpc3::write_word(u32 offset, u32 value) {
                 d.in_reset = false;
                 scsi0_.reset_released();
             }
-            d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir);
+            d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush);
             if (!(value & kScsiCtrlActiveMask)) {
                 const bool start = (value & kScsiCtrlActive) && !d.active;
                 d.active = value & kScsiCtrlActive;

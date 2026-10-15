@@ -216,9 +216,7 @@ TEST(wd33c93_reset_and_selection_timeout) {
     bool irq = false;
     wd.set_irq_callback([&](bool a) { irq = a; });
     wd.write_address(0x00);
-    wd.write_data(0x08 | 7);  // own ID 7, advanced features
-    wd.write_address(0x02);
-    wd.write_data(0x20);      // selection timeout period
+    wd.write_data(0x80 | 0x08 | 7);  // 20 MHz input clock, advanced features, own ID 7
     wd.write_address(0x18);
     wd.write_data(0x00);      // RESET
     CHECK(wd.read_aux_status() & 0x10);
@@ -227,18 +225,22 @@ TEST(wd33c93_reset_and_selection_timeout) {
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x01);  // reset with advanced features
     CHECK(!irq);
+    wd.write_address(0x02);
+    wd.write_data(0x20);     // selection timeout period (RESET cleared it): 32 x 80 / 20 = 128 ms
     wd.write_address(0x15);
     wd.write_data(3);        // destination ID
     wd.write_address(0x18);
     wd.write_data(0x07);     // SELECT without ATN
     CHECK(wd.read_aux_status() & 0x20);
-    clk.advance_to(100000 + 150000 * 20);  // ~13 ms timeout at 20 MHz
+    clk.advance_to(100000 + 150000 * 120);
+    CHECK(!irq);
+    clk.advance_to(100000 + 150000 * 130);
     CHECK(irq);
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x42);  // selection timeout
     wd.write_address(0x18);
     wd.write_data(0x04);  // DISCONNECT while not connected: no interrupt
-    clk.advance_to(100000 + 150000 * 40);
+    clk.advance_to(100000 + 150000 * 140);
     CHECK(!irq);
 }
 
@@ -284,13 +286,13 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     CHECK_EQ(r.data_in[0], 0x05);  // CD-ROM
     const u8 capacity[10] = {0x25};
     r = cd.command(capacity, 10);
-    CHECK_EQ(r.data_in[3], 15);    // last LBA
-    CHECK_EQ(r.data_in[6], 0x02);  // 512-byte blocks
-    const u8 read10[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 2, 0};
+    CHECK_EQ(r.data_in[3], 3);     // last LBA: 2048-byte blocks at power-on
+    CHECK_EQ(r.data_in[6], 0x08);
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 1, 0, 0, 2, 0};
     r = cd.command(read10, 10);
-    CHECK_EQ(r.data_in.size(), 1024u);
-    CHECK_EQ(r.data_in[0], 3);
-    CHECK_EQ(r.data_in[600], 4);
+    CHECK_EQ(r.data_in.size(), 4096u);
+    CHECK_EQ(r.data_in[0], 4);      // 512-byte block 4 starts 2048-byte block 1
+    CHECK_EQ(r.data_in[2648], 9);   // 2048 + 600 bytes in: 512-byte block 9
     const u8 write10[10] = {0x2A, 0, 0, 0, 0, 0, 0, 0, 1, 0};
     r = cd.command(write10, 10);
     CHECK_EQ(r.status, 0x02);  // write-protected medium
@@ -298,33 +300,43 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
 
 // MODE SELECT's block descriptor switches the CD-ROM to 2048-byte blocks
 // (as OpenBSD does); the disk stays at 512; a reset restores 512.
+// MODE SELECT's block descriptor switches the CD-ROM between 2048-byte
+// blocks (its power-on size) and 512 (as the PROM and IRIX select); a bus
+// reset restores 2048 and reports UNIT ATTENTION. The disk stays at 512.
 TEST(scsi_mode_select_sets_the_cdrom_block_size) {
     const TempImage image(16);
     ScsiDisk cd(ScsiDisk::Kind::CdRom, image.path);
     const u8 select6[6] = {0x15, 0x10, 0, 0, 12, 0};
-    std::vector<u8> params = {0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0x08, 0x00};  // header, descriptor: 2048
+    std::vector<u8> params = {0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0x02, 0x00};  // header, descriptor: 512
     auto r = cd.command(select6, 6);
     CHECK_EQ(r.data_out_length, 12u);
     CHECK_EQ(cd.finish_data_out(select6, params), 0x00);
     const u8 capacity[10] = {0x25};
     r = cd.command(capacity, 10);
-    CHECK_EQ(r.data_in[3], 3);     // last LBA of four 2048-byte blocks
-    CHECK_EQ(r.data_in[6], 0x08);  // 2048-byte blocks
-    const u8 read10[10] = {0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0};
+    CHECK_EQ(r.data_in[3], 15);    // last LBA of sixteen 512-byte blocks
+    CHECK_EQ(r.data_in[6], 0x02);
+    const u8 read10[10] = {0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0};
     r = cd.command(read10, 10);
-    CHECK_EQ(r.data_in.size(), 2048u);
-    CHECK_EQ(r.data_in[0], 4);  // 512-byte block 4 starts 2048-byte block 1
+    CHECK_EQ(r.data_in.size(), 512u);
+    CHECK_EQ(r.data_in[0], 3);
     const u8 sense6[6] = {0x1A, 0, 0, 0, 12, 0};
     r = cd.command(sense6, 6);
-    CHECK_EQ(r.data_in[10], 0x08);  // the descriptor reports it
-    cd.reset();
+    CHECK_EQ(r.data_in[10], 0x02);  // the descriptor reports it
+    cd.bus_reset();
     r = cd.command(capacity, 10);
-    CHECK_EQ(r.data_in[6], 0x02);
+    CHECK_EQ(r.status, 0x02);  // UNIT ATTENTION first
+    const u8 sense[6] = {0x03, 0, 0, 0, 18, 0};
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x06);
+    CHECK_EQ(r.data_in[12], 0x29);  // power on or reset
+    r = cd.command(capacity, 10);
+    CHECK_EQ(r.data_in[6], 0x08);
 
     const TempImage disk_image(16);
     ScsiDisk disk(ScsiDisk::Kind::Disk, disk_image.path);
+    params[10] = 0x08;
     disk.command(select6, 6);
-    CHECK_EQ(disk.finish_data_out(select6, params), 0x02);  // not supported
+    CHECK_EQ(disk.finish_data_out(select6, params), 0x02);  // 2048 not supported
     CHECK_EQ(disk.block_size(), 512u);
 }
 
@@ -351,7 +363,7 @@ TEST(scsi_cdrom_eject_changes_disc_with_unit_attention) {
     CHECK_EQ(r.status, 0x00);
     const u8 capacity[10] = {0x25};
     r = cd.command(capacity, 10);
-    CHECK_EQ(r.data_in[3], 31);  // the new disc
+    CHECK_EQ(r.data_in[3], 7);  // the new disc: 32 x 512 bytes in 2048-byte blocks
     // Ejected with nothing put back: not ready, medium not present.
     cd.set_eject_callback({});
     cd.command(eject, 6);

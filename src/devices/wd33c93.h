@@ -53,6 +53,8 @@ public:
         dma_from_memory_ = std::move(from_memory);
     }
     void attach(unsigned id, ScsiTarget* target) { targets_[id & 7] = target; }
+    // The SCSI bus RST line was asserted: every target resets.
+    void bus_reset();
     bool irq() const { return (aux_status_ & kAuxInt) != 0; }
 
 private:
@@ -114,6 +116,7 @@ private:
     u8 bus_phase_ = 0;              // phase the target is requesting
     u8 cdb_[12] = {};
     u8 target_status_ = 0;
+    u8 lun_ = 0;                    // logical unit addressed (Target LUN register or IDENTIFY)
     bool command_done_ = false;     // status sent; COMMAND COMPLETE follows
     bool single_byte_ = false;
     enum class DmaWait { None, TransferInfo, SelectAndTransfer } dma_wait_ = DmaWait::None;      // the current command moves one byte, leaving the count alone
