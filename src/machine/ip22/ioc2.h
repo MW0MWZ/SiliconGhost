@@ -42,6 +42,11 @@ public:
     void set_cpu_line_callback(CpuLineCallback cb) { cpu_line_ = std::move(cb); }
     void set_power_off_callback(std::function<void()> cb) { power_off_ = std::move(cb); }
 
+    // The Indy's front-panel buttons. Each press raises the panel interrupt;
+    // the volume buttons also read as held until released.
+    enum class PanelButton { Power, VolumeDown, VolumeUp };
+    void panel_button(PanelButton button, bool pressed);
+
     Z85230& scc() { return scc_; }
     Kbc8042& kbc() { return kbc_; }
     Pit8254& pit() { return pit_; }

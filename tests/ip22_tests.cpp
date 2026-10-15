@@ -127,7 +127,21 @@ TEST(ip22_rpss_counts_100ns) {
 TEST(ip22_ioc_identity_and_panel) {
     IndyRig t;
     CHECK_EQ(t.r8(ioc_addr(0x58)), 0x26);  // sysid: Indy
-    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xA1);  // panel: power on, buttons released
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF3);  // panel: power on, nothing pending, buttons released
+}
+
+TEST(ip22_panel_buttons_are_active_low) {
+    IndyRig t;
+    t.m.ioc().panel_button(ip22::Ioc2::PanelButton::Power, true);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF1);  // power interrupt pending
+    t.w8(ioc_addr(0x50), 0x03);            // acknowledged, as Linux does
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF3);
+    t.m.ioc().panel_button(ip22::Ioc2::PanelButton::VolumeUp, true);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0x33);  // volume-up interrupt pending, button held
+    t.w8(ioc_addr(0x50), 0x41);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0x73);  // acknowledged, still held
+    t.m.ioc().panel_button(ip22::Ioc2::PanelButton::VolumeUp, false);
+    CHECK_EQ(t.r8(ioc_addr(0x50)), 0xF3);
 }
 
 TEST(ip22_pit_counts_microseconds) {

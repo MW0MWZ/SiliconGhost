@@ -16,9 +16,14 @@ constexpr double kPitClock2 = 1.0e6;  // counter 2 input; its output clocks coun
 constexpr u8 kPanelPowerOn = 0x01;
 constexpr u8 kPanelPowerInt = 0x02;
 constexpr u8 kPanelVolDownInt = 0x10;
+constexpr u8 kPanelVolDownHold = 0x20;  // 0 while the button is held
 constexpr u8 kPanelVolUpInt = 0x40;
+constexpr u8 kPanelVolUpHold = 0x80;
 constexpr u8 kPanelIntMask = kPanelPowerInt | kPanelVolDownInt | kPanelVolUpInt;
-constexpr u8 kPanelReset = 0xA1;  // power on, both volume buttons released
+// The interrupt and hold bits are active low: a button press clears its
+// interrupt bit (pending until the driver writes a 1 to it) and its hold bit
+// (until it is released). IRIX writes 0xF3 to acknowledge everything.
+constexpr u8 kPanelReset = 0xF3;  // power on, nothing pending, buttons released
 
 enum Index : unsigned {
     kSccBCtrl = 0x0C, kSccBData = 0x0D, kSccACtrl = 0x0E, kSccAData = 0x0F,
@@ -68,6 +73,17 @@ void Ioc2::set_bit(u8& reg, unsigned bit, bool level) {
     update_outputs();
 }
 
+void Ioc2::panel_button(PanelButton button, bool pressed) {
+    u8 irq = kPanelPowerInt, hold = 0;
+    if (button == PanelButton::VolumeDown) irq = kPanelVolDownInt, hold = kPanelVolDownHold;
+    if (button == PanelButton::VolumeUp) irq = kPanelVolUpInt, hold = kPanelVolUpHold;
+    SG_LOG(Debug, "ioc", "panel button %d %s (local1 mask %02x)", static_cast<int>(button), pressed ? "down" : "up",
+           local1_mask_);
+    if (pressed) panel_ = static_cast<u8>(panel_ & ~(irq | hold));
+    else panel_ |= hold;
+    update_outputs();
+}
+
 u8 Ioc2::local0_status() const {
     u8 s = local0_raw_ & 0x7F;
     if (map_raw_ & map_mask0_) s |= 1u << kL0Mappable0;
@@ -77,7 +93,7 @@ u8 Ioc2::local0_status() const {
 u8 Ioc2::local1_status() const {
     u8 s = local1_raw_ & ~(1u << kL1Mappable1) & ~(1u << kL1Panel);
     if (map_raw_ & map_mask1_) s |= 1u << kL1Mappable1;
-    if (panel_ & kPanelIntMask) s |= 1u << kL1Panel;
+    if (~panel_ & kPanelIntMask) s |= 1u << kL1Panel;
     return s;
 }
 
@@ -180,7 +196,9 @@ void Ioc2::write(unsigned index, u8 value) {
         case kGcSel:
         case kGenCtrl: return;
         case kPanel:
-            panel_ = static_cast<u8>((panel_ & ~(value & kPanelIntMask)) & ~kPanelPowerOn) | (value & kPanelPowerOn);
+            SG_LOG(Debug, "ioc", "panel write %02x (was %02x, local1 mask %02x)", value, panel_, local1_mask_);
+            // Writing 1 to an interrupt bit acknowledges it; 0 leaves it.
+            panel_ = static_cast<u8>(((panel_ | (value & kPanelIntMask)) & ~kPanelPowerOn) | (value & kPanelPowerOn));
             if (!(value & kPanelPowerOn)) {
                 SG_LOG(Info, "ioc", "power off requested");
                 if (power_off_) power_off_();
