@@ -129,7 +129,11 @@ private:
     };
     const ModeTable& mode_table(unsigned did);
     u32 direct_colour(u32 mode, u32 pix) const;
-    u32 special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const;  // cursor, PUP, overlay
+    u32 special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const;  // cursor, PUP, overlay, underlay or pixel
+    bool aux_layer(u32 mode, bool pixel_nonzero, u32 aux, unsigned cursor, u32& addr) const;
+    u32 aux_mask(u32 mode, bool& underlay) const;
+    bool pixel_value_nonzero(u32 mode, u32 pix) const;
+    u32 pixel_colour(u32 mode, u32 pix) const;
     u8 did_at(const std::vector<std::pair<int, u8>>& records, int x) const;
     unsigned cursor_pixel(int x, int y) const;
     void retrace();

@@ -442,3 +442,42 @@ TEST(newport_dcb_crs_increment_persists) {
     t.w(kDcbMode, width(1) | crs(5) | slave(0));  // CRS 5 = CRS 1 on the VC2
     CHECK_EQ(t.r(kDcbData0) >> 24, 0x12u);
 }
+
+// The XMAP9 picks among the layers: a non-zero overlay over the pixel, the
+// pixel over the underlay, the underlay behind zero pixels.
+TEST(newport_overlay_and_underlay_layers) {
+    Rig t(Newport::Options{true});  // the XL24: 8 overlay bits per buffer
+    t.vc2_ram(0x000, {0x8380});
+    t.vc2_ram(0x400, {0x000, 1, 0, 0});
+    t.vc2_reg(0x1F, 1);
+    t.vc2_reg(0x00, 0x400);
+    t.vc2_reg(0x10, 0x0006);
+    t.w(kDcbMode, width(1) | crs(0) | slave(4));
+    t.w(kDcbData0, 0x00);  // XMAP config: 24-bit system, pop-ups off
+    // Mode 0: 8bpp CI over an 8-bit underlay with AUX_MSB_CMAP 1 (0x100 up).
+    t.xmap_mode(0, (1u << 19) | (1u << 16) | 0x000404);
+    t.cmap_entry(0x42, 0x123456);   // the pixel
+    t.cmap_entry(0x105, 0x00FF00);  // underlay value 5
+    t.cmap_entry(0x0, 0x000000);
+    t.w(kTopScan, 0x3FF);
+    t.w(kXYWin, 0x10021000);
+    t.fill(0, 0, 0, 0, 0x42);       // screen column 0: a pixel; 1-3 stay 0
+    // Underlay value 5 in every column (overlay planes, 8 bits).
+    t.w(kDrawMode1, (3u << 28) | (1u << 3) | 4u);  // SRC, 8bpp, overlay planes
+    t.w(kWrMask, 0xFFFFFF);
+    t.w(kColorI, 5);
+    t.w(kXYStartI, 0);
+    t.w(kXYEndI, 3u << 16);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9));
+    std::vector<u32> px;
+    unsigned w = 0, h = 0;
+    CHECK(t.np.render(px, w, h));
+    if (px.size() == 4) {
+        CHECK_EQ(px[0], 0xFF123456u);  // the pixel is non-zero: it shows
+        CHECK_EQ(px[1], 0xFF00FF00u);  // zero pixel: the underlay
+    }
+    // As an overlay instead (mode 2), the non-zero overlay covers the pixel.
+    t.xmap_mode(0, (1u << 19) | (2u << 16) | 0x000404);
+    CHECK(t.np.render(px, w, h));
+    if (px.size() == 4) CHECK_EQ(px[0], 0xFF00FF00u);
+}

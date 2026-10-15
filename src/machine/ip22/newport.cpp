@@ -1302,6 +1302,7 @@ u8 Newport::did_at(const std::vector<std::pair<int, u8>>& records, int x) const 
 // Linux allow for. Rows: CURY - 31.
 constexpr int kCursorScreenX = 29, kCursorScreenY = 31, kScanDelay = 2;
 constexpr u8 kXmapPupEnable = 0x01;  // XMAP9 config: pop-up planes shown
+constexpr u8 kXmapEightBit = 0x04;   // XMAP9 config: 8-bit system (the XL8)
 
 unsigned Newport::cursor_pixel(int x, int y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
@@ -1391,14 +1392,107 @@ u32 Newport::direct_colour(u32 mode, u32 pix) const {
     return 0xFF000000u | rgb;
 }
 
-u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
-    const Xmap& xm = xmap_[0];
+// A pixel's value in the buffer and size its display mode reads.
+static u32 pixel_value(u32 mode, u32 pix) {
+    const unsigned pix_size = (mode >> 10) & 3, buf = mode & 1;
+    switch (pix_size) {
+        case 0: return (pix >> (buf ? 4 : 0)) & 0xF;
+        case 1: return pix & 0xFF;
+        case 2: return (pix >> (buf ? 12 : 0)) & 0xFFF;
+        default: return pix & 0xFFFFFF;
+    }
+}
+
+bool Newport::pixel_value_nonzero(u32 mode, u32 pix) const { return pixel_value(mode, pix) != 0; }
+
+// The pixel's own colour: colour index through the CMAP (MSB_CMAP above it),
+// or RGB through CMAP map 0..2, then the RAMDAC's gamma unless bypassed.
+u32 Newport::pixel_colour(u32 mode, u32 pix) const {
     const std::vector<u32>& pal = cmap_[0].palette;
+    const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3;
+    const u32 v = pixel_value(mode, pix);
     u32 rgb;
-    if (cursor) rgb = pal[((xm.cursor_msb << 5) | cursor) & 0x1FFF];
-    else if (const unsigned pup = (xm.config & kXmapPupEnable) ? (aux >> 2) & 3 : 0) rgb = pal[((xm.pup_msb << 5) | pup) & 0x1FFF];
-    else if (((mode >> 16) & 7) == 2 && ((aux >> 8) & 0xFF)) rgb = pal[((mode >> 11) & 0x1F00) | ((aux >> 8) & 0xFF)];
-    else return direct_colour(mode, pix);  // not reached for table modes
+    if (pix_mode == 0) {
+        const u32 ci_msb = (mode & 0xF8) << 5;
+        rgb = pal[(pix_size == 2 ? (ci_msb & 0x1000) | v : ci_msb | v) & 0x1FFF];
+    } else {
+        u32 r, g, b;
+        unpack(v, pix_size, r, g, b);
+        const u32 base = 0x1C00 + pix_mode * 0x100;
+        rgb = (pal[base + r] & 0xFF0000) | (pal[base + g] & 0xFF00) | (pal[base + b] & 0xFF);
+    }
+    if (!(mode & 4))
+        rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
+              ramdac_.lut[2][rgb & 0xFF];
+    return 0xFF000000u | rgb;
+}
+
+// The XMAP9's choice among the layers (XMAP9 spec 3.4.3-3.4.5): cursor,
+// pop-up, a non-zero overlay, a non-zero pixel, the underlay, the pixel.
+// Overlay and underlay are colour index, their top 5 address bits from the
+// mode's AUX_MSB_CMAP. A 24-bit system has 8 aux bits per buffer (the
+// overlay bytes), used as an 8-bit underlay or overlay, double-buffered
+// 4-bit overlays, or a 4-bit overlay over a 4-bit underlay; an 8-bit system
+// has only the 2 pop-up bits, which are pop-ups or, with pop-ups disabled,
+// the same modes at 2 and 1 bits. Returns false when the pixel shows.
+bool Newport::aux_layer(u32 mode, bool pixel_nonzero, u32 aux, unsigned cursor, u32& addr) const {
+    const Xmap& xm = xmap_[0];
+    if (cursor) {
+        addr = ((xm.cursor_msb << 5) | cursor) & 0x1FFF;
+        return true;
+    }
+    const bool pup_en = xm.config & kXmapPupEnable, eight_bit = xm.config & kXmapEightBit;
+    if (pup_en) {
+        if (const unsigned pup = (aux >> 2) & 3) {
+            addr = ((xm.pup_msb << 5) | pup) & 0x1FFF;
+            return true;
+        }
+        if (eight_bit) return false;  // the pop-up bits are all the aux planes there are
+    }
+    const unsigned aux_mode = (mode >> 16) & 7;
+    const unsigned bits = eight_bit ? (aux >> 2) & 3 : (aux >> 8) & 0xFF;
+    const unsigned half = eight_bit ? 1 : 4, low = (1u << half) - 1;
+    int overlay = -1, underlay = -1;
+    switch (aux_mode) {
+        case 1: underlay = static_cast<int>(bits); break;
+        case 2: overlay = static_cast<int>(bits); break;
+        case 6:  // double buffered: OVL_Buf_Sel picks the buffer
+            overlay = eight_bit ? static_cast<int>((aux >> ((mode & 2) ? 3 : 2)) & 1)
+                                : static_cast<int>((aux >> ((mode & 2) ? 16 : 8)) & 0xF);
+            break;
+        case 7:
+            overlay = static_cast<int>(bits & low);
+            underlay = static_cast<int>(bits >> half);
+            break;
+        default: return false;
+    }
+    const u32 base = ((mode >> 19) & 0x1F) << 8;
+    if (overlay > 0) {
+        addr = base | static_cast<u32>(overlay);
+        return true;
+    }
+    if (pixel_nonzero || underlay < 0) return false;
+    addr = base | static_cast<u32>(underlay);
+    return true;
+}
+
+// The aux bits that can make aux_layer() take over a pixel in this mode,
+// and whether an underlay is shown (behind zero pixels).
+u32 Newport::aux_mask(u32 mode, bool& underlay) const {
+    const Xmap& xm = xmap_[0];
+    const bool pup_en = xm.config & kXmapPupEnable, eight_bit = xm.config & kXmapEightBit;
+    const unsigned aux_mode = (mode >> 16) & 7;
+    underlay = !(pup_en && eight_bit) && (aux_mode == 1 || aux_mode == 7);
+    u32 mask = pup_en ? 0x0Cu : 0u;
+    if (!(pup_en && eight_bit) && aux_mode) mask |= eight_bit ? 0x0Cu : (aux_mode == 6 ? 0x0F0F00u : 0xFF00u);
+    return mask;
+}
+
+u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
+    const std::vector<u32>& pal = cmap_[0].palette;
+    u32 addr = 0;
+    if (!aux_layer(mode, pixel_value_nonzero(mode, pix), aux, cursor, addr)) return pixel_colour(mode, pix);
+    u32 rgb = pal[addr];
     if (!(mode & 4))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
@@ -1468,8 +1562,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
             if (stop <= x) stop = x + 1;
             const ModeTable& t = mode_table(did);
             const u32 mode = t.mode;
-            const u32 pup_bits = (xmap_[0].config & kXmapPupEnable) ? 0x0Cu : 0u;
-            const u32 special = (((mode >> 16) & 7) == 2 ? 0xFF00u : 0u) | pup_bits;  // aux bits that override: PUP, overlay
+            bool underlay = false;
+            const u32 special = aux_mask(mode, underlay);  // aux bits that can override the pixel
             for (; x < stop; ++x) {
                 const bool inside = x < static_cast<unsigned>(kPitch);
                 const u32 pix = inside ? pix_row[x] : 0;
@@ -1478,7 +1572,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                                         ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
                                         : 0;
                 u32& o = out[x - kPipelineDelay];
-                if (cp || (aux & special)) o = special_colour(mode, pix, aux, cp);
+                if (cp || (aux & special) || underlay) o = special_colour(mode, pix, aux, cp);
                 else if (t.direct) o = direct_colour(mode, pix);
                 else o = t.lut[(pix >> t.shift) & t.mask];
             }
@@ -1504,7 +1598,6 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
     if (!(dcr & kDcrDisplay)) return true;  // blanked
 
     const Xmap& xm = xmap_[0];
-    const std::vector<u32>& pal = cmap_[0].palette;
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
         records.clear();
@@ -1528,39 +1621,7 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
             const std::size_t idx = static_cast<std::size_t>(row) * kPitch + x;
             const u32 pix = x < static_cast<unsigned>(kPitch) && row < static_cast<unsigned>(kRows) ? rgbci_[idx] : 0;
             const u32 aux = x < static_cast<unsigned>(kPitch) && row < static_cast<unsigned>(kRows) ? cidaux_[idx] : 0;
-            u32 rgb;
-            if (const unsigned cp = cursor_pixel(static_cast<int>(x), static_cast<int>(y))) {
-                rgb = pal[((xm.cursor_msb << 5) | cp) & 0x1FFF];
-            } else if (const unsigned pup = (xm.config & kXmapPupEnable) ? (aux >> 2) & 3 : 0) {
-                rgb = pal[((xm.pup_msb << 5) | pup) & 0x1FFF];
-            } else if (((mode >> 16) & 7) == 2 && ((aux >> 8) & 0xFF)) {  // 8-bit overlay
-                rgb = pal[((mode >> 11) & 0x1F00) | ((aux >> 8) & 0xFF)];
-            } else {
-                const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3, buf = mode & 1;
-                if (pix_mode == 0) {  // colour index
-                    const u32 ci_msb = (mode & 0xF8) << 5;
-                    u32 ci;
-                    switch (pix_size) {
-                        case 0: ci = ci_msb | ((pix >> (buf ? 4 : 0)) & 0xF); break;
-                        case 2: ci = (ci_msb & 0x1000) | ((pix >> (buf ? 12 : 0)) & 0xFFF); break;
-                        default: ci = ci_msb | (pix & 0xFF); break;
-                    }
-                    rgb = pal[ci & 0x1FFF];
-                } else {  // RGB through CMAP map 0..2
-                    u32 v = pix;
-                    if (pix_size == 0) v >>= buf ? 4 : 0;
-                    else if (pix_size == 2) v >>= buf ? 12 : 0;
-                    u32 r, g, b;
-                    unpack(v & depth_mask(pix_size), pix_size, r, g, b);
-                    const u32 base = 0x1C00 + pix_mode * 0x100;
-                    rgb = (pal[base + r] & 0xFF0000) | (pal[base + g] & 0xFF00) | (pal[base + b] & 0xFF);
-                }
-            }
-            if (!(mode & 4)) {  // gamma correction in the RAMDAC unless bypassed
-                rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
-                      ramdac_.lut[2][rgb & 0xFF];
-            }
-            out[ox] = 0xFF000000u | rgb;
+            out[ox] = special_colour(mode, pix, aux, cursor_pixel(static_cast<int>(x), static_cast<int>(y)));
         }
     }
     return true;
