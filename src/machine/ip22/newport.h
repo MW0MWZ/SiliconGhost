@@ -65,6 +65,8 @@ private:
     void execute();
     void do_setup();
     void draw_span_block(bool block);
+    void line_setup(bool fractional);
+    void advance_line_stipple();
     void draw_line();
     void draw_aline();
     void scr2scr();

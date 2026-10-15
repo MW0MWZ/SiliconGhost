@@ -497,3 +497,51 @@ TEST(newport_host_read_fields) {
     t.w(kDrawMode0 | kGo, 1u);
     CHECK_EQ(t.r(kHostRw0), 0x02020202u);  // the low 4 bits of each pixel, a byte each
 }
+
+namespace {
+u32 pixel8(Rig& t, int x, int y) {
+    t.w(kDrawMode1, (3u << 28) | (1u << 8) | (1u << 3) | 1u);  // 8-bit host, one pixel
+    t.w(kXYStartI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kXYEndI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kDrawMode0 | kGo, 1u);
+    return t.r(kHostRw0) >> 24;
+}
+void line_mode(Rig& t, u32 ci) {
+    t.w(kDrawMode1, (3u << 28) | (1u << 3) | 1u);
+    t.w(kWrMask, 0xFF);
+    t.w(kColorI, ci);
+}
+}  // namespace
+
+// A line drawn a point per GO (after one SETUP) follows the same pixels as
+// the line drawn whole: the Bresenham error term carries from GO to GO.
+TEST(newport_line_points_follow_the_whole_line) {
+    Rig a, b;
+    for (Rig* t : {&a, &b}) {
+        line_mode(*t, 7);
+        t->w(kXYStartI, (3u << 16) | 2u);
+        t->w(kXYEndI, (40u << 16) | 13u);
+    }
+    a.w(kDrawMode0 | kGo, 2u | (2u << 2) | (1u << 5) | (1u << 8) | (1u << 9));  // I_LINE, DOSETUP, whole
+    b.w(kDrawMode0 | 0, 2u | (2u << 2));
+    b.w(0x030, 0);                                                           // SETUP
+    for (int i = 0; i < 38; ++i) b.w(kDrawMode0 | kGo, 2u | (2u << 2));     // a point per GO
+    for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 44; ++x) CHECK_EQ(pixel8(a, x, y), pixel8(b, x, y));
+    CHECK_EQ(pixel8(a, 40, 13), 7u);
+    CHECK_EQ(pixel8(a, 3, 2), 7u);
+}
+
+// The line stipple repeats each bit LSREPEAT times and wraps after LSLENGTH
+// bits (17 here), most significant first.
+TEST(newport_line_stipple_repeat_and_length) {
+    Rig t;
+    line_mode(t, 9);
+    t.w(0x008, (0u << 24) | (2u << 8) | 2u);  // LSMODE: length 17, repeat 2, count 2
+    t.w(0x00C, 0xA0000000u);                  // LSPATTERN: 1 0 1 0 0 ...
+    t.w(kXYStartI, (0u << 16) | 4u);
+    t.w(kXYEndI, (39u << 16) | 4u);
+    t.w(kDrawMode0 | kGo, 2u | (2u << 2) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 13));  // ENLSPATTERN
+    const char* expect = "1100110000000000000000000000000000110011";  // 2 x 17 = 34 pixels per cycle
+    for (int x = 0; x < 40; ++x) CHECK_EQ(pixel8(t, x, 4), expect[x] == '1' ? 9u : 0u);
+}

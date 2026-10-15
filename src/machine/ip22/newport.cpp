@@ -37,7 +37,7 @@ enum Rex3 : u32 {
 // DRAWMODE0
 constexpr u32 kDm0DoSetup = 1u << 5, kDm0ColorHost = 1u << 6, kDm0StopOnX = 1u << 8, kDm0StopOnY = 1u << 9;
 constexpr u32 kDm0SkipFirst = 1u << 10, kDm0SkipLast = 1u << 11, kDm0EnZPattern = 1u << 12;
-constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
+constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0LsAdvLast = 1u << 14, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
 constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0CiClamp = 1u << 21;
 constexpr u32 kDm0AlphaHost = 1u << 7;
 // DRAWMODE1
@@ -338,8 +338,14 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kSmask0X: smask0x_ = v; return;
         case kSmask0Y: smask0y_ = v; return;
         case kSetup: do_setup(); return;
-        case kLsRestore: lspattern_ = lspatsave_; return;
-        case kLsSave: lspatsave_ = lspattern_; return;
+        case kLsRestore:  // pattern and repeat count from the saved copies
+            lspattern_ = lspatsave_;
+            lsmode_ = (lsmode_ & ~0xFFu) | ((lsmode_ >> 16) & 0xFF);
+            return;
+        case kLsSave:
+            lspatsave_ = lspattern_;
+            lsmode_ = (lsmode_ & ~0xFF0000u) | ((lsmode_ & 0xFF) << 16);
+            return;
         case kStepZ: zfail_next_ = true; return;  // with GO: the current pixel fails the Z test
         case kStall0:
         case kStall1: return;
@@ -480,6 +486,8 @@ void Newport::do_setup() {
     const s32 dx = std::abs(x1 - x2), dy = std::abs(y1 - y2);
     const u32 octant = (y1 > y2 ? 1u : 0u) | (x1 > x2 ? 2u : 0u) | (dx > dy ? 4u : 0u);
     bresoctinc1_ = (bresoctinc1_ & ~0x07000000u) | (octant << 24);
+    const unsigned adrmode = (drawmode0_ >> 2) & 7;
+    if (adrmode == 2 || adrmode == 3) line_setup(adrmode == 3);
 }
 
 void Newport::reload_shade() {
@@ -854,57 +862,113 @@ void Newport::draw_aline() {
     }
 }
 
-void Newport::draw_line() {
-    // Integer Bresenham between the start and end points. Fractional (F_LINE)
-    // lines use the integer endpoints for now.
+// Lines follow the REX3 specification's Bresenham (section 3.6.1): SETUP
+// (or DOSETUP) finds the octant and the error terms, which live in BRESD,
+// BRESOCTINC1 and BRESRNDINC2 (19.8, 17.3 and 18.3 fixed point), and every
+// GO carries on from them, so a line drawn a point or 32 pixels at a time
+// follows the same pixels as one drawn whole. I_LINE has integer end
+// points and draws both; F_LINE has 16.4 end points (the error term
+// starts at 3dy - 2dx + 2(dx*yfract - dy*xfract), fractions flipped in the
+// octants left of and below the start) and stops short of the end point.
+// The error terms here are in 1/256 of a pixel.
+void Newport::line_setup(bool fractional) {
     const u32 octant = (bresoctinc1_ >> 24) & 7;
-    const int x1 = int_part(xstart_), y1 = int_part(ystart_), x2 = int_part(xend_), y2 = int_part(yend_);
+    const bool xmajor = octant & 4, xdec = octant & 2, ydec = octant & 1;
+    s64 d, inc1, inc2;
+    if (!fractional) {
+        const int dx = std::abs(int_part(xend_) - int_part(xstart_)), dy = std::abs(int_part(yend_) - int_part(ystart_));
+        const s64 major = xmajor ? dx : dy, minor = xmajor ? dy : dx;
+        d = 256 * (2 * minor - major);
+        inc1 = 512 * minor;
+        inc2 = 512 * (minor - major);
+    } else {
+        const s32 x1 = sext(xstart_ >> 7, 20), y1 = sext(ystart_ >> 7, 20);  // 16.4
+        const s32 x2 = sext(xend_ >> 7, 20), y2 = sext(yend_ >> 7, 20);
+        const s64 dx = std::abs(x1 - x2), dy = std::abs(y1 - y2);
+        const s64 xf = xdec ? 16 - (x1 & 0xF) : (x1 & 0xF), yf = ydec ? 16 - (y1 & 0xF) : (y1 & 0xF);
+        const s64 major = xmajor ? dx : dy, minor = xmajor ? dy : dx;
+        const s64 major_fract = xmajor ? xf : yf, minor_fract = xmajor ? yf : xf;
+        d = 48 * minor - 32 * major + 2 * (major * minor_fract - minor * major_fract);
+        inc1 = 32 * minor;
+        inc2 = 32 * (minor - major);
+    }
+    bresd_ = static_cast<u32>(d) & 0x7FFFFFF;
+    bresoctinc1_ = (bresoctinc1_ & 0x07000000u) | (static_cast<u32>(inc1 >> 5) & 0xFFFFF);
+    bresrndinc2_ = (bresrndinc2_ & 0xFF000000u) | (static_cast<u32>(inc2 >> 5) & 0x1FFFFF);
+}
+
+// One step of the line stipple: LSPATTERN's top LSLENGTH bits rotate one
+// place each LSREPEAT pixels (LSRCOUNT counting them down).
+void Newport::advance_line_stipple() {
+    u32 count = lsmode_ & 0xFF;
+    if (count == 0 || --count == 0) {
+        const unsigned length = ((lsmode_ >> 24) & 0xF) + 17, low = 32 - length;
+        const u32 top = ~0u << low;
+        lspattern_ = ((lspattern_ << 1) & top) | ((lspattern_ >> 31) << low) | (lspattern_ & ~top);
+        count = (lsmode_ >> 8) & 0xFF;
+    }
+    lsmode_ = (lsmode_ & ~0xFFu) | count;
+}
+
+void Newport::draw_line() {
+    const u32 octant = (bresoctinc1_ >> 24) & 7;
+    const bool fractional = ((drawmode0_ >> 2) & 7) == 3;
     const bool xmajor = octant & 4;
     const int sx_step = (octant & 2) ? -1 : 1, sy_step = (octant & 1) ? -1 : 1;
-    const int dx = std::abs(x2 - x1), dy = std::abs(y2 - y1);
-    const int major = xmajor ? dx : dy, minor = xmajor ? dy : dx;
-    int d = 2 * minor - major;
-    int x = x1, y = y1;
+    s64 d = sext(bresd_, 27);
+    const s64 inc1 = static_cast<s64>(bresoctinc1_ & 0xFFFFF) << 5, inc2 = static_cast<s64>(sext(bresrndinc2_ & 0x1FFFFF, 21)) << 5;
+    int x = int_part(xstart_), y = int_part(ystart_);
+    const int remaining = (xmajor ? std::abs(int_part(xend_) - x) : std::abs(int_part(yend_) - y)) + (fractional ? 0 : 1);
     auto step = [&] {
-        if (d >= 0) {
+        if (d < 0) {
+            d += inc1;
+        } else {
             if (xmajor) y += sy_step;
             else x += sx_step;
-            d -= 2 * major;
+            d += inc2;
         }
         if (xmajor) x += sx_step;
         else y += sy_step;
-        d += 2 * minor;
     };
-    const u32 pattern = (drawmode0_ & kDm0EnLsPattern) ? lspattern_ : ~0u;
-    const bool opaque = drawmode0_ & kDm0LsOpaque;
-    unsigned bit = 31;
+    // Patterns: the line stipple (rotating) and ZPATTERN (from its msb each
+    // GO). A pixel takes the source colour if both enabled patterns allow,
+    // otherwise COLORBACK where an opaque pattern says so.
+    const bool ls_en = drawmode0_ & kDm0EnLsPattern, zp_en = drawmode0_ & kDm0EnZPattern;
+    const bool ls_opaque = drawmode0_ & kDm0LsOpaque, zp_opaque = drawmode0_ & kDm0ZpOpaque;
+    unsigned zbit = 31;
     bool first = true;
-    auto draw = [&](int px, int py, bool skipped) {
+    auto draw = [&](int px, int py, bool skipped, bool last) {
         const bool zfail = zfail_ && first;
         first = false;
+        const bool ls = !ls_en || (lspattern_ >> 31), zs = (!zp_en || ((zpattern_ >> zbit) & 1)) && !zfail;
         if (!skipped) {
-            if (!zfail && ((pattern >> bit) & 1)) plot(px, py, source_color(px, py));
-            else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(px, py, default_color(colorback_));
+            if (ls && zs) plot(px, py, source_color(px, py));
+            else if ((ls || ls_opaque) && (zs || zp_opaque || (zfail && zp_opaque))) plot(px, py, default_color(colorback_));
         }
         if (drawmode0_ & kDm0Shade) iterate_shade();
-        bit = (bit - 1) & 31;
+        zbit = (zbit - 1) & 31;
+        if (ls_en && (!last || (drawmode0_ & kDm0LsAdvLast))) advance_line_stipple();
     };
 
-    if (!(drawmode0_ & (kDm0StopOnX | kDm0StopOnY))) {  // one point per GO
-        draw(x, y, drawmode0_ & kDm0SkipFirst);
-        step();
-    } else {
-        // LENGTH32 limits one GO to 32 pixels; the start is left on the
-        // next pixel, so the following GO carries on from there.
-        const bool cut = (drawmode0_ & kDm0Length32) && major >= 32;
-        const int pixels = cut ? 32 : major + 1;
-        for (int i = 0; i < pixels; ++i) {
-            const bool last = !cut && i == pixels - 1;
-            const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (last && (drawmode0_ & kDm0SkipLast));
-            draw(x, y, skip);
-            if (!last) step();
+    if (remaining > 0) {
+        if (!(drawmode0_ & (kDm0StopOnX | kDm0StopOnY))) {  // one point per GO
+            draw(x, y, drawmode0_ & kDm0SkipFirst, remaining == 1);
+            step();
+        } else {
+            // LENGTH32 limits one GO to 32 pixels, the next GO carrying on.
+            // At the end the iterators rest on the end point with SKIPLAST
+            // (for the next connected line), else just past it.
+            const bool cut = (drawmode0_ & kDm0Length32) && remaining > 32;
+            const int pixels = cut ? 32 : remaining;
+            for (int i = 0; i < pixels; ++i) {
+                const bool last = !cut && i == pixels - 1;
+                const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (last && (drawmode0_ & kDm0SkipLast));
+                draw(x, y, skip, last);
+                if (!last || !(drawmode0_ & kDm0SkipLast)) step();
+            }
         }
     }
+    bresd_ = static_cast<u32>(d) & 0x7FFFFFF;
     write_x_start(static_cast<u32>(x) << 11);
     write_y_start(static_cast<u32>(y) << 11);
 }
