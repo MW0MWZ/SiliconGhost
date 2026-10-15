@@ -170,12 +170,16 @@ if(SG_WITH_SDL3)
         VERBATIM)
 
       install(TARGETS siliconghost BUNDLE DESTINATION .)
+      # The Info.plist is installed explicitly as well, and the libraries are
+      # gathered from the program's own path, so neither depends on the other.
+      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/Info.plist DESTINATION SiliconGhost.app/Contents)
       install(CODE [[
         include(BundleUtilities)
         set(app "${CMAKE_INSTALL_PREFIX}/SiliconGhost.app")
-        fixup_bundle("${app}" "" "")
+        fixup_bundle("${app}/Contents/MacOS/SiliconGhost" "" "")
         # Signed for this machine (ad hoc): copying the libraries in changed them.
         execute_process(COMMAND codesign --force --deep --sign - "${app}" COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(COMMAND codesign --verify --deep --strict "${app}" COMMAND_ERROR_IS_FATAL ANY)
       ]])
     endif()
   else()
