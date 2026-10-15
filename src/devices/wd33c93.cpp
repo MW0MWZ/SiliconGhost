@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Reference: Western Digital WD33C93A/B data sheet.
 #include "devices/wd33c93.h"
 

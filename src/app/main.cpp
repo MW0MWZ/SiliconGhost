@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // SiliconGhost front end. Started with no arguments it opens the window with
 // the machine powered off and the saved settings; with arguments it powers on
 // at once. With --headless (or without SDL3) both serial ports are connected

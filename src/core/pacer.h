@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Ties guest time (the CPU cycle counter, which drives every emulated clock)
 // to the host's clock.
 //

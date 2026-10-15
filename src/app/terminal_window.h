@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // A window of its own showing one serial port's terminal, with the keyboard
 // typing into the port. Each window has its own SDL renderer and ImGui
 // context; it can be closed and reopened while the terminal keeps receiving.

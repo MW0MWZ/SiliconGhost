@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: ANSI X3.131 (SCSI-2), SCSI Multimedia Commands for READ TOC.
 #include "devices/scsi_disk.h"
 

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Intel 8254 programmable interval timer.
 //
 // Counters are evaluated lazily from the scheduler clock (CPU cycles) rather

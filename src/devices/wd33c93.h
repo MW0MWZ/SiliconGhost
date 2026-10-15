@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Western Digital WD33C93A/B SCSI bus interface controller (initiator role).
 //
 // Host interface: an address register (SASR) selects one of 32 internal

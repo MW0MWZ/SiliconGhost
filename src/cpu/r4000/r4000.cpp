@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // MIPS R4000/R4400 reference interpreter.
 //
 // References: MIPS R4000 Microprocessor User's Manual (2nd ed., Heinrich),

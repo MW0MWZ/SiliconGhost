@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Microwire serial EEPROM (93C46/56/66 family, x16 organisation), as used for
 // the IP22's 93CS56. Driven bit-by-bit through set_lines(); DO is read back
 // with data_out(). Writes complete instantly (DO reads "ready").

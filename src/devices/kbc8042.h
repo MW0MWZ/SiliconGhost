@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Intel 8042-compatible keyboard/mouse controller with an attached PS/2
 // keyboard and mouse that answer the standard command set. Host input is
 // injected as scan codes with key_input() and as mouse movement with

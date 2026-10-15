@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 chipset tests: MC, HPC3, IOC2/INT3 accessed at their physical addresses.
 #include <cmath>
 #include <array>

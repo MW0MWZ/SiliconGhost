@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Event scheduler. The CPU cycle counter is the master clock; devices own
 // Timers that fire callbacks at absolute cycle counts. The machine run loop
 // executes the CPU up to the next due event, then dispatches events, so no

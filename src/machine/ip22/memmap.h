@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // SGI IP22 (Indy "Guinness" / Indigo2 "Fullhouse") physical memory map.
 // Sources: SGI MC chip specification; Linux arch/mips/include/asm/sgi/*.h.
 #pragma once

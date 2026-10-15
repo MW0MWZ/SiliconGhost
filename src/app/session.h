@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // A machine built from Settings that can be powered on and off: owns the
 // Indy, its network connection, pacing and the NVRAM file. Used by the
 // window and by the headless console alike.

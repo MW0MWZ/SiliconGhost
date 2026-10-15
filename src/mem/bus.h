@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Physical address space. A flat page table (64 KiB granularity over the low
 // 4 GiB) resolves each physical page to either host memory (RAM/ROM, accessed
 // directly) or a Device (MMIO, dispatched virtually). RAM accesses never leave

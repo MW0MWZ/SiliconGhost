@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: SGI "MC Chip Specification"; Linux arch/mips/include/asm/sgi/mc.h
 // and arch/mips/sgi-ip22/ip22-mc.c; NetBSD sys/arch/sgimips/dev/imc.c.
 #include "machine/ip22/mc.h"

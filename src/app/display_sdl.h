@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // The SDL3 front end: a window showing the Newport display, with menus for
 // the machine's switches and media, a settings dialog, a status bar, serial
 // terminal windows, PS/2 keyboard and mouse input and HAL2 audio.

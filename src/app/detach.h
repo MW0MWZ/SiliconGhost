@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Letting the window run without holding the terminal it was started from:
 // the program starts a copy of itself in the background, in a session of
 // its own (Linux, macOS) or as a detached process (Windows), with its output

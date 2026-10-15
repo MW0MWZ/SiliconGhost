@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Memory for generated code, never writable and executable at once (W^X).
 // Linux: the same pages are mapped twice, writable and executable; code is
 // written through one view and run through the other (Windows: the same

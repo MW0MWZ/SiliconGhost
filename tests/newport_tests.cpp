@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Newport graphics tests, driven through the REX3 register window.
 #include <vector>
 

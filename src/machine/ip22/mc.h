@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 MC (memory controller): CPU/GIO control, SIMM bank decode, bus error
 // reporting, RPSS counter and semaphores. Mapped at 0x1FA00000 (128 KiB).
 //

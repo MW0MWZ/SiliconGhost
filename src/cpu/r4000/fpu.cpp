@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // R4000/R4400 floating-point unit (COP1).
 //
 // Arithmetic runs on the host FPU with the guest rounding mode installed and

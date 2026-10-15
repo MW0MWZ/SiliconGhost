@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: Linux arch/mips/include/asm/sgi/ioc.h, ip22-int.c, ip22-time.c;
 // NetBSD sys/arch/sgimips/dev/int.c, int2reg.h.
 #include "machine/ip22/ioc2.h"

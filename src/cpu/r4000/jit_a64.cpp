@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // R4000 dynamic recompiler, AArch64 back end.
 //
 // The same translation as the x86-64 back end (see jit_x64.cpp): a hot

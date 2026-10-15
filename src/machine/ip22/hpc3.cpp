@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: Linux arch/mips/include/asm/sgi/hpc3.h, ip22-nvram.c;
 // NetBSD sys/arch/sgimips/hpc/hpcreg.h.
 #include "machine/ip22/hpc3.h"

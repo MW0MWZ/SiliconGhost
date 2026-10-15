@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // The main window: the Newport picture between a menu bar and a status bar,
 // with the Settings dialog and the serial terminal windows.
 #include <SDL3/SDL.h>

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
 project(SiliconGhost VERSION 0.1.0 DESCRIPTION "SGI IP22 (Indy) emulator" LANGUAGES CXX)
 

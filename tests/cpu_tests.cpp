@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // R4000 interpreter tests: hand-assembled programs run from kseg0 in kernel mode.
 #include <array>
 #include <cstddef>

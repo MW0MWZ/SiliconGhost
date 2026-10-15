@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 IOC2 (Indy "Guinness"): Z85230 serial, 8042 keyboard/mouse, front
 // panel, system ID, and the INT3 interrupt controller with its 8254 timers.
 // Sits on HPC3 PBUS channel 6 at 0x1FBD9800; every register is one byte on

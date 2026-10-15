@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // SCSI targets: the interface the WD33C93 talks to, and a direct-access disk /
 // CD-ROM backed by an image file of 512-byte blocks.
 //

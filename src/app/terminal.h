@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // An 80x24 VT100-style terminal screen, fed with the bytes a serial port
 // sends: enough of the VT100/ANSI set for IRIX, its installer and the PROM
 // (cursor movement, erasing, scroll regions, insert/delete, attributes, line

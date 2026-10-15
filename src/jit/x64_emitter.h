@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Minimal x86-64 machine-code emitter: the instructions the dynamic
 // recompiler needs, with memory operands of the form [base + disp32].
 #pragma once

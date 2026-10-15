@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // HAL2 audio processor, on HPC3 PBUS PIO channels 0-3 (control and indirect
 // registers, AES, volume, synth). It owns the codec (DAC/ADC) and AES ports;
 // each port is tied to a PBUS DMA channel and clocked by one of three

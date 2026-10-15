@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Newport (XL8/XL24) graphics for the IP22 GFX slot: REX3 raster engine,
 // RB2 frame buffer, the display control bus (DCB) with VC2 video timing and
 // cursor, XMAP9 pixel-mode mapping, CMAP colour maps and the Bt445 RAMDAC.

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Tests for the generic peripheral chips (PIT, RTC, EEPROM, SCC).
 #include <filesystem>
 #include <fstream>

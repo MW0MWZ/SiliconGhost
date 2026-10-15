@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Everything that describes a machine and how to run it: filled from the
 // command line, or kept in a settings file by the window's Settings dialog.
 #pragma once

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // Seeq 8003/80C03 Ethernet data link controller: station address, receive
 // address filter, and the receive and transmit command and status
 // registers. The data moves through the host interface's DMA (HPC3 on the

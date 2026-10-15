@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // References: SGI REX3, VC2, XMAP9, CMAP and RB2 datasheets; Linux
 // include/video/newport.h and newport_con.c; NetBSD sys/arch/sgimips/gio/
 // newport.c; X.org xf86-video-newport.

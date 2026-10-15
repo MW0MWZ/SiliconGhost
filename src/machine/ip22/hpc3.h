@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 // IP22 HPC3 peripheral controller at 0x1FB80000 (512 KiB window): PBUS,
 // SCSI and Ethernet DMA channels, interrupt status, the serial EEPROM, the
 // PBUS device windows (IOC2 on channel 6) and the DS1386 RTC/NVRAM.

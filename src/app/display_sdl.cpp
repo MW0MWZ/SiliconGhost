@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 #include "app/display_sdl.h"
 #include "app/sdl_common.h"
 

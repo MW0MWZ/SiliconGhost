@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andy Taylor
 #include "net/tap_backend.h"
 
 #if defined(__linux__)
