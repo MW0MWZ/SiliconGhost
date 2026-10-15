@@ -869,3 +869,9 @@ TEST(ip22_mc_dma_tlb_miss_faults_and_resumes) {
     CHECK_EQ(t.r32(kPage + 4), 0xA5A5A5A5u);
     CHECK_EQ(t.r32(kPage + 8), 0u);
 }
+
+// Only sizes two banks of 16, 32, 64 or 128 MiB can make are accepted.
+TEST(ip22_ram_sizes_two_banks) {
+    for (unsigned mb : {16u, 32u, 48u, 64u, 80u, 96u, 128u, 144u, 160u, 192u, 256u}) CHECK(ram_size_fits(mb));
+    for (unsigned mb : {0u, 8u, 112u, 176u, 208u, 224u, 240u, 272u}) CHECK(!ram_size_fits(mb));
+}

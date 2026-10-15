@@ -23,6 +23,10 @@
 
 namespace sg::ip22 {
 
+// Whether `mb` MiB of RAM can be fitted: one or two banks of 16, 32, 64
+// or 128 MiB.
+bool ram_size_fits(unsigned mb);
+
 struct IndyConfig {
     unsigned ram_mb = 64;       // 16..256, multiple of 16
     double cpu_hz = 150.0e6;    // pipeline clock

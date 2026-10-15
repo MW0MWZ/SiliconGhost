@@ -142,8 +142,8 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "cdrom") s.cdroms.push_back(v);
     else if (key == "cpu") ok = find_cpu_model(v) && (s.cpu = v, true);
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 1000 && (s.cpu_mhz = n, true);
-    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 256 && static_cast<unsigned>(n) % 16 == 0 &&
-                                  (s.ram_mb = static_cast<unsigned>(n), true);
+    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 256 && n == static_cast<unsigned>(n) &&
+                                  ip22::ram_size_fits(static_cast<unsigned>(n)) && (s.ram_mb = static_cast<unsigned>(n), true);
     else if (key == "graphics") {
         // xl8, xl24 or none (1 and 0 from older files: XL8, none)
         bool on = false;

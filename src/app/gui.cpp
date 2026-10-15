@@ -1156,7 +1156,7 @@ void Gui::draw_settings() {
             const std::string ram = std::to_string(edit_.ram_mb) + " MiB";
             if (ImGui::BeginCombo("##ram", ram.c_str())) {
                 for (unsigned mb = 16; mb <= 256; mb += 16)
-                    if (ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
+                    if (ip22::ram_size_fits(mb) && ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
                 ImGui::EndCombo();
             }
             label("Graphics");

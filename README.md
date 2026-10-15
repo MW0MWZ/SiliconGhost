@@ -154,7 +154,7 @@ Main options (`siliconghost --help` lists them all):
 | `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
 | `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
-| `--ram MB` | memory size, 16 to 256 (default 64) |
+| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64) |
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
 | `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |

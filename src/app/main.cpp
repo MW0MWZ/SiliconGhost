@@ -77,7 +77,8 @@ void usage(const char* argv0) {
                    "                   interface to the guest (may be repeated)\n",
                    stderr);
     std::fprintf(stderr,
-                 "  --ram MB         memory size, 16..256 (default 64)\n"
+                 "  --ram MB         memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256\n"
+                 "                   (one or two banks of 16, 32, 64 or 128; default 64)\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc or r4000pc\n"
                  "  --cpu-mhz N      pipeline clock (default 150)\n"
                  "  --graphics BOARD xl8 (8-bit Newport, the default), xl24 (24-bit) or none\n"

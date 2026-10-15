@@ -50,6 +50,8 @@ public:
 
     Z85230& scc() { return scc_; }
     Kbc8042& kbc() { return kbc_; }
+    // The MC's bus error line: recorded in the error status register (bit 1).
+    void set_mc_bus_error(bool level) { err_stat_ = static_cast<u8>(level ? (err_stat_ | 0x02) : (err_stat_ & ~0x02)); }
     Pit8254& pit() { return pit_; }
 
 private:

@@ -23,9 +23,22 @@ mips::R4000::Options cpu_options(const IndyConfig& c) {
     return o;
 }
 
+}  // namespace
+
+// An Indy has two memory banks, each empty or holding 16, 32, 64 or 128 MiB
+// (four SIMMs of 4, 8, 16 or 32 MiB); the PROM sizes those two banks.
+bool ram_size_fits(unsigned mb) {
+    for (unsigned a : {16u, 32u, 64u, 128u})
+        for (unsigned b : {0u, 16u, 32u, 64u, 128u})
+            if (b <= a && a + b == mb) return true;
+    return false;
+}
+
+namespace {
+
 u64 checked_ram_bytes(const IndyConfig& c) {
-    if (c.ram_mb < 16 || c.ram_mb > 256 || c.ram_mb % 16 != 0)
-        throw std::invalid_argument("Indy RAM must be 16..256 MiB in steps of 16");
+    if (!ram_size_fits(c.ram_mb))
+        throw std::invalid_argument("Indy RAM must be one or two banks of 16, 32, 64 or 128 MiB (16-256 MiB, not 112, 176, 208, 224 or 240)");
     return u64{c.ram_mb} << 20;
 }
 
@@ -61,7 +74,10 @@ Indy::Indy(const IndyConfig& config)
     // Interrupt routing: INT3 LOCAL0/LOCAL1 and 8254 timers 0/1 drive
     // IP2..IP5; the MC bus error interrupt drives IP6.
     ioc_.set_cpu_line_callback([this](unsigned line, bool level) { cpu_.set_int_line(line, level); });
-    mc_.set_irq_callback([this](bool level) { cpu_.set_int_line(4, level); });
+    mc_.set_irq_callback([this](bool level) {
+        ioc_.set_mc_bus_error(level);
+        cpu_.set_int_line(4, level);
+    });
     mc_.set_dma_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0McDma, level); });
     newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
     mc_.set_reset_callback([this] {
