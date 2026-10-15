@@ -38,10 +38,11 @@ enum Rex3 : u32 {
 constexpr u32 kDm0DoSetup = 1u << 5, kDm0ColorHost = 1u << 6, kDm0StopOnX = 1u << 8, kDm0StopOnY = 1u << 9;
 constexpr u32 kDm0SkipFirst = 1u << 10, kDm0SkipLast = 1u << 11, kDm0EnZPattern = 1u << 12;
 constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0LsAdvLast = 1u << 14, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
-constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0CiClamp = 1u << 21;
+constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0XyOffset = 1u << 20;
+constexpr u32 kDm0CiClamp = 1u << 21, kDm0YStride = 1u << 23;
 constexpr u32 kDm0AlphaHost = 1u << 7;
 // DRAWMODE1
-constexpr u32 kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
+constexpr u32 kDm1YFlip = 1u << 6, kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
 constexpr u32 kDm1RgbMode = 1u << 15, kDm1Dither = 1u << 16, kDm1FastClear = 1u << 17, kDm1Blend = 1u << 18;
 constexpr u32 kDm1BackBlend = 1u << 25;
 constexpr unsigned kDm1SFactorShift = 19, kDm1DFactorShift = 22;
@@ -602,7 +603,7 @@ u32 Newport::source_color(int x, int y) {
     if (drawmode0_ & kDm0ColorHost) colour = host_color(&host_alpha);
     else if ((drawmode0_ & kDm0Shade) || (drawmode1_ & kDm1RgbMode)) colour = shaded_color(x, y);
     else colour = default_color(ci_index());
-    if (drawmode1_ & kDm1Blend) {
+    if ((drawmode1_ & kDm1Blend) || ((drawmode1_ >> 12) & 7) != 7) {  // blending or the alpha test need it
         if (drawmode0_ & kDm0AlphaHost) {
             if (!(drawmode0_ & kDm0ColorHost)) host_color(&host_alpha);
             src_alpha_ = host_alpha;
@@ -651,14 +652,21 @@ u32 Newport::blend(u32 src, int px, int py) const {
     return pack(channel(sr, dr), channel(sg, dg), channel(sb, db), depth);
 }
 
+// Window-relative coordinates to frame buffer: XYOFFSET adds XYMOVE (for
+// writes, which is all that come here); YFLIP puts the origin at the lower
+// left (GL), the screen row then XYWIN.y less the coordinate.
 bool Newport::clip(int x, int y, int& px, int& py) const {
+    if (drawmode0_ & kDm0XyOffset) {
+        x += xmove_;
+        y += ymove_;
+    }
     if (clipmode_ & 1) {
         if (x < static_cast<s16>(smask0x_ >> 16) || x > static_cast<s16>(smask0x_) ||
             y < static_cast<s16>(smask0y_ >> 16) || y > static_cast<s16>(smask0y_))
             return false;
     }
     px = x + static_cast<s16>(xywin_ >> 16) - 0x1000;
-    py = y + static_cast<s16>(xywin_) - 0x1000;
+    py = (drawmode1_ & kDm1YFlip) ? static_cast<s16>(xywin_) - 0x2000 - y : y + static_cast<s16>(xywin_) - 0x1000;
     if (clipmode_ & 0x1E) {
         bool inside = false;
         for (unsigned m = 0; m < 4 && !inside; ++m) {
@@ -754,6 +762,28 @@ void Newport::plot(int x, int y, u32 colour) {
     if (clip(x, y, px, py)) store(px, py, colour);
 }
 
+// A source pixel, subject to DRAWMODE1 COMPARE (conditions OR'ed; all three
+// is no test): in RGB mode the alpha test, source alpha against ALPHAREF;
+// in colour index mode a comparison of source and destination indexes.
+void Newport::plot_source(int x, int y, u32 colour) {
+    int px, py;
+    if (!clip(x, y, px, py)) return;
+    const unsigned cmp = (drawmode1_ >> 12) & 7;
+    if (cmp != 7) {
+        u32 s, d;
+        if (drawmode1_ & kDm1RgbMode) {
+            s = src_alpha_;
+            d = alpharef_;
+        } else {
+            const u32 mask = depth_mask((drawmode1_ >> 3) & 3);
+            s = colour & mask;
+            d = fetch(px, py) & mask;
+        }
+        if (!(((cmp & 4) && s > d) || ((cmp & 2) && s == d) || ((cmp & 1) && s < d))) return;
+    }
+    store(px, py, colour);
+}
+
 void Newport::draw_span_block(bool block) {
     const u32 octant = (bresoctinc1_ >> 24) & 7;
     const int dx = (octant & 2) ? -1 : 1, dy = (octant & 1) ? -1 : 1;
@@ -785,7 +815,7 @@ void Newport::draw_span_block(bool block) {
                 // iterators step (shading runs on across rows and GOs). A
                 // pixel failing the Z test (STEPZ) draws COLORBACK if ZPOPAQUE.
                 const bool zfail = zfail_ && drawn == 0;
-                if (!zfail && ((pattern >> bit) & 1)) plot(sx, sy, source_color(sx, sy));
+                if (!zfail && ((pattern >> bit) & 1)) plot_source(sx, sy, source_color(sx, sy));
                 else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(sx, sy, default_color(colorback_));
                 if ((drawmode0_ & kDm0Shade) && !fastclear) iterate_shade();
                 bit = (bit - 1) & 31;
@@ -795,16 +825,17 @@ void Newport::draw_span_block(bool block) {
         }
         const bool row_done = sx == end_x || lr_abort;
         if (row_done) {
-            if (block) {
+            if (block) {  // YSTRIDE steps two rows (the video option's fields)
                 sx = xsave_;
-                sy += dy;
+                sy += (drawmode0_ & kDm0YStride) ? 2 * dy : dy;
             }
         }
         // Packed host pixels come a data word per GO: a finished row waits
         // for the next word. An unpacked host pixel fills the whole block
         // (pixel zoom).
         const bool host_packed = (drawmode0_ & kDm0ColorHost) && (drawmode1_ & kDm1RwPacked);
-        if (!block || !row_done || !stop_y || sy == end_y || host_packed) break;
+        const bool past_end = dy > 0 ? sy >= end_y : sy <= end_y;  // YSTRIDE may step over the end row
+        if (!block || !row_done || !stop_y || past_end || host_packed) break;
     }
     write_x_start(static_cast<u32>(sx) << 11);
     if (block) write_y_start(static_cast<u32>(sy) << 11);
@@ -839,7 +870,7 @@ void Newport::draw_aline() {
         u32 colour = source_color(px, py);
         if (rgb) src_alpha_ = coverage * 0x11;
         else colour = (colour & ~0xFu) | coverage;
-        plot(px, py, colour);
+        plot_source(px, py, colour);
     };
     const bool one = !(drawmode0_ & (kDm0StopOnX | kDm0StopOnY));  // one step per GO
     for (int m = first;; m += step) {
@@ -942,7 +973,7 @@ void Newport::draw_line() {
         first = false;
         const bool ls = !ls_en || (lspattern_ >> 31), zs = (!zp_en || ((zpattern_ >> zbit) & 1)) && !zfail;
         if (!skipped) {
-            if (ls && zs) plot(px, py, source_color(px, py));
+            if (ls && zs) plot_source(px, py, source_color(px, py));
             else if ((ls || ls_opaque) && (zs || zp_opaque || (zfail && zp_opaque))) plot(px, py, default_color(colorback_));
         }
         if (drawmode0_ & kDm0Shade) iterate_shade();

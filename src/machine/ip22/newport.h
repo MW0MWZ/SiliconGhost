@@ -86,6 +86,7 @@ private:
     u32 shaded_color(int x, int y) const;
     void iterate_shade();
     void reload_shade();
+    void plot_source(int x, int y, u32 colour);
     void plot(int x, int y, u32 colour);
     bool clip(int x, int y, int& px, int& py) const;
     void store(int px, int py, u32 colour);
