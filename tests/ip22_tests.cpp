@@ -474,7 +474,8 @@ TEST(ip22_hal2_rate_fields_of_zero_mean_65536) {
     }
 }
 
-// ADC_C2 amplifies each side in 1.5 dB steps, clipping at full scale.
+// ADC_C2 amplifies each side in 1.5 dB steps, clipping at full scale; a mic
+// side starts 9 dB down.
 TEST(ip22_hal2_adc_input_gain) {
     for (const bool ds16 : {false, true}) {
         IndyRig t;
@@ -493,16 +494,16 @@ TEST(ip22_hal2_adc_input_gain) {
         hal2_write(t, 0x2104, 0);
         hal2_write(t, 0x2108, 0xFFFF0004);  // 48 kHz
         hal2_write(t, 0x1504, 0x209);       // ADC: PBUS channel 1, clock 1, stereo
-        hal2_write(t, 0x1508, 0x34F);       // ADC_C2: left +6 dB, right +22.5 dB, mic selected
+        hal2_write(t, 0x1508, 0x24F);       // ADC_C2: left +6 dB on mic (-9 dB trim), right +22.5 dB on line
         hal2_write(t, 0x9104, 0x10);
         t.w32(kPbus0 + 0x2000 + 4, kDesc);
         t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
         t.m.run(static_cast<u64>(t.m.cycles_per_second() * 20 / 48000));
         if (ds16) {
-            CHECK_EQ(t.r32(kBuf), static_cast<u32>(std::lround(1000 * 256 * std::pow(10.0, 6.0 / 20))));
+            CHECK_EQ(t.r32(kBuf), static_cast<u32>(std::lround(1000 * 256 * std::pow(10.0, -3.0 / 20))));
             CHECK_EQ(t.r32(kBuf + 4), 0x7FFFFFu);  // clipped
         } else {
-            CHECK_EQ(t.r32(kBuf), (static_cast<u32>(std::lround(1000 * std::pow(10.0, 6.0 / 20))) << 16) | 0x7FFFu);
+            CHECK_EQ(t.r32(kBuf), (static_cast<u32>(std::lround(1000 * std::pow(10.0, -3.0 / 20))) << 16) | 0x7FFFu);
         }
     }
 }
