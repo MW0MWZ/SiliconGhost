@@ -70,7 +70,7 @@ constexpr u32 kEnetRxCbp = 0x14000, kEnetRxNdbp = 0x14004, kEnetRxBcd = 0x15000,
 constexpr u32 kEnetReset = 0x15014, kEnetDmaCfg = 0x15018, kEnetPioCfg = 0x1501C;
 constexpr u32 kEnetTxCbp = 0x16000, kEnetTxNdbp = 0x16004, kEnetTxBcd = 0x17000, kEnetTxCtrl = 0x17004;
 constexpr u32 kSeeqWindow = 0x54000, kSeeqWindowEnd = 0x54500;
-constexpr u32 kEnetCtrlEndian = 1u << 8, kEnetCtrlActive = 1u << 9;
+constexpr u32 kEnetCtrlEndian = 1u << 8, kEnetCtrlActive = 1u << 9, kEnetCtrlActiveMask = 1u << 10;
 constexpr u32 kEnetResetChannel = 1u << 0, kEnetResetClearIrq = 1u << 1, kEnetResetLoopback = 1u << 2;
 // Ethernet descriptor count word
 constexpr u32 kEnetDescEnd = 1u << 31;        // end of chain (transmit) / ring (receive)
@@ -118,6 +118,7 @@ void Hpc3::reset() {
     hal2_.reset();
     update_dma_irq();
     enet_reset();
+    enet_held_ = true;
     enet_loopback_ = false;
     enet_dconfig_ = enet_pconfig_ = 0;
     enet_rx_.cbp = enet_rx_.ndbp = enet_rx_.cdp = enet_tx_.cbp = enet_tx_.ndbp = 0;
@@ -183,8 +184,12 @@ void Hpc3::enet_receive(const u8* frame, std::size_t length) {
         bus_.read<u32>(desc, pbuf);
         bus_.read<u32>(desc + 4, cnt);
         bus_.read<u32>(desc + 8, next);
-        if (!(cnt & kEnetDescOwn)) {  // the driver has not handed this buffer back yet
-            if (done == 0) return;  // no room: the frame is lost
+        if (!(cnt & kEnetDescOwn)) {
+            // The driver has not handed this buffer back yet (OWN is the
+            // drivers' convention; the HPC3 itself only stops at EOX). The
+            // frame is dropped rather than written over a buffer still in
+            // use, and the channel stays ready for the next one.
+            if (done == 0) return;
             status = Seeq8003::kRxOverflow;
             break;
         }
@@ -251,7 +256,9 @@ u32 Hpc3::enet_read(u32 offset) {
         case kEnetRxNdbp: return enet_rx_.ndbp;
         case kEnetRxCtrl:
             return seeq_.rx_status() | (enet_rx_.ctrl & kEnetCtrlEndian) | (enet_rx_.active ? kEnetCtrlActive : 0);
-        case kEnetReset: return (enet_irq_ ? kEnetResetClearIrq : 0) | (enet_loopback_ ? kEnetResetLoopback : 0);
+        case kEnetReset:
+            return (enet_held_ ? kEnetResetChannel : 0) | (enet_irq_ ? kEnetResetClearIrq : 0) |
+                   (enet_loopback_ ? kEnetResetLoopback : 0);
         case kEnetDmaCfg: return enet_dconfig_;
         case kEnetPioCfg: return enet_pconfig_;
         case kEnetTxCbp: return enet_tx_.cbp;
@@ -270,10 +277,11 @@ void Hpc3::enet_write(u32 offset, u32 value) {
         case kEnetRxNdbp: enet_rx_.ndbp = value; return;
         case kEnetRxCtrl:
             enet_rx_.ctrl = value;
-            enet_rx_.active = value & kEnetCtrlActive;
+            if (!(value & kEnetCtrlActiveMask)) enet_rx_.active = (value & kEnetCtrlActive) && !enet_held_;
             return;
         case kEnetReset:
-            if (value & kEnetResetChannel) enet_reset();
+            enet_held_ = value & kEnetResetChannel;
+            if (enet_held_) enet_reset();
             if (value & kEnetResetClearIrq) {
                 enet_irq_ = false;
                 ioc_.set_local0(Ioc2::kL0Ethernet, false);
@@ -286,8 +294,10 @@ void Hpc3::enet_write(u32 offset, u32 value) {
         case kEnetTxNdbp: enet_tx_.ndbp = value; return;
         case kEnetTxCtrl: {
             enet_tx_.ctrl = value;
-            const bool start = (value & kEnetCtrlActive) && !enet_tx_.active;
-            enet_tx_.active = value & kEnetCtrlActive;
+            if (value & kEnetCtrlActiveMask) return;
+            const bool active = (value & kEnetCtrlActive) && !enet_held_;
+            const bool start = active && !enet_tx_.active;
+            enet_tx_.active = active;
             if (start) enet_tx_timer_->schedule_in(static_cast<u64>(cpu_hz_ * 2e-6));  // after a short setup
             if (!enet_tx_.active) enet_tx_timer_->cancel();
             return;

@@ -132,6 +132,7 @@ private:
     Seeq8003 seeq_;
     EnetDma enet_rx_, enet_tx_;
     bool enet_irq_ = false, enet_loopback_ = false;
+    bool enet_held_ = true;  // channel reset bit: set at power-on, holds the channel and the Seeq in reset
     u32 enet_dconfig_ = 0, enet_pconfig_ = 0;
     net::NetBackend* net_ = nullptr;
     u64 enet_tx_frames_ = 0, enet_rx_frames_ = 0;
