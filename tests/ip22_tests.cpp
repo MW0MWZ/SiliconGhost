@@ -704,6 +704,7 @@ TEST(ip22_mc_dma_feeds_one_gio_address) {
     // 8-bit pixels from the host, eight per doubleword, into the block (0,0)-(7,1)
     t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
     t.w32(kRex3 + 0x220, 0xFF);                                                  // WRMASK
+    t.w32(kRex3 + 0x1328, 0x1E00);                                               // CLIPMODE: all CID codes
     t.w32(kRex3 + 0x150, 0);                                                     // XYSTARTI (0,0)
     t.w32(kRex3 + 0x154, (7u << 16) | 1u);                                       // XYENDI (7,1)
     t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));   // DRAW BLOCK COLORHOST STOPX STOPY
@@ -738,6 +739,7 @@ TEST(ip22_mc_dma_from_unaligned_memory_feeds_the_aligned_data_port) {
     // 8-bit pixels from the host, eight per doubleword, into the block (0,0)-(7,1)
     t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
     t.w32(kRex3 + 0x220, 0xFF);                                                  // WRMASK
+    t.w32(kRex3 + 0x1328, 0x1E00);                                               // CLIPMODE: all CID codes
     t.w32(kRex3 + 0x150, 0);                                                     // XYSTARTI (0,0)
     t.w32(kRex3 + 0x154, (7u << 16) | 1u);                                       // XYENDI (7,1)
     t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));   // DRAW BLOCK COLORHOST STOPX STOPY

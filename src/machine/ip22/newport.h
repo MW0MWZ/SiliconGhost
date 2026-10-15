@@ -73,7 +73,8 @@ private:
     void set_color_index(u32 v);
 
     u32 source_color(int x, int y);
-    u32 host_color();
+    u32 host_color(u32* alpha = nullptr);
+    u32 blend(u32 src, int px, int py) const;
     u32 default_color(u32 colour) const;
     u32 shaded_color(int x, int y) const;
     void iterate_shade();
@@ -148,6 +149,7 @@ private:
     u32 aweight0_ = 0, aweight1_ = 0;
     u32 colorred_ = 0, coloralpha_ = 0, colorgrn_ = 0, colorblue_ = 0;
     s32 curr_red_ = 0, curr_alpha_ = 0, curr_grn_ = 0, curr_blue_ = 0;
+    u32 src_alpha_ = 0xFF;  // alpha of the pixel being drawn, for blending
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
@@ -156,7 +158,7 @@ private:
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
     u64 dcb_busy_until_ = 0;
-    bool warned_blend_ = false, warned_aline_ = false;  // unmodelled features, reported once  // an access to an absent slave is waiting for its acknowledge
+    bool warned_aline_ = false;  // unmodelled features, reported once  // an access to an absent slave is waiting for its acknowledge
 
     u64 display_version_ = 0;
     bool full_redraw_ = true;

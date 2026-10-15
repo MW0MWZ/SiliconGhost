@@ -38,9 +38,12 @@ constexpr u32 kDm0DoSetup = 1u << 5, kDm0ColorHost = 1u << 6, kDm0StopOnX = 1u <
 constexpr u32 kDm0SkipFirst = 1u << 10, kDm0SkipLast = 1u << 11, kDm0EnZPattern = 1u << 12;
 constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
 constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0CiClamp = 1u << 21;
+constexpr u32 kDm0AlphaHost = 1u << 7;
 // DRAWMODE1
 constexpr u32 kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
 constexpr u32 kDm1RgbMode = 1u << 15, kDm1Dither = 1u << 16, kDm1FastClear = 1u << 17, kDm1Blend = 1u << 18;
+constexpr u32 kDm1BackBlend = 1u << 25, kDm1BlendAlpha = 1u << 27;
+constexpr unsigned kDm1SFactorShift = 19, kDm1DFactorShift = 22;
 
 constexpr u32 kStatusVersion = 3;
 constexpr u32 kStatusBackBusy = 1u << 4;  // the display control bus is busy
@@ -65,10 +68,12 @@ constexpr int kBayer[4][4] = {{0, 12, 3, 15}, {8, 4, 11, 7}, {2, 14, 1, 13}, {10
 
 s32 sext(u32 v, unsigned bits) { return static_cast<s32>(v << (32 - bits)) >> (32 - bits); }
 
-// Slopes are written sign-magnitude (sign in bit 31) and held as two's complement.
+// Slopes are written sign-magnitude (sign in bit 31) and held as two's
+// complement. Minus zero is zero: IRIX writes it for flat alpha.
 u32 sign_magnitude(u32 data, u32 magnitude_mask, u32 result_sign) {
-    if (data & 0x80000000u) return ((result_sign - (data & magnitude_mask)) & (result_sign | magnitude_mask)) | result_sign;
-    return data & magnitude_mask;
+    const u32 magnitude = data & magnitude_mask;
+    if ((data & 0x80000000u) && magnitude) return ((result_sign - magnitude) & (result_sign | magnitude_mask)) | result_sign;
+    return magnitude;
 }
 
 // Logical BGR formats <-> 8-bit channels.
@@ -522,13 +527,14 @@ u32 Newport::shaded_color(int x, int y) const {
     return pack(r, g, b, depth);
 }
 
-u32 Newport::host_color() {
+u32 Newport::host_color(u32* alpha) {
     static constexpr int kWidths[4] = {8, 8, 16, 32};
     static constexpr u32 kMasks[4] = {0xF, 0xFF, 0xFFF, 0xFFFFFFFF};
     const unsigned hostdepth = (drawmode1_ >> 8) & 3;
     const int width = kWidths[hostdepth];
     if (host_shift_ < 0) host_shift_ = 64 - width;
     u32 colour = static_cast<u32>(hostrw_ >> host_shift_) & kMasks[hostdepth];
+    if (alpha) *alpha = hostdepth == 3 ? colour >> 24 : 0xFF;  // only 32-bit host pixels carry alpha (ABGR)
     if (drawmode1_ & kDm1RwPacked) {
         if (((drawmode1_ & kDm1RwDouble) && host_shift_ > 0) || host_shift_ > 32) host_shift_ -= width;
         else host_shift_ = 64 - width;
@@ -544,11 +550,60 @@ u32 Newport::host_color() {
     return colour;
 }
 
+// The pixel's colour, and its alpha for blending (src_alpha_): from the
+// alpha iterator, or from the host data with ALPHAHOST (which may also be
+// set without COLORHOST, to blend iterated colours by host alphas).
 u32 Newport::source_color(int x, int y) {
     if (drawmode1_ & kDm1FastClear) return default_color(colorvram_);
-    if (drawmode0_ & kDm0ColorHost) return host_color();
-    if ((drawmode0_ & kDm0Shade) || (drawmode1_ & kDm1RgbMode)) return shaded_color(x, y);
-    return default_color(colori_);
+    u32 host_alpha = 0xFF, colour;
+    if (drawmode0_ & kDm0ColorHost) colour = host_color(&host_alpha);
+    else if ((drawmode0_ & kDm0Shade) || (drawmode1_ & kDm1RgbMode)) colour = shaded_color(x, y);
+    else colour = default_color(colori_);
+    if (drawmode1_ & kDm1Blend) {
+        if (drawmode0_ & kDm0AlphaHost) {
+            if (!(drawmode0_ & kDm0ColorHost)) host_color(&host_alpha);
+            src_alpha_ = host_alpha;
+        } else {
+            const u32 a = (static_cast<u32>(curr_alpha_) >> 11) & 0x1FF;
+            src_alpha_ = (a >= 0x180 || curr_alpha_ < 0) ? 0 : std::min<u32>(a, 0xFF);
+        }
+    }
+    return colour;
+}
+
+// Cb = Cs * Fs + Cd * Fd for each channel, the destination being the frame
+// buffer or COLORBACK; factors are normalised as (v + msb) / 256, so 0xFF is
+// 1.0. Blending works on RGB pixels; the result replaces the logic op.
+u32 Newport::blend(u32 src, int px, int py) const {
+    const unsigned depth = (drawmode1_ >> 3) & 3;
+    u32 sr, sg, sb, dr, dg, db;
+    unpack(src & depth_mask(depth), depth, sr, sg, sb);
+    unpack((drawmode1_ & kDm1BackBlend) ? colorback_ & depth_mask(depth) : fetch(px, py), depth, dr, dg, db);
+    auto norm = [](u32 v) { return v + (v >> 7); };
+    const u32 sa = norm(src_alpha_);
+    const unsigned sf = (drawmode1_ >> kDm1SFactorShift) & 7, df = (drawmode1_ >> kDm1DFactorShift) & 7;
+    auto channel = [&](u32 s, u32 d) {
+        static constexpr u32 kOne = 256;
+        u32 fs = 0, fd = 0;
+        switch (sf) {
+            case 1: fs = kOne; break;
+            case 2: fs = norm(d); break;
+            case 3: fs = kOne - norm(d); break;
+            case 4: fs = sa; break;
+            case 5: fs = kOne - sa; break;
+            default: break;
+        }
+        switch (df) {
+            case 1: fd = kOne; break;
+            case 2: fd = norm(s); break;
+            case 3: fd = kOne - norm(s); break;
+            case 4: fd = sa; break;
+            case 5: fd = kOne - sa; break;
+            default: break;
+        }
+        return std::min<u32>(0xFF, (s * fs + d * fd) >> 8);
+    };
+    return pack(channel(sr, dr), channel(sg, dg), channel(sb, db), depth);
 }
 
 bool Newport::clip(int x, int y, int& px, int& py) const {
@@ -599,6 +654,9 @@ void Newport::store(int px, int py, u32 colour) {
     ++pixels_drawn_;
     const unsigned planes = drawmode1_ & 7, depth = (drawmode1_ >> 3) & 3;
     if (planes == kPlanesNone || planes == 3 || planes == 7) return;
+    if ((drawmode1_ & (kDm1Blend | kDm1FastClear | kDm1RgbMode)) == (kDm1Blend | kDm1RgbMode) &&
+        (planes == kPlanesRgb || planes == kPlanesRgba))
+        colour = blend(colour, px, py);
     // Replicate the value into every buffer lane, then move aux values into place.
     u32 v;
     switch (depth) {
@@ -633,11 +691,6 @@ void Newport::store(int px, int py, u32 colour) {
             default: v = ~0u; break;
         }
     }
-    // Blending is not modelled yet: blended pixels are written as the source colour.
-    if ((drawmode1_ & kDm1Blend) && !warned_blend_) {
-        warned_blend_ = true;
-        SG_LOG(Debug, "newport", "blending requested (drawmode1 %08x); drawn unblended", drawmode1_);
-    }
     const u32 mask = wrmask_ & (opts_.xl24 ? 0xFFFFFFu : 0xFFu);
     const u32 updated = (dst & ~mask) | (v & mask);
     if (updated != dst) {
@@ -647,6 +700,10 @@ void Newport::store(int px, int py, u32 colour) {
     }
 }
 
+// CID checking is not applied: IRIX 6.5 clears the CID planes to one code
+// for the whole screen, then draws visible GL windows with CIDMATCH 0 (no
+// code selected) and clips them with the screen masks, so on the real
+// board such writes cannot be blocked as the REX3 specification reads.
 void Newport::plot(int x, int y, u32 colour) {
     int px, py;
     if (clip(x, y, px, py)) store(px, py, colour);

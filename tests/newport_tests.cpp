@@ -28,7 +28,8 @@ struct Rig {
     u64 now = 0;
     Scheduler sched;
     Newport np;
-    Rig() : np((sched.set_clock([this] { return now; }), sched), 150.0e6, Newport::Options{}) {}
+    // CLIPMODE resets with no CID codes selected: allow them all, as drivers do.
+    explicit Rig(Newport::Options o = {}) : np((sched.set_clock([this] { return now; }), sched), 150.0e6, o) { w(0x1328, 0x1E00); }
     void w(u32 off, u32 v) { CHECK(np.write(off, 4, v)); }
     u32 r(u32 off) {
         u64 v = 0;
@@ -320,4 +321,60 @@ TEST(newport_render_matches_the_reference_conversion) {
             compare();
         }
     }
+}
+
+namespace {
+
+// 24-bit RGB pixels on an XL24: one point per GO, and reading one back.
+constexpr u32 kRgb24 = (3u << 28) | (1u << 15) | (3u << 3) | 1u;  // logicop SRC, RGBMODE, 24bpp, RGB planes
+void point24(Rig& t, int x, int y, u32 bgr, u32 dm1 = kRgb24, u32 dm0_extra = 0) {
+    t.w(kDrawMode1, dm1);
+    t.w(kWrMask, 0xFFFFFF);
+    t.w(kColorI, bgr);
+    t.w(kXYStartI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kXYEndI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kDrawMode0 | kGo, 2u | (1u << 5) | dm0_extra);  // DRAW SPAN DOSETUP: one pixel
+}
+u32 read24(Rig& t, int x, int y) {
+    t.w(kDrawMode1, kRgb24 | (3u << 8));  // 32-bit host pixels
+    t.w(kXYStartI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kXYEndI, (static_cast<u32>(x) << 16) | static_cast<u32>(y));
+    t.w(kDrawMode0 | kGo, 1u);
+    return t.r(kHostRw0) & 0xFFFFFF;
+}
+constexpr u32 kBlend = 1u << 18, kBackBlend = 1u << 25;
+constexpr u32 factors(u32 s, u32 d) { return (s << 19) | (d << 22); }
+constexpr u32 kSa = 4, kMsa = 5;
+
+}  // namespace
+
+// Cb = Cs*Fs + Cd*Fd, factors normalised as (v + msb)/256.
+TEST(newport_blend_source_alpha_over_frame_buffer_and_colorback) {
+    Rig t(Newport::Options{true, 0xA});
+    point24(t, 10, 10, 0x0000FF);  // red
+    t.w(0x204, 0x80u << 11);       // COLORALPHA 128
+    point24(t, 10, 10, 0xFF0000, kRgb24 | kBlend | factors(kSa, kMsa));  // blue at alpha 128
+    CHECK_EQ(read24(t, 10, 10), (128u << 16) | 126u);
+    // BACKBLEND: the destination is COLORBACK (green) whatever is stored.
+    t.w(0x018, 0x00FF00);
+    point24(t, 11, 10, 0xFF0000, kRgb24 | kBlend | kBackBlend | factors(kSa, kMsa));
+    CHECK_EQ(read24(t, 11, 10), (128u << 16) | (126u << 8));
+    // ONE, ONE adds and clamps.
+    point24(t, 12, 10, 0x8080FF);
+    point24(t, 12, 10, 0x80C001, kRgb24 | kBlend | factors(1, 1));
+    CHECK_EQ(read24(t, 12, 10), 0xFFFFFFu);
+}
+
+// A slope written as minus zero leaves the iterator where it is.
+TEST(newport_minus_zero_slope_keeps_alpha) {
+    Rig t(Newport::Options{true, 0xA});
+    for (int x = 20; x < 24; ++x) point24(t, x, 5, 0x0000FF);
+    t.w(0x204, 0x80u << 11);  // COLORALPHA 128
+    t.w(0x214, 0x80000000u);  // SLOPEALPHA -0
+    t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
+    t.w(kColorI, 0xFF0000);
+    t.w(kXYStartI, (20u << 16) | 5u);
+    t.w(kXYEndI, (23u << 16) | 5u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 5) | (1u << 8) | (1u << 18));  // DRAW SPAN DOSETUP STOPX SHADE
+    for (int x = 20; x < 24; ++x) CHECK_EQ(read24(t, x, 5), (128u << 16) | 126u);
 }
