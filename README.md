@@ -23,6 +23,10 @@ SiliconGhost is under active development. What works today:
   to the graphical login and the IRIX desktop (4Dwm, Toolchest, winterm) on
   Newport, with the PS/2 keyboard and mouse. IRIS GL programs run, such as
   the flight simulator and the atlantis and ideas demos.
+- **IRIX 6.5 (June 1998):** installs from its CD set (Installation Tools,
+  Foundation 1 and 2, Applications, ONC3/NFS, Development Foundation and
+  Libraries) onto an XFS disk, changing discs as the installer asks, and
+  boots to the graphical login on Newport.
 - **NetBSD 9.0/sgimips:** finds and attaches every device of the machine,
   installs to disk with its own installer (over the network) and boots
   multi-user on the serial console, with networking and sound.
@@ -178,6 +182,13 @@ ISO 9660, so a raw dump of the disc is used as it is. To install:
 3. Choose *Install System Software* from the maintenance menu and install
    from the CD-ROM as on a real Indy.
 
+For a set of discs, such as IRIX 6.5, give `--cdrom` once for each disc, in
+the order the installer reads them (Installation Tools first). When the
+installer asks for another disc, press Ctrl+Alt+E (or send `SIGUSR1`) until
+it is in the drive; the start-up messages (`--log info`) name each disc as
+it goes in. The IRIX 6.5 Base Documentation disc is a plain ISO 9660 disc to
+browse, not an installer distribution, so the installer cannot open it.
+
 Install with the graphics board present (no `--no-graphics`): IRIX only
 installs the Newport kernel driver and X server on a machine where it finds
 the board. To add them to a system installed without graphics, start
@@ -291,8 +302,8 @@ with performance layers on top that must give exactly the same results:
   and 24-bit boards from a register read whose real-hardware result is not
   known yet, and on the emulated board it chooses 24-bit. Use the serial
   console.
-- IRIX 5.3 and NetBSD 9.0 are the systems tested so far; IRIX 6.5 and Linux
-  have not been tried.
+- IRIX 5.3, IRIX 6.5 and NetBSD 9.0 are the systems tested so far; Linux
+  has not been tried.
 - The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
   Linux is the host tested most. macOS on Apple silicon has run the IRIX
@@ -303,7 +314,7 @@ with performance layers on top that must give exactly the same results:
 ## Roadmap
 
 - Newport 24-bit boards (XL24) and the remaining raster operations
-- IRIX 6.5; Linux/mips; NetBSD on the graphics console
+- Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
 - Indigo² (IP22 "Fullhouse") machine profile
 
