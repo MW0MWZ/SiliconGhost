@@ -454,6 +454,22 @@ TEST(ip22_hal2_adc_records_from_the_audio_source) {
     }
 }
 
+// The rate generators' 16-bit increment and modulus count 0 as 65536: IRIX
+// sets 44.1 kHz as 44.1 kHz * 0/0, Linux as 44.1 kHz * 4/4.
+TEST(ip22_hal2_rate_fields_of_zero_mean_65536) {
+    for (const u32 c2 : {0xFFFF0000u, 0xFFFF0004u}) {
+        IndyRig t;
+        t.w32(kHal2 + 0x10, 0x18);
+        hal2_write(t, 0x2204, 1);    // generator 2: the 44.1 kHz master
+        hal2_write(t, 0x2208, c2);   // inc - mod - 1 = -1, inc = 0 (or 4)
+        hal2_write(t, 0x1404, 0x110);  // DAC: PBUS channel 0, clock 2, mono
+        hal2_write(t, 0x9104, 0x08);   // codec transmit DMA port on
+        const auto port = t.m.hpc3().hal2().port(Hal2::kDac);
+        CHECK(port.enabled);
+        CHECK(port.rate == 44100.0);
+    }
+}
+
 // ADC_C2 amplifies each side in 1.5 dB steps, clipping at full scale.
 TEST(ip22_hal2_adc_input_gain) {
     for (const bool ds16 : {false, true}) {

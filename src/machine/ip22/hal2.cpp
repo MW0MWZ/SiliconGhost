@@ -139,9 +139,12 @@ Hal2::PortConfig Hal2::port(Port p) const {
         const u32 bres_c1 = indirect(kBresC1 + 0x100 * (clock - 1));
         const u32 bres_c2 = indirect(kBresC2 + 0x100 * (clock - 1));
         const unsigned master = bres_c1 & 3;
-        const u32 inc = bres_c2 & 0xFFFF;
-        const u32 mod = (inc - (bres_c2 >> 16) - 1) & 0xFFFF;  // written as inc - mod - 1
-        if (master < 2 && inc && mod && inc <= mod) c.rate = (master ? 44100.0 : 48000.0) * inc / mod;
+        // 16-bit fields where 0 stands for 65536: IRIX runs at the master
+        // rate with inc = mod = 0, Linux with inc = mod = 4.
+        auto field = [](u32 v) { return (v & 0xFFFF) ? (v & 0xFFFF) : 0x10000u; };
+        const u32 inc = field(bres_c2);
+        const u32 mod = field(inc - (bres_c2 >> 16) - 1);  // written as inc - mod - 1
+        if (master < 2 && inc <= mod) c.rate = (master ? 44100.0 : 48000.0) * inc / mod;
     }
     c.enabled = (isr_ & 0x08) && (indirect(kDmaPortEn) & kPortBit[p]) && c.rate > 0 && c.voices > 0;
     return c;
