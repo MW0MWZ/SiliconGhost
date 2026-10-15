@@ -646,6 +646,8 @@ void Gui::handle_event(const SDL_Event& ev) {
             if (ev.key.down && to_guest && !ev.key.repeat && sc < keys_down_.size()) {
                 send_key(*machine, ev.key.scancode, true);
                 keys_down_[sc] = true;
+            } else if (ev.key.down && ev.key.repeat && machine && sc < keys_down_.size() && keys_down_[sc]) {
+                send_key(*machine, ev.key.scancode, true, true);  // typematic repeat
             } else if (!ev.key.down && sc < keys_down_.size() && keys_down_[sc]) {
                 if (machine) send_key(*machine, ev.key.scancode, false);
                 keys_down_[sc] = false;

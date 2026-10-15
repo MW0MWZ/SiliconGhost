@@ -131,7 +131,7 @@ u8 Ioc2::read(unsigned index) {
         case kKbdCmd: return kbc_.read_status();
         case kGcSel:
         case kGenCtrl:
-        case kRead: return 0;
+        case kRead: return 0x50;  // twisted-pair link (bit 7 low), Ethernet +12 V and SCSI +5 V present
         case kPanel: return panel_;
         case kSysId: return kSysIdIndy;
         case kDmaSel: return dmasel_;

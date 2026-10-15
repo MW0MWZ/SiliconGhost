@@ -839,3 +839,32 @@ TEST(wd33c93_dma_transfer_waits_for_the_host_channel) {
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);
 }
+
+// Set 3 per-key modes: FB/FC/FD take a list of keys ended by the next
+// command, F7-FA set every key; all keys start typematic with breaks.
+TEST(kbc_set3_key_modes) {
+    Kbc8042 kbc;
+    CHECK(kbc.repeats(0x1C) && kbc.sends_break(0x1C));
+    kbc.write_data(0xFC);  // make/break only for...
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0x14);  // Caps Lock
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0x76);  // Num Lock
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0xED);  // the next command ends the list
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    kbc.write_data(0x00);
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK(!kbc.repeats(0x14) && kbc.sends_break(0x14));
+    CHECK(!kbc.repeats(0x76));
+    CHECK(kbc.repeats(0x1C));
+    kbc.write_data(0xF8);  // every key make/break (as X sets it)
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK(!kbc.repeats(0x1C) && kbc.sends_break(0x1C));
+    kbc.write_data(0xF6);  // defaults
+    CHECK_EQ(kbc.read_data(), 0xFA);
+    CHECK(kbc.repeats(0x14));
+    kbc.write_command(0xD1);  // write output port: its byte is taken, not sent to the keyboard
+    kbc.write_data(0xDF);
+    CHECK(!(kbc.read_status() & 1));
+}

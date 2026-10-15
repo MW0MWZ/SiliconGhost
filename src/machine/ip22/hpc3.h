@@ -139,6 +139,7 @@ private:
     std::unique_ptr<Timer> enet_tx_timer_, enet_poll_timer_;
     u32 eeprom_reg_ = 0;
     std::unordered_map<u32, u32> regs_;  // registers without behaviour yet
+    std::unordered_map<u32, u32> written_;  // last word written by sub-word writes, per register
 };
 
 }  // namespace sg::ip22

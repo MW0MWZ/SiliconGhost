@@ -103,10 +103,11 @@ KeyCodes key_codes(SDL_Scancode sc) {
 
 }  // namespace
 
-void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
+void send_key(ip22::Indy& m, SDL_Scancode sc, bool down, bool repeat) {
     auto& kbc = m.ioc().kbc();
     // Print Screen and Pause are sequences in set 2 (Pause has no break).
     if (sc == SDL_SCANCODE_PRINTSCREEN || sc == SDL_SCANCODE_PAUSE) {
+        if (repeat) return;
         const bool print = sc == SDL_SCANCODE_PRINTSCREEN;
         if (kbc.scan_set() == 3) {
             if (!down) kbc.key_input(0xF0);
@@ -123,8 +124,12 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down) {
     }
     const KeyCodes k = key_codes(sc);
     if (!k.set2) return;
-    if (kbc.scan_set() == 3) {
-        if (!down) kbc.key_input(0xF0);
+    if (kbc.scan_set() == 3) {  // per-key modes decide on breaks and repeats
+        if (repeat && !kbc.repeats(k.set3)) return;
+        if (!down) {
+            if (!kbc.sends_break(k.set3)) return;
+            kbc.key_input(0xF0);
+        }
         kbc.key_input(k.set3);
         return;
     }

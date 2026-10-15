@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Andy Taylor
 #include "machine/ip22/hal2.h"
 
+#include <algorithm>
+
 #include <cmath>
 
 namespace sg::ip22 {
@@ -61,7 +63,9 @@ u32 Hal2::indirect(u32 reg) const {
 void Hal2::indirect_access(u32 iar) {
     const u32 reg = iar & kIarRegMask;
     if (iar & kIarRead) {
+        // A 32-bit register reads back low half in IDR0, high half in IDR1.
         idr_[0] = (indirect(reg) >> (16 * (iar & 1))) & 0xFFFF;
+        idr_[1] = (indirect(reg) >> 16) & 0xFFFF;
         return;
     }
     regs_[reg] = (idr_[0] & 0xFFFF) | ((idr_[1] & 0xFFFF) << 16);
@@ -72,7 +76,7 @@ u32 Hal2::read(u32 offset) {
     if (offset < kControlWindowEnd) {
         switch (offset) {
             case kIsr: return isr_;
-            case kRev: return 0;  // audio present (H2_REV_AUDIO_PRESENT clear)
+            case kRev: return 0x4010;  // as fitted on Indys; bit 15 clear: audio present
             case kIar: return iar_;
             default:
                 if (offset >= kIdr0 && offset <= kIdr3 && (offset & 0xF) == 0) return idr_[(offset - kIdr0) >> 4];
@@ -151,7 +155,10 @@ Hal2::PortConfig Hal2::port(Port p) const {
         auto field = [](u32 v) { return (v & 0xFFFF) ? (v & 0xFFFF) : 0x10000u; };
         const u32 inc = field(bres_c2);
         const u32 mod = field(inc - (bres_c2 >> 16) - 1);  // written as inc - mod - 1
-        if (master < 2 && inc <= mod) c.rate = (master ? 44100.0 : 48000.0) * inc / mod;
+        // A generator can only divide its master clock down (inc above mod
+        // runs at the master rate); the AES-derived masters (2, 3) follow
+        // an input that is not connected, taken as 48 kHz.
+        c.rate = (master == 1 ? 44100.0 : 48000.0) * std::min(inc, mod) / mod;
     }
     c.enabled = (isr_ & 0x08) && (indirect(kDmaPortEn) & kPortBit[p]) && c.rate > 0 && c.voices > 0;
     return c;

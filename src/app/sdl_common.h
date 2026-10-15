@@ -10,6 +10,8 @@
 namespace sg::app {
 
 // Sends a host key press or release to the Indy's PS/2 keyboard, by position.
-void send_key(ip22::Indy& machine, SDL_Scancode scancode, bool down);
+// `repeat`: the host's key repeat for a key still held, sent as the
+// keyboard's typematic repeat (where the key's mode allows it).
+void send_key(ip22::Indy& machine, SDL_Scancode scancode, bool down, bool repeat = false);
 
 }  // namespace sg::app

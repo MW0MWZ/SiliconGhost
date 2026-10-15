@@ -50,6 +50,8 @@ void Kbc8042::reset() {
     pending_ = Pending::None;
     kbd_arg_command_ = mouse_arg_command_ = 0;
     scan_set_ = 2;
+    key_modes_.fill(kModeTypematic | kModeBreak);
+    listing_mode_ = -1;
     translate_break_ = false;
     mouse_reporting_ = false;
     mouse_buttons_ = 0;
@@ -123,7 +125,7 @@ void Kbc8042::write_command(u8 value) {
         case 0xAE: command_byte_ &= ~kCmdKbdDisable; break;    // enable keyboard
         case 0xC0: push(0xFF, false); break;                   // read input port
         case 0xD0: push(0x01, false); break;                   // read output port
-        case 0xD1: break;                                      // write output port (byte follows, ignored)
+        case 0xD1: pending_ = Pending::OutputPort; break;      // write output port: the byte that follows is taken
         case 0xD2: pending_ = Pending::ToOutputKbd; break;
         case 0xD3: pending_ = Pending::ToOutputAux; break;
         case 0xD4: pending_ = Pending::ToAux; break;
@@ -148,6 +150,7 @@ void Kbc8042::write_data(u8 value) {
             update_irq();
             return;
         case Pending::ToAux: mouse_command(value); return;
+        case Pending::OutputPort: return;  // A20 / reset lines: nothing to do
         case Pending::ToOutputKbd: push(value, false); return;
         case Pending::ToOutputAux: push(value, true); return;
         case Pending::None: keyboard_command(value); return;
@@ -155,6 +158,15 @@ void Kbc8042::write_data(u8 value) {
 }
 
 void Kbc8042::keyboard_command(u8 value) {
+    // FB/FC/FD take a list of set 3 key codes, ended by the next command.
+    if (listing_mode_ >= 0) {
+        if (value < 0xED) {
+            key_modes_[value] = static_cast<u8>(listing_mode_);
+            push_keyboard(kAck);
+            return;
+        }
+        listing_mode_ = -1;
+    }
     if (kbd_arg_command_) {  // argument of a previous command
         const u8 command = kbd_arg_command_;
         kbd_arg_command_ = 0;
@@ -168,9 +180,26 @@ void Kbc8042::keyboard_command(u8 value) {
     switch (value) {
         case 0xFF:  // reset
             scan_set_ = 2;
+            key_modes_.fill(kModeTypematic | kModeBreak);
             push_keyboard(kAck);
             push_keyboard(kSelfTestPassed);
             break;
+        case 0xF6:  // set defaults
+            key_modes_.fill(kModeTypematic | kModeBreak);
+            push_keyboard(kAck);
+            break;
+        case 0xF7: case 0xF8: case 0xF9: case 0xFA: {  // all keys: typematic / make-break / make only / both
+            static constexpr u8 kAll[] = {kModeTypematic, kModeBreak, 0, kModeTypematic | kModeBreak};
+            key_modes_.fill(kAll[value - 0xF7]);
+            push_keyboard(kAck);
+            break;
+        }
+        case 0xFB: case 0xFC: case 0xFD: {  // listed keys: typematic / make-break / make only
+            static constexpr u8 kListed[] = {kModeTypematic, kModeBreak, 0};
+            listing_mode_ = kListed[value - 0xFB];
+            push_keyboard(kAck);
+            break;
+        }
         case 0xF2:  // identify
             push_keyboard(kAck);
             push_keyboard(0xAB);
@@ -180,9 +209,6 @@ void Kbc8042::keyboard_command(u8 value) {
         case 0xED:                             // set LEDs
         case 0xF0:                             // select scan code set
         case 0xF3:                             // typematic rate
-        case 0xFB:
-        case 0xFC:
-        case 0xFD:
             kbd_arg_command_ = value;
             push_keyboard(kAck);
             break;

@@ -106,6 +106,7 @@ Hpc3::Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz)
 
 void Hpc3::reset() {
     regs_.clear();
+    written_.clear();
     eeprom_reg_ = 0;
     eeprom_.set_lines(false, false, false);
     scsi0_.reset();
@@ -678,7 +679,12 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
         const u32 word = offset & ~3u;
         const unsigned shift = (4 - size - (offset & 3)) * 8;
         const u32 mask = ((1u << (size * 8)) - 1) << shift;
-        write_word(word, (read_word(word) & ~mask) | ((static_cast<u32>(value) << shift) & mask));
+        // A PIO access is always a whole word on the HPC3's side, and a write
+        // never reads: the other lanes are taken from the last word written,
+        // so a byte at lane 3 reaches an 8-bit device as is.
+        u32& last = written_[word];
+        last = (last & ~mask) | ((static_cast<u32>(value) << shift) & mask);
+        write_word(word, last);
     }
     return true;
 }
