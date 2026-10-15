@@ -227,10 +227,11 @@ int main(int argc, char** argv) {
     bool trace = false, dump = false, headless = false, timing_given = false, foreground = false, log_given = false;
     sg::log::set_level(sg::log::Level::Warn);
 
-    // Finder on older macOS passes a process serial number: not an option.
+    // Options that describe a machine. Finder on older macOS passes a process
+    // serial number, which is not one, nor is --foreground.
     int real_args = 0;
     for (int i = 1; i < argc; ++i)
-        if (std::strncmp(argv[i], "-psn_", 5) != 0) ++real_args;
+        if (std::strncmp(argv[i], "-psn_", 5) != 0 && std::strcmp(argv[i], "--foreground") != 0) ++real_args;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (!std::strncmp(a, "-psn_", 5)) continue;

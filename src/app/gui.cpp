@@ -824,7 +824,11 @@ void Gui::frame() {
         SDL_SetTextureScaleMode(texture_, std::fabs(k - std::round(k)) < 0.01f ? SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
         SDL_RenderTexture(renderer_, texture_, nullptr, &px);
     }
+    // ImGui draws in window coordinates and clips in pixels: SDL's render
+    // scale turns the one into the other (2 on a high-density screen).
+    SDL_SetRenderScale(renderer_, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer_);
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     SDL_RenderPresent(renderer_);
 }
 

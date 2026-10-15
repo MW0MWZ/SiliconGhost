@@ -236,7 +236,11 @@ void TerminalWindow::frame(u64 now_ns) {
     ImGui::Render();
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
+    // ImGui draws in window coordinates and clips in pixels (see Gui::frame).
+    const ImVec2 fb = ImGui::GetIO().DisplayFramebufferScale;
+    SDL_SetRenderScale(renderer_, fb.x, fb.y);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer_);
+    SDL_SetRenderScale(renderer_, 1.0f, 1.0f);
     SDL_RenderPresent(renderer_);
 }
 
