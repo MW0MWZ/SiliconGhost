@@ -52,6 +52,9 @@ public:
     // (screenshots; render() is checked against it).
     bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
     u64 frames() const { return frames_; }
+    // Where the VC2 shows the hardware cursor: the top left of its glyph in
+    // screen coordinates. False while the cursor is off.
+    bool cursor_position(int& x, int& y) const;
     // Pixels the REX3 has drawn (a measure of how busy the board is).
     u64 pixels_drawn() const { return pixels_drawn_; }
 

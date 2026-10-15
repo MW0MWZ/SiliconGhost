@@ -1258,6 +1258,15 @@ unsigned Newport::cursor_pixel(int x, int y) const {
     return ((vc2_.ram[word & 0x7FFF] >> bit) & 1) | (((vc2_.ram[(word + 64) & 0x7FFF] >> bit) & 1) << 1);
 }
 
+bool Newport::cursor_position(int& x, int& y) const {
+    const u16 dcr = vc2_.reg[kVc2Control];
+    if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return false;
+    const int size = (dcr & kDcrLargeCursor) ? 64 : 32;
+    x = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (size - 1);
+    y = static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1);
+    return true;
+}
+
 void Newport::cursor_moving() {
     ++display_version_;
     const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;

@@ -130,6 +130,7 @@ private:
     void handle_event(const SDL_Event& ev);
     bool hotkey(const SDL_KeyboardEvent& key);
     void set_captured(bool on);
+    void mouse_frame();
     void release_keys();
     void update_title();
 
@@ -177,6 +178,11 @@ private:
     int pending_frames_ = 3;
 
     bool captured_ = false;
+    // Following the guest's hardware cursor (see mouse_frame)
+    bool have_cursor_ = false, syncing_ = false;
+    int last_cx_ = 0, last_cy_ = 0, hot_x_ = 0, hot_y_ = 0, sync_frames_ = 0;
+    int push_[4] = {};  // pushed against the left, right, top and bottom edges
+    float sync_x_ = 0, sync_y_ = 0;
     unsigned buttons_ = 0;
     float dx_ = 0, dy_ = 0;
     std::bitset<SDL_SCANCODE_COUNT> keys_down_;
@@ -344,14 +350,7 @@ int Gui::run() {
             if (auto* m = session_.machine()) m->ioc().panel_button(*volume_held_, false);
             volume_held_.reset();
         }
-        if (captured_ && session_.on()) {
-            const int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
-            if (x || y) {
-                dx_ -= static_cast<float>(x);
-                dy_ -= static_cast<float>(y);
-                session_.machine()->ioc().kbc().mouse_motion(x, -y, buttons_);  // PS/2 counts up as positive
-            }
-        }
+        mouse_frame();
         frame();
         for (auto& t : terminal_windows_) t->frame(now);
     }
@@ -450,7 +449,76 @@ void Gui::set_captured(bool on) {
     }
     buttons_ = 0;
     dx_ = dy_ = 0;
+    std::fill(std::begin(push_), std::end(push_), 0);
+    have_cursor_ = syncing_ = false;
     update_title();
+}
+
+// Once a frame while the mouse is captured: the motion gathered goes to the
+// PS/2 mouse. Where the system shows the Newport's hardware cursor (the X
+// server does), the window also follows the guest's pointer: after a capture
+// it steers the pointer to where the click was, and pushing against an edge
+// of the screen where the pointer has stopped releases the mouse there, the
+// host pointer carrying on from the same place.
+void Gui::mouse_frame() {
+    auto* m = session_.machine();
+    if (!captured_ || !m) return;
+    int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
+    dx_ -= static_cast<float>(x);
+    dy_ -= static_cast<float>(y);
+    ip22::Newport* np = m->newport();
+    int cx = 0, cy = 0;
+    const bool cursor = np && np->cursor_position(cx, cy) && tex_w_ && tex_h_;
+    if (syncing_) {
+        if (!cursor || ++sync_frames_ > 120) {
+            syncing_ = false;
+        } else {
+            // Moves made meanwhile move the target; the guest may accelerate
+            // the steps, which the next frame's reading corrects.
+            sync_x_ += static_cast<float>(x);
+            sync_y_ += static_cast<float>(y);
+            x = std::clamp(static_cast<int>(std::lround(sync_x_)) - (cx + hot_x_), -24, 24);
+            y = std::clamp(static_cast<int>(std::lround(sync_y_)) - (cy + hot_y_), -24, 24);
+            if (std::abs(x) <= 1 && std::abs(y) <= 1) syncing_ = false, x = y = 0;
+        }
+    }
+    if (x || y) m->ioc().kbc().mouse_motion(x, -y, buttons_);  // PS/2 counts up as positive
+    if (!cursor || !have_cursor_ || syncing_) {
+        have_cursor_ = cursor;
+        last_cx_ = cx;
+        last_cy_ = cy;
+        return;
+    }
+    // Pushing against an edge, with the cursor there and not moving: the
+    // glyph is 32 pixels, the pointer somewhere inside it.
+    const int w = static_cast<int>(tex_w_), h = static_cast<int>(tex_h_);
+    auto push = [](int& acc, int amount, bool stuck) { acc = stuck ? acc + amount : 0; };
+    if (x < 0) push(push_[0], -x, cx >= last_cx_ && cx <= 0);
+    if (x > 0) push(push_[1], x, cx <= last_cx_ && cx >= w - 33);
+    if (y < 0) push(push_[2], -y, cy >= last_cy_ && cy <= 0);
+    if (y > 0) push(push_[3], y, cy <= last_cy_ && cy >= h - 33);
+    last_cx_ = cx;
+    last_cy_ = cy;
+    constexpr int kPushToLeave = 48;  // guest pixels pushed against the edge
+    for (int edge = 0; edge < 4; ++edge) {
+        if (push_[edge] < kPushToLeave) continue;
+        // At an edge the pointer's position there is known: learn where it
+        // sits in the glyph.
+        if (edge == 0) hot_x_ = -cx;
+        if (edge == 1) hot_x_ = (w - 1) - cx;
+        if (edge == 2) hot_y_ = -cy;
+        if (edge == 3) hot_y_ = (h - 1) - cy;
+        const float px = static_cast<float>(std::clamp(cx + hot_x_, 0, w - 1)) + 0.5f;
+        const float py = static_cast<float>(std::clamp(cy + hot_y_, 0, h - 1)) + 0.5f;
+        float wx = dest_.x + px * dest_.w / static_cast<float>(w), wy = dest_.y + py * dest_.h / static_cast<float>(h);
+        if (edge == 0) wx = dest_.x;
+        if (edge == 1) wx = dest_.x + dest_.w - 1;
+        if (edge == 2) wy = dest_.y;
+        if (edge == 3) wy = dest_.y + dest_.h - 1;
+        set_captured(false);
+        SDL_WarpMouseInWindow(window_, wx, wy);
+        return;
+    }
 }
 
 void Gui::release_keys() {
@@ -541,6 +609,11 @@ void Gui::handle_event(const SDL_Event& ev) {
                 ev.button.x >= dest_.x && ev.button.x < dest_.x + dest_.w && ev.button.y >= dest_.y &&
                 ev.button.y < dest_.y + dest_.h) {
                 set_captured(true);
+                // Bring the guest's pointer to where the click was.
+                syncing_ = dest_.w > 0 && dest_.h > 0;
+                sync_frames_ = 0;
+                sync_x_ = (ev.button.x - dest_.x) * static_cast<float>(tex_w_) / dest_.w;
+                sync_y_ = (ev.button.y - dest_.y) * static_cast<float>(tex_h_) / dest_.h;
                 return;
             }
             break;
