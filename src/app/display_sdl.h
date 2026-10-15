@@ -32,7 +32,11 @@ struct GuiOptions {
     std::string settings_file;
     bool power_on = false;  // power the machine on at once
     std::string screenshot;  // saved when the window closes
+    std::string log_file;    // where messages go when not on a terminal (shown in About)
 };
+
+// A file in the user's SiliconGhost folder (where the settings live).
+std::string user_file(const std::string& name);
 
 // Runs the window until it is closed or `stop` becomes set. `next_disc` is
 // a request (from a signal) to change to the next CD-ROM disc. Returns the

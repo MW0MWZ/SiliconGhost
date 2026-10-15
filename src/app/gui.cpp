@@ -48,13 +48,7 @@ std::string folder_of(const std::string& path) {
     return ec ? std::string() : dir.string() + "/";
 }
 
-std::string default_settings_path() {
-    char* dir = SDL_GetPrefPath("SiliconGhost", "SiliconGhost");
-    if (!dir) return "siliconghost.ini";
-    std::string path = std::string(dir) + "settings.ini";
-    SDL_free(dir);
-    return path;
-}
+std::string default_settings_path() { return user_file("settings.ini"); }
 
 // What a file chooser was opened for.
 enum class Pick { Prom, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
@@ -1148,6 +1142,7 @@ void Gui::draw_popups() {
         ImGui::TextUnformatted("GNU General Public License, version 2 or later");
         ImGui::Spacing();
         ImGui::TextDisabled("Menus and dialogs: Dear ImGui (MIT licence)");
+        if (!options_.log_file.empty()) ImGui::TextDisabled("Messages: %s", options_.log_file.c_str());
         ImGui::TextDisabled("SGI, Indy and IRIX are trademarks of their owners.");
         if (ImGui::Button("OK", ImVec2(90 * scale_, 0))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
@@ -1255,6 +1250,14 @@ void Gui::apply_choice(const PickResult& r) {
 }
 
 }  // namespace
+
+std::string user_file(const std::string& name) {
+    char* dir = SDL_GetPrefPath("SiliconGhost", "SiliconGhost");  // made if missing; no SDL_Init needed
+    if (!dir) return name;
+    std::string path = std::string(dir) + name;
+    SDL_free(dir);
+    return path;
+}
 
 int run_gui(Settings settings, const GuiOptions& options, volatile std::sig_atomic_t& stop,
             volatile std::sig_atomic_t& next_disc) {

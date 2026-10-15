@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/detach.h"
 #include "app/session.h"
 #include "app/settings.h"
 #include "core/log.h"
@@ -80,6 +81,8 @@ void usage(const char* argv0) {
                  "  --cpu-mhz N      pipeline clock (default 150)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only)\n"
                  "  --headless       no window: both serial ports use this terminal\n"
+                 "  --foreground     keep the window's messages on this terminal (the window otherwise\n"
+                 "                   runs in the background, writing them to siliconghost.log)\n"
                  "  --screenshot F   on exit, save the display as a binary PPM image\n"
                  "  --max N          stop after N cycles (default: run until Ctrl-C); implies --headless\n"
                  "  --timing MODE    realtime: guest clocks follow the host clock and the CPU runs as\n"
@@ -219,7 +222,7 @@ int main(int argc, char** argv) {
     sg::app::Settings settings;
     std::string screenshot, settings_file;
     unsigned long long max_cycles = ~0ull;
-    bool trace = false, dump = false, headless = false, timing_given = false;
+    bool trace = false, dump = false, headless = false, timing_given = false, foreground = false, log_given = false;
     sg::log::set_level(sg::log::Level::Warn);
 
     for (int i = 1; i < argc; ++i) {
@@ -258,7 +261,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "error: %s %s\n", a, error.c_str());
                 return 2;
             }
-            if (key == "log") sg::app::apply_log_level(value);
+            if (key == "log") {
+                sg::app::apply_log_level(value);
+                log_given = true;
+            }
         } else if (!std::strcmp(a, "--settings")) {
             settings_file = next();
             if (!sg::app::load_settings(settings_file, settings, error)) {
@@ -270,6 +276,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--trace")) trace = true;
         else if (!std::strcmp(a, "--dump-state")) dump = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
+        else if (!std::strcmp(a, "--foreground")) foreground = true;
         else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
             usage(argv[0]);
             return 0;
@@ -288,6 +295,19 @@ int main(int argc, char** argv) {
     }
     sg::app::apply_log_level(settings.log);
 
+#if defined(SG_HAVE_SDL3)
+    // The window runs in the background, leaving the terminal free, unless
+    // its messages were asked for (--log, --foreground).
+    std::string log_file;
+    if (!headless && !foreground && !log_given) {
+        log_file = sg::app::user_file("siliconghost.log");
+        if (sg::app::detach_from_terminal(argc, argv, log_file) == sg::app::Detach::Parent) return 0;
+    }
+#else
+    (void)foreground;  // no window: the terminal is always the console
+    (void)log_given;
+#endif
+
     std::signal(SIGINT, on_stop_signal);
     std::signal(SIGTERM, on_stop_signal);  // stop cleanly (NVRAM is saved) when asked to terminate
 #if defined(SIGUSR1)
@@ -300,6 +320,7 @@ int main(int argc, char** argv) {
         options.settings_file = settings_file;
         options.power_on = argc > 1;  // started with a machine described: power it on
         options.screenshot = screenshot;
+        options.log_file = log_file;
         const int rc = sg::app::run_gui(settings, options, g_interrupted, g_next_disc);
         if (rc >= 0) return rc;
         std::fprintf(stderr, "note: no window could be opened; using the serial console\n");

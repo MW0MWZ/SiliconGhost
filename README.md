@@ -145,6 +145,7 @@ Main options (`siliconghost --help` lists them all):
 | `--cpu-mhz N` | CPU clock (default 150) |
 | `--no-graphics` | no graphics board: the console is on the first serial port |
 | `--headless` | no window: both serial ports use the terminal |
+| `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
 | `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
@@ -156,6 +157,14 @@ Main options (`siliconghost --help` lists them all):
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
 
 ### The window
+
+Started from a terminal, the window carries on in the background and the
+terminal is free again at once; its messages go to `siliconghost.log` in the
+settings folder (`~/.local/share/SiliconGhost/SiliconGhost/` on Linux,
+`~/Library/Application Support/SiliconGhost/SiliconGhost/` on macOS,
+`%APPDATA%\SiliconGhost\SiliconGhost\` on Windows; *Help > About* shows
+the path). `--foreground` or `--log` keeps them on the terminal, and
+`--headless` always runs there.
 
 The Newport screen fills the window between a menu bar and a status bar;
 the window can be resized and made full screen. The machine's sound plays

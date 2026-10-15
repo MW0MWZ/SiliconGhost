@@ -89,6 +89,7 @@ endif()
 
 # Front-end pieces without a window: settings, power control, terminal screen
 add_library(sg_app STATIC
+  src/app/detach.cpp
   src/app/session.cpp
   src/app/settings.cpp
   src/app/terminal.cpp
