@@ -63,6 +63,7 @@ private:
     void do_setup();
     void draw_span_block(bool block);
     void draw_line();
+    void draw_aline();
     void scr2scr();
     void pixel_read();
     void write_x_start(u32 v) { xstart_ = v & 0x07FFFF80u; }
@@ -157,8 +158,7 @@ private:
     u32 dcbmode_ = 0;
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
-    u64 dcb_busy_until_ = 0;
-    bool warned_aline_ = false;  // unmodelled features, reported once  // an access to an absent slave is waiting for its acknowledge
+    u64 dcb_busy_until_ = 0;  // an access to an absent slave is waiting for its acknowledge
 
     u64 display_version_ = 0;
     bool full_redraw_ = true;

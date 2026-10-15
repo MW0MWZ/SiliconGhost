@@ -6,6 +6,7 @@
 #include "machine/ip22/newport.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 #include "core/endian.h"
@@ -444,8 +445,8 @@ void Newport::execute() {
                 case 0: draw_span_block(false); return;
                 case 1: draw_span_block(true); return;
                 case 2:
-                case 3:
-                case 4: draw_line(); return;
+                case 3: draw_line(); return;
+                case 4: draw_aline(); return;
                 default: SG_LOG(Debug, "newport", "invalid address mode %u", (drawmode0_ >> 2) & 7); return;
             }
         case 3: scr2scr(); return;
@@ -760,14 +761,63 @@ void Newport::draw_span_block(bool block) {
     if (block) write_y_start(static_cast<u32>(sy) << 11);
 }
 
+// Antialiased line (A_LINE): at each step along the major axis, the two
+// pixels either side of the exact line (subpixel endpoints) are drawn, each
+// with a coverage from the 16-entry AWEIGHT table: the far pixel's indexed by
+// the line's fractional distance into it, the near pixel's by the rest. In
+// RGB the coverage is the source alpha (software blends with SA, 1-SA); in
+// colour index it replaces the index's low four bits. The order of the
+// table's 4-bit entries in AWEIGHT0/1 is not in the specification: entry 0
+// is taken from the low bits of AWEIGHT0 (UNVERIFIED).
+void Newport::draw_aline() {
+    const u32 octant = (bresoctinc1_ >> 24) & 7;
+    const bool xmajor = octant & 4;
+    // 16.4 fixed point endpoints
+    const double x1 = sext(xstart_ >> 7, 20) / 16.0, y1 = sext(ystart_ >> 7, 20) / 16.0;
+    const double x2 = sext(xend_ >> 7, 20) / 16.0, y2 = sext(yend_ >> 7, 20) / 16.0;
+    const double m1 = xmajor ? x1 : y1, m2 = xmajor ? x2 : y2, n1 = xmajor ? y1 : x1, n2 = xmajor ? y2 : x2;
+    const int step = m2 >= m1 ? 1 : -1;
+    const double slope = m2 != m1 ? (n2 - n1) / (m2 - m1) : 0.0;
+    const int first = static_cast<int>(std::lround(m1)), last = static_cast<int>(std::lround(m2));
+    auto weight = [this](double c) {
+        const unsigned i = std::min(15u, static_cast<unsigned>(c * 16));
+        return ((i < 8 ? aweight0_ : aweight1_) >> (4 * (i & 7))) & 0xF;
+    };
+    const bool rgb = drawmode1_ & kDm1RgbMode;
+    auto draw = [&](int m, int n, unsigned coverage) {
+        if (!coverage) return;
+        const int px = xmajor ? m : n, py = xmajor ? n : m;
+        u32 colour = source_color(px, py);
+        if (rgb) src_alpha_ = coverage * 0x11;
+        else colour = (colour & ~0xFu) | coverage;
+        plot(px, py, colour);
+    };
+    const bool one = !(drawmode0_ & (kDm0StopOnX | kDm0StopOnY));  // one step per GO
+    for (int m = first;; m += step) {
+        const bool skip = (m == first && (drawmode0_ & kDm0SkipFirst)) || (m == last && (drawmode0_ & kDm0SkipLast));
+        if (drawmode0_ & kDm0Shade) iterate_shade();
+        if (!skip) {
+            const double n = n1 + (m - m1) * slope;
+            const double lower = std::floor(n), f = n - lower;
+            draw(m, static_cast<int>(lower), weight(1.0 - f));
+            draw(m, static_cast<int>(lower) + 1, weight(f));
+        }
+        if (one || m == last) {
+            // Carry on from the next step (one point per GO) or rest at the end.
+            const double nm = one && m != last ? m + step : m2, nn = one && m != last ? n1 + (nm - m1) * slope : n2;
+            const auto fixed = [](double v) { return static_cast<u32>(static_cast<s32>(std::lround(v * 16))) << 7; };
+            write_x_start(fixed(xmajor ? nm : nn));
+            write_y_start(fixed(xmajor ? nn : nm));
+            break;
+        }
+    }
+    if (!one) reload_shade();
+}
+
 void Newport::draw_line() {
     // Integer Bresenham between the start and end points. Fractional (F_LINE)
-    // and antialiased (A_LINE) lines use the integer endpoints for now.
+    // lines use the integer endpoints for now.
     const u32 octant = (bresoctinc1_ >> 24) & 7;
-    if (((drawmode0_ >> 2) & 7) == 4 && !warned_aline_) {
-        warned_aline_ = true;
-        SG_LOG(Debug, "newport", "antialiased line requested; drawn as a plain line");
-    }
     const int x1 = int_part(xstart_), y1 = int_part(ystart_), x2 = int_part(xend_), y2 = int_part(yend_);
     const bool xmajor = octant & 4;
     const int sx_step = (octant & 2) ? -1 : 1, sy_step = (octant & 1) ? -1 : 1;

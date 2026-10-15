@@ -378,3 +378,29 @@ TEST(newport_minus_zero_slope_keeps_alpha) {
     t.w(kDrawMode0 | kGo, 2u | (1u << 5) | (1u << 8) | (1u << 18));  // DRAW SPAN DOSETUP STOPX SHADE
     for (int x = 20; x < 24; ++x) CHECK_EQ(read24(t, x, 5), (128u << 16) | 126u);
 }
+
+// A_LINE: the two pixels across the exact line, weighted from AWEIGHT and
+// blended by coverage.
+TEST(newport_antialiased_line_coverage) {
+    Rig t(Newport::Options{true, 0xA});
+    auto line = [&](double x1, double y1, double x2, double y2) {
+        auto fixed = [](double v) { return static_cast<u32>(static_cast<s32>(v * 16)) << 7; };
+        t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
+        t.w(kWrMask, 0xFFFFFF);
+        t.w(kColorI, 0xFFFFFF);
+        t.w(0x130, 0x76543210);  // AWEIGHT: entry i = i
+        t.w(0x134, 0xFEDCBA98);
+        t.w(0x100, fixed(x1));
+        t.w(0x104, fixed(y1));
+        t.w(0x108, fixed(x2));
+        t.w(0x10C, fixed(y2));
+        t.w(kDrawMode0 | kGo, 2u | (4u << 2) | (1u << 5) | (1u << 8));  // DRAW A_LINE DOSETUP STOPX
+    };
+    line(10, 20, 20, 20);  // on the pixel row: full coverage there, none above
+    CHECK_EQ(read24(t, 15, 20), 0xFFFFFFu);
+    CHECK_EQ(read24(t, 15, 21), 0u);
+    line(10, 40.5, 20, 40.5);  // between two rows: half each (entry 8 -> alpha 0x88)
+    CHECK_EQ(t.r(0x100) >> 11, 20u);  // XSTART rests at the end point
+    CHECK_EQ(read24(t, 15, 40), 0x888888u);
+    CHECK_EQ(read24(t, 15, 41), 0x888888u);
+}
