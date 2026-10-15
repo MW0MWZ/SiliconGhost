@@ -196,7 +196,7 @@ bool Newport::write(u32 offset, unsigned size, u64 value) {
     u32 reg;
     bool go;
     if (!decode(offset, reg, go)) return false;
-    const u32 word = reg & ~3u;
+    const u32 word = reg & (size == 8 ? ~7u : ~3u);  // a doubleword is a register pair
     if (word == kDcbData0 || word == kDcbData1) {
         dcb_write(size, value);
     } else if (size == 8) {

@@ -344,9 +344,12 @@ void Mc::update_irq() {
 // Virtual DMA: moves rectangular memory areas to or from a GIO64 address, or
 // fills memory with a constant. The GIO address stays fixed: it names a
 // device's data port (such as REX3's host data register with GO), which
-// takes every doubleword in turn. Memory addresses go through a 4-entry TLB of
-// 4 MiB segments whose PTEs live in main memory; addresses no entry covers
-// are used as physical addresses (the boot PROM clears memory this way).
+// takes every doubleword in turn. Memory may start at any byte; IRIX sets
+// the GIO address's low bits to match, but a doubleword on GIO64 has no
+// byte address, so the device sees the aligned address. Memory addresses go
+// through a 4-entry TLB of 4 MiB segments whose PTEs live in main memory;
+// addresses no entry covers are used as physical addresses (the boot PROM
+// clears memory this way).
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -387,7 +390,7 @@ void Mc::finish_dma() {
     const bool to_host = dma_mode_ & kDmaModeToHost, fill = dma_mode_ & kDmaModeFill;
     const s32 step = (dma_mode_ & kDmaModeIncrement) ? 1 : -1;
     u32 addr = dma_mem_addr_;
-    const u64 gio = dma_gio_addr_;
+    const u64 gio = dma_gio_addr_ & ~u64{7};
     for (u32 line = 0; line < lines; ++line) {
         for (u32 z = 0; z < std::max(zoom, 1u); ++z) {
             u32 a = addr;

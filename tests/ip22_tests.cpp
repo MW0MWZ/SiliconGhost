@@ -691,3 +691,37 @@ TEST(ip22_mc_dma_feeds_one_gio_address) {
         }
     }
 }
+
+TEST(ip22_mc_dma_from_unaligned_memory_feeds_the_aligned_data_port) {
+    IndyRig t;
+    t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+    constexpr u32 kRex3 = 0x1F0F0000, kGo = 0x800;
+    constexpr u32 kMc = 0x1FA00000, kSrc = 0x08100000;
+    // 2 lines of 8 pixels starting 5 bytes into a doubleword; IRIX sets the
+    // GIO address's low bits to match.
+    for (u32 i = 0; i < 16; ++i) t.w8(kSrc + 5 + i, static_cast<u8>(0x10 + i));
+    // 8-bit pixels from the host, eight per doubleword, into the block (0,0)-(7,1)
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x400u | 0x100u | 0x80u | 0x8u | 1u);  // SRC, RWDOUBLE, HD8, RWPACKED, DD8, CI
+    t.w32(kRex3 + 0x220, 0xFF);                                                  // WRMASK
+    t.w32(kRex3 + 0x150, 0);                                                     // XYSTARTI (0,0)
+    t.w32(kRex3 + 0x154, (7u << 16) | 1u);                                       // XYENDI (7,1)
+    t.w32(kRex3 + 0x004, 2u | (1u << 2) | (1u << 6) | (1u << 8) | (1u << 9));   // DRAW BLOCK COLORHOST STOPX STOPY
+    t.w32(kMc + 0x2004, kSrc + 5);          // DMA_MEMADR
+    t.w32(kMc + 0x2014, (2u << 16) | 8u);   // DMA_SIZE: 2 lines of 8 bytes
+    t.w32(kMc + 0x201C, 1u << 16);          // DMA_STRIDE: zoom 1, no gap
+    t.w32(kMc + 0x2034, 1u << 4);           // DMA_MODE: memory to GIO, incrementing
+    t.w32(kMc + 0x202C, kRex3 + kGo + 0x235);  // DMA_GIO_ADR, and start
+    t.m.run(10000);
+    CHECK(t.r32(kMc + 0x204C) & (1u << 3));  // DMA_RUN: done
+    // Read both lines back.
+    t.w32(kRex3 + 0x000, 0x30000000u | 0x100u | 0x8u | 1u);
+    for (u32 y = 0; y < 2; ++y) {
+        for (u32 x = 0; x < 8; x += 4) {
+            t.w32(kRex3 + 0x150, (x << 16) | y);
+            t.w32(kRex3 + 0x154, ((x + 3) << 16) | y);
+            t.w32(kRex3 + kGo + 0x004, 1u);  // READ
+            const u32 base = 0x10 + y * 8 + x;
+            CHECK_EQ(t.r32(kRex3 + 0x230), (base << 24) | ((base + 1) << 16) | ((base + 2) << 8) | (base + 3));
+        }
+    }
+}
