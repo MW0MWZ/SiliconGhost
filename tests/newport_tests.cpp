@@ -155,16 +155,18 @@ TEST(newport_host_pixels_advance_per_go) {
 // times out.
 TEST(newport_dcb_access_to_an_absent_slave_stays_busy_until_reset_or_timeout) {
     Rig t;
-    constexpr u32 kBackBusy = 1u << 4, kSyncAck = 1u << 13, kDcbReset = 0x1340;
+    constexpr u32 kBackBusy = 1u << 4, kSyncAck = 1u << 11, kDcbReset = 0x1340;
     t.w(kDcbMode, width(1) | slave(0) | kSyncAck);
     t.w(kDcbData0, 0);  // VC2 answers
     CHECK(!(t.r(kUStatus) & kBackBusy));
-    t.w(kDcbMode, 0x0099b601);  // the probe's mode: slave 12, synchronous acknowledge
+    t.w(kDcbMode, 0x0099b601);  // the probe's mode: slave 12, acknowledge awaited
     t.w(kDcbData0, 0);
     CHECK(t.r(kUStatus) & kBackBusy);
     CHECK(t.r(kUStatus) & kBackBusy);
-    t.w(kDcbReset, 0);
+    t.w(kDcbReset, 0);  // also returns DCBMODE to its reset value
     CHECK(!(t.r(kUStatus) & kBackBusy));
+    CHECK_EQ(t.r(kDcbMode), 0x780u);
+    t.w(kDcbMode, 0x0099b601);
     t.w(kDcbData0, 0);
     CHECK(t.r(kUStatus) & kBackBusy);
     t.now += 150 * 20;  // 20 us at 150 MHz
@@ -424,4 +426,19 @@ TEST(newport_length32_line_draws_each_pixel_once) {
         t.w(kDrawMode0 | kGo, 1u);
         CHECK_EQ(t.r(kHostRw0), x < 100 ? 0x01010101u : 0u);
     }
+}
+
+// The register select stepped by ENCRSINC carries on into the next access
+// until DCBMODE is written; the VC2 decodes CRS bits 1:0, and CRS 2 reads the
+// low byte a CRS 1 read fetched.
+TEST(newport_dcb_crs_increment_persists) {
+    Rig t;
+    t.vc2_reg(0x05, 0x1234);  // DID entry
+    t.w(kDcbMode, width(1) | kCrsInc | crs(0) | slave(0));
+    t.w(kDcbData0, 0x05u << 24);  // index 5; CRS now 1
+    CHECK_EQ((t.r(kDcbMode) >> 4) & 7, 1u);
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0x12u);  // CRS 1: high byte (and the low one latched)
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0x34u);  // CRS 2: the latched low byte
+    t.w(kDcbMode, width(1) | crs(5) | slave(0));  // CRS 5 = CRS 1 on the VC2
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0x12u);
 }

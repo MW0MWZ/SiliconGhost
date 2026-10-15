@@ -92,6 +92,7 @@ private:
     // ---- DCB ----
     // DCBDATA accesses: the bytes of the CPU access, in address order and
     // limited to DCBMODE.DATAWIDTH, are transferred one by one.
+    unsigned dcb_width(unsigned size) const;
     void dcb_write(unsigned size, u64 value);
     u64 dcb_read(u32 reg, unsigned size);
     void dcb_begin();
@@ -157,8 +158,10 @@ private:
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
+    bool zfail_next_ = false, zfail_ = false;  // STEPZ: the next GO's first pixel fails the Z test
     int host_shift_ = 0;
     u32 dcbmode_ = 0;
+    unsigned dcb_crs_ = 0;  // the DCB's register select, stepped by ENCRSINC until DCBMODE is written
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
     u64 dcb_busy_until_ = 0;  // an access to an absent slave is waiting for its acknowledge
@@ -178,6 +181,7 @@ private:
         u8 data_hi = 0;
         bool ram_hi_pending = true;  // next RAM byte written is the high byte
         u8 ram_lo_latch = 0;
+        u8 reg_lo_latch = 0;  // low byte of the register a CRS 1 read fetched
         bool ram_read_hi = true;
     } vc2_;
     struct Xmap {

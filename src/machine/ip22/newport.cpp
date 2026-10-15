@@ -266,10 +266,12 @@ u32 Newport::rex3_read(u32 reg) {
             return (static_cast<u32>(static_cast<u16>(int_part(xend_))) << 16) | static_cast<u16>(int_part(yend_));
         case kXStartEndI:
             return (static_cast<u32>(static_cast<u16>(int_part(xstart_))) << 16) | static_cast<u16>(int_part(xend_));
-        case kColorRed: return colorred_;
-        case kColorAlpha: return coloralpha_;
-        case kColorGrn: return colorgrn_;
-        case kColorBlue: return colorblue_;
+        // The colour registers are the shading iterators: reads return where
+        // the last primitive left them.
+        case kColorRed: return static_cast<u32>(curr_red_) & 0xFFFFFF;
+        case kColorAlpha: return static_cast<u32>(curr_alpha_) & 0xFFFFF;
+        case kColorGrn: return static_cast<u32>(curr_grn_) & 0xFFFFF;
+        case kColorBlue: return static_cast<u32>(curr_blue_) & 0xFFFFF;
         case kSlopeRed:
         case kSlopeRed1: return slopered_;
         case kSlopeAlpha: return slopealpha_;
@@ -280,7 +282,7 @@ u32 Newport::rex3_read(u32 reg) {
         case kColorX: return colorx_;
         case kHostRw0: return static_cast<u32>(hostrw_ >> 32);
         case kHostRw1: return static_cast<u32>(hostrw_);
-        case kDcbMode: return dcbmode_;
+        case kDcbMode: return (dcbmode_ & ~0x70u) | (dcb_crs_ << 4);
         case kTopScan: return topscan_;
         case kXYWin: return xywin_;
         case kClipMode: return clipmode_;
@@ -326,8 +328,8 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kSetup: do_setup(); return;
         case kLsRestore: lspattern_ = lspatsave_; return;
         case kLsSave: lspatsave_ = lspattern_; return;
+        case kStepZ: zfail_next_ = true; return;  // with GO: the current pixel fails the Z test
         case kStall0:
-        case kStepZ:
         case kStall1: return;
         case kXStart:
         case kXStartF:
@@ -412,7 +414,10 @@ void Newport::rex3_write(u32 reg, u32 v) {
             hostrw_ = (hostrw_ & 0xFFFFFFFF00000000ull) | v;
             host_shift_ = -1;
             return;
-        case kDcbMode: dcbmode_ = v & 0x1FFFFFFF; return;
+        case kDcbMode:
+            dcbmode_ = v & 0x1FFFFFFF;
+            dcb_crs_ = (dcbmode_ >> 4) & 7;
+            return;
         case kTopScan:
             topscan_ = v & 0x3FF;
             picture_changed();
@@ -420,7 +425,9 @@ void Newport::rex3_write(u32 reg, u32 v) {
         case kXYWin: xywin_ = v; return;
         case kClipMode: clipmode_ = v & 0x1FFF; return;
         case kConfig: config_ = v & 0x1FFFFF; return;
-        case kDcbReset:
+        case kDcbReset:  // the DCB state machine, DCBMODE included
+            dcbmode_ = 0x780;
+            dcb_crs_ = 0;
             dcb_busy_until_ = 0;
             vc2_.ram_hi_pending = vc2_.ram_read_hi = true;
             for (auto& x : xmap_) x.mode_count = 0;
@@ -436,6 +443,8 @@ void Newport::rex3_write(u32 reg, u32 v) {
 // ---------------------------------------------------------------------------
 
 void Newport::execute() {
+    zfail_ = zfail_next_;
+    zfail_next_ = false;
     if (drawmode0_ & kDm0DoSetup) do_setup();
     switch (drawmode0_ & 3) {
         case 0: return;  // NOOP
@@ -739,9 +748,13 @@ void Newport::draw_span_block(bool block) {
         const bool lr_abort = (drawmode0_ & kDm0LrOnly) && dx < 0;
         if (!lr_abort) {
             do {
+                // Each pixel is drawn in the current colour, then the
+                // iterators step (shading runs on across rows and GOs). A
+                // pixel failing the Z test (STEPZ) draws COLORBACK if ZPOPAQUE.
+                const bool zfail = zfail_ && drawn == 0;
+                if (!zfail && ((pattern >> bit) & 1)) plot(sx, sy, source_color(sx, sy));
+                else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(sx, sy, default_color(colorback_));
                 if ((drawmode0_ & kDm0Shade) && !fastclear) iterate_shade();
-                if ((pattern >> bit) & 1) plot(sx, sy, source_color(sx, sy));
-                else if (opaque) plot(sx, sy, default_color(colorback_));
                 bit = (bit - 1) & 31;
                 sx += dx;
                 ++drawn;
@@ -749,7 +762,6 @@ void Newport::draw_span_block(bool block) {
         }
         const bool row_done = sx == end_x || lr_abort;
         if (row_done) {
-            reload_shade();
             if (block) {
                 sx = xsave_;
                 sy += dy;
@@ -797,13 +809,13 @@ void Newport::draw_aline() {
     const bool one = !(drawmode0_ & (kDm0StopOnX | kDm0StopOnY));  // one step per GO
     for (int m = first;; m += step) {
         const bool skip = (m == first && (drawmode0_ & kDm0SkipFirst)) || (m == last && (drawmode0_ & kDm0SkipLast));
-        if (drawmode0_ & kDm0Shade) iterate_shade();
         if (!skip) {
             const double n = n1 + (m - m1) * slope;
             const double lower = std::floor(n), f = n - lower;
             draw(m, static_cast<int>(lower), weight(1.0 - f));
             draw(m, static_cast<int>(lower) + 1, weight(f));
         }
+        if (drawmode0_ & kDm0Shade) iterate_shade();
         if (one || m == last) {
             // Carry on from the next step (one point per GO) or rest at the end.
             const double nm = one && m != last ? m + step : m2, nn = one && m != last ? n1 + (nm - m1) * slope : n2;
@@ -813,7 +825,6 @@ void Newport::draw_aline() {
             break;
         }
     }
-    if (!one) reload_shade();
 }
 
 void Newport::draw_line() {
@@ -840,15 +851,20 @@ void Newport::draw_line() {
     const u32 pattern = (drawmode0_ & kDm0EnLsPattern) ? lspattern_ : ~0u;
     const bool opaque = drawmode0_ & kDm0LsOpaque;
     unsigned bit = 31;
-    auto draw = [&](int px, int py) {
+    bool first = true;
+    auto draw = [&](int px, int py, bool skipped) {
+        const bool zfail = zfail_ && first;
+        first = false;
+        if (!skipped) {
+            if (!zfail && ((pattern >> bit) & 1)) plot(px, py, source_color(px, py));
+            else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(px, py, default_color(colorback_));
+        }
         if (drawmode0_ & kDm0Shade) iterate_shade();
-        if ((pattern >> bit) & 1) plot(px, py, source_color(px, py));
-        else if (opaque) plot(px, py, default_color(colorback_));
         bit = (bit - 1) & 31;
     };
 
     if (!(drawmode0_ & (kDm0StopOnX | kDm0StopOnY))) {  // one point per GO
-        if (!(drawmode0_ & kDm0SkipFirst)) draw(x, y);
+        draw(x, y, drawmode0_ & kDm0SkipFirst);
         step();
     } else {
         // LENGTH32 limits one GO to 32 pixels; the start is left on the
@@ -858,10 +874,9 @@ void Newport::draw_line() {
         for (int i = 0; i < pixels; ++i) {
             const bool last = !cut && i == pixels - 1;
             const bool skip = (i == 0 && (drawmode0_ & kDm0SkipFirst)) || (last && (drawmode0_ & kDm0SkipLast));
-            if (!skip) draw(x, y);
+            draw(x, y, skip);
             if (!last) step();
         }
-        reload_shade();
     }
     write_x_start(static_cast<u32>(x) << 11);
     write_y_start(static_cast<u32>(y) << 11);
@@ -945,46 +960,63 @@ void Newport::dcb_begin() {
 
 bool Newport::dcb_stalled() const { return scheduler_.now() < dcb_busy_until_; }
 
-void Newport::dcb_write(unsigned size, u64 value) {
-    dcb_begin();
-    // The bytes of the CPU access in address order (most significant first).
-    u8 bytes[8];
-    unsigned n = 0;
-    if (size == 8) {
-        for (int i = 7; i >= 0; --i) bytes[n++] = static_cast<u8>(value >> (8 * i));
-    } else {
-        for (int i = static_cast<int>(size) - 1; i >= 0; --i) bytes[n++] = static_cast<u8>(value >> (8 * i));
-    }
+// A DCBDATA access moves DATAWIDTH bytes of each 32-bit word addressed
+// (DCBDATA0 first; a doubleword access covers both), or every addressed
+// byte with ENDATAPACK. SWAPENDIAN reverses 2- and 4-byte transfers. With
+// ENCRSINC the register select steps after each byte, and goes on from
+// there in the next access until DCBMODE is written again.
+namespace {
+constexpr u32 kDcbDataPack = 1u << 2, kDcbCrsInc = 1u << 3, kDcbSwapEndian = 1u << 28;
+}
+
+unsigned Newport::dcb_width(unsigned size) const {
     unsigned width = dcbmode_ & 3;
     if (width == 0) width = 4;
-    n = std::min(n, width);
-    if (dcbmode_ & (1u << 28)) std::reverse(bytes, bytes + n);  // SWAPENDIAN
+    return (dcbmode_ & kDcbDataPack) ? size : width;
+}
+
+void Newport::dcb_write(unsigned size, u64 value) {
+    dcb_begin();
+    const unsigned words = size == 8 ? 2 : 1, word_size = size == 8 ? 4 : size;
     const unsigned addr = (dcbmode_ >> 7) & 0xF;
-    unsigned crs = (dcbmode_ >> 4) & 7;
-    for (unsigned i = 0; i < n; ++i) {
-        dcb_write_byte(addr, crs, bytes[i]);
-        if (dcbmode_ & 8) crs = (crs + 1) & 7;
+    for (unsigned w = 0; w < words; ++w) {
+        const u64 word = size == 8 ? (value >> (32 * (1 - w))) & 0xFFFFFFFFu : value;
+        u8 bytes[4];
+        unsigned n = 0;
+        for (int i = static_cast<int>(word_size) - 1; i >= 0; --i) bytes[n++] = static_cast<u8>(word >> (8 * i));
+        n = std::min(n, dcb_width(word_size));
+        if ((dcbmode_ & kDcbSwapEndian) && (n == 2 || n == 4)) std::reverse(bytes, bytes + n);
+        for (unsigned i = 0; i < n; ++i) {
+            dcb_write_byte(addr, dcb_crs_, bytes[i]);
+            if (dcbmode_ & kDcbCrsInc) dcb_crs_ = (dcb_crs_ + 1) & 7;
+        }
     }
 }
 
 u64 Newport::dcb_read(u32 reg, unsigned size) {
     dcb_begin();
-    unsigned width = dcbmode_ & 3;
-    if (width == 0) width = 4;
     const unsigned addr = (dcbmode_ >> 7) & 0xF;
-    unsigned crs = (dcbmode_ >> 4) & 7;
-    u8 bytes[4] = {0, 0, 0, 0};
-    for (unsigned i = 0; i < width; ++i) {
-        bytes[i] = dcb_read_byte(addr, crs);
-        if (dcbmode_ & 8) crs = (crs + 1) & 7;
+    auto read_word = [&](unsigned word_size) {
+        const unsigned width = std::min(dcb_width(word_size), 4u);
+        u8 bytes[4] = {0, 0, 0, 0};
+        for (unsigned i = 0; i < width; ++i) {
+            bytes[i] = dcb_read_byte(addr, dcb_crs_);
+            if (dcbmode_ & kDcbCrsInc) dcb_crs_ = (dcb_crs_ + 1) & 7;
+        }
+        if ((dcbmode_ & kDcbSwapEndian) && (width == 2 || width == 4)) std::reverse(bytes, bytes + width);
+        // Data is left-justified in the word and replicated into the lower
+        // lanes for 1- and 2-byte transfers, so narrow and full-word loads
+        // both see it.
+        u32 v = (u32{bytes[0]} << 24) | (u32{bytes[1]} << 16) | (u32{bytes[2]} << 8) | bytes[3];
+        if (width == 1) v = bytes[0] * 0x01010101u;
+        else if (width == 2) v = ((u32{bytes[0]} << 8) | bytes[1]) * 0x00010001u;
+        return v;
+    };
+    if (size == 8) {
+        const u32 hi = read_word(4);
+        return (u64{hi} << 32) | read_word(4);
     }
-    if (dcbmode_ & (1u << 28)) std::reverse(bytes, bytes + width);
-    // Data is left-justified in the word and replicated into the lower lanes
-    // for 1- and 2-byte transfers, so narrow and full-word loads both see it.
-    u32 v = (u32{bytes[0]} << 24) | (u32{bytes[1]} << 16) | (u32{bytes[2]} << 8) | bytes[3];
-    if (width == 1) v = bytes[0] * 0x01010101u;
-    else if (width == 2) v = ((u32{bytes[0]} << 8) | bytes[1]) * 0x00010001u;
-    if (size == 8) return u64{v} << 32;
+    const u32 v = read_word(4);
     if (size == 4) return v;
     return (v >> ((4 - size - (reg & 3)) * 8)) & ((1u << (size * 8)) - 1);
 }
@@ -1023,8 +1055,9 @@ u8 Newport::dcb_read_byte(unsigned addr, unsigned crs) {
     }
 }
 
+// The VC2 decodes CRS bits 1:0 only.
 void Newport::vc2_write(unsigned crs, u8 b) {
-    switch (crs) {
+    switch (crs & 3) {
         case 0: vc2_.index = b & 0x1F; break;
         case 1: vc2_.data_hi = b; break;
         case 2: {
@@ -1067,10 +1100,14 @@ u8 Newport::vc2_read(unsigned crs) {
         }
         return vc2_.reg[i];
     };
-    switch (crs) {
+    switch (crs & 3) {
         case 0: return static_cast<u8>(vc2_.index);
-        case 1: return static_cast<u8>(reg(vc2_.index) >> 8);
-        case 2: return static_cast<u8>(reg(vc2_.index));
+        case 1: {  // fetches the whole register; CRS 2 then reads its low byte
+            const u16 v = reg(vc2_.index);
+            vc2_.reg_lo_latch = static_cast<u8>(v);
+            return static_cast<u8>(v >> 8);
+        }
+        case 2: return vc2_.index == kVc2Config ? static_cast<u8>(reg(kVc2Config)) : vc2_.reg_lo_latch;
         case 3: {
             u16& addr = vc2_.reg[kVc2RamAddr];
             const u16 w = vc2_.ram[addr & 0x7FFF];
@@ -1246,13 +1283,20 @@ u8 Newport::did_at(const std::vector<std::pair<int, u8>>& records, int x) const 
     return did;
 }
 
+// The glyph's origin is pixel 31 for both sizes. Horizontally the cursor
+// comes out of the VC2 at HPOS time and runs through the XMAP9's longer
+// cursor pipeline; with SGI's timing tables that puts the glyph's left edge
+// at screen column CURX - 29 (frame buffer column CURX - 27), as IRIX and
+// Linux allow for. Rows: CURY - 31.
+constexpr int kCursorScreenX = 29, kCursorScreenY = 31, kScanDelay = 2;
+
 unsigned Newport::cursor_pixel(int x, int y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return 0;
     const bool large = dcr & kDcrLargeCursor;
     const int size = large ? 64 : 32;
-    const int col = x - (static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (size - 1));
-    const int row = y - (static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1));
+    const int col = x - (static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay);
+    const int row = y - (static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY);
     if (col < 0 || col >= size || row < 0 || row >= size) return 0;
     const unsigned entry = vc2_.reg[kVc2CursorEntry];
     const unsigned bit = 15 - (col & 15);
@@ -1264,16 +1308,15 @@ unsigned Newport::cursor_pixel(int x, int y) const {
 bool Newport::cursor_position(int& x, int& y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return false;
-    const int size = (dcr & kDcrLargeCursor) ? 64 : 32;
-    x = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (size - 1);
-    y = static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1);
+    x = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX;  // screen (picture) coordinates
+    y = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
     return true;
 }
 
 void Newport::cursor_moving() {
     ++display_version_;
     const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
-    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - (size - 1);
+    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
     if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
         full_redraw_ = true;
         cursor_rows_.clear();
@@ -1373,8 +1416,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
     // The cursor's rows and columns (scan-out coordinates).
     const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible) && !(dcr & kDcrCrosshair);
     const int cursor_size = (dcr & kDcrLargeCursor) ? 64 : 32;
-    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - (cursor_size - 1);
-    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - (cursor_size - 1);
+    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay;  // frame buffer column
+    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
 
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
