@@ -269,6 +269,12 @@ int Gui::run() {
     // and drawn at the coordinate size, so it stays sharp.
     density_ = std::max(1.0f, SDL_GetWindowPixelDensity(window_));
     scale_ = std::clamp(SDL_GetWindowDisplayScale(window_) / density_, 1.0f, 4.0f);
+    {
+        // The bars at the window's own scale (the display's may differ): the
+        // picture keeps its size.
+        const float exact = kBars * (13.0f + 6.0f) * scale_;
+        if (std::fabs(exact - bars) >= 1) SDL_SetWindowSize(window_, static_cast<int>(w), static_cast<int>(h - bars + exact));
+    }
     ctx_ = ImGui::CreateContext();
     ImGui::SetCurrentContext(ctx_);
     ImGuiIO& io = ImGui::GetIO();
