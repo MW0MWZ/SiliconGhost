@@ -166,6 +166,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "jit") ok = parse_bool(v, s.jit);
     else if (key == "audio") ok = parse_bool(v, s.audio);
     else if (key == "audio_in") ok = parse_bool(v, s.audio_in);
+    else if (key == "mouse_auto_capture") ok = parse_bool(v, s.mouse_auto_capture);
     else if (key == "log") ok = (v == "trace" || v == "debug" || v == "info" || v == "warn" || v == "error") && (s.log = v, true);
     else {
         error = "unknown setting \"" + key + "\"";
@@ -241,7 +242,8 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nmax_speed=" << s.max_speed << "\nidle_skip=" << (s.idle_skip ? 1 : 0)
           << "\nblock_cache=" << (s.block_cache ? 1 : 0) << "\njit=" << (s.jit ? 1 : 0) << "\naudio=" << (s.audio ? 1 : 0)
-          << "\naudio_in=" << (s.audio_in ? 1 : 0) << "\nlog=" << s.log << "\n";
+          << "\naudio_in=" << (s.audio_in ? 1 : 0) << "\nlog=" << s.log
+          << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0) << "\n";
         if (!f) {
             error = "cannot write " + tmp;
             return false;

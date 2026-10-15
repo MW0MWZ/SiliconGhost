@@ -43,6 +43,7 @@ struct Settings {
     double max_speed = 2.0;
     bool idle_skip = true, block_cache = true, jit = true;
     bool audio = true, audio_in = false;
+    bool mouse_auto_capture = true;  // the window captures the mouse when the pointer moves onto the screen
     std::string log = "warn";
 
     ip22::IndyConfig indy_config() const;

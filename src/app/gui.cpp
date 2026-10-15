@@ -130,6 +130,8 @@ private:
     void handle_event(const SDL_Event& ev);
     bool hotkey(const SDL_KeyboardEvent& key);
     void set_captured(bool on);
+    void capture_at(float x, float y);
+    bool auto_capture(float x, float y);
     void mouse_frame();
     void release_keys();
     void update_title();
@@ -183,6 +185,11 @@ private:
     int last_cx_ = 0, last_cy_ = 0, hot_x_ = 0, hot_y_ = 0, sync_frames_ = 0;
     int push_[4] = {};  // pushed against the left, right, top and bottom edges
     float sync_x_ = 0, sync_y_ = 0;
+    int sent_x_ = 0, sent_y_ = 0;          // the last steering step
+    float gain_x_ = 1.0f, gain_y_ = 1.0f;  // the guest's pointer acceleration, as seen
+    // Moving onto the screen may capture the mouse; not again after a release
+    // until the pointer has been off the screen.
+    bool capture_armed_ = true;
     unsigned buttons_ = 0;
     float dx_ = 0, dy_ = 0;
     std::bitset<SDL_SCANCODE_COUNT> keys_down_;
@@ -464,7 +471,42 @@ void Gui::set_captured(bool on) {
     dx_ = dy_ = 0;
     std::fill(std::begin(push_), std::end(push_), 0);
     have_cursor_ = syncing_ = false;
+    if (!on) capture_armed_ = false;
     update_title();
+}
+
+// Captures the mouse and brings the guest's pointer to (x, y) in the window.
+void Gui::capture_at(float x, float y) {
+    set_captured(true);
+    syncing_ = dest_.w > 0 && dest_.h > 0;
+    sync_frames_ = 0;
+    sync_x_ = (x - dest_.x) * static_cast<float>(tex_w_) / dest_.w;
+    sync_y_ = (y - dest_.y) * static_cast<float>(tex_h_) / dest_.h;
+    sent_x_ = sent_y_ = 0;
+    gain_x_ = gain_y_ = 1.0f;
+}
+
+// The pointer moved to (x, y) while the mouse was free: moving onto the screen
+// captures it, where the setting allows and the guest shows its hardware
+// cursor (which can then be steered to the host pointer, and released at the
+// screen's edges again). Not while the window is in the background, a button
+// is held (a drag from outside) or a menu or dialog is open.
+bool Gui::auto_capture(float x, float y) {
+    const bool on_screen =
+        picture_ && x >= dest_.x && x < dest_.x + dest_.w && y >= dest_.y && y < dest_.y + dest_.h;
+    if (!on_screen) {
+        capture_armed_ = true;
+        return false;
+    }
+    auto* m = session_.machine();
+    ip22::Newport* np = m ? m->newport() : nullptr;
+    int cx = 0, cy = 0;
+    if (!capture_armed_ || !session_.settings().mouse_auto_capture || !np || !np->cursor_position(cx, cy) ||
+        !(SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) || SDL_GetMouseState(nullptr, nullptr) ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        return false;
+    capture_at(x, y);
+    return true;
 }
 
 // Once a frame while the mouse is captured: the motion gathered goes to the
@@ -486,13 +528,28 @@ void Gui::mouse_frame() {
         if (!cursor || ++sync_frames_ > 120) {
             syncing_ = false;
         } else {
-            // Moves made meanwhile move the target; the guest may accelerate
-            // the steps, which the next frame's reading corrects.
+            // Moves made meanwhile move the target. The guest accelerates
+            // larger steps: how much is learnt from what the last step did,
+            // and most of the rest of the way is sent each frame, so the
+            // pointer gets there in a few frames without overshooting much.
             sync_x_ += static_cast<float>(x);
             sync_y_ += static_cast<float>(y);
-            x = std::clamp(static_cast<int>(std::lround(sync_x_)) - (cx + hot_x_), -24, 24);
-            y = std::clamp(static_cast<int>(std::lround(sync_y_)) - (cy + hot_y_), -24, 24);
-            if (std::abs(x) <= 1 && std::abs(y) <= 1) syncing_ = false, x = y = 0;
+            const int rest_x = static_cast<int>(std::lround(sync_x_)) - (cx + hot_x_);
+            const int rest_y = static_cast<int>(std::lround(sync_y_)) - (cy + hot_y_);
+            auto steer = [](int rest, int& sent, int moved, float& gain) {
+                if (std::abs(sent) >= 4 && moved * sent > 0)
+                    gain = std::clamp(static_cast<float>(moved) / static_cast<float>(sent), 1.0f, 8.0f);
+                sent = std::abs(rest) <= 2 ? rest : static_cast<int>(std::lround(static_cast<float>(rest) * 0.75f / gain));
+                sent = std::clamp(sent, -127, 127);
+                return sent;
+            };
+            if (std::abs(rest_x) <= 1 && std::abs(rest_y) <= 1) {
+                syncing_ = false;
+                x = y = 0;
+            } else {
+                x = steer(rest_x, sent_x_, cx - last_cx_, gain_x_);
+                y = steer(rest_y, sent_y_, cy - last_cy_, gain_y_);
+            }
         }
     }
     if (x || y) m->ioc().kbc().mouse_motion(x, -y, buttons_);  // PS/2 counts up as positive
@@ -596,7 +653,11 @@ void Gui::handle_event(const SDL_Event& ev) {
             if (captured_) return;
             break;
         }
+        case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+            capture_armed_ = true;
+            break;
         case SDL_EVENT_MOUSE_MOTION:
+            if (!captured_ && machine && auto_capture(ev.motion.x, ev.motion.y)) return;
             if (captured_) {
                 // Motion in guest pixels, whatever the window's scale.
                 const float k = dest_.w > 0 ? static_cast<float>(tex_w_) / dest_.w : 1.0f;
@@ -621,12 +682,7 @@ void Gui::handle_event(const SDL_Event& ev) {
             if (ev.button.down && ev.button.button == SDL_BUTTON_LEFT && machine && picture_ && !io.WantCaptureMouse &&
                 ev.button.x >= dest_.x && ev.button.x < dest_.x + dest_.w && ev.button.y >= dest_.y &&
                 ev.button.y < dest_.y + dest_.h) {
-                set_captured(true);
-                // Bring the guest's pointer to where the click was.
-                syncing_ = dest_.w > 0 && dest_.h > 0;
-                sync_frames_ = 0;
-                sync_x_ = (ev.button.x - dest_.x) * static_cast<float>(tex_w_) / dest_.w;
-                sync_y_ = (ev.button.y - dest_.y) * static_cast<float>(tex_h_) / dest_.h;
+                capture_at(ev.button.x, ev.button.y);  // the guest's pointer to where the click was
                 return;
             }
             break;
@@ -851,6 +907,13 @@ std::vector<MenuEntry> Gui::menus() {
     view.push_back(E::separator());
     view.push_back(E::item("Status Bar", [this] { show_status_ = !show_status_; }, true, show_status_));
     view.push_back(E::item("Full Screen", [this] { toggle_fullscreen(); }, true, fullscreen_).key('F'));
+    view.push_back(E::item("Capture Mouse on Entry", [this] {
+                       Settings s = session_.settings();
+                       s.mouse_auto_capture = !s.mouse_auto_capture;
+                       session_.set_settings(s);
+                       save_settings_to(settings_path_);
+                   }, true, session_.settings().mouse_auto_capture)
+                       .tip("Capture the mouse when the pointer moves onto the screen (once the system shows its pointer)"));
 
     std::vector<E> help;
     help.push_back(E::item("Keyboard and Mouse", [this] { keys_open_ = true; }));
@@ -1223,8 +1286,11 @@ void Gui::draw_settings() {
                 edit_.max_speed = limit;
                 ImGui::SameLine();
                 const double fastest = edit_.cpu_mhz * edit_.max_speed;
-                ImGui::TextColored(fastest > 350 ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
-                                   "at most %.0f MHz (IRIX 5.3 boots up to about 350)", fastest);
+                const bool too_fast = fastest > 350;
+                ImGui::TextColored(too_fast ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
+                                   too_fast ? "up to %.0f MHz, too fast for IRIX 5.3" : "up to %.0f MHz", fastest);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("IRIX 5.3 times the CPU at boot and fails beyond about 350 MHz (clock x limit)");
             }
             ImGui::Spacing();
             ImGui::Checkbox("Skip idle loops", &edit_.idle_skip);
@@ -1330,7 +1396,9 @@ void Gui::draw_popups() {
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Keyboard and Mouse", nullptr, flags)) {
         const std::string ca = std::string("Ctrl+") + kAlt + "+";
-        ImGui::TextUnformatted("Click the screen to capture the mouse for the Indy.");
+        ImGui::TextUnformatted("Click the screen to capture the mouse for the Indy. Once the system shows its");
+        ImGui::TextUnformatted("pointer (the desktop), moving onto the screen captures it (View > Capture Mouse");
+        ImGui::TextUnformatted("on Entry) and pushing past an edge of the screen releases it.");
         ImGui::Spacing();
         if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_SizingFixedFit)) {
             const std::pair<std::string, const char*> rows[] = {

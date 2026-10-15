@@ -211,9 +211,12 @@ why it could not open a window.
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G
   (Ctrl+Option+G on a Mac), or switching to another window, releases it.
   All three buttons work. Where the system draws its pointer with the
-  Newport's hardware cursor (the IRIX desktop does), capturing brings the
-  pointer to where you clicked, and pushing it against an edge of the screen
-  releases the mouse there, as virtual machines do.
+  Newport's hardware cursor (the IRIX desktop does), simply moving onto the
+  screen captures the mouse, with the system's pointer jumping to where the
+  host pointer entered (View > Capture Mouse on Entry turns this off), and
+  pushing it against an edge of the screen releases the mouse there, as
+  virtual machines do. A click captures it anywhere, with the pointer
+  brought to where you clicked.
 - **Keys kept by the window:** Ctrl+Alt+G (release the mouse), Ctrl+Alt+P
   (power button), Ctrl+Alt+E (next disc), Ctrl+Alt+F (full screen).
 - **Keyboard:** keys are sent by position as a PS/2 keyboard would send
