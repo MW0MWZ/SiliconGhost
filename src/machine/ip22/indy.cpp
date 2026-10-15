@@ -17,6 +17,8 @@ namespace {
 mips::R4000::Options cpu_options(const IndyConfig& c) {
     mips::R4000::Options o;
     o.prid = c.prid;
+    o.config = c.cpu_config;
+    o.scache_bytes = c.scache_bytes;
     return o;
 }
 
@@ -83,8 +85,12 @@ Indy::Indy(const IndyConfig& config)
         for (const auto& path : config_.cdrom_images)
             if (!std::ifstream(path, std::ios::binary)) throw std::runtime_error("cannot open " + path);
         attach(cdrom_, ScsiDisk::Kind::CdRom, config_.cdrom_images.front(), 4);
-        cdrom_->set_eject_callback([this] { next_disc(); });
+        disc_loaded_ = true;
+    } else if (config_.cdrom_drive) {
+        cdrom_ = std::make_unique<ScsiDisk>(ScsiDisk::Kind::CdRom, std::string());  // empty drive
+        hpc3_.scsi0().attach(4, cdrom_.get());
     }
+    if (cdrom_) cdrom_->set_eject_callback([this] { next_disc(); });
 
     // The RTC starts at the host's wall-clock time and then follows guest time.
     {
@@ -106,14 +112,67 @@ void Indy::request_next_disc() {
     cpu_.request_stop();
 }
 
+// Guest eject (or the host's "next disc"): the next disc of the set goes in,
+// after the last the first again. With no set the drive stays empty.
 void Indy::next_disc() {
     if (!cdrom_) return;
-    disc_ = (disc_ + 1) % config_.cdrom_images.size();
+    if (config_.cdrom_images.empty()) {
+        cdrom_->eject();
+        disc_loaded_ = false;
+        return;
+    }
+    select_disc((disc_ + (disc_loaded_ ? 1 : 0)) % config_.cdrom_images.size());
+}
+
+int Indy::disc_in_drive() const {
+    return cdrom_ && disc_loaded_ && cdrom_->loaded() ? static_cast<int>(disc_) : -1;
+}
+
+bool Indy::eject_disc() {
+    if (!cdrom_ || cdrom_->removal_prevented()) return false;
+    cdrom_->eject();
+    disc_loaded_ = false;
+    SG_LOG(Info, "indy", "CD-ROM: ejected");
+    return true;
+}
+
+void Indy::force_eject_disc() {
+    if (!cdrom_) return;
+    cdrom_->eject();
+    disc_loaded_ = false;
+    SG_LOG(Info, "indy", "CD-ROM: ejected (forced)");
+}
+
+bool Indy::select_disc(std::size_t index) {
+    if (!cdrom_ || index >= config_.cdrom_images.size()) return false;
+    disc_ = index;
     const std::string& path = config_.cdrom_images[disc_];
-    if (cdrom_->change_medium(path))
+    disc_loaded_ = cdrom_->change_medium(path);
+    if (disc_loaded_)
         SG_LOG(Info, "indy", "CD-ROM: %s (%llu blocks)", path.c_str(), static_cast<unsigned long long>(cdrom_->blocks()));
     else
         SG_LOG(Warn, "indy", "CD-ROM: cannot open %s, drive empty", path.c_str());
+    return disc_loaded_;
+}
+
+bool Indy::insert_disc(const std::string& path) {
+    if (!cdrom_) return false;
+    auto& set = config_.cdrom_images;
+    auto it = std::find(set.begin(), set.end(), path);
+    if (it == set.end()) it = set.insert(set.end(), path);
+    return select_disc(static_cast<std::size_t>(it - set.begin()));
+}
+
+Indy::Activity Indy::activity() const {
+    Activity a;
+    a.disk = disk_ ? disk_->activity() : 0;
+    a.cdrom = cdrom_ ? cdrom_->activity() : 0;
+    a.net_tx = hpc3_.enet_tx_frames();
+    a.net_rx = hpc3_.enet_rx_frames();
+    a.cycles = cpu_.cycles();
+    a.idle_cycles = cpu_.idle_skipped_cycles();
+    a.pixels = newport_.pixels_drawn();
+    return a;
 }
 
 bool Indy::load_prom(const std::string& path, std::string& error) {

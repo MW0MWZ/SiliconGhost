@@ -44,6 +44,9 @@ public:
     Seeq8003& seeq() { return seeq_; }
     // Ethernet frames go to and come from `backend` (null: no cable).
     void set_network(net::NetBackend* backend);
+    // Frames sent and received on the Ethernet port (for activity lights).
+    u64 enet_tx_frames() const { return enet_tx_frames_; }
+    u64 enet_rx_frames() const { return enet_rx_frames_; }
     // Called by the machine's run loop: starts taking in frames when the
     // host has some (the poll then runs only while frames keep coming).
     void poll_network();
@@ -130,6 +133,7 @@ private:
     bool enet_irq_ = false, enet_loopback_ = false;
     u32 enet_dconfig_ = 0, enet_pconfig_ = 0;
     net::NetBackend* net_ = nullptr;
+    u64 enet_tx_frames_ = 0, enet_rx_frames_ = 0;
     std::unique_ptr<Timer> enet_tx_timer_, enet_poll_timer_;
     u32 eeprom_reg_ = 0;
     std::unordered_map<u32, u32> regs_;  // registers without behaviour yet

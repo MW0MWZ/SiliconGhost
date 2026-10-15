@@ -16,7 +16,7 @@ constexpr u8 kCheckCondition = 0x02;
 
 constexpr u8 kSenseNone = 0x0, kSenseNotReady = 0x2, kSenseMediumError = 0x3, kSenseIllegalRequest = 0x5;
 constexpr u8 kSenseUnitAttention = 0x6, kSenseDataProtect = 0x7;
-constexpr u8 kAscMediumChanged = 0x28, kAscMediumNotPresent = 0x3A;
+constexpr u8 kAscMediumChanged = 0x28, kAscMediumNotPresent = 0x3A, kAscRemovalPrevented = 0x53;
 constexpr u8 kAscInvalidOpcode = 0x20, kAscLbaOutOfRange = 0x21, kAscWriteProtected = 0x27;
 constexpr u8 kAscUnrecoveredRead = 0x11;
 
@@ -54,7 +54,16 @@ bool ScsiDisk::open(const std::string& path) {
     return file_.is_open();
 }
 
+void ScsiDisk::eject() {
+    if (!file_.is_open()) return;
+    file_.close();
+    blocks_ = 0;
+    prevent_removal_ = false;
+    unit_attention_ = true;
+}
+
 bool ScsiDisk::change_medium(const std::string& path) {
+    prevent_removal_ = false;
     unit_attention_ = true;
     return open(path);
 }
@@ -69,6 +78,7 @@ ScsiTarget::Result ScsiDisk::check_condition(u8 key, u8 asc, u8 ascq) {
 }
 
 bool ScsiDisk::read_blocks(u64 lba, u32 count, std::vector<u8>& out) {
+    ++activity_;
     out.resize(static_cast<std::size_t>(count) * kBlockSize);
     file_.clear();
     file_.seekg(static_cast<std::streamoff>(lba * kBlockSize));
@@ -154,12 +164,15 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
         case 0x16:  // RESERVE
         case 0x17:  // RELEASE
         case 0x1D:  // SEND DIAGNOSTIC
-        case 0x1E:  // PREVENT ALLOW MEDIUM REMOVAL
         case 0x2F:  // VERIFY(10)
         case 0x35:  // SYNCHRONIZE CACHE
             break;
+        case 0x1E:  // PREVENT ALLOW MEDIUM REMOVAL
+            prevent_removal_ = cdb[4] & 1;
+            break;
         case 0x1B:                                                   // START STOP UNIT
             if (kind_ == Kind::CdRom && (cdb[4] & 0x03) == 0x02) {  // LoEj, stop: eject
+                if (prevent_removal_) return check_condition(kSenseIllegalRequest, kAscRemovalPrevented);
                 file_.close();
                 blocks_ = 0;
                 if (eject_cb_) eject_cb_();
@@ -252,6 +265,7 @@ u8 ScsiDisk::finish_data_out(const u8* cdb, const std::vector<u8>& data) {
     const u8 op = cdb[0];
     if (op == 0x0A || op == 0x2A) {
         const u64 lba = op == 0x0A ? (((cdb[1] & 0x1F) << 16) | (cdb[2] << 8) | cdb[3]) : be32(&cdb[2]);
+        ++activity_;
         file_.clear();
         file_.seekp(static_cast<std::streamoff>(lba * kBlockSize));
         file_.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));

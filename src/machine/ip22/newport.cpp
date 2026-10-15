@@ -595,6 +595,7 @@ u32 Newport::fetch(int px, int py) const {
 }
 
 void Newport::store(int px, int py, u32 colour) {
+    ++pixels_drawn_;
     const unsigned planes = drawmode1_ & 7, depth = (drawmode1_ >> 3) & 3;
     if (planes == kPlanesNone || planes == 3 || planes == 7) return;
     // Replicate the value into every buffer lane, then move aux values into place.

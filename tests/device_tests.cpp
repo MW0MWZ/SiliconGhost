@@ -243,7 +243,9 @@ TEST(wd33c93_reset_and_selection_timeout) {
 
 namespace {
 std::string make_image(unsigned blocks) {
-    const std::string path = (std::filesystem::temp_directory_path() / "sg_scsi_test.img").string();
+    static unsigned serial = 0;  // a name per image, so a test can have several
+    const std::string path =
+        (std::filesystem::temp_directory_path() / ("sg_scsi_test" + std::to_string(serial++) + ".img")).string();
     std::ofstream f(path, std::ios::binary);
     for (unsigned b = 0; b < blocks; ++b) {
         std::vector<char> block(512, static_cast<char>(b));

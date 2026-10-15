@@ -47,6 +47,13 @@ public:
     bool change_medium(const std::string& path);
     // Called when the initiator ejects the medium (START STOP UNIT, LoEj).
     void set_eject_callback(std::function<void()> cb) { eject_cb_ = std::move(cb); }
+    // The initiator has locked the medium in (PREVENT MEDIUM REMOVAL).
+    bool removal_prevented() const { return prevent_removal_; }
+    // Ejects at once, as the drive's own button does; the callback is not called.
+    void eject();
+    bool loaded() const { return file_.is_open(); }
+    // Counts reads and writes of the medium (for activity lights).
+    u64 activity() const { return activity_; }
 
     Result command(const u8* cdb, unsigned length) override;
     u8 finish_data_out(const u8* cdb, const std::vector<u8>& data) override;
@@ -64,6 +71,8 @@ private:
     Kind kind_;
     std::fstream file_;
     bool unit_attention_ = false;
+    bool prevent_removal_ = false;
+    u64 activity_ = 0;
     std::function<void()> eject_cb_;
     u64 blocks_ = 0;
     bool read_only_;

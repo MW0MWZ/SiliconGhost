@@ -167,6 +167,7 @@ void Hpc3::enet_poll() {
 // OWN and leaves the unused byte count in each one it fills.
 void Hpc3::enet_receive(const u8* frame, std::size_t length) {
     if (!seeq_.accepts(frame, length) || length > kEnetMaxFrame) return;
+    ++enet_rx_frames_;
     if (!enet_rx_.active) return;  // no buffers: the frame is lost
     std::vector<u8> data(2 + std::max(length, kEnetMinFrame) + 1, 0);
     std::memcpy(&data[2], frame, length);
@@ -233,6 +234,7 @@ void Hpc3::enet_transmit() {
         enet_tx_.ndbp = next;
     }
     if (frame.size() < kEnetMinFrame) frame.resize(kEnetMinFrame, 0);
+    ++enet_tx_frames_;
     if (enet_loopback_) enet_receive(frame.data(), frame.size());
     else if (net_) net_->send(frame.data(), frame.size());
     irq |= seeq_.transmitted(end_of_packet ? Seeq8003::kTxDone : Seeq8003::kTxUnderflow);

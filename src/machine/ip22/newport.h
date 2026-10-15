@@ -51,6 +51,8 @@ public:
     // (screenshots; render() is checked against it).
     bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
     u64 frames() const { return frames_; }
+    // Pixels the REX3 has drawn (a measure of how busy the board is).
+    u64 pixels_drawn() const { return pixels_drawn_; }
 
 private:
     // ---- REX3 ----
@@ -131,6 +133,7 @@ private:
     Timer retrace_timer_;
     std::function<void(bool)> retrace_cb_;
     u64 frames_ = 0;
+    u64 pixels_drawn_ = 0;
 
     // REX3 state
     u32 drawmode0_ = 0, drawmode1_ = 0;
