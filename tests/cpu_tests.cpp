@@ -1074,6 +1074,188 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_mips4_fpu_programs) {
     R4000::set_jit_fma(true);
 }
 
+// Each MIPS IV instruction the recompiler translates, both ways where it has
+// two outcomes, in a hot loop that stores what it did: the same in every
+// engine, with and without FMA.
+TEST(cpu_jit_mips4_operations_match_interpreter) {
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto cop1x = [](unsigned func, unsigned fr, unsigned ft, unsigned fs, unsigned fd) {
+        return (0x13u << 26) | (fr << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto movci = [](unsigned rd, unsigned rs, unsigned cc, unsigned tf) {
+        return (rs << 21) | (cc << 18) | (tf << 16) | (rd << 11) | 0x01u;
+    };
+    auto bc1 = [](unsigned cc, unsigned nd, unsigned tf, s32 off) {
+        return (0x11u << 26) | (0x08u << 21) | (cc << 18) | (nd << 17) | (tf << 16) | (static_cast<u32>(off) & 0xFFFF);
+    };
+    auto cfc1 = [](unsigned rt) { return (0x11u << 26) | (0x02u << 21) | (rt << 16) | (31u << 11); };
+    auto dbits = [](double v) {
+        u64 b;
+        std::memcpy(&b, &v, 8);
+        return b;
+    };
+    auto fbits = [](float v) {
+        u32 b;
+        std::memcpy(&b, &v, 4);
+        return u64{b};
+    };
+    std::vector<u32> body;
+    s32 slot = 0;
+    auto sw = [&](unsigned r) { body.push_back(SW(r, slot, s0)), slot += 4; };
+    auto sd1 = [&](unsigned f) {
+        slot = (slot + 7) & ~7;
+        body.push_back(I(0x3D, s0, f, slot)), slot += 8;
+    };
+    for (unsigned f : {0x0Au, 0x0Bu})  // MOVZ, MOVN: on a zero and a nonzero rt
+        for (unsigned rt : {t0, t1}) {
+            body.push_back(ADDIU(a0, zero, 7));
+            body.push_back(R(f, t2, rt, a0));
+            sw(a0);
+        }
+    body.push_back(cop1(17, 2, 0, 3 << 2, 0x3C));  // C.LT.D f0 < f2 -> FCC3 set
+    body.push_back(cop1(17, 2, 0, 5 << 2, 0x32));  // C.EQ.D -> FCC5 clear
+    body.push_back(cop1(17, 2, 0, 0, 0x3C));       // C.LT.D -> FCC0 set
+    body.push_back(cfc1(t4));
+    sw(t4);
+    for (unsigned cc : {0u, 3u, 5u})
+        for (unsigned tf : {0u, 1u}) {
+            body.push_back(ADDIU(a0, zero, 7));
+            body.push_back(movci(a0, t2, cc, tf));
+            sw(a0);
+        }
+    for (unsigned cc : {3u, 5u})
+        for (unsigned tf : {0u, 1u})
+            for (unsigned nd : {0u, 1u}) {
+                body.push_back(ADDIU(a1, zero, 1));
+                body.push_back(bc1(cc, nd, tf, 2));
+                body.push_back(ADDIU(a1, a1, 2));  // delay slot
+                body.push_back(ADDIU(a1, a1, 4));  // skipped if taken
+                sw(a1);
+            }
+    for (unsigned cc : {3u, 5u})
+        for (unsigned tf : {0u, 1u}) {
+            body.push_back(cop1(17, 0, 4, 20, 0x06));                // MOV.D f20, f4
+            body.push_back(cop1(17, (cc << 2) | tf, 2, 20, 0x11));   // MOVF/MOVT.D f20, f2
+            sd1(20);
+            body.push_back(cop1(16, 0, 13, 21, 0x06));               // MOV.S f21, f13
+            body.push_back(cop1(16, (cc << 2) | tf, 12, 21, 0x11));  // MOVF/MOVT.S f21, f12
+            sd1(21);
+        }
+    for (unsigned f : {0x12u, 0x13u})
+        for (unsigned rt : {t0, t1}) {
+            body.push_back(cop1(17, 0, 4, 20, 0x06));
+            body.push_back(cop1(17, rt, 2, 20, f));  // MOVZ/MOVN.D f20, f2, rt
+            sd1(20);
+        }
+    for (unsigned func : {0x21u, 0x29u, 0x31u, 0x39u}) {  // MADD/MSUB/NMADD/NMSUB.D: inexact and exact
+        body.push_back(cop1x(func, 10, 8, 6, 22));
+        sd1(22);
+        body.push_back(cfc1(t4));
+        sw(t4);
+        body.push_back(cop1x(func, 0, 2, 0, 22));
+        sd1(22);
+        body.push_back(cfc1(t4));
+        sw(t4);
+    }
+    for (unsigned func : {0x20u, 0x28u, 0x30u, 0x38u}) {  // .S
+        body.push_back(cop1x(func, 12, 13, 14, 23));
+        sd1(23);
+        body.push_back(cfc1(t4));
+        sw(t4);
+    }
+    for (unsigned fs : {2u, 4u}) {  // RECIP.D of 4 (exact) and 1/3
+        body.push_back(cop1(17, 0, fs, 24, 0x15));
+        sd1(24);
+        body.push_back(cfc1(t4));
+        sw(t4);
+    }
+    body.push_back(cop1(16, 0, 12, 25, 0x15));  // RECIP.S of 3
+    sd1(25);
+    body.push_back(cop1x(0x01, s0, t5, 0, 26));  // LDXC1 f26, t5(s0)
+    body.push_back(cop1x(0x00, s0, t6, 0, 27));  // LWXC1 f27, t6(s0)
+    body.push_back(cop1x(0x09, s0, t6, 2, 0));   // SDXC1 f2, t6(s0)
+    body.push_back(cop1x(0x08, s0, t5, 12, 0));  // SWXC1 f12, t5(s0)
+    body.push_back(cop1x(0x0F, s0, t5, 0, 0));   // PREFX
+    body.push_back(I(0x33, s0, 0, 0x40));        // PREF
+    sd1(26);
+    sd1(27);
+    std::vector<u32> prog = {ADDIU(s1, zero, 20)};
+    const s32 loop = static_cast<s32>(prog.size());
+    prog.insert(prog.end(), body.begin(), body.end());
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, loop - static_cast<s32>(prog.size()) - 1));
+    prog.push_back(NOP);
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    CHECK(slot + 0x200 < 0x800);
+    for (bool fma : {true, false}) {
+        R4000::set_jit_fma(fma);
+        auto run = [&](Engine engine) {
+            Rig t(r5000_options());
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::FR);
+            const double third = 1.0 / 3;
+            const u64 values[] = {dbits(3.0), 0, dbits(4.0), 0, dbits(third), 0, dbits(1.0 + std::ldexp(1.0, -30)), 0,
+                                  dbits(1.0 - std::ldexp(1.0, -30)), 0, dbits(-1.0), 0, fbits(3.0f), fbits(0.1f),
+                                  fbits(5.0f)};
+            for (std::size_t i = 0; i < std::size(values); ++i) t.cpu.fpr[i] = values[i];
+            t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+            t.cpu.gpr[t0] = 0, t.cpu.gpr[t1] = 5, t.cpu.gpr[t2] = 0x1234, t.cpu.gpr[t5] = 0x700, t.cpu.gpr[t6] = 0x708;
+            store_be<u64>(&t.ram[0x10700], dbits(2.5));
+            store_be<u64>(&t.ram[0x10708], fbits(1.5f) << 32);
+            u64 paddr = 0x1000;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.set_pc(0xFFFFFFFF80001000ull);
+            t.cpu.run_until(60000);
+            return capture(t, 0x10000, 0x800);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        CHECK_EQ(reference.cause, 0u);  // no exception
+        CHECK(run(Engine::Blocks) == reference);
+        CHECK(run(Engine::Jit) == reference);
+    }
+    R4000::set_jit_fma(true);
+}
+
+// A translation of MIPS IV code made in kernel mode runs again for the same
+// memory in user mode: reserved without Status.XX, allowed with it.
+TEST(cpu_jit_mips4_reserved_in_user_mode_without_xx) {
+    for (bool xx : {false, true})
+        for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+            Rig t(r5000_options());
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.load({NOP, R(0x0B, t0, t0, t1), ADDIU(t2, t2, -1), BNE(t2, zero, -3), NOP, SYSCALL}, 0x10000);
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.gpr[t0] = 9;
+            t.cpu.gpr[t2] = 20;
+            t.cpu.set_pc(0xFFFFFFFF80010000ull);
+            t.cpu.run_until(2000);
+            CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Sys));
+            CHECK_EQ(t.cpu.gpr[t1], 9u);
+            t.cpu.cp0_write(cop0::Index, 0);
+            t.cpu.cp0_write(cop0::EntryHi, 0x00010000);
+            t.cpu.cp0_write(cop0::EntryLo0, (0x10u << 6) | (3u << 3) | 7u);
+            t.cpu.cp0_write(cop0::EntryLo1, 1);
+            t.cpu.cp0_write(cop0::EPC, 0x10000);
+            t.cpu.cp0_write(cop0::Status, sr::KSU_USER | sr::EXL | (xx ? sr::XX : 0));
+            t.load({TLBWI, ERET}, 0x2000);
+            t.cpu.set_pc(0xFFFFFFFF80002000ull);
+            t.cpu.gpr[t1] = 0;
+            t.cpu.gpr[t2] = 5;
+            t.cpu.run_until(4000);
+            CHECK_EQ(t.exc_code(), static_cast<unsigned>(xx ? Exc::Sys : Exc::RI));
+            CHECK_EQ(t.cpu.gpr[t1], xx ? 9u : 0u);
+        }
+}
+
 // Trap instructions in translated code: not taken while the loop is hot,
 // then taken (Tr, with EPC at the trap) in every engine.
 TEST(cpu_jit_trap_instructions_trap) {

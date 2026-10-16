@@ -31,6 +31,9 @@ Uses inline_uses(u32 w) {
                 case 0x00:
                 case 0x02:
                 case 0x03: return {bit(rt), bit(rd)};
+                case 0x01: return {bit(rs) | bit(rd), bit(rd)};  // MOVF, MOVT: rd may keep its value
+                case 0x0A:
+                case 0x0B: return {bit(rs) | bit(rt) | bit(rd), bit(rd)};  // MOVZ, MOVN
                 case 0x08: return {bit(rs), 0};
                 case 0x09: return {bit(rs), bit(rd)};
                 case 0x10:
@@ -99,10 +102,13 @@ Uses inline_uses(u32 w) {
         case 0x0D:
         case 0x0E: return {bit(rs), bit(rt)};
         case 0x0F: return {0, bit(rt)};
-        case 0x11:  // MFC1, DMFC1, MTC1, DMTC1
+        case 0x11:  // MFC1, DMFC1, MTC1, DMTC1; MOVZ.fmt, MOVN.fmt read rt
             if (rs == 0x00 || rs == 0x01) return {0, bit(rt)};
             if (rs == 0x04 || rs == 0x05) return {bit(rt), 0};
+            if ((rs == 0x10 || rs == 0x11) && ((w & 63) == 0x12 || (w & 63) == 0x13)) return {bit(rt), 0};
             return {};
+        case 0x13:  // COP1X indexed loads and stores: base + index
+            return (w & 0x36) == 0 ? Uses{bit(rs) | bit(rt), 0} : Uses{};
         case 0x20:
         case 0x21:
         case 0x23:
@@ -249,6 +255,18 @@ void R4000::jit_fp_uses(u32 w, const std::function<void(unsigned, bool, bool)>& 
         case 0x35: return use(ft, true, true);   // LDC1
         case 0x39: return use(ft, false, false);  // SWC1
         case 0x3D: return use(ft, true, false);   // SDC1
+        case 0x13:  // COP1X
+            switch (func) {
+                case 0x00: case 0x01: return use(fd, func == 0x01, true);   // LWXC1, LDXC1
+                case 0x08: case 0x09: return use(fs, func == 0x09, false);  // SWXC1, SDXC1
+                case 0x20: case 0x21: case 0x28: case 0x29:
+                case 0x30: case 0x31: case 0x38: case 0x39: {               // MADD and family
+                    const bool d = func & 1;
+                    use(fs, d, false), use(ft, d, false), use(fmt, d, false), use(fd, d, true);
+                    return;
+                }
+                default: return;
+            }
         case 0x11: break;
         default: return;
     }
@@ -267,8 +285,10 @@ void R4000::jit_fp_uses(u32 w, const std::function<void(unsigned, bool, bool)>& 
     const bool dbl = fmt == 0x11;
     if (func <= 0x03) {
         use(fs, dbl, false), use(ft, dbl, false), use(fd, dbl, true);
-    } else if (func <= 0x07) {  // SQRT, ABS, MOV, NEG
+    } else if (func <= 0x07 || func == 0x15) {  // SQRT, ABS, MOV, NEG, RECIP
         use(fs, dbl, false), use(fd, dbl, true);
+    } else if (func >= 0x11 && func <= 0x13) {  // MOVF/MOVT, MOVZ, MOVN.fmt: fd may keep its value
+        use(fs, dbl, false), use(fd, dbl, false), use(fd, dbl, true);
     } else if ((func == 0x20 && dbl) || (func == 0x21 && !dbl)) {  // CVT.S.D, CVT.D.S
         use(fs, dbl, false), use(fd, !dbl, true);
     } else if (func == 0x0C || func == 0x0D || func == 0x24) {  // ROUND.W, TRUNC.W, CVT.W

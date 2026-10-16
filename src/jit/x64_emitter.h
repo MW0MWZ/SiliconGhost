@@ -115,6 +115,10 @@ public:
         rex(true, 0, r);
         byte(0xF7), byte(0xC0 | (2 << 3) | (r & 7));
     }
+    void cmov(Cond c, Reg dst, Reg src) {  // 64-bit
+        rex(true, dst, src);
+        byte(0x0F), byte(0x40 + static_cast<unsigned>(c)), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
     void setcc(Cond c, Reg r) {  // r must be al/cl/dl/bl
         byte(0x0F), byte(0x90 + static_cast<unsigned>(c)), byte(0xC0 | (r & 7));
     }

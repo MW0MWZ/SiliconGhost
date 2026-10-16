@@ -150,8 +150,7 @@ std::vector<std::string> configuration_notes(const Settings& s) {
         notes.push_back("IRIX 5.3 and 6.5, NetBSD and OpenBSD run.");
     }
     if (cpu && cpu->core == mips::Core::R5000)
-        notes.push_back("The R5000 needs PROM 070-9101-011 (5.3 Rev B10) or later. Its MIPS IV instructions are run "
-                        "by the interpreter, not the recompiler, so programs built for MIPS IV run slower.");
+        notes.push_back("The R5000 needs PROM 070-9101-011 (5.3 Rev B10) or later.");
     if (cpu && cpu->core == mips::Core::R4600 && cpu->scache_bytes)
         notes.push_back("NetBSD does not use the R4600SC's secondary cache (IRIX does).");
     if (cpu) {

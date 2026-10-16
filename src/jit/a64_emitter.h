@@ -97,6 +97,10 @@ public:
     Site cbnz_bit(Reg r, unsigned bit) {
         return emit_site(0x37000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | r, Fix::B14);
     }
+    // TBZ: to the site if bit `bit` of r is clear.
+    Site cbz_bit(Reg r, unsigned bit) {
+        return emit_site(0x36000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | r, Fix::B14);
+    }
     void b_to(std::size_t target) { bind_to(b(), target); }
     void br(Reg r) { emit(0xD61F0000u | (u32{r} << 5)); }
     void blr(Reg r) { emit(0xD63F0000u | (u32{r} << 5)); }
@@ -218,6 +222,9 @@ public:
     void mul(Reg d, Reg n, Reg m, bool w64 = true) { madd(d, n, m, xzr, w64); }
     void smull(Reg d, Reg n, Reg m) { emit(0x9B200000u | (u32{m} << 16) | (31u << 10) | (u32{n} << 5) | d); }
     void umull(Reg d, Reg n, Reg m) { emit(0x9BA00000u | (u32{m} << 16) | (31u << 10) | (u32{n} << 5) | d); }
+    void csel(Reg d, Reg n, Reg m, Cond c) {  // d = c ? n : m (64-bit)
+        emit(0x9A800000u | (u32{m} << 16) | (static_cast<u32>(c) << 12) | (u32{n} << 5) | d);
+    }
     void cset(Reg d, Cond c) {  // CSINC d, zr, zr, !c
         emit(0x9A800400u | (31u << 16) | (static_cast<u32>(invert(c)) << 12) | (31u << 5) | d);
     }

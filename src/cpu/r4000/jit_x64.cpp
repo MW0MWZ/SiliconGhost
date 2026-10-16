@@ -400,6 +400,24 @@ bool R4000::jit_compile(Block& b) {
         e.alu_imm(Alu::Cmp, rax, kUser - kSupervisor, false);
         slow.push_back(e.jcc(Cond::Be));
     };
+    // MIPS IV instructions (R5000 only): reserved in user and supervisor
+    // mode without Status.XX (mips4_enabled()).
+    const Mem m_status_top{kCpu, offset_of(this, &status_) + 3};
+    auto need_mips4 = [&](std::vector<std::size_t>& slow) {
+        e.mov(rax, m_entry_mode, false);
+        e.alu_imm(Alu::Sub, rax, kSupervisor, false);
+        e.alu_imm(Alu::Cmp, rax, kUser - kSupervisor, false);
+        const std::size_t kernel = e.jcc(Cond::A);
+        e.test8_imm(m_status_top, static_cast<u8>(sr::XX >> 24));
+        slow.push_back(e.jcc(Cond::E));
+        e.bind(kernel);
+    };
+    // An FPU condition code's FCR31 bit, as a byte offset and a mask.
+    auto fcc_byte = [&](unsigned cc) {
+        const unsigned bit = cc ? 24 + cc : 23;
+        return std::pair<Mem, u8>{Mem{kCpu, offset_of(this, &fcr31) + static_cast<s32>(bit / 8)},
+                                  static_cast<u8>(1u << (bit % 8))};
+    };
     auto emit_alu = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w), rd = f_rd(w), sa = f_sa(w);
         const s32 simm = static_cast<s16>(w & 0xFFFF);
@@ -423,8 +441,24 @@ bool R4000::jit_compile(Block& b) {
             slow.push_back(e.jcc(kTrap[rt - 0x08]));  // the trap: the handler raises it
             return true;
         }
+        if (opc == 0x33 && mips4_) {  // PREF: a hint
+            need_mips4(slow);
+            return true;
+        }
         if (opc != 0x00) return false;
         const unsigned funct = w & 63;
+        if ((funct == 0x0A || funct == 0x0B) && mips4_) {  // MOVZ, MOVN
+            need_mips4(slow);
+            if (!rd) return true;
+            ensure(rs), ensure(rt), ensure(rd);
+            read(rcx, rt);
+            e.test(rcx, rcx);
+            read(rax, rd);
+            read(rdx, rs);
+            e.cmov(funct == 0x0A ? Cond::E : Cond::Ne, rax, rdx);
+            write(rd, rax);
+            return true;
+        }
         switch (funct) {
             case 0x30:  // TGE
             case 0x31:  // TGEU
@@ -520,7 +554,7 @@ bool R4000::jit_compile(Block& b) {
     const Mem m_status{kCpu, offset_of(this, &status_)};
     const Mem m_fcr31{kCpu, offset_of(this, &fcr31)};
     const Mem m_fp_control{kCpu, offset_of(this, &jit_fp_control_)};
-    constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u, kCond = 1u << 23;
+    constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;
     auto fp_usable = [&](std::vector<std::size_t>& slow) {
         e.mov(rax, m_status, false);
         e.alu_imm(Alu::And, rax, static_cast<s32>(sr::CU1 | sr::FR), false);
@@ -580,9 +614,30 @@ bool R4000::jit_compile(Block& b) {
     };
     auto fp_commit_exact = [&] { e.alu_imm(Alu::And, m_fcr31, static_cast<s32>(~kCauseMask), false); };
     auto emit_fpu = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
-        if ((w >> 26) != 0x11) return false;
-        const unsigned fmt = f_rs(w), ft = f_rt(w), fs = f_rd(w), fd = f_sa(w), func = w & 63;
-        switch (fmt) {
+        const unsigned opc = w >> 26;
+        if (opc == 0x00 && (w & 63) == 0x01 && mips4_) {  // MOVF, MOVT
+            const unsigned rs = f_rs(w), rd = f_rd(w);
+            need_mips4(slow);
+            e.test8_imm(m_status_top, static_cast<u8>(sr::CU1 >> 24));
+            slow.push_back(e.jcc(Cond::E));
+            touch_();
+            if (!rd) return true;
+            ensure(rs), ensure(rd);
+            const auto [m, mask] = fcc_byte((w >> 18) & 7);
+            read(rax, rd);
+            read(rdx, rs);
+            e.test8_imm(m, mask);
+            e.cmov((w >> 16) & 1 ? Cond::Ne : Cond::E, rax, rdx);
+            write(rd, rax);
+            return true;
+        }
+        // COP1X multiply-add: fr in the rs field, the format in the function's low bit.
+        const bool madd = opc == 0x13 && (w & 0x06) == 0 && (w & 63) >= 0x20;
+        if (opc != 0x11 && !madd) return false;
+        if (madd && !mips4_) return false;
+        const unsigned fmt = madd ? 0x10 + (w & 1) : f_rs(w), ft = f_rt(w), fs = f_rd(w), fd = f_sa(w), fr_reg = f_rs(w);
+        unsigned func = w & 63;
+        switch (madd ? 0x10u : fmt) {
             case 0x00:  // MFC1
             case 0x01:  // DMFC1
                 if (fmt == 0x01) need64(slow);
@@ -708,10 +763,89 @@ bool R4000::jit_compile(Block& b) {
             e.sse(S::Mul, dbl, 7, 6), e.sse(S::Add, dbl, 1, 7);                   // + xl * yh
             e.sse(S::Mul, dbl, 6, 2), e.sse(S::Add, dbl, 1, 6);                   // + xl * yl
         };
-        if (func <= 0x01 || (func <= 0x04 && (jit_fma_ || kDekker))) {  // ADD, SUB; MUL, DIV, SQRT exactly
+        if (madd) {  // MADD, MSUB, NMADD, NMSUB: p = fs * ft rounded, then p +- fr rounded
+            if (!(jit_fma_ || kDekker)) return false;
+            const bool subtract = (func & 0x08) != 0, negate = (func & 0x10) != 0;
+            need_mips4(slow);
             fp_usable(slow);
             fp_nearest(slow);
-            const unsigned a = fp_operand(fs, dbl, 4, slow);
+            const unsigned a = fp_operand(fs, dbl, 4, slow), m = fp_operand(ft, dbl, 3, slow);
+            e.movapd(0, a);
+            e.sse(Emitter::Sse::Mul, dbl, 0, m);
+            if (jit_fma_) {
+                e.movapd(1, 0);
+                e.fmsub231(dbl, 1, a, m);  // a * m - p
+            } else {
+                split_ok(a), split_ok(m);
+                two_product(a, m, 0);
+            }
+            e.movq_from_xmm(rax, 0, dbl);
+            result_check({a, m}, min_result);  // the product: neither tiny nor overflowing
+            nonzero(1);
+            e.mov(m_scratch, rcx);  // the product was inexact
+            e.movapd(4, 0);         // p
+            const unsigned c = fp_operand(fr_reg, dbl, 2, slow);
+            e.movapd(0, 4);
+            e.sse(subtract ? Emitter::Sse::Sub : Emitter::Sse::Add, dbl, 0, c);
+            e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, 4);  // TwoSum / TwoDiff with p in xmm4
+            e.movapd(2, c), e.sse(subtract ? Emitter::Sse::Add : Emitter::Sse::Sub, dbl, 2, 1);
+            e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
+            e.movapd(1, 4), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
+            e.sse(subtract ? Emitter::Sse::Sub : Emitter::Sse::Add, dbl, 1, 2);
+            e.movq_from_xmm(rax, 0, dbl);
+            result_check({0}, 1);  // a zero sum is exact
+            nonzero(1);
+            e.alu(Alu::Or, rcx, m_scratch);
+            commit_inexact_rcx();
+            if (negate) {
+                e.movq_from_xmm(rax, 0, dbl);
+                if (dbl) e.mov_imm64(rcx, u64{1} << 63);
+                else e.mov_imm32(rcx, 0x80000000u);
+                e.alu(Alu::Xor, rax, rcx, dbl);
+                fp_write_gpr(fd, dbl, rax);
+            } else {
+                fp_write_xmm(fd, dbl, 0);
+            }
+            touch_();
+            return true;
+        }
+        if (func >= 0x11 && func <= 0x13 && mips4_) {  // MOVF/MOVT.fmt, MOVZ.fmt, MOVN.fmt: Cause untouched
+            need_mips4(slow);
+            fp_usable(slow);
+            touch_();
+            // Both registers are brought into the cache before the condition
+            // splits the way, so either way leaves the same state.
+            const unsigned x = fp_src(fs, dbl, 0);
+            fp_slot(fd, dbl);
+            std::size_t skip;
+            if (func == 0x11) {
+                const auto [m, mask] = fcc_byte(ft >> 2);
+                e.test8_imm(m, mask);
+                skip = e.jcc((ft & 1) ? Cond::E : Cond::Ne);
+            } else {
+                ensure(ft);
+                read(rcx, ft);
+                e.test(rcx, rcx);
+                skip = e.jcc(func == 0x12 ? Cond::Ne : Cond::E);
+            }
+            fp_write_xmm(fd, dbl, x);
+            e.bind(skip);
+            return true;
+        }
+        const bool recip = func == 0x15 && mips4_;
+        if (func <= 0x01 || ((func <= 0x04 || recip) && (jit_fma_ || kDekker))) {  // ADD, SUB; MUL, DIV, SQRT, RECIP exactly
+            if (recip) need_mips4(slow);
+            fp_usable(slow);
+            fp_nearest(slow);
+            unsigned a = 4;
+            if (recip) {
+                if (dbl) e.mov_imm64(rax, 0x3FF0000000000000ull);
+                else e.mov_imm32(rax, 0x3F800000u);
+                e.movq_to_xmm(4, rax, dbl);
+            } else {
+                a = fp_operand(fs, dbl, 4, slow);
+            }
+            if (recip) func = 0x03;  // RECIP: 1 / fs, as DIV
             if (func == 0x04) {  // SQRT: a zero or a positive number not too small
                 e.test(rax, rax);
                 if (!dbl) e.test_imm(rax, 0x80000000u);
@@ -740,7 +874,7 @@ bool R4000::jit_compile(Block& b) {
                     e.movapd(1, 2);
                 }
             } else {
-                const unsigned c = fp_operand(ft, dbl, 3, slow);
+                const unsigned c = fp_operand(recip ? fs : ft, dbl, 3, slow);
                 if (func == 0x03) {  // DIV: a nonzero divisor, a dividend zero or not too small
                     e.mov(rcx, rax);
                     e.shift_imm(Shift::Shl, rcx, 1, dbl);
@@ -900,8 +1034,10 @@ bool R4000::jit_compile(Block& b) {
             default:
                 break;
         }
-        if (func >= 0x30 && (fd >> 2) == 0) {  // C.cond, condition code 0: no NaN operand, so ordered
+        if (func >= 0x30 && ((fd >> 2) == 0 || mips4_)) {  // C.cond: no NaN operand, so ordered
             const unsigned cond = func & 6;  // less (4), equal (2)
+            const unsigned cc = fd >> 2, bit = cc ? 24 + cc : 23;
+            if (cc) need_mips4(slow);
             fp_usable(slow);
             auto not_nan = [&](unsigned n, unsigned scratch) {
                 const unsigned x = fp_src(n, dbl, scratch);
@@ -919,10 +1055,10 @@ bool R4000::jit_compile(Block& b) {
                 e.ucomis(dbl, xa, xb);
                 e.setcc(cond == 6 ? Cond::Be : cond == 4 ? Cond::B : Cond::E, rax);
                 e.movzx8(rax, rax);
-                e.shift_imm(Shift::Shl, rax, 23, false);
+                e.shift_imm(Shift::Shl, rax, static_cast<u8>(bit), false);
             }
             e.mov(rdx, m_fcr31, false);
-            e.alu_imm(Alu::And, rdx, static_cast<s32>(~(kCauseMask | kCond)), false);
+            e.alu_imm(Alu::And, rdx, static_cast<s32>(~(kCauseMask | (1u << bit))), false);
             e.alu(Alu::Or, rdx, rax, false);
             e.mov(m_fcr31, rdx, false);
             touch_();
@@ -934,7 +1070,25 @@ bool R4000::jit_compile(Block& b) {
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
         unsigned size;
         bool is_store = false, merge = false, w64 = false, fp = false;
-        switch (opc) {
+        // COP1X (R5000): the address is base (rs) + index (rt); the FPU
+        // register is fd for loads, fs for stores.
+        const bool indexed = opc == 0x13 && mips4_;
+        unsigned freg = rt;
+        if (indexed) {
+            switch (w & 63) {
+                case 0x00: size = 4, freg = f_sa(w); break;                    // LWXC1
+                case 0x01: size = 8, freg = f_sa(w); break;                    // LDXC1
+                case 0x08: size = 4, freg = f_rd(w), is_store = true; break;   // SWXC1
+                case 0x09: size = 8, freg = f_rd(w), is_store = true; break;   // SDXC1
+                case 0x0F:  // PREFX: a hint
+                    need_mips4(slow);
+                    fp_usable(slow);
+                    touch_();
+                    return true;
+                default: return false;
+            }
+            fp = true;
+        } else switch (opc) {
             case 0x31: size = 4, fp = true; break;                   // LWC1
             case 0x35: size = 8, fp = true; break;                   // LDC1
             case 0x39: size = 4, fp = true, is_store = true; break;  // SWC1
@@ -958,13 +1112,15 @@ bool R4000::jit_compile(Block& b) {
         }
         const bool right = opc == 0x26 || opc == 0x2E || opc == 0x1B || opc == 0x2D;
         if (w64) need64(slow);
+        if (indexed) need_mips4(slow);
         if (fp) fp_usable(slow);
         // Operands are loaded before the paths split, so both agree.
         ensure(rs);
-        if ((is_store || merge) && !fp) ensure(rt);
+        if (((is_store || merge) && !fp) || indexed) ensure(rt);
         const s32 table = is_store ? kTableBytes : 0;
         read(rax, rs);
-        e.alu_imm(Alu::Add, rax, static_cast<s16>(w & 0xFFFF));
+        if (indexed) alu_g(Alu::Add, rax, rt);
+        else e.alu_imm(Alu::Add, rax, static_cast<s16>(w & 0xFFFF));
         if (!addr64) e.movsxd(rax, rax);
         if (size > 1 && !merge) {
             e.test_imm(rax, size - 1);
@@ -999,7 +1155,7 @@ bool R4000::jit_compile(Block& b) {
                 e.mov(rax, Mem{rdx, 0}, size == 8);
                 if (size == 8) e.bswap64(rax);
                 else e.bswap32(rax);
-                fp_write_gpr(rt, size == 8, rax);
+                fp_write_gpr(freg, size == 8, rax);
                 touch_();
                 return true;
             }
@@ -1119,7 +1275,7 @@ bool R4000::jit_compile(Block& b) {
         e.mov(Mem{rdx, log_host}, rcx);
         e.mov_store_imm32(Mem{rdx, log_size}, size);
         e.mov_store_imm(Mem{rdx, log_value}, 0);
-        if (fp) fp_read_gpr(rax, rt, size == 8);
+        if (fp) fp_read_gpr(rax, freg, size == 8);
         else read(rax, rt, size == 8);
         switch (size) {
             case 1: e.mov8(Mem{rcx, 0}, rax); break;
@@ -1401,7 +1557,7 @@ bool R4000::jit_compile(Block& b) {
                 likely = rt >= 2;
                 break;
             case 0x11:  // BC1F, BC1T, BC1FL, BC1TL
-                if (rs != 0x08 || (rt >> 2) != 0) return false;  // condition code 0 only
+                if (rs != 0x08 || ((rt >> 2) != 0 && !mips4_)) return false;  // condition codes 1-7: R5000
                 kind = kFpCond, not_taken = (rt & 1) ? Cond::E : Cond::Ne, likely = (rt & 2) != 0;
                 break;
             case 0x02: case 0x03: kind = kJump; break;  // J, JAL
@@ -1413,9 +1569,12 @@ bool R4000::jit_compile(Block& b) {
         }
         if (opc >= 0x14 && opc <= 0x17) likely = true;
 
-        if (kind == kFpCond) {  // the FPU unusable: leave, for the handler to raise it
+        if (kind == kFpCond) {  // the FPU unusable (or MIPS IV for codes 1-7): leave, for the handler
+            std::vector<std::size_t> leave;
+            if (rt >> 2) need_mips4(leave);
             e.test8_imm(Mem{kCpu, offset_of(this, &status_) + 3}, static_cast<u8>(sr::CU1 >> 24));
             const std::size_t usable = e.jcc(Cond::Ne);
+            for (std::size_t site : leave) e.bind(site);
             pc_plus(rax, 4 * i);
             e.mov(m_pc, rax);
             set_time(i);
@@ -1427,7 +1586,8 @@ bool R4000::jit_compile(Block& b) {
         e.mov(m_pc, rax);
         std::size_t to_not_taken = 0;
         if (kind == kFpCond) {
-            e.test8_imm(Mem{kCpu, offset_of(this, &fcr31) + 2}, 0x80);  // the condition, FCR31 bit 23
+            const auto [m, mask] = fcc_byte(rt >> 2);  // the condition: FCR31 bit 23, or 25-31
+            e.test8_imm(m, mask);
             to_not_taken = e.jcc(not_taken);
         } else if (kind == kCompare) {
             read(rcx, rs);
