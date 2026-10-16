@@ -950,7 +950,7 @@ bool R4000::jit_compile(Block& b) {
         const u32 w = op.inst;
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
         const s64 simm = static_cast<s16>(w & 0xFFFF);
-        enum Kind { kCompare, kSign, kJump, kJumpReg } kind;
+        enum Kind { kCompare, kSign, kFpCond, kJump, kJumpReg } kind;
         Cond not_taken = Cond::E;
         bool likely = false;
         switch (opc) {
@@ -966,6 +966,10 @@ bool R4000::jit_compile(Block& b) {
                 }
                 likely = rt >= 2;
                 break;
+            case 0x11:  // BC1F, BC1T, BC1FL, BC1TL
+                if (rs != 0x08) return false;
+                kind = kFpCond, not_taken = (rt & 1) ? Cond::E : Cond::Ne, likely = (rt & 2) != 0;
+                break;
             case 0x02: case 0x03: kind = kJump; break;  // J, JAL
             case 0x00:
                 if ((w & 63) != 0x08 && (w & 63) != 0x09) return false;
@@ -975,10 +979,23 @@ bool R4000::jit_compile(Block& b) {
         }
         if (opc >= 0x14 && opc <= 0x17) likely = true;
 
+        if (kind == kFpCond) {  // the FPU unusable: leave, for the handler to raise it
+            e.test8_imm(Mem{kCpu, offset_of(this, &status_) + 3}, static_cast<u8>(sr::CU1 >> 24));
+            const std::size_t usable = e.jcc(Cond::Ne);
+            pc_plus(rax, 4 * i);
+            e.mov(m_pc, rax);
+            set_time(i);
+            exits.push_back({e.jmp(), i, dirty});
+            e.bind(usable);
+            e.alu_imm(Alu::Add, Mem{kCpu, offset_of(this, &change_epoch_)}, 1);  // touch()
+        }
         pc_plus(rax, 4 * i + 4);
         e.mov(m_pc, rax);
         std::size_t to_not_taken = 0;
-        if (kind == kCompare) {
+        if (kind == kFpCond) {
+            e.test8_imm(Mem{kCpu, offset_of(this, &fcr31) + 2}, 0x80);  // the condition, FCR31 bit 23
+            to_not_taken = e.jcc(not_taken);
+        } else if (kind == kCompare) {
             read(rcx, rs);
             alu_g(Alu::Cmp, rcx, rt);
             to_not_taken = e.jcc(not_taken);
@@ -990,7 +1007,7 @@ bool R4000::jit_compile(Block& b) {
 
         // Taken: the target in rcx.
         const s64 delta = 4 * static_cast<s64>(i) + 4 + 4 * simm;
-        if (kind == kCompare || kind == kSign) {
+        if (kind == kCompare || kind == kSign || kind == kFpCond) {
             pc_plus(rcx, delta);
             add_successor(delta);
         } else if (kind == kJump) {
@@ -1011,7 +1028,7 @@ bool R4000::jit_compile(Block& b) {
         }
         e.mov(m_npc, rcx);
         e.mov_store_imm8(m_next_delay, 1);
-        const bool maybe_backward = ((kind == kCompare || kind == kSign) && simm < 0) || opc == 0x02;
+        const bool maybe_backward = ((kind == kCompare || kind == kSign || kind == kFpCond) && simm < 0) || opc == 0x02;
         if (maybe_backward) {
             const unsigned idx = ((page_offset + 4 * i) >> 2) & ((1u << kLoopTableBits) - 1);
             const Mem m_loop_pc{kCpu, offset_of(this, &loops_[idx].branch_pc)};
