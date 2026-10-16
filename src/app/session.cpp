@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include "app/proms.h"
 #include "core/log.h"
 #include "net/slirp_backend.h"
 #include "net/tap_backend.h"
@@ -48,10 +49,8 @@ bool load_file(const std::string& path, std::vector<u8>& data) {
 bool Session::power_on(std::string& error) {
     if (machine_) return true;
     const Settings& s = settings_;
-    if (s.prom.empty() && s.load_elf.empty()) {
-        error = "no boot PROM image chosen";
-        return false;
-    }
+    PromImage prom;
+    if (s.load_elf.empty() && !select_prom(s, prom, error)) return false;
     apply_log_level(s.log);
 
     std::unique_ptr<net::NetBackend> network;
@@ -67,7 +66,10 @@ bool Session::power_on(std::string& error) {
 
     try {
         auto machine = std::make_unique<ip22::Indy>(s.indy_config());
-        if (!s.prom.empty() && !machine->load_prom(s.prom, error)) return false;
+        if (!prom.path.empty()) {
+            if (!machine->load_prom(prom.path, error)) return false;
+            SG_LOG(Info, "session", "boot PROM: %s (%s)", prom.path.c_str(), prom.version.c_str());
+        }
         machine->set_network(network.get());
         if (!s.nvram.empty()) {
             std::vector<u8> image(machine->nvram_size());

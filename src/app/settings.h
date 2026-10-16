@@ -45,7 +45,9 @@ const std::vector<Platform>& platforms();
 const Platform* find_platform(const std::string& id);
 
 struct Settings {
-    std::string prom, nvram, disk;
+    std::string prom_dir;  // folder of PROM images; empty: see prom_folder()
+    std::string prom;      // a specific PROM image instead of choosing from the folder
+    std::string nvram, disk;
     std::vector<std::string> cdroms;
     std::string machine = "indy";  // indy | indigo2
     std::string cpu = "r4400sc";

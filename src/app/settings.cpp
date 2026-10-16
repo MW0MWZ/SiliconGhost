@@ -140,17 +140,13 @@ std::vector<std::string> configuration_notes(const Settings& s) {
     const CpuModel* cpu = find_cpu_model(s.cpu);
     char text[160];
     if (board == ip22::Board::Indigo2) {
-        notes.push_back("Needs an Indigo2 (IP22) boot PROM, such as 070-8127-002; the Indy's will not start.");
         notes.push_back("IRIX 5.3 and 6.5 run (disks installed on an Indy boot unchanged).");
-        notes.push_back("NetBSD and OpenBSD do not start: the 5.1 Indigo2 PROM loads only ECOFF programs and "
+        notes.push_back("NetBSD and OpenBSD do not start with the 5.1 Indigo2 PROM: it loads only ECOFF programs and "
                         "their boot loaders are ELF.");
         notes.push_back("Graphics: Newport (XL) only. The EISA slots are empty.");
     } else {
-        notes.push_back("Needs an Indy (IP24) boot PROM, such as 070-9101-011.");
         notes.push_back("IRIX 5.3 and 6.5, NetBSD and OpenBSD run.");
     }
-    if (cpu && cpu->core == mips::Core::R5000)
-        notes.push_back("The R5000 needs PROM 070-9101-011 (5.3 Rev B10) or later.");
     if (cpu && cpu->core == mips::Core::R4600 && cpu->scache_bytes)
         notes.push_back("NetBSD does not use the R4600SC's secondary cache (IRIX does).");
     if (cpu) {
@@ -273,6 +269,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     double n = 0;
     bool ok = true;
     if (key == "prom") s.prom = v;
+    else if (key == "prom_dir") s.prom_dir = v;
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
@@ -378,7 +375,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
     {
         std::ofstream f(tmp, std::ios::trunc);
         f << "# SiliconGhost settings\n";
-        f << "prom=" << s.prom << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
+        f << "prom_dir=" << s.prom_dir << "\nprom=" << s.prom << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "machine=" << s.machine << "\ncpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
           << "\ngraphics_rev=" << (s.graphics_rev >= 0 ? std::to_string(s.graphics_rev) : "")

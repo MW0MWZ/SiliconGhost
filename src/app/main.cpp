@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "app/detach.h"
+#include "app/proms.h"
 #include "app/session.h"
 #include "app/settings.h"
 #include "core/log.h"
@@ -48,7 +49,9 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [options]\n"
                  "With no options the window opens with the machine off and the last settings.\n"
-                 "  --prom FILE      IP22 boot PROM image (raw, big-endian)\n"
+                 "  --prom-dir DIR   folder of boot PROM images; the one the machine needs is chosen\n"
+                 "                   (default: ./roms, else roms in the SiliconGhost folder)\n"
+                 "  --prom FILE      a specific boot PROM image instead (raw, big-endian)\n"
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved when it changes\n"
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media; give it\n"
@@ -258,7 +261,7 @@ int main(int argc, char** argv) {
         static const struct {
             const char* flag;
             const char* key;
-        } kValued[] = {{"--prom", "prom"},   {"--nvram", "nvram"},     {"--disk", "disk"},
+        } kValued[] = {{"--prom", "prom"},   {"--prom-dir", "prom_dir"},  {"--nvram", "nvram"},     {"--disk", "disk"},
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},  {"--machine", "machine"},
                        {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"},
@@ -325,6 +328,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
             return 2;
         }
+        // A machine described here needs its PROM: say so before anything starts.
+        sg::app::PromImage prom;
+        if ((real_args > 0 || headless) && settings.load_elf.empty() && !sg::app::select_prom(settings, prom, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 2;
+        }
     }
     if (!settings.load_elf.empty()) {  // a bare-metal program: console only, as fast as possible
         headless = true;
@@ -375,10 +384,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "note: this build has no window or sound (SDL3 was not found when it was built); "
                              "using the serial console\n");
 #endif
-    if (settings.prom.empty() && settings.load_elf.empty()) {
-        usage(argv[0]);
-        return 2;
-    }
 
     sg::app::Session session(settings);
     session.set_serial_output([](unsigned, sg::u8 byte) {

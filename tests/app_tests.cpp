@@ -5,6 +5,7 @@
 #include <fstream>
 #include <string>
 
+#include "app/proms.h"
 #include "app/session.h"
 #include "app/settings.h"
 #include "app/terminal.h"
@@ -197,6 +198,55 @@ TEST(settings_check_hardware_refuses_impossible_combinations) {
     CHECK(error.find("384 MiB") != std::string::npos);
     s.ram_mb = 256;
     CHECK(app::check_hardware(s, true, error));
+}
+
+TEST(proms_are_identified_and_chosen_for_the_machine) {
+    namespace fs = std::filesystem;
+    const fs::path dir = temp_path("sg_proms_test");
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto image = [&](const char* name, const std::string& version) {
+        std::string data(4096, '\0');
+        data.replace(1000, version.size(), version);
+        std::ofstream(dir / name, std::ios::binary) << data;
+    };
+    image("a.bin", "SGI Version 5.0 Rev B6 IP24 Sep 28, 1994");
+    image("b.bin", "SGI Version 5.3 Rev B10 R4X00/R5000 IP24 Feb 12, 1996");
+    image("c.bin", "SGI Version 5.1 Rev B IP22 Sep 16, 1993");
+    image("notes.txt", "nothing to see");
+    CHECK_EQ(app::scan_proms(dir.string()).size(), 3u);
+    const app::PromImage b = app::identify_prom((dir / "b.bin").string());
+    CHECK_STR(b.system, std::string("ip24"));
+    CHECK_STR(b.version, std::string("5.3 Rev B10"));
+    CHECK(b.r5000);
+
+    app::Settings s;
+    s.prom_dir = dir.string();
+    app::PromImage p;
+    std::string error;
+    CHECK(app::select_prom(s, p, error));  // Indy: the newest
+    CHECK_STR(fs::path(p.path).filename().string(), std::string("b.bin"));
+    s.machine = "indigo2";
+    CHECK(app::select_prom(s, p, error));
+    CHECK_STR(fs::path(p.path).filename().string(), std::string("c.bin"));
+    // An Indy with an R5000 and only the 5.0 PROM: refused, saying why.
+    fs::remove(dir / "b.bin");
+    s.machine = "indy", s.cpu = "r5000sc";
+    CHECK(!app::select_prom(s, p, error));
+    CHECK(error.find("predates the R5000") != std::string::npos);
+    s.cpu = "r4600sc";
+    CHECK(app::select_prom(s, p, error));
+    // A specific file must suit the machine.
+    s.prom = (dir / "c.bin").string();
+    CHECK(!app::select_prom(s, p, error));
+    CHECK(error.find("Indigo2 (IP22) PROM") != std::string::npos);
+    // No PROM at all for the Indigo2.
+    s.prom.clear();
+    fs::remove(dir / "c.bin");
+    s.machine = "indigo2", s.cpu = "r4400sc";
+    CHECK(!app::select_prom(s, p, error));
+    CHECK(error.find("no Indigo2 (IP22) boot PROM") != std::string::npos);
+    fs::remove_all(dir);
 }
 
 TEST(blank_images_are_created_once) {

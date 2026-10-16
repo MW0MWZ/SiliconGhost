@@ -138,28 +138,38 @@ Check the configure output: it says if SDL3 or libslirp was not found.
 
 ## Running
 
-SiliconGhost does not include any SGI software. You need your own dump of
-the Indy boot PROM and, for IRIX, your own installation media.
+SiliconGhost does not include any SGI software. You need your own dumps of
+the boot PROMs and, for IRIX, your own installation media.
+
+Put your PROM dumps, under any names, in a `roms` folder: the one in the
+SiliconGhost folder (below), or one in the folder you start it from, or one
+named with `--prom-dir`. SiliconGhost recognises each dump (by its checksum,
+or else the version string inside it) and starts each machine with the
+newest one that suits it: an Indy (IP24) PROM for the Indy, 5.3 Rev B10
+(070-9101-011) or later with an R5000, 5.0 Rev B6 (070-9101-007) or later
+with an R4600, an IP22 PROM for the Indigo². If there is none, it says which
+it needs. `--prom FILE` (*Specific PROM* in the settings) chooses one by
+hand; it must suit the machine too.
 
 Started with no arguments, SiliconGhost opens its window with the machine
-powered off: choose the PROM, NVRAM, disk and CD-ROM images and the rest in
+powered off: choose the NVRAM, disk and CD-ROM images and the rest in
 *Machine > Settings*, then power on. The settings are kept for next time.
 Given options on the command line, it powers on at once with them:
 
 ```sh
-# The PROM, with the serial console on the terminal
-build/siliconghost --prom ip24prom.bin --nvram indy.nvram --no-graphics --headless
+# The PROM (from ./roms), with the serial console on the terminal
+build/siliconghost --nvram indy.nvram --no-graphics --headless
 
 # IRIX from an installed disk, with the CD available
-build/siliconghost --prom ip24prom.bin --nvram indy.nvram \
-    --disk irix.img --cdrom irix53.img --cpu-mhz 175
+build/siliconghost --nvram indy.nvram --disk irix.img --cdrom irix53.img --cpu-mhz 175
 ```
 
 Main options (`siliconghost --help` lists them all):
 
 | Option | Meaning |
 |---|---|
-| `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
+| `--prom-dir DIR` | folder of boot PROM dumps, from which the one the machine needs is chosen (default `./roms`, else `roms` in the SiliconGhost folder) |
+| `--prom FILE` | a specific boot PROM image instead (raw, big-endian); it must suit the machine |
 | `--machine indy\|indigo2` | the system board (default Indy); the Indigo² needs its own PROM and takes R4000/R4400 modules. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
 | `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
