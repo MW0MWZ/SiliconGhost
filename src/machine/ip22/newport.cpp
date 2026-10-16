@@ -159,9 +159,7 @@ void Newport::reset() {
     vc2_ = Vc2{};
     for (auto& x : xmap_) x = Xmap{};
     for (auto& c : cmap_) c = Cmap{};
-    ramdac_ = Ramdac{};
-    for (unsigned i = 0; i < 256; ++i)
-        for (auto& ch : ramdac_.lut) ch[i] = static_cast<u8>(i);
+    ramdac_reset();
 
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
 }
@@ -1224,9 +1222,15 @@ void Newport::vc2_write(unsigned crs, u8 b) {
 
 u8 Newport::vc2_read(unsigned crs) {
     auto reg = [this](unsigned i) -> u16 {
-        if (i == kVc2LineCounter) {  // beam position, derived from time within the frame
+        if (i == kVc2LineCounter) {
+            // The beam's line in the frame (1065 lines with SGI's tables):
+            // the vertical interrupt comes on line 1064, the counter then
+            // reading about 1054 (it counts from the start of the timing
+            // table's frame, ahead of the display).
+            constexpr u64 kLines = 1065, kAtInterrupt = 1054;
             const u64 frame = static_cast<u64>(cpu_hz_ / 60);
-            return static_cast<u16>((scheduler_.now() % frame) * 1066 / frame);
+            const u64 since = (scheduler_.now() - last_retrace_) % frame;
+            return static_cast<u16>((kAtInterrupt + since * kLines / frame) % kLines);
         }
         return vc2_.reg[i];
     };
@@ -1329,7 +1333,7 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
             return v;
         }
         case 3: return c.command;
-        case 4: return 0x18;  // write FIFO empty
+        case 4: return static_cast<u8>(0x18 | (c.rgb & 3));  // write FIFO empty; the R/G/B byte counter
         case 6:
             // CMAP0: board revision and 8-bit flag; CMAP1: monitor sense.
             if (which == 0) return opts_.xl24 ? 0x02 : 0xA1;
@@ -1339,29 +1343,86 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
     }
 }
 
+namespace {
+// Bt445 reset values (data sheet table 1): control (CRS 2), the channel
+// registers (CRS 5: MSB position, width, display and blink enable for red,
+// green, blue, overlay and cursor) and the configuration (CRS 6).
+constexpr u8 kBtControl[8] = {0x3A, 0xA0, 0, 0, 0xFF, 0x00, 0x43, 0x00};
+constexpr u8 kBtChannel[0x24] = {0x07, 0x08, 0xFF, 0, 0, 0, 0, 0, 0x07, 0x08, 0xFF, 0, 0, 0, 0, 0,
+                                 0x07, 0x08, 0xFF, 0, 0, 0, 0, 0, 0x09, 0x02, 0x03, 0, 0, 0, 0, 0,
+                                 0x00, 0x02, 0x03, 0};
+constexpr u8 kBtConfig[16] = {0, 0x40, 0, 0x03, 0, 0x19, 0x04, 0, 0x04, 0x28, 0x08, 0x03, 0, 0x0A, 0, 0x01};
+constexpr unsigned kBtPixelFormat = 0x0A;
+}  // namespace
+
+void Newport::ramdac_reset() {
+    ramdac_ = Ramdac{};
+    for (unsigned i = 0; i < 256; ++i)
+        for (auto& ch : ramdac_.lut) ch[i] = static_cast<u8>(i);
+    std::copy(std::begin(kBtControl), std::end(kBtControl), ramdac_.control.begin());
+    std::copy(std::begin(kBtChannel), std::end(kBtChannel), ramdac_.channel.begin());
+    std::copy(std::begin(kBtConfig), std::end(kBtConfig), ramdac_.config.begin());
+}
+
+// The Pixel Format register's bits 1:0 say where gamma bypass comes from:
+// 01 always, 10 the bypass bit of each pixel (the XMAP9 mode's, as the
+// PROM sets it up), 00 never.
+bool Newport::gamma_bypassed(u32 mode) const {
+    switch (ramdac_.config[kBtPixelFormat] & 3) {
+        case 1: return true;
+        case 2: return mode & 4;
+        default: return false;
+    }
+}
+
 void Newport::ramdac_write(unsigned crs, u8 b) {
     picture_changed();
+    auto colour = [&](auto& table, unsigned size) {
+        table[ramdac_.rgb][ramdac_.addr % size] = b;
+        if (++ramdac_.rgb == 3) {
+            ramdac_.rgb = 0;
+            ++ramdac_.addr;
+        }
+    };
     switch (crs) {
         case 0:
             ramdac_.addr = b;
             ramdac_.rgb = 0;
             break;
-        case 1:
-            ramdac_.lut[ramdac_.rgb][ramdac_.addr] = b;
-            if (++ramdac_.rgb == 3) {
-                ramdac_.rgb = 0;
-                ++ramdac_.addr;
-            }
+        case 1: colour(ramdac_.lut, 256); break;
+        case 2:
+            if (ramdac_.addr >= 2 && ramdac_.addr < ramdac_.control.size()) ramdac_.control[ramdac_.addr] = b;  // ID, revision read-only
             break;
-        default: ramdac_.regs[crs] = b; break;
+        case 3: colour(ramdac_.overlay, 16); break;
+        case 5:
+            if (ramdac_.addr < ramdac_.channel.size()) ramdac_.channel[ramdac_.addr] = b;
+            break;
+        case 6:
+            if (ramdac_.addr < ramdac_.config.size()) ramdac_.config[ramdac_.addr] = b;
+            break;
+        case 7: colour(ramdac_.cursor, 4); break;
+        default: break;
     }
 }
 
 u8 Newport::ramdac_read(unsigned crs) {
+    auto colour = [&](const auto& table, unsigned size) {
+        const u8 v = table[ramdac_.rgb][ramdac_.addr % size];
+        if (++ramdac_.rgb == 3) {
+            ramdac_.rgb = 0;
+            ++ramdac_.addr;
+        }
+        return v;
+    };
     switch (crs) {
         case 0: return ramdac_.addr;
-        case 2: return 0xA0;  // revision A
-        default: return ramdac_.regs[crs];
+        case 1: return colour(ramdac_.lut, 256);
+        case 2: return ramdac_.addr < ramdac_.control.size() ? ramdac_.control[ramdac_.addr] : 0;
+        case 3: return colour(ramdac_.overlay, 16);
+        case 5: return ramdac_.addr < ramdac_.channel.size() ? ramdac_.channel[ramdac_.addr] : 0;
+        case 6: return ramdac_.addr < ramdac_.config.size() ? ramdac_.config[ramdac_.addr] : 0;
+        case 7: return colour(ramdac_.cursor, 4);
+        default: return 0;
     }
 }
 
@@ -1377,6 +1438,7 @@ void Newport::set_vrint(bool level) {
 
 void Newport::retrace() {
     ++frames_;
+    last_retrace_ = scheduler_.now();
     if (vc2_.reg[kVc2Control] & kDcrVintr) set_vrint(true);
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
 }
@@ -1464,7 +1526,7 @@ const Newport::ModeTable& Newport::mode_table(unsigned did) {
     const std::vector<u32>& pal = cmap_[0].palette;
     const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3, buf = mode & 1;
     auto finish = [&](u32 rgb) {
-        if (!(mode & 4))  // gamma correction in the RAMDAC unless bypassed
+        if (!gamma_bypassed(mode))  // gamma correction in the RAMDAC unless bypassed
             rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
                   ramdac_.lut[2][rgb & 0xFF];
         return 0xFF000000u | rgb;
@@ -1504,7 +1566,7 @@ u32 Newport::direct_colour(u32 mode, u32 pix) const {
     unpack(pix & 0xFFFFFF, 3, r, g, b);
     const u32 map = 0x1C00 + ((mode >> 8) & 3) * 0x100;
     u32 rgb = (pal[map + r] & 0xFF0000) | (pal[map + g] & 0xFF00) | (pal[map + b] & 0xFF);
-    if (!(mode & 4))
+    if (!gamma_bypassed(mode))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
     return 0xFF000000u | rgb;
@@ -1539,7 +1601,7 @@ u32 Newport::pixel_colour(u32 mode, u32 pix) const {
         const u32 base = 0x1C00 + pix_mode * 0x100;
         rgb = (pal[base + r] & 0xFF0000) | (pal[base + g] & 0xFF00) | (pal[base + b] & 0xFF);
     }
-    if (!(mode & 4))
+    if (!gamma_bypassed(mode))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
     return 0xFF000000u | rgb;
@@ -1611,7 +1673,7 @@ u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
     u32 addr = 0;
     if (!aux_layer(mode, pixel_value_nonzero(mode, pix), aux, cursor, addr)) return pixel_colour(mode, pix);
     u32 rgb = pal[addr];
-    if (!(mode & 4))
+    if (!gamma_bypassed(mode))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
     return 0xFF000000u | rgb;

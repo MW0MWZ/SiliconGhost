@@ -110,6 +110,7 @@ private:
     u8 xmap_read(unsigned which, unsigned crs);
     void cmap_write(unsigned which, unsigned crs, u8 b);
     u8 cmap_read(unsigned which, unsigned crs);
+    void ramdac_reset();
     void ramdac_write(unsigned crs, u8 b);
     u8 ramdac_read(unsigned crs);
 
@@ -167,7 +168,8 @@ private:
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
     bool zfail_next_ = false, zfail_ = false;
-    bool fastclear_ = false;  // the primitive running writes COLORVRAM (fast clear)  // STEPZ: the next GO's first pixel fails the Z test
+    bool fastclear_ = false;
+    u64 last_retrace_ = 0;  // when the last vertical interrupt came  // the primitive running writes COLORVRAM (fast clear)  // STEPZ: the next GO's first pixel fails the Z test
     int host_shift_ = 0;
     u32 dcbmode_ = 0;
     unsigned dcb_crs_ = 0;  // the DCB's register select, stepped by ENCRSINC until DCBMODE is written
@@ -205,15 +207,23 @@ private:
         u16 addr = 0;
         unsigned rgb = 0;  // byte position within an R,G,B triple
         u32 pending = 0;
-        u8 command = 0, crs7 = 0;
+        u8 command = 3, crs7 = 0;  // command: reset value 3
     };
     std::array<Cmap, 2> cmap_;
+    // Bt445: the address register (CRS 0) selects within the group CRS
+    // names; palette, overlay palette and cursor colour accesses (CRS 1, 3
+    // and 7) go R, G, B and step the address, control registers do not.
     struct Ramdac {
         std::array<std::array<u8, 256>, 3> lut{};
+        std::array<std::array<u8, 16>, 3> overlay{};
+        std::array<std::array<u8, 4>, 3> cursor{};
         u8 addr = 0;
         unsigned rgb = 0;
-        std::array<u8, 8> regs{};
+        std::array<u8, 8> control{};    // CRS 2
+        std::array<u8, 0x24> channel{};  // CRS 5
+        std::array<u8, 16> config{};    // CRS 6
     } ramdac_;
+    bool gamma_bypassed(u32 mode) const;
 };
 
 }  // namespace sg::ip22
