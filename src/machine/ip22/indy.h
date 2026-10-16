@@ -24,11 +24,18 @@
 
 namespace sg::ip22 {
 
-// Whether `mb` MiB of RAM can be fitted: one or two banks of 16, 32, 64
-// or 128 MiB.
-bool ram_size_fits(unsigned mb);
+// The IP22 boards: the Indy ("Guinness", IP24 PROM) and the Indigo2
+// ("Full House"). They share the chipset; the Indigo2 adds an EISA bus, a
+// second SCSI channel, a third memory bank and slot interrupt routing, and
+// keeps the PROM's settings in a serial EEPROM.
+enum class Board { Indy, Indigo2 };
+
+// Whether `mb` MiB of RAM can be fitted: one or two banks (three on the
+// Indigo2) of 16, 32, 64 or 128 MiB.
+bool ram_size_fits(unsigned mb, Board board = Board::Indy);
 
 struct IndyConfig {
+    Board board = Board::Indy;
     unsigned ram_mb = 64;       // 16..256, multiple of 16
     double cpu_hz = 150.0e6;    // pipeline clock
     double sysclk_hz = 50.0e6;  // SysAD bus clock
@@ -116,6 +123,14 @@ public:
     Bus& bus() { return bus_; }
     Scheduler& scheduler() { return scheduler_; }
     Ds1386& rtc() { return hpc3_.rtc(); }
+    Board board() const { return config_.board; }
+    // What the machine keeps when powered off, as one image: the DS1386's
+    // memory, after the serial EEPROM (big-endian words) on the Indigo2.
+    // load_nvram_image() takes a shorter image as the start of one.
+    std::size_t nvram_size() const;
+    std::vector<u8> nvram_image();
+    void load_nvram_image(const std::vector<u8>& image);
+    u64 nvram_changes() const { return hpc3_.rtc().nvram_changes() + hpc3_.eeprom().changes(); }
     Hpc3& hpc3() { return hpc3_; }
     // The host side of the Ethernet port (null: unplugged); it must outlive
     // the machine or be detached first.
@@ -175,6 +190,19 @@ private:
         bool write(u32, unsigned, u64) override { return true; }
     };
     ScacheControl scache_control_;
+    // The Indigo2's EISA I/O space with no cards: reads float high (all
+    // ones), writes go nowhere.
+    class EisaIo final : public Device {
+    public:
+        const char* name() const override { return "eisa-io"; }
+        bool read(u32, unsigned size, u64& value) override {
+            value = size == 8 ? ~u64{0} : (u64{1} << (size * 8)) - 1;
+            return true;
+        }
+        bool write(u32, unsigned, u64) override { return true; }
+        bool read_is_pure(u32, unsigned) const override { return true; }
+    };
+    EisaIo eisa_io_;
     int exit_code_ = -1;
 
     SerialOutput serial_out_;

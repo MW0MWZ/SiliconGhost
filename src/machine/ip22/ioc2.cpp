@@ -10,7 +10,8 @@ namespace sg::ip22 {
 
 namespace {
 
-constexpr u8 kSysIdIndy = 0x26;  // Guinness, board revision 3, chip revision 1
+constexpr u8 kSysIdIndy = 0x26;       // Guinness, board revision 3, chip revision 1
+constexpr u8 kSysIdIndigo2 = 0x11;    // Full House, board revision 8, chip revision 0
 constexpr double kPitClock2 = 1.0e6;  // counter 2 input; its output clocks counters 0 and 1
 
 // Front panel bits
@@ -35,10 +36,19 @@ enum Index : unsigned {
     kPit0 = 0x2C, kPitControl = 0x2F,
 };
 
+// The INT2's registers (Full House, PBUS channel 4) by index, and the INT3
+// index of the same register.
+constexpr unsigned kInt2PortConfig = 7, kInt2Pit0 = 12;
+constexpr unsigned int2_to_int3(unsigned i) {
+    return i <= 6 ? kL0Status + i : i == 8 ? static_cast<unsigned>(kTimerClear) : ~0u;
+}
+// PORT_CONFIG: the retrace latch clear lines are active low.
+constexpr u8 kPconClrSgRetrace = 1u << 3, kPconClrS0Retrace = 1u << 4;
+
 }  // namespace
 
-Ioc2::Ioc2(Scheduler& scheduler, double cpu_hz, u64 scc_char_cycles)
-    : scc_(scheduler, scc_char_cycles), pit_(scheduler, cpu_hz, {0.0, 0.0, kPitClock2}) {
+Ioc2::Ioc2(Scheduler& scheduler, double cpu_hz, u64 scc_char_cycles, bool full_house)
+    : scc_(scheduler, scc_char_cycles), pit_(scheduler, cpu_hz, {0.0, 0.0, kPitClock2}), full_house_(full_house) {
     scc_.set_irq_callback([this](bool a) { set_mappable(kMapSerial, a); });
     kbc_.set_irq_callback([this](bool a) { set_mappable(kMapKeyboard, a); });
     pit_.set_output_callback([this](unsigned c, bool level) {
@@ -63,8 +73,29 @@ void Ioc2::reset() {
     dmasel_ = reset_ = write_ = gc_select_ = gen_ctrl_ = 0;
     local0_mask_ = local1_mask_ = map_mask0_ = map_mask1_ = map_pol_ = 0;
     err_stat_ = 0;
+    ext_io_ = 0xFFFF;
+    port_config_ = 0;
+    gfx_irq_.fill(false);
     timer_int_.fill(false);
     update_outputs();
+}
+
+// GIO interrupt 0 (FIFO) and 1 (graphics) go to local 0, 2 (retrace) to
+// local 1; EXTIO records the slot. The retrace is latched until the driver
+// pulses PORT_CONFIG's clear line.
+void Ioc2::set_gfx_slot_irq(unsigned gio_int, bool level) {
+    static constexpr u16 kExt[3] = {kExtSgIrq2, kExtSgIrq1, kExtSgRetrace};
+    if (gio_int > 2) return;
+    if (gio_int == 2 && !level) return;  // the latch holds it
+    gfx_irq_[gio_int] = level;
+    ext_io_ = static_cast<u16>(level ? (ext_io_ & ~kExt[gio_int]) : (ext_io_ | kExt[gio_int]));
+    if (gio_int == 0) set_local0(kL0Fifo, level);
+    else if (gio_int == 1) set_local0(kL0Graphics, level);
+    else set_local1(kL1Retrace, level);
+}
+
+void Ioc2::ext_io_write(u16 value) {
+    (void)value;  // the status bits are read-only
 }
 
 void Ioc2::set_bit(u8& reg, unsigned bit, bool level) {
@@ -133,10 +164,19 @@ u8 Ioc2::read(unsigned index) {
         case kGenCtrl: return gen_ctrl_;  // nothing drives the pins set as inputs
         case kRead: return 0x50;  // twisted-pair link (bit 7 low), Ethernet +12 V and SCSI +5 V present
         case kPanel: return panel_;
-        case kSysId: return kSysIdIndy;
+        case kSysId: return full_house_ ? kSysIdIndigo2 : kSysIdIndy;
         case kDmaSel: return dmasel_;
         case kReset: return reset_;
         case kWrite: return write_;
+        default:
+            if (index >= kL0Status && index <= kPitControl && !full_house_) return int_read(index);
+            SG_LOG(Debug, "ioc", "read of unknown register %02x", index * 4);
+            return 0;
+    }
+}
+
+u8 Ioc2::int_read(unsigned reg) {
+    switch (reg) {
         case kL0Status: return local0_status();
         case kL0Mask: return local0_mask_;
         case kL1Status: return local1_status();
@@ -148,9 +188,47 @@ u8 Ioc2::read(unsigned index) {
         case kErrStat: return err_stat_;
         case kPit0:
         case kPit0 + 1:
-        case kPit0 + 2: return pit_.read(index - kPit0);
-        default: SG_LOG(Debug, "ioc", "read of unknown register %02x", index * 4); return 0;
+        case kPit0 + 2: return pit_.read(reg - kPit0);
+        default: return 0;
     }
+}
+
+u8 Ioc2::int2_read(unsigned index) {
+    if (index == kInt2PortConfig) return port_config_;
+    if (index >= kInt2Pit0 && index < kInt2Pit0 + 4) return int_read(kPit0 + index - kInt2Pit0);
+    const unsigned reg = int2_to_int3(index);
+    if (reg == ~0u || reg == kTimerClear) {
+        SG_LOG(Debug, "ioc", "INT2 read of unknown register %02x", index * 4);
+        return 0;
+    }
+    return int_read(reg);
+}
+
+bool Ioc2::int2_read_is_pure(unsigned index) const {
+    return index == kInt2PortConfig || (index <= 6);
+}
+
+void Ioc2::int2_write(unsigned index, u8 value) {
+    if (index == kInt2PortConfig) {
+        // A clear line taken low (and released) clears that slot's retrace latch.
+        if (!(value & kPconClrSgRetrace) && gfx_irq_[2]) {
+            gfx_irq_[2] = false;
+            ext_io_ |= kExtSgRetrace;
+            set_local1(kL1Retrace, false);
+        }
+        port_config_ = value;
+        return;
+    }
+    if (index >= kInt2Pit0 && index < kInt2Pit0 + 4) {
+        int_write(kPit0 + index - kInt2Pit0, value);
+        return;
+    }
+    const unsigned reg = int2_to_int3(index);
+    if (reg == ~0u || reg == kL0Status || reg == kL1Status || reg == kMapStatus) {
+        SG_LOG(Debug, "ioc", "INT2 write to register %02x = %02x", index * 4, value);
+        return;
+    }
+    if (int_write(reg, value)) update_outputs();
 }
 
 // Status and configuration registers are plain state; data ports (which
@@ -177,7 +255,7 @@ bool Ioc2::read_is_pure(unsigned index) const {
         case kMapMask0:
         case kMapMask1:
         case kMapPol:
-        case kErrStat: return true;
+        case kErrStat: return !full_house_;
         default: return false;
     }
 }
@@ -212,27 +290,39 @@ void Ioc2::write(unsigned index, u8 value) {
             reset_ = value;
             return;
         case kWrite: write_ = value; return;
-        case kL0Mask: local0_mask_ = value; break;
-        case kL1Mask: local1_mask_ = value; break;
-        case kMapMask0: map_mask0_ = value; break;
-        case kMapMask1: map_mask1_ = value; break;
-        case kMapPol: map_pol_ = value; return;
+        default:
+            if (index >= kL0Status && index <= kPitControl && !full_house_) {
+                if (int_write(index, value)) update_outputs();
+                return;
+            }
+            SG_LOG(Debug, "ioc", "write to unknown register %02x = %02x", index * 4, value);
+            return;
+    }
+}
+
+// Returns true if the interrupt outputs need updating.
+bool Ioc2::int_write(unsigned reg, u8 value) {
+    switch (reg) {
+        case kL0Mask: local0_mask_ = value; return true;
+        case kL1Mask: local1_mask_ = value; return true;
+        case kMapMask0: map_mask0_ = value; return true;
+        case kMapMask1: map_mask1_ = value; return true;
+        case kMapPol: map_pol_ = value; return false;
         case kTimerClear:
             if (value & 1) timer_int_[0] = false;
             if (value & 2) timer_int_[1] = false;
-            break;
+            return true;
         case kPit0:
         case kPit0 + 1:
         case kPit0 + 2:
         case kPitControl:
             programming_pit_ = true;
-            pit_.write(index - kPit0, value);
+            pit_.write(reg - kPit0, value);
             update_cascade();
             programming_pit_ = false;
-            return;
-        default: SG_LOG(Debug, "ioc", "write to unknown register %02x = %02x", index * 4, value); return;
+            return false;
+        default: SG_LOG(Debug, "ioc", "write to unknown register %02x = %02x", reg * 4, value); return false;
     }
-    update_outputs();
 }
 
 }  // namespace sg::ip22

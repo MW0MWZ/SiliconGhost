@@ -26,6 +26,7 @@ public:
     void write(unsigned index, u8 value);
 
     std::vector<u8>& memory() { return mem_; }  // whole array, for NVRAM persistence
+    const std::vector<u8>& memory() const { return mem_; }
     // Counts writes that changed the battery-backed RAM (not the clock), so
     // the host can tell when its copy needs saving.
     u64 nvram_changes() const { return nvram_changes_; }

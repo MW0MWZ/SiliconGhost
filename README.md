@@ -5,8 +5,9 @@
 
 # SiliconGhost
 
-An open-source emulator for the SGI **Indy** (IP22): MIPS R4000, R4400,
-R4600 and R5000 processor modules, the MC/HPC3/IOC2 chipset and **Newport (REX3)** graphics. The aim is to run the
+An open-source emulator for the SGI **Indy** and **Indigo²** (IP22): MIPS
+R4000, R4400, R4600 and R5000 processor modules, the MC/HPC3/IOC2 chipset
+and **Newport (REX3)** graphics. The aim is to run the
 original boot PROM and IRIX unmodified, at or above the speed of the real
 machine. Linux is the primary host; it also builds and runs on macOS, and
 builds for Windows.
@@ -39,6 +40,10 @@ SiliconGhost is under active development. What works today:
 - **Networking:** the Ethernet port works (DHCP, ping, DNS, telnet, ssh,
   file transfers in both directions), through user-mode NAT on the host (no
   privileges needed) or a Linux TAP interface.
+- **Indigo² (IP22 "Full House"):** with `--machine indigo2` and the Indigo²
+  PROM (5.1), IRIX 5.3 and 6.5 boot from the same disks as on the Indy, to
+  the graphical desktop on a Newport (XL) board; IRIX finds the EISA bus and
+  both SCSI controllers. Up to 384 MiB of memory in three banks.
 - **CPU:** the full R4000/R4400 and R4600 (MIPS III) and R5000 (MIPS IV)
   integer and floating-point instruction sets, TLB, exceptions, 32/64-bit
   addressing and cache tag operations, with or without a secondary cache.
@@ -57,10 +62,11 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | CPU | MIPS R4000, R4400, R4600 or R5000 (PC or SC module), FPU, 48-entry TLB | complete |
 | Memory controller | MC: memory configuration, GIO bus errors | working |
 | Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
-| Interrupts/timers | IOC2 / INT3, 8254 PIT | working |
+| Interrupts/timers | IOC2 / INT3 (Indy), INT2 and EXTIO (Indigo²), 8254 PIT | working |
 | Serial | Zilog 85230 SCC (two ports) | working |
-| Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved as it changes |
-| SCSI | WD33C93 with disk and CD-ROM targets | working |
+| Real-time clock/NVRAM | Dallas DS1386; on the Indigo², settings in the 93CS56 serial EEPROM | working, saved as it changes |
+| SCSI | WD33C93 with disk and CD-ROM targets (a second controller on the Indigo²) | working |
+| EISA (Indigo²) | the bus, with no cards fitted | working |
 | Graphics | Newport XL8 and XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit and 24-bit boards) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
@@ -154,9 +160,10 @@ Main options (`siliconghost --help` lists them all):
 | Option | Meaning |
 |---|---|
 | `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
-| `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
+| `--machine indy\|indigo2` | the system board (default Indy); the Indigo² needs its own PROM and takes R4000/R4400 modules |
+| `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
-| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64) |
+| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384) |
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
 | `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
@@ -433,7 +440,8 @@ with performance layers on top that must give exactly the same results:
   revision directly, finds the board and runs its console on both the 8-bit
   and the 24-bit board. With 9.0 or 11.0, use the serial console.
 - IRIX 5.3, IRIX 6.5, NetBSD 9.0 and 11.0 and OpenBSD 6.9 are the systems
-  tested so far; Linux has not been tried. (Current Debian releases no longer include
+  tested so far (on the Indigo², IRIX: its 5.1 PROM loads only ECOFF
+  programs, and the NetBSD and OpenBSD boot loaders are ELF); Linux has not been tried. (Current Debian releases no longer include
   Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
 - The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
@@ -446,7 +454,8 @@ with performance layers on top that must give exactly the same results:
 
 - Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
-- Indigo² (IP22 "Fullhouse") machine profile
+- Indigo² graphics other than Newport (GR2 XZ/Extreme, IMPACT), EISA cards
+- Other SGI machines from the same PROM set (Indigo IP20, Indigo² R8000 and R10000)
 
 ## Legal
 

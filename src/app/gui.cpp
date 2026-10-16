@@ -1017,7 +1017,8 @@ void Gui::draw_status_bar() {
     const Settings& s = session_.settings();
     const CpuModel* model = find_cpu_model(s.cpu);
     char right[96];
-    std::snprintf(right, sizeof right, "%s %.0f MHz, %u MiB", model ? model->label : s.cpu.c_str(), s.cpu_mhz, s.ram_mb);
+    std::snprintf(right, sizeof right, "%s%s %.0f MHz, %u MiB", s.machine == "indigo2" ? "Indigo2, " : "",
+                  model ? model->label : s.cpu.c_str(), s.cpu_mhz, s.ram_mb);
     // Only the model name, before any detail in parentheses.
     std::string text = right;
     if (const auto paren = text.find(" ("); paren != std::string::npos) {
@@ -1133,12 +1134,25 @@ void Gui::draw_settings() {
     ImGui::BeginChild("##tabs", ImVec2(0, -footer));
     if (ImGui::BeginTabBar("##settings")) {
         if (ImGui::BeginTabItem("Machine")) {
+            const bool indigo2 = edit_.machine == "indigo2";
+            const ip22::Board board = indigo2 ? ip22::Board::Indigo2 : ip22::Board::Indy;
+            label("System");
+            ImGui::SetNextItemWidth(-1);
+            int system = indigo2 ? 1 : 0;
+            if (ImGui::Combo("##machine", &system, "Indy\0Indigo2\0")) {
+                edit_.machine = system ? "indigo2" : "indy";
+                const CpuModel* m = find_cpu_model(edit_.cpu);
+                if (system && m && m->core != mips::Core::R4000) edit_.cpu = "r4400sc";  // the Indigo2's modules
+                if (!ip22::ram_size_fits(edit_.ram_mb, system ? ip22::Board::Indigo2 : ip22::Board::Indy))
+                    edit_.ram_mb = 256;
+            }
             label("Processor");
             ImGui::SetNextItemWidth(-1);
             const CpuModel* current = find_cpu_model(edit_.cpu);
             if (ImGui::BeginCombo("##cpu", current ? current->label : edit_.cpu.c_str())) {
                 for (const auto& model : cpu_models())
-                    if (ImGui::Selectable(model.label, edit_.cpu == model.id) && edit_.cpu != model.id) {
+                    if ((!indigo2 || model.core == mips::Core::R4000) &&
+                        ImGui::Selectable(model.label, edit_.cpu == model.id) && edit_.cpu != model.id) {
                         edit_.cpu = model.id;
                         edit_.cpu_mhz = model.mhz;
                     }
@@ -1158,8 +1172,8 @@ void Gui::draw_settings() {
             ImGui::SetNextItemWidth(120 * scale_);
             const std::string ram = std::to_string(edit_.ram_mb) + " MiB";
             if (ImGui::BeginCombo("##ram", ram.c_str())) {
-                for (unsigned mb = 16; mb <= 256; mb += 16)
-                    if (ip22::ram_size_fits(mb) && ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
+                for (unsigned mb = 16; mb <= 384; mb += 16)
+                    if (ip22::ram_size_fits(mb, board) && ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
                 ImGui::EndCombo();
             }
             label("Graphics");

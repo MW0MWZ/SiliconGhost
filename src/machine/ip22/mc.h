@@ -68,7 +68,8 @@ public:
     // sizes the MC can decode (4..128 MiB, largest first, at most 4 banks).
     // 128, 32 and 8 MiB banks are built from double-sided SIMMs (two
     // sub-banks); 64, 16 and 4 MiB banks from single-sided ones.
-    Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz);
+    // `eisa`: the board has an EISA bus (the Indigo2), reported in SYSID.
+    Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa = false);
 
     void reset();
     const char* name() const override { return "mc"; }
@@ -132,6 +133,7 @@ private:
     Scheduler& scheduler_;
     EmptyBank empty_bank_;
     Eeprom93Cxx cpu_eeprom_;
+    bool eisa_;
     u8* ram_;
     std::vector<Bank> banks_;
     std::vector<std::pair<u32, u64>> mapped_;  // memory windows currently mapped

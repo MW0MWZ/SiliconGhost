@@ -12,7 +12,8 @@ namespace sg::ip22 {
 
 namespace {
 
-constexpr u32 kSysIdIndy = 0x03;  // MC revision C, no EISA
+constexpr u32 kSysIdRevC = 0x03;     // MC revision C
+constexpr u32 kSysIdEisa = 1u << 4;  // EISA bus present
 
 constexpr u32 kCpuCtrl0SysInit = 1u << 9;
 constexpr u32 kErrStatAddr = 1u << 10;  // CPU: bad address; GIO: timeout uses the same bit position
@@ -48,9 +49,10 @@ constexpr u32 kTlbValid = 1u << 1, kPteValid = 1u << 1, kPteDirty = 1u << 2;
 
 }  // namespace
 
-Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz)
+Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa)
     : bus_(bus),
       scheduler_(scheduler),
+      eisa_(eisa),
       ram_(ram),
       cycles_per_sysclk_(cpu_hz / sysclk_hz),
       dma_timer_(scheduler, [this] { finish_dma(); }) {
@@ -152,7 +154,7 @@ u32 Mc::read_reg(u32 reg) {
         return v;
     }
     switch (reg) {
-        case kSysId: return kSysIdIndy;
+        case kSysId: return kSysIdRevC | (eisa_ ? kSysIdEisa : 0);
         case kDogc: return 0;
         case kRefCtr: return regs_[kCtrld];
         case kEerom: return (regs_[kEerom] & ~kEeromSi) | (cpu_eeprom_.data_out() ? kEeromSi : 0);

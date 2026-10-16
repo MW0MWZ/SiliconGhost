@@ -38,8 +38,9 @@ u32 ioc_addr(unsigned reg_offset) { return kIoc + reg_offset + 3; }
 struct IndyRig {
     Indy m;
     std::string serial;
-    explicit IndyRig(unsigned ram_mb = 64) : m([ram_mb] {
+    explicit IndyRig(unsigned ram_mb = 64, Board board = Board::Indy) : m([ram_mb, board] {
         IndyConfig c;
+        c.board = board;
         c.ram_mb = ram_mb;
         return c;
     }()) {
@@ -956,4 +957,136 @@ TEST(ip22_load_elf_rejects_other_files) {
     CHECK(!m.load_elf(path, error));
     CHECK(!error.empty());
     std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// Indigo2 (Full House)
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr u32 kInt2 = 0x1FBD9000;
+constexpr u32 kExtIo = 0x1FBD9900;
+u32 int2_addr(unsigned reg_offset) { return kInt2 + reg_offset + 3; }
+struct Indigo2Rig : IndyRig {
+    explicit Indigo2Rig(unsigned ram_mb = 64) : IndyRig(ram_mb, Board::Indigo2) {}
+};
+}  // namespace
+
+TEST(indigo2_identity_registers) {
+    Indigo2Rig t;
+    CHECK_EQ(t.r32(kMcSysId), 0x13u);         // MC revision C, EISA present
+    CHECK_EQ(t.r8(ioc_addr(0x58)), 0x11);     // IOC: Full House
+    CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu);  // EXTIO: nothing pending (active low)
+    // The interrupt controller is the INT2, not part of the IOC.
+    t.w8(int2_addr(0x04), 0xA5);  // local 0 mask
+    t.w8(int2_addr(0x14), 0x5A);  // map mask 0
+    CHECK_EQ(t.r8(int2_addr(0x04)), 0xA5);
+    CHECK_EQ(t.r8(int2_addr(0x14)), 0x5A);
+    CHECK_EQ(t.r8(ioc_addr(0x84)), 0x00);  // no INT3 in the IOC window
+    IndyRig indy;
+    CHECK_EQ(indy.r32(kMcSysId), 0x03u);
+}
+
+TEST(indigo2_int2_timer_interrupt) {
+    Indigo2Rig t;
+    // As ip22_pit_timer0_interrupt_via_cascade, through the INT2's 8254.
+    t.w8(int2_addr(0x3C), 0xB4);
+    t.w8(int2_addr(0x38), 100);
+    t.w8(int2_addr(0x38), 0);
+    t.w8(int2_addr(0x3C), 0x34);
+    t.w8(int2_addr(0x30), 10);
+    t.w8(int2_addr(0x30), 0);
+    t.m.run(100000);
+    CHECK(!t.ip(4));
+    t.m.run(200000);
+    CHECK(t.ip(4));
+    t.w8(int2_addr(0x20), 1);  // timer clear
+    CHECK(!t.ip(4));
+}
+
+TEST(indigo2_graphics_slot_interrupts_in_extio) {
+    Indigo2Rig t;
+    t.w8(int2_addr(0x04), 0x41);  // local 0: graphics, FIFO
+    t.w8(int2_addr(0x0C), 0x80);  // local 1: retrace
+    t.m.ioc().set_gfx_slot_irq(1, true);
+    CHECK(t.ip(2));
+    CHECK_EQ(t.r8(int2_addr(0x00)) & 0x40, 0x40);
+    CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu & ~Ioc2::kExtSgIrq1);
+    t.m.ioc().set_gfx_slot_irq(1, false);
+    CHECK(!t.ip(2));
+    CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu);
+    // The retrace is latched until PORT_CONFIG's clear line is pulsed.
+    t.w8(int2_addr(0x1C), 0xFF);
+    t.m.ioc().set_gfx_slot_irq(2, true);
+    t.m.ioc().set_gfx_slot_irq(2, false);
+    CHECK(t.ip(3));
+    CHECK_EQ(t.r32(kExtIo) & Ioc2::kExtSgRetrace, 0u);
+    t.w8(int2_addr(0x1C), 0xFF & ~0x08);
+    t.w8(int2_addr(0x1C), 0xFF);
+    CHECK(!t.ip(3));
+    CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu);
+}
+
+TEST(indigo2_second_scsi_controller) {
+    Indigo2Rig t;
+    const u32 scsi1 = 0x1FBCC000;
+    t.w32(0x1FB93004, 0);  // release channel 1 from reset
+    t.w8(scsi1 + 3, 0x00);  // SASR = own ID
+    t.w8(scsi1 + 7, 0x07);
+    t.w8(scsi1 + 3, 0x00);
+    CHECK_EQ(t.r8(scsi1 + 7), 0x07);
+    t.w32(0x1FB92004, 0x08001000);  // channel 1 NDBP
+    CHECK_EQ(t.r32(0x1FB92004), 0x08001000u);
+    CHECK_EQ(t.r32(0x1FB90004), 0u);  // channel 0's is separate
+}
+
+TEST(indigo2_ram_sizes_three_banks) {
+    for (unsigned mb : {16u, 64u, 256u, 272u, 320u, 384u}) CHECK(ram_size_fits(mb, Board::Indigo2));
+    for (unsigned mb : {272u, 320u, 384u}) CHECK(!ram_size_fits(mb, Board::Indy));
+    for (unsigned mb : {8u, 368u, 400u, 512u}) CHECK(!ram_size_fits(mb, Board::Indigo2));
+    CHECK(ram_size_fits(112, Board::Indigo2));  // 64 + 32 + 16
+    Indigo2Rig t(384);
+    CHECK_EQ(t.m.mc().banks().size(), 3u);
+}
+
+TEST(indigo2_nvram_lives_in_the_serial_eeprom) {
+    Indigo2Rig t;
+    t.m.reset();
+    // The Ethernet address goes to bytes 250-255 of the EEPROM.
+    const auto& words = t.m.hpc3().eeprom().words();
+    CHECK_EQ(words[125], 0x0800);
+    CHECK_EQ(words[126] >> 8, 0x69);
+    CHECK_EQ(t.m.nvram_size(), 256u + 8192u);
+    std::vector<u8> image = t.m.nvram_image();
+    CHECK_EQ(image.size(), t.m.nvram_size());
+    CHECK_EQ(image[250], 0x08);
+    image[10] = 0x12, image[11] = 0x34;  // EEPROM word 5
+    image[256 + 0x50] = 0x99;            // RTC memory
+    Indigo2Rig u;
+    u.m.load_nvram_image(image);
+    CHECK_EQ(u.m.hpc3().eeprom().words()[5], 0x1234);
+    CHECK_EQ(u.m.rtc().memory()[0x50], 0x99);
+    CHECK(u.m.nvram_image() == image);
+}
+
+TEST(indigo2_empty_eisa_io_reads_all_ones) {
+    Indigo2Rig t;
+    CHECK_EQ(t.r32(0x0009FFC0), 0xFFFFFFFFu);
+    CHECK_EQ(t.r8(0x00080C83), 0xFF);
+    IndyRig indy;
+    u32 v = 0;
+    CHECK(!indy.m.bus().read<u32>(0x0009FFC0, v));  // nothing there on the Indy
+}
+
+TEST(indigo2_takes_r4000_family_modules_only) {
+    IndyConfig c;
+    c.board = Board::Indigo2;
+    c.cpu_core = mips::Core::R5000;
+    bool threw = false;
+    try {
+        Indy m(c);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
 }

@@ -67,9 +67,13 @@ void Eeprom93Cxx::clock_in(bool bit) {
                 if (write_enabled_) {
                     const unsigned word = address_ % words_.size();
                     if (opcode_ == 1) {
-                        if (writable(word)) words_[word] = data;
+                        if (writable(word) && words_[word] != data) {
+                            words_[word] = data;
+                            ++changes_;
+                        }
                     } else if (protect_ == 0xFF) {  // WRALL: only with nothing protected
                         for (auto& w : words_) w = data;
+                        ++changes_;
                     }
                 }
                 state_ = State::Idle;

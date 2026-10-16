@@ -39,6 +39,7 @@ bool load_file(const std::string& path, std::vector<u8>& data) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    data.resize(static_cast<std::size_t>(f.gcount()));
     return true;
 }
 
@@ -68,8 +69,11 @@ bool Session::power_on(std::string& error) {
         auto machine = std::make_unique<ip22::Indy>(s.indy_config());
         if (!s.prom.empty() && !machine->load_prom(s.prom, error)) return false;
         machine->set_network(network.get());
-        if (!s.nvram.empty() && !load_file(s.nvram, machine->rtc().memory()))
-            SG_LOG(Warn, "session", "%s not found, starting with empty NVRAM", s.nvram.c_str());
+        if (!s.nvram.empty()) {
+            std::vector<u8> image(machine->nvram_size());
+            if (load_file(s.nvram, image)) machine->load_nvram_image(image);
+            else SG_LOG(Warn, "session", "%s not found, starting with empty NVRAM", s.nvram.c_str());
+        }
         machine->rtc().power_on();  // the clock follows the host's (UTC)
         machine->set_serial_output(serial_out_);
         machine->reset();
@@ -81,7 +85,7 @@ bool Session::power_on(std::string& error) {
         pacer_ = std::make_unique<Pacer>(s.timing, machine->cycles_per_second());
         pacer_->set_max_speed(s.max_speed);
         pacer_->update(cpu.cycles(), cpu.instructions());
-        nvram_saved_ = machine->rtc().nvram_changes();
+        nvram_saved_ = machine->nvram_changes();
         network_ = std::move(network);
         machine_ = std::move(machine);
     } catch (const std::exception& e) {
@@ -117,19 +121,19 @@ void Session::run(u64 cycles) {
 }
 
 void Session::periodic() {
-    if (machine_ && machine_->rtc().nvram_changes() != nvram_saved_) save_nvram();
+    if (machine_ && machine_->nvram_changes() != nvram_saved_) save_nvram();
 }
 
 // Each save goes to a temporary file that then replaces the old one, so a
 // crash never leaves half an NVRAM behind.
 void Session::save_nvram() {
     if (!machine_ || settings_.nvram.empty()) return;
-    nvram_saved_ = machine_->rtc().nvram_changes();
+    nvram_saved_ = machine_->nvram_changes();
     const std::string& path = settings_.nvram;
     const std::string tmp = path + ".tmp";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        const auto& mem = machine_->rtc().memory();
+        const std::vector<u8> mem = machine_->nvram_image();
         f.write(reinterpret_cast<const char*>(mem.data()), static_cast<std::streamsize>(mem.size()));
         if (!f) {
             SG_LOG(Warn, "session", "cannot write %s", tmp.c_str());

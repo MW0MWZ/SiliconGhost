@@ -42,6 +42,7 @@ const CpuModel* find_cpu_model(const std::string& id) {
 
 ip22::IndyConfig Settings::indy_config() const {
     ip22::IndyConfig c;
+    c.board = machine == "indigo2" ? ip22::Board::Indigo2 : ip22::Board::Indy;
     c.ram_mb = ram_mb;
     c.cpu_hz = cpu_mhz * 1.0e6;
     if (const CpuModel* m = find_cpu_model(cpu)) {
@@ -150,10 +151,12 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
+    else if (key == "machine") ok = (v == "indy" || v == "indigo2") && (s.machine = v, true);
     else if (key == "cpu") ok = find_cpu_model(v) && (s.cpu = v, true);
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 1000 && (s.cpu_mhz = n, true);
-    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 256 && n == static_cast<unsigned>(n) &&
-                                  ip22::ram_size_fits(static_cast<unsigned>(n)) && (s.ram_mb = static_cast<unsigned>(n), true);
+    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 384 && n == static_cast<unsigned>(n) &&
+                                  ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2) &&
+                                  (s.ram_mb = static_cast<unsigned>(n), true);  // checked against the board at power-on
     else if (key == "graphics") {
         // xl8, xl24 or none (1 and 0 from older files: XL8, none)
         bool on = false;
@@ -252,7 +255,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         f << "# SiliconGhost settings\n";
         f << "prom=" << s.prom << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
-        f << "cpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
+        f << "machine=" << s.machine << "\ncpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
           << "\ngraphics_rev=" << (s.graphics_rev >= 0 ? std::to_string(s.graphics_rev) : "")
           << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";

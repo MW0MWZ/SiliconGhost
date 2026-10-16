@@ -127,13 +127,13 @@ void Ds1386::commit() {
 }
 
 u8 Ds1386::read(unsigned index) {
-    if (index >= mem_.size()) return 0xFF;
+    index &= static_cast<unsigned>(mem_.size() - 1);  // smaller parts (the DS1286) repeat
     if (index < kNumClockRegs && index != kRegCommand && !frozen_ && valid_) load_registers();
     return mem_[index];
 }
 
 void Ds1386::write(unsigned index, u8 value) {
-    if (index >= mem_.size()) return;
+    index &= static_cast<unsigned>(mem_.size() - 1);
     if (index < kNumClockRegs) loaded_centis_ = kNotLoaded;  // registers no longer show the loaded time
     if (index == kRegCommand) {
         const bool te = value & 0x80;

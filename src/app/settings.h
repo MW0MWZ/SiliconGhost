@@ -33,6 +33,7 @@ const CpuModel* find_cpu_model(const std::string& id);
 struct Settings {
     std::string prom, nvram, disk;
     std::vector<std::string> cdroms;
+    std::string machine = "indy";  // indy | indigo2
     std::string cpu = "r4400sc";
     double cpu_mhz = 150.0;
     unsigned ram_mb = 64;

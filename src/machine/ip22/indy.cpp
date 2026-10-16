@@ -28,20 +28,27 @@ mips::R4000::Options cpu_options(const IndyConfig& c) {
 
 }  // namespace
 
-// An Indy has two memory banks, each empty or holding 16, 32, 64 or 128 MiB
-// (four SIMMs of 4, 8, 16 or 32 MiB); the PROM sizes those two banks.
-bool ram_size_fits(unsigned mb) {
+// An Indy has two memory banks, an Indigo2 three, each empty or holding
+// 16, 32, 64 or 128 MiB (four SIMMs of 4, 8, 16 or 32 MiB), the larger
+// first; the PROM sizes them.
+bool ram_size_fits(unsigned mb, Board board) {
     for (unsigned a : {16u, 32u, 64u, 128u})
         for (unsigned b : {0u, 16u, 32u, 64u, 128u})
-            if (b <= a && a + b == mb) return true;
+            for (unsigned c : {0u, 16u, 32u, 64u, 128u})
+                if (b <= a && c <= b && (board == Board::Indigo2 || c == 0) && a + b + c == mb) return true;
     return false;
 }
 
 namespace {
 
 u64 checked_ram_bytes(const IndyConfig& c) {
-    if (!ram_size_fits(c.ram_mb))
+    if (c.board == Board::Indigo2 && c.cpu_core != mips::Core::R4000)
+        throw std::invalid_argument("the Indigo2 takes R4000 and R4400 processor modules");
+    if (!ram_size_fits(c.ram_mb, c.board)) {
+        if (c.board == Board::Indigo2)
+            throw std::invalid_argument("Indigo2 RAM must be one to three banks of 16, 32, 64 or 128 MiB (16-384 MiB)");
         throw std::invalid_argument("Indy RAM must be one or two banks of 16, 32, 64 or 128 MiB (16-256 MiB, not 112, 176, 208, 224 or 240)");
+    }
     return u64{c.ram_mb} << 20;
 }
 
@@ -58,9 +65,10 @@ Indy::Indy(const IndyConfig& config)
       ram_(std::make_unique<u8[]>(checked_ram_bytes(config))),
       prom_(std::make_unique<u8[]>(kPromMaxSize)),
       cpu_(bus_, cpu_options(config)),
-      ioc_(scheduler_, config.cpu_hz, kSccCharCycles),
-      hpc3_(bus_, ioc_, scheduler_, config.cpu_hz),
-      mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz),
+      ioc_(scheduler_, config.cpu_hz, kSccCharCycles, config.board == Board::Indigo2),
+      hpc3_(bus_, ioc_, scheduler_, config.cpu_hz, config.board == Board::Indigo2),
+      mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz,
+          config.board == Board::Indigo2),
       newport_(scheduler_, config.cpu_hz, Newport::Options{config.xl24, 0xA, config.graphics_revision}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
     std::memset(ram_.get(), 0, checked_ram_bytes(config));
@@ -72,6 +80,7 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
     if (config_.graphics) bus_.map_device(kGioGfx, kGioGfxSize, &gfx_slot_);
+    if (config_.board == Board::Indigo2) bus_.map_device(kEisaIo, kEisaIoSize, &eisa_io_);
     // An R4600 or R5000 module with a secondary cache the processor does not
     // report: the PROM reads its size from the module's EEPROM.
     if (config_.cpu_core != mips::Core::R4000 && config_.scache_bytes) {
@@ -104,7 +113,13 @@ Indy::Indy(const IndyConfig& config)
         cpu_.set_int_line(4, level);
     });
     mc_.set_dma_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0McDma, level); });
-    newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
+    // The Newport's retrace: on the Indy its own interrupt line; on the
+    // Indigo2 the graphics slot's GIO interrupt 1 (the driver reads the
+    // retrace from the REX3's status there).
+    if (config_.board == Board::Indigo2)
+        newport_.set_retrace_callback([this](bool level) { ioc_.set_gfx_slot_irq(1, level); });
+    else
+        newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
     mc_.set_reset_callback([this] {
         reset_pending_ = true;
         cpu_.request_stop();
@@ -247,14 +262,54 @@ void Indy::load_prom_image(const u8* data, std::size_t size) {
     std::memcpy(prom_.get(), data, size < kPromMaxSize ? size : kPromMaxSize);
 }
 
-// The factory programs each Indy's Ethernet address into NVRAM bytes 250-255.
+// The factory programs each machine's Ethernet address into NVRAM bytes
+// 250-255 (on the Indigo2, of the serial EEPROM).
 void Indy::apply_ethernet_address() {
     static constexpr std::array<u8, 6> kDefaultMac = {0x08, 0x00, 0x69, 0x0C, 0x5E, 0x01};  // SGI OUI
-    u8* nv = &rtc().memory()[kNvramBase + kNvramEaddr];
-    const bool blank = std::all_of(nv, nv + 6, [](u8 b) { return b == 0x00; }) ||
-                       std::all_of(nv, nv + 6, [](u8 b) { return b == 0xFF; });
-    if (config_.mac) std::copy(config_.mac->begin(), config_.mac->end(), nv);
-    else if (blank) std::copy(kDefaultMac.begin(), kDefaultMac.end(), nv);
+    std::array<u8, 6> nv{};
+    std::vector<u16>& words = hpc3_.eeprom().words();
+    if (config_.board == Board::Indigo2) {
+        for (unsigned i = 0; i < 6; ++i) nv[i] = static_cast<u8>(words[(kNvramEaddr + i) / 2] >> ((i & 1) ? 0 : 8));
+    } else {
+        std::copy_n(&rtc().memory()[kNvramBase + kNvramEaddr], 6, nv.begin());
+    }
+    const bool blank = std::all_of(nv.begin(), nv.end(), [](u8 b) { return b == 0x00; }) ||
+                       std::all_of(nv.begin(), nv.end(), [](u8 b) { return b == 0xFF; });
+    if (config_.mac) nv = *config_.mac;
+    else if (blank) nv = kDefaultMac;
+    else return;
+    if (config_.board == Board::Indigo2) {
+        for (unsigned i = 0; i < 6; i += 2) words[(kNvramEaddr + i) / 2] = static_cast<u16>(nv[i] << 8 | nv[i + 1]);
+    } else {
+        std::copy(nv.begin(), nv.end(), &rtc().memory()[kNvramBase + kNvramEaddr]);
+    }
+}
+
+std::size_t Indy::nvram_size() const {
+    const std::size_t rtc_bytes = hpc3_.rtc().memory().size();
+    return config_.board == Board::Indigo2 ? 2 * hpc3_.eeprom().words().size() + rtc_bytes : rtc_bytes;
+}
+
+std::vector<u8> Indy::nvram_image() {
+    std::vector<u8> image;
+    if (config_.board == Board::Indigo2)
+        for (u16 w : hpc3_.eeprom().words()) image.push_back(static_cast<u8>(w >> 8)), image.push_back(static_cast<u8>(w));
+    const auto& mem = rtc().memory();
+    image.insert(image.end(), mem.begin(), mem.end());
+    return image;
+}
+
+void Indy::load_nvram_image(const std::vector<u8>& image) {
+    std::size_t at = 0;
+    if (config_.board == Board::Indigo2) {
+        for (u16& w : hpc3_.eeprom().words()) {
+            if (at + 2 > image.size()) return;
+            w = static_cast<u16>(image[at] << 8 | image[at + 1]);
+            at += 2;
+        }
+    }
+    auto& mem = rtc().memory();
+    for (std::size_t i = 0; i < mem.size() && at < image.size(); ++i) mem[i] = image[at++];
 }
 
 void Indy::reset() {

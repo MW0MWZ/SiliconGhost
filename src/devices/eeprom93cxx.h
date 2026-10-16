@@ -23,6 +23,9 @@ public:
     bool data_out() const { return do_; }
 
     std::vector<u16>& words() { return words_; }
+    const std::vector<u16>& words() const { return words_; }
+    // Writes that changed the contents, so the host knows when to save them.
+    u64 changes() const { return changes_; }
 
 private:
     enum class State { Idle, Command, ReadOut, WriteData };
@@ -44,6 +47,7 @@ private:
     bool protect_enabled_ = false, protect_locked_ = false;
     int out_width_ = 16;  // data bits per read: 16, or 8 for PRREAD
     State state_ = State::Idle;
+    u64 changes_ = 0;
     u32 shift_ = 0;
     unsigned nbits_ = 0;
     unsigned opcode_ = 0, address_ = 0;

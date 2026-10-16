@@ -41,6 +41,11 @@ constexpr u32 kPromMaxSize = 0x00080000;
 // R4600SC module: secondary cache control, uncached, at 0x80000000 | the
 // physical address of the line (the module decodes the top address bit).
 constexpr u32 kR4600ScControl = 0x80000000;
+
+// Indigo2: the EISA bus's I/O space and its alias, as the EISA interface
+// decodes them with no card fitted.
+constexpr u32 kEisaIo = 0x00080000;
+constexpr u32 kEisaIoSize = 0x00020000;
 constexpr u64 kR4600ScControlSize = 0x80000000;
 
 }  // namespace sg::ip22

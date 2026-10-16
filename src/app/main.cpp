@@ -77,8 +77,10 @@ void usage(const char* argv0) {
                    "                   interface to the guest (may be repeated)\n",
                    stderr);
     std::fprintf(stderr,
+                 "  --machine BOARD  indy (default) or indigo2\n"
                  "  --ram MB         memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256\n"
-                 "                   (one or two banks of 16, 32, 64 or 128; default 64)\n"
+                 "                   (one or two banks of 16, 32, 64 or 128; default 64); on the\n"
+                 "                   indigo2 up to three banks, to 384\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc, r4000pc, r4600sc, r4600pc,\n"
                  "                   r5000sc or r5000pc\n"
                  "  --cpu-mhz N      pipeline clock (default 150)\n"
@@ -255,7 +257,7 @@ int main(int argc, char** argv) {
             const char* key;
         } kValued[] = {{"--prom", "prom"},   {"--nvram", "nvram"},     {"--disk", "disk"},
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
-                       {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},
+                       {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},  {"--machine", "machine"},
                        {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"},
                        {"--graphics-rev", "graphics_rev"}, {"--timing", "timing"}, {"--max-speed", "max_speed"},
                        {"--log", "log"}};
