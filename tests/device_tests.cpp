@@ -176,6 +176,53 @@ TEST(eeprom_write_enable_write_read) {
     CHECK_EQ(ee_read(ee, 0x10), 0xBEEF);
 }
 
+// With PRE high the instructions address the protect register; PRCLEAR is
+// not an erase of word 127.
+TEST(eeprom_protect_register) {
+    Eeprom93Cxx ee;
+    auto cmd = [&](u32 bits, bool pre) {
+        ee.set_lines(true, false, false, pre);
+        for (int i = 10; i >= 0; --i) {
+            const bool b = (bits >> i) & 1;
+            ee.set_lines(true, false, b, pre);
+            ee.set_lines(true, true, b, pre);
+        }
+    };
+    auto end = [&] { ee.set_lines(false, false, false); };
+    auto write = [&](unsigned addr, u16 v) {
+        ee_cmd(ee, (0b101u << 8) | addr, 11);
+        ee_cmd(ee, v, 16);
+        end();
+    };
+    ee_cmd(ee, (0b100u << 8) | 0xC0, 11);  // WEN
+    end();
+    write(0x7F, 0x1234);
+    write(0x20, 0x5555);
+    cmd((0b100u << 8) | 0xC0, true);  // PREN
+    end();
+    cmd((0b111u << 8) | 0xFF, true);  // PRCLEAR
+    end();
+    CHECK_EQ(ee_read(ee, 0x7F), 0x1234u);
+    cmd((0b100u << 8) | 0xC0, true);  // PREN, then PRWRITE 0x20: protect 0x20 and up
+    end();
+    cmd((0b101u << 8) | 0x20, true);
+    end();
+    write(0x20, 0xAAAA);
+    write(0x1F, 0xAAAA);
+    CHECK_EQ(ee_read(ee, 0x20), 0x5555u);
+    CHECK_EQ(ee_read(ee, 0x1F), 0xAAAAu);
+    cmd((0b110u << 8), true);  // PRREAD
+    CHECK(!ee.data_out());
+    u32 v = 0;
+    for (int i = 0; i < 8; ++i) {
+        ee.set_lines(true, false, false, true);
+        ee.set_lines(true, true, false, true);
+        v = (v << 1) | (ee.data_out() ? 1 : 0);
+    }
+    end();
+    CHECK_EQ(v, 0x20u);
+}
+
 TEST(scc_transmit_and_interrupts) {
     Clock clk;
     Z85230 scc(clk.sched, 50);

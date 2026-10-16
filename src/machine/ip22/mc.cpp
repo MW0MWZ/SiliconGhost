@@ -27,7 +27,11 @@ constexpr u32 kLowWindow = 0x08000000, kLowWindowEnd = 0x18000000;
 constexpr u32 kHighWindow = 0x20000000, kHighWindowEnd = 0x30000000;
 constexpr u32 kLowAliasSize = 0x80000;
 
+// GIO64 space: the graphics and expansion slots, and the EXP area below
+// the HPC3.
 constexpr u32 kGioSpaceStart = 0x1F000000, kGioSpaceEnd = 0x1FA00000;
+constexpr u32 kGioExpStart = 0x1FB00000, kGioExpEnd = 0x1FB80000;
+constexpr u32 kCpuCtrl1AbortEn = 1u << 4;
 
 // Virtual DMA
 constexpr u32 kDmaModeToMemory = 1u << 1;
@@ -71,13 +75,15 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
 
 void Mc::reset() {
     regs_.clear();
-    regs_[kCpuCtrl0] = 0;
-    regs_[kCpuCtrl1] = 0;
+    regs_[kCpuCtrl0] = 0x00100012;  // MUX_HWM 1, refresh on, 2 lines a burst
+    regs_[kCpuCtrl1] = 0xC;         // MC_HWM
     regs_[kRpssDivider] = 0x0104;
     regs_[kCtrld] = 0x0C30;
-    regs_[kGio64Arb] = 0x1;  // HPC64, from the boot configuration
-    regs_[kCpuTime] = 0x1000;
+    regs_[kGio64Arb] = 0x401;  // one GIO64 bus; HPC64, from the boot configuration
+    regs_[kCpuTime] = 0x100;
     regs_[kLbTime] = 0x200;
+    regs_[kCpuMemAcc] = 0x01454333;
+    regs_[kGioMemAcc] = 0x4333;
     regs_[kLockMemory] = 1;
     regs_[kEisaLock] = 1;
     regs_[kMemCfg0] = 0;
@@ -331,11 +337,13 @@ void Mc::remap_memory() {
 void Mc::report_bus_error(u64 paddr, unsigned size, bool is_write) {
     u32 lanes = 0;
     for (unsigned i = 0; i < size; ++i) lanes |= 1u << (7 - ((paddr + i) & 7));
-    const bool gio = paddr >= kGioSpaceStart && paddr < kGioSpaceEnd;
+    const bool gio = (paddr >= kGioSpaceStart && paddr < kGioSpaceEnd) || (paddr >= kGioExpStart && paddr < kGioExpEnd);
     if (gio) {
+        // A GIO timeout is recorded (TIME) only with ABORT_EN; without it the
+        // real bus hangs, which is not modelled: the access still fails.
         if (!gio_error_stat_) {
             gio_error_addr_ = static_cast<u32>(paddr);
-            gio_error_stat_ = kErrStatAddr | lanes;  // GIO timeout
+            gio_error_stat_ = (regs_[kCpuCtrl1] & kCpuCtrl1AbortEn ? kErrStatAddr : 0) | lanes;
         }
     } else if (!cpu_error_stat_) {
         cpu_error_addr_ = static_cast<u32>(paddr);

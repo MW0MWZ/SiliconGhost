@@ -52,6 +52,7 @@ constexpr u32 kPbusStride = 0x2000;
 constexpr u32 kPbusCtrl = 0x1000;
 // Control register: written...
 constexpr u32 kPbusCtrlLittleEndian = 1u << 1;
+constexpr u32 kPbusCtrlReceive = 1u << 2;  // device to memory
 constexpr u32 kPbusCtrlAct = 1u << 4;
 constexpr u32 kPbusCtrlLoad = 1u << 5;  // ACT is written only with this set
 // ...and read
@@ -84,6 +85,7 @@ constexpr u32 kRtcWindow = 0x60000;
 constexpr u32 kRtcWindowEnd = 0x68000;
 
 // EEPROM register bits
+constexpr u32 kEepromPre = 1u << 0;  // protect register enable
 constexpr u32 kEepromCs = 1u << 1;
 constexpr u32 kEepromClk = 1u << 2;
 constexpr u32 kEepromDataOut = 1u << 3;  // CPU -> EEPROM
@@ -392,7 +394,8 @@ void Hpc3::pbus_complete(unsigned ch) {
 void Hpc3::play(unsigned ch, u32 addr, u32 frames, const Hal2::PortConfig& dac) {
     const unsigned size = pbus_sample_bytes(ch);
     std::vector<s16> samples(static_cast<std::size_t>(frames) * dac.voices);
-    const bool little = dac.little_endian || (pbus_[ch].ctrl & kPbusCtrlLittleEndian);
+    // HAL2 and the HPC3 each swap bytes when set for little-endian: both cancel.
+    const bool little = dac.little_endian != ((pbus_[ch].ctrl & kPbusCtrlLittleEndian) != 0);
     for (u32 i = 0; i < samples.size(); ++i) {
         u8 b[4] = {0, 0, 0, 0};
         for (u32 k = 0; k < size; ++k) bus_.read<u8>(addr + size * i + k, b[k]);
@@ -426,8 +429,9 @@ const Hal2::Port* Hpc3::pbus_port(unsigned ch) const {
 // (whole frames; with `last`, the rest of it). As on the hardware, data moves
 // as the transfer goes: software that follows the buffer pointer refills
 // (or empties) the memory behind it, so it must be done with by then.
-// The codec input (ADC) records from the host when a source is set and the
-// digital input (AES) has nothing connected: silence otherwise. What the DAC
+// The channel's receive bit sets the direction. The codec input (ADC)
+// records from the host when a source is set and the digital input (AES) has
+// nothing connected: silence otherwise, as from an output port. What the DAC
 // plays goes to the audio sink.
 void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
     PbusChannel& c = pbus_[ch];
@@ -439,16 +443,16 @@ void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
     upto = last ? c.bc : std::min(upto, c.bc) / frame * frame;
     if (upto <= c.filled) return;
     const u32 n = upto - c.filled;
-    if (!in.input) {
+    if (!(c.ctrl & kPbusCtrlReceive)) {
         if (*port == Hal2::kDac && audio_sink_ && n >= frame) play(ch, c.bptr + c.filled, n / frame, in);
         c.filled = upto;
         return;
     }
     std::vector<u8> bytes(n, 0);
-    if (audio_source_ && *port == Hal2::kAdc && in.voices && n >= frame) {
+    if (audio_source_ && *port == Hal2::kAdc && in.input && in.voices && n >= frame) {
         std::vector<s16> samples(n / frame * in.voices, 0);
         audio_source_(samples.data(), samples.size() / in.voices, in.voices, in.rate);
-        const bool little = in.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
+        const bool little = in.little_endian != ((c.ctrl & kPbusCtrlLittleEndian) != 0);
         double gain[2];
         hal2_.input_gain(gain[0], gain[1]);
         const bool unity = gain[0] == 1.0 && gain[1] == 1.0;
@@ -738,7 +742,7 @@ void Hpc3::write_word(u32 offset, u32 value) {
     switch (offset) {
         case kEepromReg:
             eeprom_reg_ = value & 0x1F;
-            eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut);
+            eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut, value & kEepromPre);
             return;
         case kGioMisc: regs_[offset] = value & 3; return;
         case kScsi0Ndbp:  // the descriptor in use, if any, is finished first

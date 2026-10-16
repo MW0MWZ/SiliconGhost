@@ -117,8 +117,15 @@ TEST(ip22_mc_bus_errors) {
     CHECK(t.ip(6));
     t.w32(kMcCpuErrorStat, 0);
     CHECK(!t.ip(6));
-    // Empty GIO expansion slot.
+    // Empty GIO expansion slot: a timeout is recorded only with ABORT_EN.
     CHECK(!t.m.bus().read<u32>(0x1F400000, v));
+    CHECK_EQ(t.r32(0x1FA000FC), 0xF0u);  // GIO_ERROR_STAT: the byte lanes only
+    t.w32(0x1FA000FC, 0);
+    CHECK_EQ(t.r32(0x1FA0000C), 0xCu);  // CPUCTRL1 reset value
+    t.w32(0x1FA0000C, 0x1C);            // ABORT_EN
+    CHECK(!t.m.bus().read<u32>(0x1FB00000, v));
+    CHECK_EQ(t.r32(0x1FA000F4), 0x1FB00000u);
+    CHECK_EQ(t.r32(0x1FA000FC), 0x4F0u);  // TIME
 }
 
 TEST(ip22_rpss_counts_100ns) {
@@ -439,7 +446,7 @@ TEST(ip22_hal2_adc_records_from_the_audio_source) {
         hal2_write(t, 0x1504, 0x209);       // ADC: PBUS channel 1, clock 1, stereo
         hal2_write(t, 0x9104, 0x10);        // codec receive DMA port on
         t.w32(kPbus0 + 0x2000 + 4, kDesc);
-        t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
+        t.w32(kPbus0 + 0x2000 + 0x1000, 0x34);  // LD | ACT | receive
         // Halfway through, what lies below the buffer pointer has arrived.
         t.m.run(static_cast<u64>(t.m.cycles_per_second() * 25 / 48000));
         const u32 at = t.r32(kPbus0 + 0x2000) - kBuf;
@@ -497,7 +504,7 @@ TEST(ip22_hal2_adc_input_gain) {
         hal2_write(t, 0x1508, 0x24F);       // ADC_C2: left +6 dB on mic (-9 dB trim), right +22.5 dB on line
         hal2_write(t, 0x9104, 0x10);
         t.w32(kPbus0 + 0x2000 + 4, kDesc);
-        t.w32(kPbus0 + 0x2000 + 0x1000, 0x30);
+        t.w32(kPbus0 + 0x2000 + 0x1000, 0x34);  // LD | ACT | receive
         t.m.run(static_cast<u64>(t.m.cycles_per_second() * 20 / 48000));
         if (ds16) {
             CHECK_EQ(t.r32(kBuf), static_cast<u32>(std::lround(1000 * 256 * std::pow(10.0, -3.0 / 20))));
