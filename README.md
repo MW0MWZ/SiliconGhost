@@ -158,6 +158,7 @@ Main options (`siliconghost --help` lists them all):
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
 | `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
+| `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 2 for the XL8, 0 for the XL24); drivers pick timings and cursor offsets by it, and see an 8-bit board only from revision 2 |
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |

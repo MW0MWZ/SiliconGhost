@@ -285,9 +285,15 @@ TEST(newport_render_matches_the_reference_conversion) {
         t.vc2_reg(0x05, 0x600);  // DID entry
         t.vc2_reg(0x1F, 1);
         t.vc2_reg(0x00, 0x400);
-        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080 | (round % 2 ? 0x0200 : 0));  // display, timing, DID, cursor
+        // display, timing, DID, cursor; large or crosshair in some rounds
+        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080 | (round % 2 ? 0x0200 : 0) | (round % 3 == 2 ? 0x0100 : 0));
         t.w(kTopScan, 0x3FF);
         t.w(kXYWin, 0x10001000);
+        auto retrace = [&] {  // the VC2 takes cursor and DID pointers then
+            t.now += 150000000 / 60 + 1;
+            t.sched.run_due(t.now);
+        };
+        retrace();
         auto draw = [&](int n) {
             for (int i = 0; i < n; ++i) {
                 static constexpr u32 kPlanes[] = {1, 1, 1, 4, 5, 6};
@@ -315,7 +321,10 @@ TEST(newport_render_matches_the_reference_conversion) {
         for (int step = 0; step < 12; ++step) {
             switch (rnd(5)) {
                 case 0: draw(1 + static_cast<int>(rnd(5))); break;
-                case 1: move_cursor(); break;
+                case 1:
+                    move_cursor();
+                    retrace();
+                    break;
                 case 2: t.cmap_entry(rnd(0x2000), rnd(0x1000000)); break;
                 case 3: gamma(); break;
                 default: t.w(kTopScan, (0x3FF + rnd(8)) & 0x3FF); break;
@@ -617,4 +626,50 @@ TEST(newport_logic_op_destination_from_dblsrc) {
     point((3u << 28) | k8, 0xFF00, 0x0F);        // buffer 1 0x0F
     point((6u << 28) | k8 | (1u << 5), 0xFF, 0xF0);  // XOR into buffer 0 against buffer 1
     CHECK_EQ(pixel8(t, 4, 4), 0xFFu);
+}
+
+// CMAP0 reports the board revision in bits 6:4, with the 8-bit flag.
+TEST(newport_board_revision) {
+    auto revision = [](Newport::Options o) {
+        Rig t(o);
+        t.w(kDcbMode, width(0) | crs(6) | slave(1));
+        return t.r(kDcbData0) >> 24;
+    };
+    CHECK_EQ(revision({}), 0xA1u);
+    CHECK_EQ(revision({true, 0xA}), 0x02u);
+    CHECK_EQ(revision({false, 0xA, 6}), 0xE1u);
+    CHECK_EQ(revision({true, 0xA, 4}), 0x42u);
+}
+
+// The VC2 takes a new cursor position, and DID table, at vertical retrace.
+TEST(newport_cursor_and_did_latched_at_retrace) {
+    Rig t;
+    t.vc2_ram(0x000, {static_cast<u16>(0x8080 | (62u << 7))});  // 60 x 40
+    t.vc2_ram(0x400, {0x000, 40, 0, 0});
+    for (u16 a = 0; a < 128; ++a) t.vc2_ram(static_cast<u16>(0x3000 + a), {0xFFFF});  // solid glyph
+    for (u32 i = 0; i < 0x2000; i += 0x100) t.cmap_entry(i, 0xFFFFFF);  // a white screen; the cursor is black
+    t.vc2_reg(0x01, 0x3000);
+    t.vc2_reg(0x1F, 1);
+    t.vc2_reg(0x00, 0x400);
+    t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080);  // display, timing, cursor
+    auto retrace = [&] {
+        t.now += 150000000 / 60 + 1;
+        t.sched.run_due(t.now);
+    };
+    retrace();
+    std::vector<u32> before, after;
+    unsigned w = 0, h = 0;
+    CHECK(t.np.render(before, w, h));
+    t.vc2_reg(0x02, 40);  // CURSX, then CURSY: on screen
+    t.vc2_reg(0x03, 40);
+    int x = 0, y = 0;
+    CHECK(t.np.cursor_position(x, y));
+    CHECK_EQ(x, 40 - 29);
+    CHECK_EQ(y, 40 - 31);
+    after = before;
+    CHECK(t.np.render(after, w, h));
+    CHECK(after == before);  // not shown before the retrace
+    retrace();
+    CHECK(t.np.render(after, w, h));
+    CHECK(after != before);
 }

@@ -36,6 +36,7 @@ struct IndyConfig {
     u32 scache_bytes = 1u << 20;                    // secondary cache; 0 for a PC module
     bool graphics = true;       // a Newport board in the GFX slot
     bool xl24 = false;          // the 24-bit board (XL24) rather than the 8-bit XL8
+    int graphics_revision = -1;  // its board revision, 0-7; -1 for the usual one
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
     // SCSI CD-ROM (ID 4) discs, raw 512-byte blocks (IRIX media layout). The
     // first is in the drive at power-on; ejecting moves on to the next.

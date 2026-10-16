@@ -157,6 +157,7 @@ void Newport::reset() {
     std::fill(cidaux_.begin(), cidaux_.end(), 0);
 
     vc2_ = Vc2{};
+    shown_ = Shown{};
     for (auto& x : xmap_) x = Xmap{};
     for (auto& c : cmap_) c = Cmap{};
     ramdac_reset();
@@ -1254,9 +1255,11 @@ void Newport::vc2_write(unsigned crs, u8 b) {
         case 1: vc2_.data_hi = b; break;
         case 2: {
             const u16 v = static_cast<u16>((vc2_.data_hi << 8) | b);
-            // A cursor move only changes the lines it leaves and enters.
-            const bool cursor = vc2_.index == kVc2CursorX || vc2_.index == kVc2CursorY || vc2_.index == kVc2CurCursorX;
-            if (cursor) cursor_moving();
+            // The cursor and DID pointers take effect at the next vertical
+            // retrace (latch_shown()).
+            const bool latched = vc2_.index == kVc2CursorX || vc2_.index == kVc2CursorY ||
+                                 vc2_.index == kVc2CurCursorX || vc2_.index == kVc2CursorEntry ||
+                                 vc2_.index == kVc2DidEntry;
             vc2_.reg[vc2_.index] = v;
             if (vc2_.index == kVc2RamAddr) {
                 vc2_.reg[kVc2RamAddr] = v & 0x7FFF;
@@ -1264,8 +1267,7 @@ void Newport::vc2_write(unsigned crs, u8 b) {
             } else if (vc2_.index == kVc2CursorY) {
                 vc2_.reg[kVc2CurCursorX] = vc2_.reg[kVc2CursorX];
             }
-            if (cursor) cursor_moving();
-            else if (vc2_.index != kVc2RamAddr) picture_changed();
+            if (!latched && vc2_.index != kVc2RamAddr) picture_changed();
             break;
         }
         case 3:
@@ -1399,8 +1401,12 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
         case 3: return c.command;
         case 4: return static_cast<u8>(0x18 | (c.rgb & 3));  // write FIFO empty; the R/G/B byte counter
         case 6:
-            // CMAP0: board revision and 8-bit flag; CMAP1: monitor sense.
-            if (which == 0) return opts_.xl24 ? 0x02 : 0xA1;
+            // CMAP0: 8-bit flag, board revision (6:4) and CMAP revision;
+            // CMAP1: monitor sense.
+            if (which == 0) {
+                const int rev = opts_.board_revision >= 0 ? opts_.board_revision & 7 : opts_.xl24 ? 0 : 2;
+                return static_cast<u8>((opts_.xl24 ? 0x02 : 0x81) | (rev << 4));
+            }
             return static_cast<u8>((opts_.monitor_id << 4) | (opts_.xl24 ? 0x02 : 0x01));
         case 7: return c.crs7;
         default: return 0;
@@ -1503,6 +1509,7 @@ void Newport::set_vrint(bool level) {
 void Newport::retrace() {
     ++frames_;
     last_retrace_ = scheduler_.now();
+    latch_shown();
     if (vc2_.reg[kVc2Control] & kDcrVintr) set_vrint(true);
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
 }
@@ -1548,15 +1555,18 @@ constexpr int kCursorScreenX = 29, kCursorScreenY = 31, kScanDelay = 2;
 constexpr u8 kXmapPupEnable = 0x01;  // XMAP9 config: pop-up planes shown
 constexpr u8 kXmapEightBit = 0x04;   // XMAP9 config: 8-bit system (the XL8)
 
+// The crosshair, centred on the cursor position, is the whole line and
+// column through it, in cursor colour 1.
 unsigned Newport::cursor_pixel(int x, int y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
-    if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return 0;
+    if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible)) return 0;
+    const int col = x - (static_cast<int>(shown_.cursor_x) - kCursorScreenX + kScanDelay);
+    const int row = y - (static_cast<int>(shown_.cursor_y) - kCursorScreenY);
+    if (dcr & kDcrCrosshair) return col == 0 || row == 0 ? 1 : 0;
     const bool large = dcr & kDcrLargeCursor;
     const int size = large ? 64 : 32;
-    const int col = x - (static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay);
-    const int row = y - (static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY);
     if (col < 0 || col >= size || row < 0 || row >= size) return 0;
-    const unsigned entry = vc2_.reg[kVc2CursorEntry];
+    const unsigned entry = shown_.cursor_entry;
     const unsigned bit = 15 - (col & 15);
     if (large) return (vc2_.ram[(entry + row * 4 + (col >> 4)) & 0x7FFF] >> bit) & 1;
     const unsigned word = entry + row * 2 + (col >> 4);
@@ -1571,15 +1581,25 @@ bool Newport::cursor_position(int& x, int& y) const {
     return true;
 }
 
-void Newport::cursor_moving() {
-    ++display_version_;
-    const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
-    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
-    if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
-        full_redraw_ = true;
-        cursor_rows_.clear();
+void Newport::latch_shown() {
+    const Shown now{vc2_.reg[kVc2CurCursorX], vc2_.reg[kVc2CursorY], vc2_.reg[kVc2CursorEntry], vc2_.reg[kVc2DidEntry]};
+    const bool crosshair = vc2_.reg[kVc2Control] & kDcrCrosshair;
+    const bool moved = now.cursor_x != shown_.cursor_x || now.cursor_y != shown_.cursor_y;
+    if (now.did_entry != shown_.did_entry || (crosshair && moved)) picture_changed();
+    if (moved || now.cursor_entry != shown_.cursor_entry) {
+        // A cursor move only changes the lines it leaves and enters.
+        ++display_version_;
+        const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
+        if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
+            full_redraw_ = true;
+            cursor_rows_.clear();
+        }
+        for (const u16 y : {shown_.cursor_y, now.cursor_y}) {
+            const int first = static_cast<int>(y) - kCursorScreenY;
+            cursor_rows_.emplace_back(first, first + size);
+        }
     }
-    cursor_rows_.emplace_back(first, first + size);
+    shown_ = now;
 }
 
 const Newport::ModeTable& Newport::mode_table(unsigned did) {
@@ -1765,10 +1785,11 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
     }
 
     // The cursor's rows and columns (scan-out coordinates).
-    const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible) && !(dcr & kDcrCrosshair);
+    const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible);
+    const bool crosshair = dcr & kDcrCrosshair;
     const int cursor_size = (dcr & kDcrLargeCursor) ? 64 : 32;
-    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay;  // frame buffer column
-    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
+    const int cursor_x0 = static_cast<int>(shown_.cursor_x) - kCursorScreenX + kScanDelay;  // frame buffer column
+    const int cursor_y0 = static_cast<int>(shown_.cursor_y) - kCursorScreenY;
 
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
@@ -1779,7 +1800,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
         if (!needed) continue;
         records.clear();
         if (dcr & kDcrDid) {
-            unsigned p = vc2_.ram[(vc2_.reg[kVc2DidEntry] + y) & 0x7FFF];
+            unsigned p = vc2_.ram[(shown_.did_entry + y) & 0x7FFF];
             for (int i = 0; i < 1024; ++i) {
                 const u16 r = vc2_.ram[p++ & 0x7FFF];
                 const int rx = r >> 5;
@@ -1787,7 +1808,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                 records.emplace_back(rx, static_cast<u8>(r & 31));
             }
         }
-        const bool cursor_row = cursor_on && static_cast<int>(y) >= cursor_y0 && static_cast<int>(y) < cursor_y0 + cursor_size;
+        const bool cursor_row = cursor_on && !crosshair && static_cast<int>(y) >= cursor_y0 &&
+                                static_cast<int>(y) < cursor_y0 + cursor_size;
         const u32* const pix_row = &rgbci_[static_cast<std::size_t>(row) * kPitch];
         const u32* const aux_row = &cidaux_[static_cast<std::size_t>(row) * kPitch];
         u32* const out = &argb[static_cast<std::size_t>(y) * width];
@@ -1812,9 +1834,11 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                 const bool inside = x < static_cast<unsigned>(kPitch);
                 const u32 pix = inside ? pix_row[x] : 0;
                 const u32 aux = inside ? aux_row[x] : 0;
-                const unsigned cp = cursor_row && static_cast<int>(x) >= cursor_x0 && static_cast<int>(x) < cursor_x0 + cursor_size
-                                        ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
-                                        : 0;
+                const unsigned cp =
+                    (cursor_row && static_cast<int>(x) >= cursor_x0 && static_cast<int>(x) < cursor_x0 + cursor_size) ||
+                            (cursor_on && crosshair && (static_cast<int>(x) == cursor_x0 || static_cast<int>(y) == cursor_y0))
+                        ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
+                        : 0;
                 u32& o = out[x - kPipelineDelay];
                 if (cp || (aux & special) || underlay) o = special_colour(mode, pix, aux, cp);
                 else if (t.direct) o = direct_colour(mode, pix);
@@ -1846,7 +1870,7 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
     for (unsigned y = 0; y < height; ++y) {
         records.clear();
         if (dcr & kDcrDid) {
-            unsigned p = vc2_.ram[(vc2_.reg[kVc2DidEntry] + y) & 0x7FFF];
+            unsigned p = vc2_.ram[(shown_.did_entry + y) & 0x7FFF];
             for (int i = 0; i < 1024; ++i) {
                 const u16 r = vc2_.ram[p++ & 0x7FFF];
                 const int rx = r >> 5;

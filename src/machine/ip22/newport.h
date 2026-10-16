@@ -22,6 +22,10 @@ public:
     struct Options {
         bool xl24 = false;
         u8 monitor_id = 0xA;  // monitor sense: 0xA = 1280x1024 @ 60 Hz
+        // Board revision, 0-7, read from CMAP0; -1 for the usual one (2 for
+        // the XL8, 0 for the XL24). Drivers choose timings and cursor
+        // offsets by it, and see an 8-bit board only from revision 2.
+        int board_revision = -1;
     };
 
     // Frame buffer geometry: 1280 visible + 64 off-screen columns, 1024 rows.
@@ -52,8 +56,9 @@ public:
     // (screenshots; render() is checked against it).
     bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
     u64 frames() const { return frames_; }
-    // Where the VC2 shows the hardware cursor: the top left of its glyph in
-    // screen coordinates. False while the cursor is off.
+    // Where the system has put the hardware cursor (the VC2 shows it there
+    // from the next vertical retrace): the top left of its glyph in screen
+    // coordinates. False while the cursor is off.
     bool cursor_position(int& x, int& y) const;
     // Pixels the REX3 has drawn (a measure of how busy the board is).
     u64 pixels_drawn() const { return pixels_drawn_; }
@@ -125,7 +130,6 @@ private:
         ++display_version_;
         full_redraw_ = true;
     }
-    void cursor_moving();
     // Raw pixel value -> final colour for one XMAP mode, gamma included.
     struct ModeTable {
         u32 mode = ~0u;
@@ -171,15 +175,22 @@ private:
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
-    bool zfail_next_ = false, zfail_ = false;
-    bool fastclear_ = false;
-    u64 last_retrace_ = 0;  // when the last vertical interrupt came  // the primitive running writes COLORVRAM (fast clear)  // STEPZ: the next GO's first pixel fails the Z test
+    bool zfail_next_ = false, zfail_ = false;  // STEPZ: the next GO's first pixel fails the Z test
+    bool fastclear_ = false;                   // the primitive running writes COLORVRAM (fast clear)
+    u64 last_retrace_ = 0;                     // when the last vertical interrupt came
     int host_shift_ = 0;
     u32 dcbmode_ = 0;
     unsigned dcb_crs_ = 0;  // the DCB's register select, stepped by ENCRSINC until DCBMODE is written
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
     u64 dcb_busy_until_ = 0;  // an access to an absent slave is waiting for its acknowledge
+
+    // The cursor position and table pointers the VC2 scans out with: its
+    // copies of the registers, taken during vertical retrace.
+    struct Shown {
+        u16 cursor_x = 0, cursor_y = 0, cursor_entry = 0, did_entry = 0;
+    } shown_;
+    void latch_shown();
 
     u64 display_version_ = 0;
     bool full_redraw_ = true;

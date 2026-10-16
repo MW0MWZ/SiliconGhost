@@ -36,6 +36,7 @@ struct Settings {
     unsigned ram_mb = 64;
     bool graphics = true;  // a Newport board fitted
     bool xl24 = false;     // and it is the 24-bit XL24
+    int graphics_rev = -1;  // its board revision, 0-7; -1 for the usual one
     std::optional<std::array<u8, 6>> mac;
     std::string net = "user";  // user | tap:NAME | none
     std::vector<net::PortForward> forwards;

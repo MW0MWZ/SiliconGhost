@@ -45,6 +45,7 @@ ip22::IndyConfig Settings::indy_config() const {
     }
     c.graphics = graphics;
     c.xl24 = xl24;
+    c.graphics_revision = graphics_rev;
     c.disk_image = disk;
     c.cdrom_images = cdroms;
     c.mac = mac;
@@ -151,6 +152,11 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
         else if (parse_bool(v, on)) s.graphics = on, s.xl24 = false;
         else ok = false;
     }
+    else if (key == "graphics_rev") {
+        if (v.empty()) s.graphics_rev = -1;
+        else ok = parse_number(v, n) && n >= 0 && n <= 7 && n == static_cast<int>(n) &&
+                  (s.graphics_rev = static_cast<int>(n), true);
+    }
     else if (key == "mac") {
         std::array<u8, 6> mac{};
         if (v.empty()) s.mac.reset();
@@ -238,6 +244,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         f << "prom=" << s.prom << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "cpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
+          << "\ngraphics_rev=" << (s.graphics_rev >= 0 ? std::to_string(s.graphics_rev) : "")
           << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\nmax_speed=" << s.max_speed << "\nidle_skip=" << (s.idle_skip ? 1 : 0)
