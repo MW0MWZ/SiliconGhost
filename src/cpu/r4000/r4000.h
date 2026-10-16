@@ -384,6 +384,9 @@ private:
     void fpr_write32(unsigned n, u32 v);
     u64 fpr_read64(unsigned n) const;
     void fpr_write64(unsigned n, u64 v);
+    // The host's FP control word as FP operations start from it: no exception
+    // flags, rounding to nearest (x86-64 MXCSR; fpu.cpp).
+    static u32 host_fp_control();
 
     Bus& bus_;
     Options opts_;
@@ -473,6 +476,7 @@ private:
     bool idle_skip_ = true;
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 jit_scratch_ = 0;   // translated code's spill slot
+    u32 jit_fp_control_ = 0;  // the host FP control word translated FP operations start from
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
     // Fields translated code uses come before the large arrays, so they lie

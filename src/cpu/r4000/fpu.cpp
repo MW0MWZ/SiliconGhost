@@ -509,6 +509,14 @@ void R4000::execute_cop1(u32 inst) {
     }
 }
 
+u32 R4000::host_fp_control() {
+#if defined(SG_DIRECT_FENV) && defined(__x86_64__)
+    return kHostFpBase;
+#else
+    return 0x1F80;  // MXCSR at reset
+#endif
+}
+
 // Used by the pre-decoded COP1 handlers (r4000.cpp).
 template void R4000::fp_compute<float>(unsigned, unsigned, unsigned, unsigned);
 template void R4000::fp_compute<double>(unsigned, unsigned, unsigned, unsigned);

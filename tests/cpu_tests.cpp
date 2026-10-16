@@ -586,6 +586,8 @@ namespace {
 // Final state of a run, for comparing the block cache with step().
 struct CpuState {
     std::array<u64, 32> gpr{};
+    std::array<u64, 32> fpr{};
+    u32 fcr31 = 0;
     u64 hi = 0, lo = 0, pc = 0, cycles = 0, epc = 0, cause = 0;
     std::vector<u8> data;
     bool operator==(const CpuState&) const = default;
@@ -594,6 +596,8 @@ struct CpuState {
 CpuState capture(Rig& t, u64 data_paddr, std::size_t data_size) {
     CpuState s;
     s.gpr = t.cpu.gpr;
+    s.fpr = t.cpu.fpr;
+    s.fcr31 = t.cpu.fcr31;
     s.hi = t.cpu.hi;
     s.lo = t.cpu.lo;
     s.pc = t.cpu.pc;
@@ -737,6 +741,143 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) { check_rando
 
 TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs_across_pages) {
     check_random_programs(60, 1500, 0x1E00);
+}
+
+namespace {
+
+// A random program of FPU operations: arithmetic, conversions, compares and
+// branches on the condition, moves and loads/stores, on values mostly in a
+// moderate range (sometimes special: zeros, infinities, NaNs, denormals),
+// with the FPU enabled in either register mode.
+std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base) {
+    u64 x = seed * 0x9E3779B97F4A7C15ull + 7;
+    auto rnd = [&](u32 n) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        return static_cast<u32>(x % n);
+    };
+    auto dst = [&] {  // never s0 (the data pointer) or s1 (the loop counter)
+        unsigned r;
+        do r = rnd(32);
+        while (r == s0 || r == s1);
+        return r;
+    };
+    static constexpr unsigned kFuncs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D, 0x0E, 0x0F,
+                                          0x20, 0x21, 0x24, 0x25, 0x08, 0x09, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+                                          0x36, 0x37, 0x38, 0x3A, 0x3C, 0x3E, 0x3F};
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    const unsigned main_fmt = 16 + (seed & 1);  // S or D
+    std::vector<u32> prog{ADDIU(s1, zero, 12)};
+    while (prog.size() + 5 < length) {
+        const unsigned room = length - 5 - static_cast<unsigned>(prog.size());
+        switch (rnd(10)) {
+            case 0: case 1: case 2: case 3: {
+                const unsigned fmt = rnd(6) ? main_fmt : 16 + rnd(2);
+                prog.push_back(cop1(fmt, rnd(32), rnd(32), rnd(32), kFuncs[rnd(std::size(kFuncs))]));
+                break;
+            }
+            case 4:  // CVT.S/D.W or .L
+                prog.push_back(cop1(rnd(4) ? 20 : 21, 0, rnd(32), rnd(32), 0x20 + rnd(2)));
+                break;
+            case 5: {  // MFC1, DMFC1, CFC1, MTC1, DMTC1 (CTC1 rarely: it may set traps)
+                static constexpr unsigned kMoves[] = {0x00, 0x01, 0x02, 0x04, 0x05, 0x00, 0x04};
+                unsigned m = kMoves[rnd(std::size(kMoves))];
+                if (rnd(40) == 0) m = 0x06;
+                const unsigned rt = (m == 0x04 || m == 0x05 || m == 0x06) ? rnd(32) : dst();
+                prog.push_back(cop1(m, rt, m == 0x02 || m == 0x06 ? (rnd(2) ? 31 : 0) : rnd(32), 0, 0));
+                break;
+            }
+            case 6: {  // LWC1, LDC1, SWC1, SDC1 within the data area
+                static constexpr unsigned kOps[] = {0x31, 0x35, 0x39, 0x3D};
+                const unsigned op = kOps[rnd(4)];
+                prog.push_back(I(op, s0, rnd(32), static_cast<s32>(rnd(128) * 8 + (rnd(100) == 0 ? 4 : 0))));
+                break;
+            }
+            case 7: {  // BC1F, BC1T, BC1FL, BC1TL forwards; the delay slot is an FPU operation or a move
+                if (room < 12) break;
+                prog.push_back((0x11u << 26) | (0x08u << 21) | (rnd(4) << 16) | (1 + rnd(8)));
+                prog.push_back(rnd(2) ? cop1(main_fmt, rnd(32), rnd(32), rnd(32), rnd(8))
+                                      : I(0x09, rnd(32), dst(), static_cast<s32>(rnd(256))));
+                break;
+            }
+            default: prog.push_back(I(0x09, rnd(32), dst(), static_cast<s32>(rnd(65536)) - 32768)); break;
+        }
+    }
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, 1 - static_cast<s32>(prog.size() + 1)));
+    prog.push_back(NOP);
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    (void)base;
+    return prog;
+}
+
+}  // namespace
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
+    constexpr u64 kData = 0x10000, kBase = 0x1000;
+    constexpr unsigned kLength = 400;
+    for (u32 seed = 1; seed <= 300; ++seed) {
+        const std::vector<u32> prog = random_fp_program(seed, kLength, kBase);
+        auto run = [&](Engine engine) {
+            Rig t;
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            u64 x = seed;
+            auto next = [&] {
+                x = x * 6364136223846793005ull + 1442695040888963407ull;
+                return x;
+            };
+            auto value = [&](bool dbl) -> u64 {  // mostly a moderate number, sometimes special
+                const u64 r = next();
+                switch ((r >> 58) & 63) {
+                    case 0: return 0;
+                    case 1: return dbl ? 0x7FF0000000000000ull : 0x7F800000u;     // infinity
+                    case 2: return dbl ? 0x7FF8000000000001ull : 0x7FC00001u;     // NaN (signaling on MIPS)
+                    case 3: return dbl ? 0x7FF0000000000001ull : 0x7F800001u;     // NaN (quiet on MIPS)
+                    case 4: return dbl ? (r & 0x000FFFFFFFFFFFFFull) : (r & 0x007FFFFFu);  // denormal
+                    default: {  // sign, exponent within 2^-20..2^20, random fraction
+                        const u64 sign = (r >> 59) & 1, exp = (r >> 32) % 41;
+                        if (dbl) return (sign << 63) | ((1003 + exp) << 52) | (r & 0x000FFFFFFFFFFFFFull);
+                        return (sign << 31) | ((107 + exp) << 23) | (r & 0x007FFFFFu);
+                    }
+                }
+            };
+            const bool fr = (seed >> 1) & 1;
+            for (unsigned i = 1; i < 32; ++i) t.cpu.gpr[i] = (i & 1) ? sext32(next() >> 17) : next();
+            for (unsigned i = 0; i < 32; ++i)
+                t.cpu.fpr[i] = (seed & 1) ? value(true) : (value(false) << 32) | value(false);
+            t.cpu.gpr[s0] = 0xFFFFFFFF80000000ull + kData;
+            for (u64 a = 0; a < 0x800; a += 8) store_be<u64>(&t.ram[kData + a], value(seed & 1));
+            // Mostly round to nearest without traps; sometimes another mode, FS, or a trap enabled.
+            u32 fcsr = 0;
+            if (seed % 5 == 0) fcsr |= 1 + seed / 5 % 3;
+            if (seed % 7 == 0) fcsr |= 1u << 24;
+            if (seed % 11 == 0) fcsr |= 0x80u << (seed / 11 % 5);
+            t.cpu.fcr31 = fcsr;
+            t.cpu.cp0_write(cop0::Status, sr::CU1 | (fr ? sr::FR : 0));
+            u64 paddr = kBase;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            // Exceptions are counted (in the data area) and the faulting
+            // instruction is skipped.
+            t.load({MFC0(k0, cop0::EPC), ADDIU(k0, k0, 4), MTC0(k0, cop0::EPC), LUI(k1, 0x8001),
+                    LW(k0, 0x7FC, k1), ADDIU(k0, k0, 1), SW(k0, 0x7FC, k1), ERET}, 0x180);
+            t.cpu.set_pc(0xFFFFFFFF80000000ull + kBase);
+            t.cpu.run_until(40 * kLength + 8000);
+            return capture(t, kData, 0x800);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        if (!(run(Engine::Blocks) == reference) || !(run(Engine::Jit) == reference)) {
+            CHECK_EQ(seed, 0u);  // report the failing seed
+            break;
+        }
+    }
 }
 
 // A translation made in kernel mode runs again for the same memory in user

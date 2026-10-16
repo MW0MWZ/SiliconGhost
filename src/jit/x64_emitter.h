@@ -184,6 +184,35 @@ public:
         byte(0x66);
         op_mem(false, 0x89, src, m);
     }
+    void test8_imm(Mem m, u8 imm) {  // test byte [m], imm8
+        op_mem(false, 0xF6, Reg(0), m);
+        byte(imm);
+    }
+
+    // SSE scalar floating point on xmm registers (numbered 0-15).
+    enum class Sse : unsigned { Sqrt = 0x51, Add = 0x58, Mul = 0x59, Cvt = 0x5A, Sub = 0x5C, Div = 0x5E };
+    void sse(Sse op, bool dbl, unsigned dst, unsigned src) {  // addsd/addss... dst, src
+        xmm_rr(dbl ? 0xF2 : 0xF3, false, static_cast<unsigned>(op), dst, src);
+    }
+    void ucomis(bool dbl, unsigned a, unsigned b) { xmm_rr(dbl ? 0x66 : 0, false, 0x2E, a, b); }
+    void movq_to_xmm(unsigned x, Reg r, bool w = true) { xmm_rr(0x66, w, 0x6E, x, r); }
+    void movq_from_xmm(Reg r, unsigned x, bool w = true) { xmm_rr(0x66, w, 0x7E, x, r); }
+    // cvtsd2si / cvttsd2si (and ss) to a 32-bit register; cvtsi2sd (ss) from one.
+    void cvt_to_int(bool dbl, bool truncate, Reg dst, unsigned src) {
+        xmm_rr(dbl ? 0xF2 : 0xF3, false, truncate ? 0x2C : 0x2D, dst, src);
+    }
+    void cvt_from_int(bool dbl, unsigned dst, Reg src) { xmm_rr(dbl ? 0xF2 : 0xF3, false, 0x2A, dst, src); }
+    void ldmxcsr(Mem m) {
+        rex_opt(false, 0, m.base);
+        byte(0x0F);
+        modrm_mem(0xAE, Reg(2), m);
+    }
+    void stmxcsr(Mem m) {
+        rex_opt(false, 0, m.base);
+        byte(0x0F);
+        modrm_mem(0xAE, Reg(3), m);
+    }
+
     void add_rsp(s32 imm) { alu_imm(Alu::Add, rsp, imm); }
     void sub_rsp(s32 imm) { alu_imm(Alu::Sub, rsp, imm); }
 
@@ -231,6 +260,12 @@ private:
         byte(0x80 | ((reg & 7) << 3) | (m.base & 7));
         if ((m.base & 7) == rsp) byte(0x24);  // SIB: base only
         u32v(static_cast<u32>(m.disp));
+    }
+    // [prefix] [REX] 0F op /r, register direct (reg field `reg`, rm field `rm`).
+    void xmm_rr(unsigned prefix, bool w, unsigned op, unsigned reg, unsigned rm) {
+        if (prefix) byte(prefix);
+        rex_opt(w, reg, rm);
+        byte(0x0F), byte(op), byte(0xC0 | ((reg & 7) << 3) | (rm & 7));
     }
     void group3(unsigned ext, Reg r, bool w) {
         rex_opt(w, 0, r);

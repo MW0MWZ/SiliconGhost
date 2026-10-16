@@ -92,6 +92,10 @@ Uses inline_uses(u32 w) {
         case 0x0D:
         case 0x0E: return {bit(rs), bit(rt)};
         case 0x0F: return {0, bit(rt)};
+        case 0x11:  // MFC1, DMFC1, MTC1, DMTC1
+            if (rs == 0x00 || rs == 0x01) return {0, bit(rt)};
+            if (rs == 0x04 || rs == 0x05) return {bit(rt), 0};
+            return {};
         case 0x20:
         case 0x21:
         case 0x23:
@@ -111,6 +115,10 @@ Uses inline_uses(u32 w) {
         case 0x2D:
         case 0x2E:
         case 0x3F: return {bit(rs) | bit(rt), 0};
+        case 0x31:  // LWC1, LDC1, SWC1, SDC1: rt is an FPU register
+        case 0x35:
+        case 0x39:
+        case 0x3D: return {bit(rs), 0};
         default: return {};
     }
 }

@@ -309,11 +309,242 @@ bool R4000::jit_compile(Block& b) {
             default: return false;
         }
     };
+    // COP1, inline for the common case: the coprocessor usable, Status.FR as
+    // it was when the block was translated (it fixes where each register
+    // lives), rounding to nearest with the inexact trap off, and operands the
+    // FPU handles in hardware. The host computes the result from a clean
+    // MXCSR; any flag but inexact, or a denormal result, leaves the result
+    // to the handler, which works it out again exactly.
+    const bool fr = (status_ & sr::FR) != 0;
+    jit_fp_control_ = host_fp_control();
+    const Mem m_status{kCpu, offset_of(this, &status_)};
+    const Mem m_fcr31{kCpu, offset_of(this, &fcr31)};
+    const Mem m_fp_control{kCpu, offset_of(this, &jit_fp_control_)};
+    constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u, kCond = 1u << 23;
+    auto fpr_mem = [&](unsigned n, bool dbl) -> Mem {
+        if (fr) return {kCpu, offset_of(this, &fpr[n])};
+        return {kCpu, offset_of(this, &fpr[n & ~1u]) + (dbl ? 0 : 4 * static_cast<s32>(n & 1))};  // little-endian host
+    };
+    auto fp_usable = [&](std::vector<std::size_t>& slow) {
+        e.mov(rax, m_status, false);
+        e.alu_imm(Alu::And, rax, static_cast<s32>(sr::CU1 | sr::FR), false);
+        e.alu_imm(Alu::Cmp, rax, static_cast<s32>(sr::CU1 | (fr ? sr::FR : 0)), false);
+        slow.push_back(e.jcc(Cond::Ne));
+    };
+    auto fp_nearest = [&](std::vector<std::size_t>& slow) {  // RM nearest, inexact trap off
+        e.mov(rax, m_fcr31, false);
+        e.test_imm(rax, 0x3u | 0x80u);
+        slow.push_back(e.jcc(Cond::Ne));
+    };
+    auto touch_ = [&] { e.alu_imm(Alu::Add, m_change_epoch, 1); };
+    // `r` holds a zero or a normal number (else slow); rcx is clobbered.
+    auto fp_ordinary = [&](Reg r, bool dbl, std::vector<std::size_t>& slow) {
+        e.mov(rcx, r);
+        e.shift_imm(Shift::Shl, rcx, 1, dbl);
+        const std::size_t zero = e.jcc(Cond::E);
+        e.shift_imm(Shift::Shr, rcx, dbl ? 53 : 24, dbl);
+        e.alu_imm(Alu::Sub, rcx, 1, false);
+        e.alu_imm(Alu::Cmp, rcx, dbl ? 0x7FD : 0xFD, false);
+        slow.push_back(e.jcc(Cond::A));
+        e.bind(zero);
+    };
+    auto fp_not_denormal = [&](Reg r, bool dbl, std::vector<std::size_t>& slow) {  // rcx is clobbered
+        e.mov(rcx, r);
+        e.shift_imm(Shift::Shl, rcx, 1, dbl);
+        const std::size_t zero = e.jcc(Cond::E);
+        e.shift_imm(Shift::Shr, rcx, dbl ? 53 : 24, dbl);
+        slow.push_back(e.jcc(Cond::E));
+        e.bind(zero);
+    };
+    // Runs one SSE operation from a clean MXCSR; any flag but inexact goes
+    // to the handler. The flags stay in the scratch slot.
+    auto fp_host = [&](auto&& op, std::vector<std::size_t>& slow) {
+        e.ldmxcsr(m_fp_control);
+        op();
+        e.stmxcsr(m_scratch);
+        e.test8_imm(m_scratch, 0x1F);  // invalid, denormal, divide by zero, overflow, underflow
+        slow.push_back(e.jcc(Cond::Ne));
+    };
+    // fp_commit() of an inexact or exact result: Cause, and the sticky flag.
+    auto fp_commit_inexact = [&] {
+        e.mov(rdx, m_fcr31, false);
+        e.alu_imm(Alu::And, rdx, static_cast<s32>(~kCauseMask), false);
+        e.test8_imm(m_scratch, 0x20);
+        const std::size_t exact = e.jcc(Cond::E);
+        e.alu_imm(Alu::Or, rdx, static_cast<s32>(kCauseInexact | kFlagInexact), false);
+        e.bind(exact);
+        e.mov(m_fcr31, rdx, false);
+    };
+    auto fp_commit_exact = [&] { e.alu_imm(Alu::And, m_fcr31, static_cast<s32>(~kCauseMask), false); };
+    auto emit_fpu = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
+        if ((w >> 26) != 0x11) return false;
+        const unsigned fmt = f_rs(w), ft = f_rt(w), fs = f_rd(w), fd = f_sa(w), func = w & 63;
+        switch (fmt) {
+            case 0x00:  // MFC1
+            case 0x01:  // DMFC1
+                if (fmt == 0x01) need64(slow);
+                fp_usable(slow);
+                if (fmt == 0x00) e.movsxd(rax, fpr_mem(fs, false));
+                else e.mov(rax, fpr_mem(fs, true));
+                write_nz(ft, rax);
+                touch_();
+                return true;
+            case 0x04:  // MTC1
+            case 0x05:  // DMTC1
+                if (fmt == 0x05) need64(slow);
+                fp_usable(slow);
+                ensure(ft);
+                read(rax, ft, fmt == 0x05);
+                e.mov(fpr_mem(fs, fmt == 0x05), rax, fmt == 0x05);
+                touch_();
+                return true;
+            case 0x10:
+            case 0x11:
+            case 0x14:
+                break;
+            default: return false;
+        }
+        const bool dbl = fmt == 0x11;
+        auto load = [&](Reg r, unsigned n, bool d) { e.mov(r, fpr_mem(n, d), d); };
+        auto store = [&](unsigned n, Reg r, bool d) { e.mov(fpr_mem(n, d), r, d); };
+        if (fmt == 0x14) {  // CVT.S.W, CVT.D.W
+            if (func != 0x20 && func != 0x21) return false;
+            fp_usable(slow);
+            fp_nearest(slow);
+            load(rax, fs, false);
+            const bool to_d = func == 0x21;
+            fp_host([&] { e.cvt_from_int(to_d, 0, rax); }, slow);
+            e.movq_from_xmm(rax, 0, to_d);
+            fp_commit_inexact();
+            store(fd, rax, to_d);
+            touch_();
+            return true;
+        }
+        if (func <= 0x04) {  // ADD, SUB, MUL, DIV, SQRT
+            fp_usable(slow);
+            fp_nearest(slow);
+            load(rax, fs, dbl);
+            fp_ordinary(rax, dbl, slow);
+            e.movq_to_xmm(0, rax, dbl);
+            if (func != 0x04) {
+                load(rax, ft, dbl);
+                fp_ordinary(rax, dbl, slow);
+                e.movq_to_xmm(1, rax, dbl);
+            }
+            static constexpr Emitter::Sse kOps[] = {Emitter::Sse::Add, Emitter::Sse::Sub, Emitter::Sse::Mul,
+                                                    Emitter::Sse::Div, Emitter::Sse::Sqrt};
+            fp_host([&] { e.sse(kOps[func], dbl, 0, func == 0x04 ? 0 : 1); }, slow);
+            e.movq_from_xmm(rax, 0, dbl);
+            fp_not_denormal(rax, dbl, slow);
+            fp_commit_inexact();
+            store(fd, rax, dbl);
+            touch_();
+            return true;
+        }
+        switch (func) {
+            case 0x06:  // MOV: a plain copy, Cause untouched
+                fp_usable(slow);
+                load(rax, fs, dbl);
+                store(fd, rax, dbl);
+                touch_();
+                return true;
+            case 0x05:  // ABS
+            case 0x07: {  // NEG
+                fp_usable(slow);
+                load(rax, fs, dbl);
+                fp_ordinary(rax, dbl, slow);
+                if (dbl) e.mov_imm64(rcx, u64{1} << 63);
+                else e.mov_imm32(rcx, 0x80000000u);
+                if (func == 0x05) {
+                    e.not_(rcx);
+                    e.alu(Alu::And, rax, rcx, dbl);
+                } else {
+                    e.alu(Alu::Xor, rax, rcx, dbl);
+                }
+                fp_commit_exact();
+                store(fd, rax, dbl);
+                touch_();
+                return true;
+            }
+            case 0x20:  // CVT.S.D
+            case 0x21: {  // CVT.D.S (exact)
+                if ((func == 0x20) != dbl) return false;  // CVT.S.S and CVT.D.D are unimplemented
+                fp_usable(slow);
+                if (dbl) fp_nearest(slow);
+                load(rax, fs, dbl);
+                fp_ordinary(rax, dbl, slow);
+                e.movq_to_xmm(0, rax, dbl);
+                if (dbl) {
+                    fp_host([&] { e.sse(Emitter::Sse::Cvt, true, 0, 0); }, slow);
+                    e.movq_from_xmm(rax, 0, false);
+                    fp_not_denormal(rax, false, slow);
+                    fp_commit_inexact();
+                } else {
+                    e.sse(Emitter::Sse::Cvt, false, 0, 0);
+                    e.movq_from_xmm(rax, 0, true);
+                    fp_commit_exact();
+                }
+                store(fd, rax, !dbl);
+                touch_();
+                return true;
+            }
+            case 0x0C:  // ROUND.W (to nearest even)
+            case 0x0D:  // TRUNC.W
+            case 0x24: {  // CVT.W (RM, here nearest)
+                fp_usable(slow);
+                fp_nearest(slow);
+                load(rax, fs, dbl);
+                fp_ordinary(rax, dbl, slow);
+                e.movq_to_xmm(0, rax, dbl);
+                fp_host([&] { e.cvt_to_int(dbl, func == 0x0D, rax, 0); }, slow);  // out of range: invalid
+                fp_commit_inexact();
+                store(fd, rax, false);
+                touch_();
+                return true;
+            }
+            default:
+                break;
+        }
+        if (func >= 0x30) {  // C.cond: no NaN operand, so ordered and no exception
+            const unsigned cond = func & 6;  // less (4), equal (2)
+            fp_usable(slow);
+            auto not_nan = [&](unsigned n, unsigned x) {
+                load(rax, n, dbl);
+                e.mov(rcx, rax);
+                e.shift_imm(Shift::Shl, rcx, 1, dbl);
+                if (dbl) e.mov_imm64(rdx, 0xFFE0000000000000ull);
+                else e.mov_imm32(rdx, 0xFF000000u);
+                e.alu(Alu::Cmp, rcx, rdx, dbl);
+                slow.push_back(e.jcc(Cond::A));
+                e.movq_to_xmm(x, rax, dbl);
+            };
+            not_nan(fs, 0);
+            not_nan(ft, 1);
+            e.alu(Alu::Xor, rax, rax, false);
+            if (cond) {
+                e.ucomis(dbl, 0, 1);
+                e.setcc(cond == 6 ? Cond::Be : cond == 4 ? Cond::B : Cond::E, rax);
+                e.movzx8(rax, rax);
+                e.shift_imm(Shift::Shl, rax, 23, false);
+            }
+            e.mov(rdx, m_fcr31, false);
+            e.alu_imm(Alu::And, rdx, static_cast<s32>(~(kCauseMask | kCond)), false);
+            e.alu(Alu::Or, rdx, rax, false);
+            e.mov(m_fcr31, rdx, false);
+            touch_();
+            return true;
+        }
+        return false;
+    };
     auto emit_memory = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
         unsigned size;
-        bool is_store = false, merge = false, w64 = false;
+        bool is_store = false, merge = false, w64 = false, fp = false;
         switch (opc) {
+            case 0x31: size = 4, fp = true; break;                   // LWC1
+            case 0x35: size = 8, fp = true; break;                   // LDC1
+            case 0x39: size = 4, fp = true, is_store = true; break;  // SWC1
+            case 0x3D: size = 8, fp = true, is_store = true; break;  // SDC1
             case 0x20:
             case 0x24: size = 1; break;  // LB, LBU
             case 0x21:
@@ -333,9 +564,10 @@ bool R4000::jit_compile(Block& b) {
         }
         const bool right = opc == 0x26 || opc == 0x2E || opc == 0x1B || opc == 0x2D;
         if (w64) need64(slow);
+        if (fp) fp_usable(slow);
         // Operands are loaded before the paths split, so both agree.
         ensure(rs);
-        if (is_store || merge) ensure(rt);
+        if ((is_store || merge) && !fp) ensure(rt);
         const s32 table = is_store ? kTableBytes : 0;
         read(rax, rs);
         e.alu_imm(Alu::Add, rax, static_cast<s16>(w & 0xFFFF));
@@ -369,6 +601,14 @@ bool R4000::jit_compile(Block& b) {
             slow.push_back(e.jcc(Cond::E));
             if (merge) merge_shift();
             e.alu(Alu::Add, rdx, rax);
+            if (fp) {
+                e.mov(rax, Mem{rdx, 0}, size == 8);
+                if (size == 8) e.bswap64(rax);
+                else e.bswap32(rax);
+                e.mov(fpr_mem(rt, size == 8), rax, size == 8);
+                touch_();
+                return true;
+            }
             if (rt == 0) return true;  // the access still happens, for its exceptions
             const Mem p{rdx, 0};
             if (merge) {
@@ -482,7 +722,8 @@ bool R4000::jit_compile(Block& b) {
         e.mov(Mem{rdx, log_host}, rcx);
         e.mov_store_imm32(Mem{rdx, log_size}, size);
         e.mov_store_imm(Mem{rdx, log_value}, 0);
-        read(rax, rt, size == 8);
+        if (fp) e.mov(rax, fpr_mem(rt, size == 8), size == 8);
+        else read(rax, rt, size == 8);
         switch (size) {
             case 1: e.mov8(Mem{rcx, 0}, rax); break;
             case 2:
@@ -498,6 +739,7 @@ bool R4000::jit_compile(Block& b) {
                 e.mov(Mem{rcx, 0}, rax, false);
                 break;
         }
+        if (fp) touch_();
         return true;
     };
 
@@ -843,7 +1085,7 @@ bool R4000::jit_compile(Block& b) {
             std::vector<std::size_t> slow;
             std::size_t skip_slow = 0;
             const u32 dirty_before = dirty;
-            const bool fast = emit_alu(w, slow) || emit_memory(w, slow);
+            const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
             const u32 loaded_after = loaded;
             if (fast) {
                 if (delay_slot) leave_delay_slot();
