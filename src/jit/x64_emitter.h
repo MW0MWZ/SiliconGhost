@@ -20,7 +20,9 @@ struct Mem {
 
 enum class Alu : unsigned { Add = 0, Or = 1, And = 4, Sub = 5, Xor = 6, Cmp = 7 };
 enum class Shift : unsigned { Shl = 4, Shr = 5, Sar = 7 };
-enum class Cond : unsigned { B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, L = 0xC, Ge = 0xD, Le = 0xE, G = 0xF };
+enum class Cond : unsigned {
+    O = 0x0, No = 0x1, B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, L = 0xC, Ge = 0xD, Le = 0xE, G = 0xF
+};
 
 class Emitter {
 public:
@@ -113,6 +115,10 @@ public:
         rex(true, 0, r);
         byte(0xF7), byte(0xC0 | (2 << 3) | (r & 7));
     }
+    void cmov(Cond c, Reg dst, Reg src) {  // 64-bit
+        rex(true, dst, src);
+        byte(0x0F), byte(0x40 + static_cast<unsigned>(c)), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
     void setcc(Cond c, Reg r) {  // r must be al/cl/dl/bl
         byte(0x0F), byte(0x90 + static_cast<unsigned>(c)), byte(0xC0 | (r & 7));
     }
@@ -142,6 +148,25 @@ public:
         rex(true, dst, src);
         byte(0x0F), byte(0xBF), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
     }
+    void bswap64(Reg r) {
+        rex(true, 0, r);
+        byte(0x0F), byte(0xC8 + (r & 7));
+    }
+    // op qword/dword [m], imm32
+    void alu_imm(Alu op, Mem m, s32 imm, bool w = true) {
+        op_mem(w, 0x81, Reg(static_cast<unsigned>(op)), m);
+        u32v(static_cast<u32>(imm));
+    }
+    // One-operand multiply and divide of rax (rdx:rax) by r (w: 64-bit).
+    void mul(Reg r, bool w) { group3(4, r, w); }
+    void imul1(Reg r, bool w) { group3(5, r, w); }
+    void div(Reg r, bool w) { group3(6, r, w); }
+    void idiv(Reg r, bool w) { group3(7, r, w); }
+    void neg(Reg r, bool w = true) { group3(3, r, w); }
+    void cdq(bool w) {  // sign-extends eax into edx (cqo: rax into rdx)
+        if (w) byte(0x48);
+        byte(0x99);
+    }
     void bswap32(Reg r) {
         rex_opt(false, 0, r);
         byte(0x0F), byte(0xC8 + (r & 7));
@@ -163,6 +188,45 @@ public:
         byte(0x66);
         op_mem(false, 0x89, src, m);
     }
+    void test8_imm(Mem m, u8 imm) {  // test byte [m], imm8
+        op_mem(false, 0xF6, Reg(0), m);
+        byte(imm);
+    }
+
+    // SSE scalar floating point on xmm registers (numbered 0-15).
+    enum class Sse : unsigned { Sqrt = 0x51, Add = 0x58, Mul = 0x59, Cvt = 0x5A, Sub = 0x5C, Div = 0x5E };
+    void sse(Sse op, bool dbl, unsigned dst, unsigned src) {  // addsd/addss... dst, src
+        xmm_rr(dbl ? 0xF2 : 0xF3, false, static_cast<unsigned>(op), dst, src);
+    }
+    void ucomis(bool dbl, unsigned a, unsigned b) { xmm_rr(dbl ? 0x66 : 0, false, 0x2E, a, b); }
+    void movq_to_xmm(unsigned x, Reg r, bool w = true) { xmm_rr(0x66, w, 0x6E, x, r); }
+    void movq_from_xmm(Reg r, unsigned x, bool w = true) { xmm_rr(0x66, w, 0x7E, x, r); }
+    // cvtsd2si / cvttsd2si (and ss) to a 32-bit register; cvtsi2sd (ss) from one.
+    void cvt_to_int(bool dbl, bool truncate, Reg dst, unsigned src) {
+        xmm_rr(dbl ? 0xF2 : 0xF3, false, truncate ? 0x2C : 0x2D, dst, src);
+    }
+    void cvt_from_int(bool dbl, unsigned dst, Reg src) { xmm_rr(dbl ? 0xF2 : 0xF3, false, 0x2A, dst, src); }
+    // xmm loads and stores of the low 32 or 64 bits, and a register copy.
+    void movq_load(unsigned x, Mem m) { xmm_mem(0xF3, 0x7E, x, m); }
+    void movd_load(unsigned x, Mem m) { xmm_mem(0x66, 0x6E, x, m); }
+    void movq_store(Mem m, unsigned x) { xmm_mem(0x66, 0xD6, x, m); }
+    void movd_store(Mem m, unsigned x) { xmm_mem(0x66, 0x7E, x, m); }
+    void movapd(unsigned dst, unsigned src) { xmm_rr(0x66, false, 0x28, dst, src); }
+    // FMA3 (VEX): dst = a * b - dst (vfmsub231) or dst = dst - a * b
+    // (vfnmadd231), scalar double or single.
+    void fmsub231(bool dbl, unsigned dst, unsigned a, unsigned b) { fma(dbl, 0xBB, dst, a, b); }
+    void fnmadd231(bool dbl, unsigned dst, unsigned a, unsigned b) { fma(dbl, 0xBD, dst, a, b); }
+    void ldmxcsr(Mem m) {
+        rex_opt(false, 0, m.base);
+        byte(0x0F);
+        modrm_mem(0xAE, Reg(2), m);
+    }
+    void stmxcsr(Mem m) {
+        rex_opt(false, 0, m.base);
+        byte(0x0F);
+        modrm_mem(0xAE, Reg(3), m);
+    }
+
     void add_rsp(s32 imm) { alu_imm(Alu::Add, rsp, imm); }
     void sub_rsp(s32 imm) { alu_imm(Alu::Sub, rsp, imm); }
 
@@ -210,6 +274,29 @@ private:
         byte(0x80 | ((reg & 7) << 3) | (m.base & 7));
         if ((m.base & 7) == rsp) byte(0x24);  // SIB: base only
         u32v(static_cast<u32>(m.disp));
+    }
+    // [prefix] [REX] 0F op /r, register direct (reg field `reg`, rm field `rm`).
+    void xmm_rr(unsigned prefix, bool w, unsigned op, unsigned reg, unsigned rm) {
+        if (prefix) byte(prefix);
+        rex_opt(w, reg, rm);
+        byte(0x0F), byte(op), byte(0xC0 | ((reg & 7) << 3) | (rm & 7));
+    }
+    void fma(bool dbl, unsigned op, unsigned dst, unsigned a, unsigned b) {
+        byte(0xC4);
+        byte(((~dst >> 3) & 1) << 7 | 1u << 6 | ((~b >> 3) & 1) << 5 | 0x02);  // map 0F38
+        byte((dbl ? 0x80 : 0) | ((~a & 15) << 3) | 0x01);                        // W, vvvv = a, 66
+        byte(op);
+        byte(0xC0 | ((dst & 7) << 3) | (b & 7));
+    }
+    void xmm_mem(unsigned prefix, unsigned op, unsigned x, Mem m) {
+        byte(prefix);
+        rex_opt(false, x, m.base);
+        byte(0x0F);
+        modrm_mem(op, Reg(x), m);
+    }
+    void group3(unsigned ext, Reg r, bool w) {
+        rex_opt(w, 0, r);
+        byte(0xF7), byte(0xC0 | (ext << 3) | (r & 7));
     }
     // op rm, reg (register direct)
     void op_rr(bool w, unsigned opcode, Reg reg, Reg rm) {

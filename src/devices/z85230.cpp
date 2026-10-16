@@ -29,17 +29,31 @@ Z85230::Z85230(Scheduler& scheduler, u64 char_cycles) : scheduler_(scheduler), c
     reset();
 }
 
+// Resets change only some write register bits (the SCC user manual's reset
+// table); the time constants (WR12, WR13) and the rest keep their values.
 void Z85230::reset() {
     wr9_ = 0;  // hardware reset clears MIE, VIS, NV
     wr2_ = 0;
-    channel_reset(0);
-    channel_reset(1);
+    for (unsigned ch = 0; ch < 2; ++ch) {
+        channel_reset(ch);
+        Channel& c = chan_[ch];
+        c.wr[10] = 0;
+        c.wr[11] = 0x08;
+        c.wr[14] = static_cast<u8>((c.wr[14] & 0xC0) | 0x30);
+    }
 }
 
 void Z85230::channel_reset(unsigned ch) {
     Channel& c = chan_[ch];
     c.tx_timer->cancel();
-    c.wr.fill(0);
+    c.wr[0] = 0;
+    c.wr[1] &= 0x24;
+    c.wr[3] &= 0xFE;  // receiver off
+    c.wr[4] |= 0x04;
+    c.wr[5] &= 0x61;  // transmitter off, DTR and RTS negated
+    c.wr[10] &= 0x61;
+    c.wr[14] = static_cast<u8>((c.wr[14] & 0xC3) | 0x20);
+    c.wr[15] = 0xF8;
     c.pointer = 0;
     c.rx.clear();
     c.rx_overrun = false;

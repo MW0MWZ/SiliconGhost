@@ -39,7 +39,7 @@ constexpr u32 kDm0DoSetup = 1u << 5, kDm0ColorHost = 1u << 6, kDm0StopOnX = 1u <
 constexpr u32 kDm0SkipFirst = 1u << 10, kDm0SkipLast = 1u << 11, kDm0EnZPattern = 1u << 12;
 constexpr u32 kDm0EnLsPattern = 1u << 13, kDm0LsAdvLast = 1u << 14, kDm0Length32 = 1u << 15, kDm0ZpOpaque = 1u << 16;
 constexpr u32 kDm0LsOpaque = 1u << 17, kDm0Shade = 1u << 18, kDm0LrOnly = 1u << 19, kDm0XyOffset = 1u << 20;
-constexpr u32 kDm0CiClamp = 1u << 21, kDm0YStride = 1u << 23;
+constexpr u32 kDm0CiClamp = 1u << 21, kDm0EndptFilter = 1u << 22, kDm0YStride = 1u << 23;
 constexpr u32 kDm0AlphaHost = 1u << 7;
 // DRAWMODE1
 constexpr u32 kDm1YFlip = 1u << 6, kDm1RwPacked = 1u << 7, kDm1RwDouble = 1u << 10, kDm1SwapEndian = 1u << 11;
@@ -157,11 +157,10 @@ void Newport::reset() {
     std::fill(cidaux_.begin(), cidaux_.end(), 0);
 
     vc2_ = Vc2{};
+    shown_ = Shown{};
     for (auto& x : xmap_) x = Xmap{};
     for (auto& c : cmap_) c = Cmap{};
-    ramdac_ = Ramdac{};
-    for (unsigned i = 0; i < 256; ++i)
-        for (auto& ch : ramdac_.lut) ch[i] = static_cast<u8>(i);
+    ramdac_reset();
 
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
 }
@@ -305,6 +304,18 @@ static constexpr unsigned kCiShift[4] = {11, 11, 9, 11};
 u32 Newport::ci_index() const {
     const unsigned depth = (drawmode1_ >> 3) & 3;
     return (static_cast<u32>(curr_red_) >> kCiShift[depth]) & depth_mask(depth);
+}
+
+// The index goes up by one when its fraction's top four bits exceed the
+// dither matrix entry, or without dithering when the fraction is a half or
+// more; the largest index stays put.
+u32 Newport::ci_colour(int x, int y) const {
+    const unsigned depth = (drawmode1_ >> 3) & 3;
+    u32 i = ci_index();
+    const u32 f = (static_cast<u32>(curr_red_) >> (kCiShift[depth] - 4)) & 0xF;
+    const bool up = (drawmode1_ & kDm1Dither) ? f > static_cast<u32>(kBayer[x & 3][y & 3]) : (f & 8) != 0;
+    if (up && i < depth_mask(depth)) ++i;
+    return default_color(i);
 }
 
 void Newport::set_color_index(u32 v) {
@@ -528,34 +539,45 @@ u32 Newport::default_color(u32 src) const {
     }
 }
 
+// RGB mode iterates 8-bit channels (clamped), kept as 8-8-8 until the
+// pixel is blended and reduced to the stored depth.
 u32 Newport::shaded_color(int x, int y) const {
-    const unsigned depth = (drawmode1_ >> 3) & 3;
-    if (!(drawmode1_ & kDm1RgbMode)) return default_color(ci_index());
+    if (!(drawmode1_ & kDm1RgbMode)) return ci_colour(x, y);
     auto channel = [](s32 v) -> u32 {
         const u32 c = (static_cast<u32>(v) >> 11) & 0x1FF;
         if (c >= 0x180 || v < 0) return 0;
         return c > 0xFF ? 0xFF : c;
     };
-    const u32 r = channel(curr_red_), g = channel(curr_grn_), b = channel(curr_blue_);
-    if ((drawmode1_ & kDm1Dither) && depth < 3) {
-        const int t = kBayer[x & 3][y & 3];
-        auto dither = [t](u32 s, u32 max) {
-            u32 d = s >> 4;
-            if ((s & 15) > static_cast<u32>(t)) ++d;
-            return std::min(d, max);
-        };
-        switch (depth) {
-            case 0:
-                return (dither((b >> 3) - (b >> 4), 1) << 3) | (dither((g >> 2) - (g >> 4), 3) << 1) |
-                       dither((r >> 3) - (r >> 4), 1);
-            case 1:
-                return (dither((b >> 2) - (b >> 4), 3) << 6) | (dither((g >> 1) - (g >> 4), 7) << 3) |
-                       dither((r >> 1) - (r >> 4), 7);
-            default:
-                return (dither(b - (b >> 4), 15) << 8) | (dither(g - (g >> 4), 15) << 4) | dither(r - (r >> 4), 15);
-        }
+    return (channel(curr_blue_) << 16) | (channel(curr_grn_) << 8) | channel(curr_red_);
+}
+
+// An 8-bit channel P becomes n bits by scaling it by (2^n - 1) / 2^n, as
+// S = P[7:4-n] - P[7:4], then taking S's integer part, plus one where the
+// four fraction bits exceed the dither matrix entry for the window position
+// or, without dithering, rounded by the fraction's top bit (a 1-bit channel
+// is P[7]). 24-bit pixels are stored as they are.
+u32 Newport::reduce_rgb(u32 c, int x, int y) const {
+    const unsigned depth = (drawmode1_ >> 3) & 3;
+    if (depth == 3) return c & 0xFFFFFF;
+    const bool dither = drawmode1_ & kDm1Dither;
+    const u32 t = static_cast<u32>(kBayer[x & 3][y & 3]);
+    auto channel = [&](u32 p, unsigned n) -> u32 {
+        const u32 s = (p >> (4 - n)) - (p >> 4);
+        if (dither) return (s >> 4) + ((s & 15) > t ? 1 : 0);
+        return n == 1 ? p >> 7 : (s >> 4) + ((s >> 3) & 1);
+    };
+    const u32 r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+    switch (depth) {
+        case 0: return (channel(b, 1) << 3) | (channel(g, 2) << 1) | channel(r, 1);
+        case 1: return (channel(b, 2) << 6) | (channel(g, 3) << 3) | channel(r, 3);
+        default: return (channel(b, 4) << 8) | (channel(g, 4) << 4) | channel(r, 4);
     }
-    return pack(r, g, b, depth);
+}
+
+// COLORBACK is ABGR8888 in RGB mode, an index otherwise.
+u32 Newport::background_colour(int x, int y) const {
+    if ((drawmode1_ & kDm1RgbMode) && !fastclear_) return reduce_rgb(colorback_, x, y);
+    return default_color(colorback_);
 }
 
 // Host values sit right-aligned in 8-bit fields (4- and 8-bit pixels),
@@ -584,12 +606,12 @@ u32 Newport::host_color(u32* alpha) {
         if (((drawmode1_ & kDm1RwDouble) && host_shift_ > 0) || host_shift_ > 32) host_shift_ -= width;
         else host_shift_ = 64 - width;
     }
-    const unsigned depth = (drawmode1_ >> 3) & 3;
     const unsigned planes = drawmode1_ & 7;
-    if ((planes == kPlanesRgb || planes == kPlanesRgba) && (drawmode1_ & kDm1RgbMode) && hostdepth != depth) {
+    src_wide_ = (planes == kPlanesRgb || planes == kPlanesRgba) && (drawmode1_ & kDm1RgbMode);
+    if (src_wide_ && hostdepth != 3) {
         u32 r, g, b;
         unpack(colour, hostdepth, r, g, b);
-        colour = pack(r, g, b, depth);
+        colour = pack(r, g, b, 3);
     }
     return colour;
 }
@@ -598,14 +620,22 @@ u32 Newport::host_color(u32* alpha) {
 // alpha iterator, or from the host data with ALPHAHOST (which may also be
 // set without COLORHOST, to blend iterated colours by host alphas).
 u32 Newport::source_color(int x, int y) {
+    src_wide_ = false;
     if (fastclear_) return default_color(colorvram_);
     u32 host_alpha = 0xFF, colour;
-    if (drawmode0_ & kDm0ColorHost) colour = host_color(&host_alpha);
-    else if ((drawmode0_ & kDm0Shade) || (drawmode1_ & kDm1RgbMode)) colour = shaded_color(x, y);
-    else colour = default_color(ci_index());
+    if (drawmode0_ & kDm0ColorHost) {
+        colour = host_color(&host_alpha);
+    } else {
+        colour = shaded_color(x, y);
+        src_wide_ = drawmode1_ & kDm1RgbMode;
+    }
     if ((drawmode1_ & kDm1Blend) || ((drawmode1_ >> 12) & 7) != 7) {  // blending or the alpha test need it
         if (drawmode0_ & kDm0AlphaHost) {
-            if (!(drawmode0_ & kDm0ColorHost)) host_color(&host_alpha);
+            if (!(drawmode0_ & kDm0ColorHost)) {
+                const bool wide = src_wide_;
+                host_color(&host_alpha);
+                src_wide_ = wide;
+            }
             src_alpha_ = host_alpha;
         } else {
             const u32 a = (static_cast<u32>(curr_alpha_) >> 11) & 0x1FF;
@@ -615,16 +645,18 @@ u32 Newport::source_color(int x, int y) {
     return colour;
 }
 
-// Cb = Cs * Fs + Cd * Fd for each channel, the destination being the frame
-// buffer or COLORBACK; factors are normalised as (v + msb) / 256, so 0xFF is
-// 1.0. Blending works on RGB pixels; the result replaces the logic op.
-// BLENDALPHA only changes how alpha itself is blended, and no destination
-// alpha is kept, so it is not consulted.
+// Cb = Cs * Fs + Cd * Fd for each 8-bit channel, the source not yet
+// reduced to the stored depth and the destination the frame buffer pixel
+// widened to 8 bits or COLORBACK; factors are normalised as (v + msb) / 256,
+// so 0xFF is 1.0. Blending works on RGB pixels; the result replaces the
+// logic op. BLENDALPHA only changes how alpha itself is blended, and no
+// destination alpha is kept, so it is not consulted.
 u32 Newport::blend(u32 src, int px, int py) const {
     const unsigned depth = (drawmode1_ >> 3) & 3;
     u32 sr, sg, sb, dr, dg, db;
-    unpack(src & depth_mask(depth), depth, sr, sg, sb);
-    unpack((drawmode1_ & kDm1BackBlend) ? colorback_ & depth_mask(depth) : fetch(px, py), depth, dr, dg, db);
+    unpack(src, 3, sr, sg, sb);
+    if (drawmode1_ & kDm1BackBlend) unpack(colorback_, 3, dr, dg, db);
+    else unpack(fetch(px, py), depth, dr, dg, db);
     auto norm = [](u32 v) { return v + (v >> 7); };
     const u32 sa = norm(src_alpha_);
     const unsigned sf = (drawmode1_ >> kDm1SFactorShift) & 7, df = (drawmode1_ >> kDm1DFactorShift) & 7;
@@ -649,7 +681,7 @@ u32 Newport::blend(u32 src, int px, int py) const {
         }
         return std::min<u32>(0xFF, (s * fs + d * fd) >> 8);
     };
-    return pack(channel(sr, dr), channel(sg, dg), channel(sb, db), depth);
+    return pack(channel(sr, dr), channel(sg, dg), channel(sb, db), 3);
 }
 
 // Window-relative coordinates to frame buffer: XYOFFSET adds XYMOVE (for
@@ -707,9 +739,6 @@ void Newport::store(int px, int py, u32 colour) {
     ++pixels_drawn_;
     const unsigned planes = drawmode1_ & 7, depth = (drawmode1_ >> 3) & 3;
     if (planes == kPlanesNone || planes == 3 || planes == 7) return;
-    if (!fastclear_ && (drawmode1_ & (kDm1Blend | kDm1RgbMode)) == (kDm1Blend | kDm1RgbMode) &&
-        (planes == kPlanesRgb || planes == kPlanesRgba))
-        colour = blend(colour, px, py);
     // Replicate the value into every buffer lane, then move aux values into place.
     u32 v;
     switch (depth) {
@@ -724,7 +753,14 @@ void Newport::store(int px, int py, u32 colour) {
     u32& dst = (planes == kPlanesRgb || planes == kPlanesRgba ? rgbci_ : cidaux_)
         [static_cast<std::size_t>(py) * kPitch + static_cast<std::size_t>(px)];
     if (!fastclear_ && !(drawmode1_ & kDm1Blend)) {
-        const u32 s = v, d = dst;
+        // The destination is the pixel in the buffer DBLSRC names, in every
+        // lane: a double-buffered logic op combines with that buffer.
+        u32 d = dst;
+        if ((planes == kPlanesRgb || planes == kPlanesRgba) && depth < 3) {
+            const u32 f = fetch(px, py);
+            d = depth == 0 ? f * 0x11111111u : depth == 1 ? f * 0x01010101u : f | (f << 12);
+        }
+        const u32 s = v;
         switch (drawmode1_ >> 28) {
             case 0: v = 0; break;
             case 1: v = s & d; break;
@@ -781,6 +817,11 @@ void Newport::plot_source(int x, int y, u32 colour) {
         }
         if (!(((cmp & 4) && s > d) || ((cmp & 2) && s == d) || ((cmp & 1) && s < d))) return;
     }
+    if (src_wide_) {
+        const unsigned planes = drawmode1_ & 7;
+        if ((drawmode1_ & kDm1Blend) && (planes == kPlanesRgb || planes == kPlanesRgba)) colour = blend(colour, px, py);
+        colour = reduce_rgb(colour, x, y);
+    }
     store(px, py, colour);
 }
 
@@ -816,7 +857,7 @@ void Newport::draw_span_block(bool block) {
                 // pixel failing the Z test (STEPZ) draws COLORBACK if ZPOPAQUE.
                 const bool zfail = zfail_ && drawn == 0;
                 if (!zfail && ((pattern >> bit) & 1)) plot_source(sx, sy, source_color(sx, sy));
-                else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(sx, sy, default_color(colorback_));
+                else if (zfail ? (drawmode0_ & kDm0ZpOpaque) != 0 : opaque) plot(sx, sy, background_colour(sx, sy));
                 if ((drawmode0_ & kDm0Shade) && !fastclear) iterate_shade();
                 bit = (bit - 1) & 31;
                 sx += dx;
@@ -857,12 +898,18 @@ void Newport::draw_aline() {
     const double x2 = sext(xend_ >> 7, 20) / 16.0, y2 = sext(yend_ >> 7, 20) / 16.0;
     const double m1 = xmajor ? x1 : y1, m2 = xmajor ? x2 : y2, n1 = xmajor ? y1 : x1, n2 = xmajor ? y2 : x2;
     const int step = m2 >= m1 ? 1 : -1;
+    // The specification works in the octant mirrored onto the first, where the
+    // minor axis rises: n' = dir * n, and minor pixel P is pixel -P-1 there.
+    const int dir = n2 >= n1 ? 1 : -1;
     const double slope = m2 != m1 ? (n2 - n1) / (m2 - m1) : 0.0;
-    const int first = static_cast<int>(std::lround(m1)), last = static_cast<int>(std::lround(m2));
-    auto weight = [this](double c) {
-        const unsigned i = std::min(15u, static_cast<unsigned>(c * 16));
-        return ((i < 8 ? aweight0_ : aweight1_) >> (4 * (i & 7))) & 0xF;
-    };
+    const int first = static_cast<int>(std::floor(m1)), last = static_cast<int>(std::floor(m2));
+    // The major-axis fractions of the end points, mirrored likewise, in 1/16.
+    auto frac16 = [](double v) { return static_cast<unsigned>((v - std::floor(v)) * 16); };
+    const unsigned m1_fr = step > 0 ? frac16(m1) : 16 - frac16(m1);
+    const unsigned m2_fr = step > 0 ? frac16(m2) : 16 - frac16(m2);
+    // AWEIGHT1:AWEIGHT0 hold sixteen coverages, least to most: entry i is
+    // nibble i counted from AWEIGHT1's low end, entry 15 AWEIGHT0[31:28].
+    auto weight = [this](unsigned i) { return ((i < 8 ? aweight1_ : aweight0_) >> (4 * (i & 7))) & 0xF; };
     const bool rgb = drawmode1_ & kDm1RgbMode;
     auto draw = [&](int m, int n, unsigned coverage) {
         if (!coverage) return;
@@ -873,18 +920,34 @@ void Newport::draw_aline() {
         plot_source(px, py, colour);
     };
     const bool one = !(drawmode0_ & (kDm0StopOnX | kDm0StopOnY));  // one step per GO
+    const bool filter = drawmode0_ & kDm0EndptFilter;
     for (int m = first;; m += step) {
-        const bool skip = (m == first && (drawmode0_ & kDm0SkipFirst)) || (m == last && (drawmode0_ & kDm0SkipLast));
+        const bool at_first = m == first, at_last = m == last;
+        const bool skip = (at_first && (drawmode0_ & kDm0SkipFirst)) || (at_last && (drawmode0_ & kDm0SkipLast));
         if (!skip) {
-            const double n = n1 + (m - m1) * slope;
-            const double lower = std::floor(n), f = n - lower;
-            draw(m, static_cast<int>(lower), weight(1.0 - f));
-            draw(m, static_cast<int>(lower) + 1, weight(f));
+            // s: how far the line passes above the centre of pixel S, at the
+            // major-axis centre of this column; T is the next pixel up.
+            const double n = dir * (n1 + (m + 0.5 - m1) * slope) - 0.5;
+            const double lower = std::floor(n);
+            unsigned s_frac = std::min(15u, static_cast<unsigned>((n - lower) * 16)), ns_frac = 15 - s_frac;
+            if (filter && at_first) {  // the part of the first column the line covers
+                s_frac = s_frac * (16 - m1_fr) / 16;
+                ns_frac = ns_frac * (16 - m1_fr) / 16;
+            }
+            if (filter && at_last) {
+                s_frac = s_frac * m2_fr / 16;
+                ns_frac = ns_frac * m2_fr / 16;
+            }
+            const int s_pixel = static_cast<int>(lower);
+            draw(m, dir > 0 ? s_pixel + 1 : -s_pixel - 2, weight(s_frac));  // T
+            draw(m, dir > 0 ? s_pixel : -s_pixel - 1, weight(ns_frac));     // S
         }
         if (drawmode0_ & kDm0Shade) iterate_shade();
-        if (one || m == last) {
-            // Carry on from the next step (one point per GO) or rest at the end.
-            const double nm = one && m != last ? m + step : m2, nn = one && m != last ? n1 + (nm - m1) * slope : n2;
+        if (one || at_last) {
+            // Carry on from the next column's centre (one point per GO) or rest
+            // at the end.
+            const double nm = one && !at_last ? m + step + 0.5 : m2;
+            const double nn = one && !at_last ? n1 + (nm - m1) * slope : n2;
             const auto fixed = [](double v) { return static_cast<u32>(static_cast<s32>(std::lround(v * 16))) << 7; };
             write_x_start(fixed(xmajor ? nm : nn));
             write_y_start(fixed(xmajor ? nn : nm));
@@ -974,7 +1037,7 @@ void Newport::draw_line() {
         const bool ls = !ls_en || (lspattern_ >> 31), zs = (!zp_en || ((zpattern_ >> zbit) & 1)) && !zfail;
         if (!skipped) {
             if (ls && zs) plot_source(px, py, source_color(px, py));
-            else if ((ls || ls_opaque) && (zs || zp_opaque || (zfail && zp_opaque))) plot(px, py, default_color(colorback_));
+            else if ((ls || ls_opaque) && (zs || zp_opaque || (zfail && zp_opaque))) plot(px, py, background_colour(px, py));
         }
         if (drawmode0_ & kDm0Shade) iterate_shade();
         zbit = (zbit - 1) & 31;
@@ -1192,9 +1255,11 @@ void Newport::vc2_write(unsigned crs, u8 b) {
         case 1: vc2_.data_hi = b; break;
         case 2: {
             const u16 v = static_cast<u16>((vc2_.data_hi << 8) | b);
-            // A cursor move only changes the lines it leaves and enters.
-            const bool cursor = vc2_.index == kVc2CursorX || vc2_.index == kVc2CursorY || vc2_.index == kVc2CurCursorX;
-            if (cursor) cursor_moving();
+            // The cursor and DID pointers take effect at the next vertical
+            // retrace (latch_shown()).
+            const bool latched = vc2_.index == kVc2CursorX || vc2_.index == kVc2CursorY ||
+                                 vc2_.index == kVc2CurCursorX || vc2_.index == kVc2CursorEntry ||
+                                 vc2_.index == kVc2DidEntry;
             vc2_.reg[vc2_.index] = v;
             if (vc2_.index == kVc2RamAddr) {
                 vc2_.reg[kVc2RamAddr] = v & 0x7FFF;
@@ -1202,8 +1267,7 @@ void Newport::vc2_write(unsigned crs, u8 b) {
             } else if (vc2_.index == kVc2CursorY) {
                 vc2_.reg[kVc2CurCursorX] = vc2_.reg[kVc2CursorX];
             }
-            if (cursor) cursor_moving();
-            else if (vc2_.index != kVc2RamAddr) picture_changed();
+            if (!latched && vc2_.index != kVc2RamAddr) picture_changed();
             break;
         }
         case 3:
@@ -1224,9 +1288,15 @@ void Newport::vc2_write(unsigned crs, u8 b) {
 
 u8 Newport::vc2_read(unsigned crs) {
     auto reg = [this](unsigned i) -> u16 {
-        if (i == kVc2LineCounter) {  // beam position, derived from time within the frame
+        if (i == kVc2LineCounter) {
+            // The beam's line in the frame (1065 lines with SGI's tables):
+            // the vertical interrupt comes on line 1064, the counter then
+            // reading about 1054 (it counts from the start of the timing
+            // table's frame, ahead of the display).
+            constexpr u64 kLines = 1065, kAtInterrupt = 1054;
             const u64 frame = static_cast<u64>(cpu_hz_ / 60);
-            return static_cast<u16>((scheduler_.now() % frame) * 1066 / frame);
+            const u64 since = (scheduler_.now() - last_retrace_) % frame;
+            return static_cast<u16>((kAtInterrupt + since * kLines / frame) % kLines);
         }
         return vc2_.reg[i];
     };
@@ -1329,39 +1399,100 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
             return v;
         }
         case 3: return c.command;
-        case 4: return 0x18;  // write FIFO empty
+        case 4: return static_cast<u8>(0x18 | (c.rgb & 3));  // write FIFO empty; the R/G/B byte counter
         case 6:
-            // CMAP0: board revision and 8-bit flag; CMAP1: monitor sense.
-            if (which == 0) return opts_.xl24 ? 0x02 : 0xA1;
+            // CMAP0: 8-bit flag, board revision (6:4) and CMAP revision;
+            // CMAP1: monitor sense.
+            if (which == 0) {
+                const int rev = opts_.board_revision >= 0 ? opts_.board_revision & 7 : opts_.xl24 ? 0 : 2;
+                return static_cast<u8>((opts_.xl24 ? 0x02 : 0x81) | (rev << 4));
+            }
             return static_cast<u8>((opts_.monitor_id << 4) | (opts_.xl24 ? 0x02 : 0x01));
         case 7: return c.crs7;
         default: return 0;
     }
 }
 
+namespace {
+// Bt445 reset values (data sheet table 1): control (CRS 2), the channel
+// registers (CRS 5: MSB position, width, display and blink enable for red,
+// green, blue, overlay and cursor) and the configuration (CRS 6).
+constexpr u8 kBtControl[8] = {0x3A, 0xA0, 0, 0, 0xFF, 0x00, 0x43, 0x00};
+constexpr u8 kBtChannel[0x24] = {0x07, 0x08, 0xFF, 0, 0, 0, 0, 0, 0x07, 0x08, 0xFF, 0, 0, 0, 0, 0,
+                                 0x07, 0x08, 0xFF, 0, 0, 0, 0, 0, 0x09, 0x02, 0x03, 0, 0, 0, 0, 0,
+                                 0x00, 0x02, 0x03, 0};
+constexpr u8 kBtConfig[16] = {0, 0x40, 0, 0x03, 0, 0x19, 0x04, 0, 0x04, 0x28, 0x08, 0x03, 0, 0x0A, 0, 0x01};
+constexpr unsigned kBtPixelFormat = 0x0A;
+}  // namespace
+
+void Newport::ramdac_reset() {
+    ramdac_ = Ramdac{};
+    for (unsigned i = 0; i < 256; ++i)
+        for (auto& ch : ramdac_.lut) ch[i] = static_cast<u8>(i);
+    std::copy(std::begin(kBtControl), std::end(kBtControl), ramdac_.control.begin());
+    std::copy(std::begin(kBtChannel), std::end(kBtChannel), ramdac_.channel.begin());
+    std::copy(std::begin(kBtConfig), std::end(kBtConfig), ramdac_.config.begin());
+}
+
+// The Pixel Format register's bits 1:0 say where gamma bypass comes from:
+// 01 always, 10 the bypass bit of each pixel (the XMAP9 mode's, as the
+// PROM sets it up), 00 never.
+bool Newport::gamma_bypassed(u32 mode) const {
+    switch (ramdac_.config[kBtPixelFormat] & 3) {
+        case 1: return true;
+        case 2: return mode & 4;
+        default: return false;
+    }
+}
+
 void Newport::ramdac_write(unsigned crs, u8 b) {
     picture_changed();
+    auto colour = [&](auto& table, unsigned size) {
+        table[ramdac_.rgb][ramdac_.addr % size] = b;
+        if (++ramdac_.rgb == 3) {
+            ramdac_.rgb = 0;
+            ++ramdac_.addr;
+        }
+    };
     switch (crs) {
         case 0:
             ramdac_.addr = b;
             ramdac_.rgb = 0;
             break;
-        case 1:
-            ramdac_.lut[ramdac_.rgb][ramdac_.addr] = b;
-            if (++ramdac_.rgb == 3) {
-                ramdac_.rgb = 0;
-                ++ramdac_.addr;
-            }
+        case 1: colour(ramdac_.lut, 256); break;
+        case 2:
+            if (ramdac_.addr >= 2 && ramdac_.addr < ramdac_.control.size()) ramdac_.control[ramdac_.addr] = b;  // ID, revision read-only
             break;
-        default: ramdac_.regs[crs] = b; break;
+        case 3: colour(ramdac_.overlay, 16); break;
+        case 5:
+            if (ramdac_.addr < ramdac_.channel.size()) ramdac_.channel[ramdac_.addr] = b;
+            break;
+        case 6:
+            if (ramdac_.addr < ramdac_.config.size()) ramdac_.config[ramdac_.addr] = b;
+            break;
+        case 7: colour(ramdac_.cursor, 4); break;
+        default: break;
     }
 }
 
 u8 Newport::ramdac_read(unsigned crs) {
+    auto colour = [&](const auto& table, unsigned size) {
+        const u8 v = table[ramdac_.rgb][ramdac_.addr % size];
+        if (++ramdac_.rgb == 3) {
+            ramdac_.rgb = 0;
+            ++ramdac_.addr;
+        }
+        return v;
+    };
     switch (crs) {
         case 0: return ramdac_.addr;
-        case 2: return 0xA0;  // revision A
-        default: return ramdac_.regs[crs];
+        case 1: return colour(ramdac_.lut, 256);
+        case 2: return ramdac_.addr < ramdac_.control.size() ? ramdac_.control[ramdac_.addr] : 0;
+        case 3: return colour(ramdac_.overlay, 16);
+        case 5: return ramdac_.addr < ramdac_.channel.size() ? ramdac_.channel[ramdac_.addr] : 0;
+        case 6: return ramdac_.addr < ramdac_.config.size() ? ramdac_.config[ramdac_.addr] : 0;
+        case 7: return colour(ramdac_.cursor, 4);
+        default: return 0;
     }
 }
 
@@ -1377,6 +1508,8 @@ void Newport::set_vrint(bool level) {
 
 void Newport::retrace() {
     ++frames_;
+    last_retrace_ = scheduler_.now();
+    latch_shown();
     if (vc2_.reg[kVc2Control] & kDcrVintr) set_vrint(true);
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
 }
@@ -1422,15 +1555,18 @@ constexpr int kCursorScreenX = 29, kCursorScreenY = 31, kScanDelay = 2;
 constexpr u8 kXmapPupEnable = 0x01;  // XMAP9 config: pop-up planes shown
 constexpr u8 kXmapEightBit = 0x04;   // XMAP9 config: 8-bit system (the XL8)
 
+// The crosshair, centred on the cursor position, is the whole line and
+// column through it, in cursor colour 1.
 unsigned Newport::cursor_pixel(int x, int y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
-    if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return 0;
+    if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible)) return 0;
+    const int col = x - (static_cast<int>(shown_.cursor_x) - kCursorScreenX + kScanDelay);
+    const int row = y - (static_cast<int>(shown_.cursor_y) - kCursorScreenY);
+    if (dcr & kDcrCrosshair) return col == 0 || row == 0 ? 1 : 0;
     const bool large = dcr & kDcrLargeCursor;
     const int size = large ? 64 : 32;
-    const int col = x - (static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay);
-    const int row = y - (static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY);
     if (col < 0 || col >= size || row < 0 || row >= size) return 0;
-    const unsigned entry = vc2_.reg[kVc2CursorEntry];
+    const unsigned entry = shown_.cursor_entry;
     const unsigned bit = 15 - (col & 15);
     if (large) return (vc2_.ram[(entry + row * 4 + (col >> 4)) & 0x7FFF] >> bit) & 1;
     const unsigned word = entry + row * 2 + (col >> 4);
@@ -1445,15 +1581,25 @@ bool Newport::cursor_position(int& x, int& y) const {
     return true;
 }
 
-void Newport::cursor_moving() {
-    ++display_version_;
-    const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
-    const int first = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
-    if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
-        full_redraw_ = true;
-        cursor_rows_.clear();
+void Newport::latch_shown() {
+    const Shown now{vc2_.reg[kVc2CurCursorX], vc2_.reg[kVc2CursorY], vc2_.reg[kVc2CursorEntry], vc2_.reg[kVc2DidEntry]};
+    const bool crosshair = vc2_.reg[kVc2Control] & kDcrCrosshair;
+    const bool moved = now.cursor_x != shown_.cursor_x || now.cursor_y != shown_.cursor_y;
+    if (now.did_entry != shown_.did_entry || (crosshair && moved)) picture_changed();
+    if (moved || now.cursor_entry != shown_.cursor_entry) {
+        // A cursor move only changes the lines it leaves and enters.
+        ++display_version_;
+        const int size = (vc2_.reg[kVc2Control] & kDcrLargeCursor) ? 64 : 32;
+        if (cursor_rows_.size() >= 64) {  // a lot of movement since the last picture
+            full_redraw_ = true;
+            cursor_rows_.clear();
+        }
+        for (const u16 y : {shown_.cursor_y, now.cursor_y}) {
+            const int first = static_cast<int>(y) - kCursorScreenY;
+            cursor_rows_.emplace_back(first, first + size);
+        }
     }
-    cursor_rows_.emplace_back(first, first + size);
+    shown_ = now;
 }
 
 const Newport::ModeTable& Newport::mode_table(unsigned did) {
@@ -1464,7 +1610,7 @@ const Newport::ModeTable& Newport::mode_table(unsigned did) {
     const std::vector<u32>& pal = cmap_[0].palette;
     const unsigned pix_mode = (mode >> 8) & 3, pix_size = (mode >> 10) & 3, buf = mode & 1;
     auto finish = [&](u32 rgb) {
-        if (!(mode & 4))  // gamma correction in the RAMDAC unless bypassed
+        if (!gamma_bypassed(mode))  // gamma correction in the RAMDAC unless bypassed
             rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
                   ramdac_.lut[2][rgb & 0xFF];
         return 0xFF000000u | rgb;
@@ -1504,7 +1650,7 @@ u32 Newport::direct_colour(u32 mode, u32 pix) const {
     unpack(pix & 0xFFFFFF, 3, r, g, b);
     const u32 map = 0x1C00 + ((mode >> 8) & 3) * 0x100;
     u32 rgb = (pal[map + r] & 0xFF0000) | (pal[map + g] & 0xFF00) | (pal[map + b] & 0xFF);
-    if (!(mode & 4))
+    if (!gamma_bypassed(mode))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
     return 0xFF000000u | rgb;
@@ -1539,7 +1685,7 @@ u32 Newport::pixel_colour(u32 mode, u32 pix) const {
         const u32 base = 0x1C00 + pix_mode * 0x100;
         rgb = (pal[base + r] & 0xFF0000) | (pal[base + g] & 0xFF00) | (pal[base + b] & 0xFF);
     }
-    if (!(mode & 4))
+    if (!gamma_bypassed(mode))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
     return 0xFF000000u | rgb;
@@ -1611,7 +1757,7 @@ u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
     u32 addr = 0;
     if (!aux_layer(mode, pixel_value_nonzero(mode, pix), aux, cursor, addr)) return pixel_colour(mode, pix);
     u32 rgb = pal[addr];
-    if (!(mode & 4))
+    if (!gamma_bypassed(mode))
         rgb = (u32{ramdac_.lut[0][(rgb >> 16) & 0xFF]} << 16) | (u32{ramdac_.lut[1][(rgb >> 8) & 0xFF]} << 8) |
               ramdac_.lut[2][rgb & 0xFF];
     return 0xFF000000u | rgb;
@@ -1639,10 +1785,11 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
     }
 
     // The cursor's rows and columns (scan-out coordinates).
-    const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible) && !(dcr & kDcrCrosshair);
+    const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible);
+    const bool crosshair = dcr & kDcrCrosshair;
     const int cursor_size = (dcr & kDcrLargeCursor) ? 64 : 32;
-    const int cursor_x0 = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX + kScanDelay;  // frame buffer column
-    const int cursor_y0 = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
+    const int cursor_x0 = static_cast<int>(shown_.cursor_x) - kCursorScreenX + kScanDelay;  // frame buffer column
+    const int cursor_y0 = static_cast<int>(shown_.cursor_y) - kCursorScreenY;
 
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
@@ -1653,7 +1800,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
         if (!needed) continue;
         records.clear();
         if (dcr & kDcrDid) {
-            unsigned p = vc2_.ram[(vc2_.reg[kVc2DidEntry] + y) & 0x7FFF];
+            unsigned p = vc2_.ram[(shown_.did_entry + y) & 0x7FFF];
             for (int i = 0; i < 1024; ++i) {
                 const u16 r = vc2_.ram[p++ & 0x7FFF];
                 const int rx = r >> 5;
@@ -1661,7 +1808,8 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                 records.emplace_back(rx, static_cast<u8>(r & 31));
             }
         }
-        const bool cursor_row = cursor_on && static_cast<int>(y) >= cursor_y0 && static_cast<int>(y) < cursor_y0 + cursor_size;
+        const bool cursor_row = cursor_on && !crosshair && static_cast<int>(y) >= cursor_y0 &&
+                                static_cast<int>(y) < cursor_y0 + cursor_size;
         const u32* const pix_row = &rgbci_[static_cast<std::size_t>(row) * kPitch];
         const u32* const aux_row = &cidaux_[static_cast<std::size_t>(row) * kPitch];
         u32* const out = &argb[static_cast<std::size_t>(y) * width];
@@ -1686,9 +1834,11 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                 const bool inside = x < static_cast<unsigned>(kPitch);
                 const u32 pix = inside ? pix_row[x] : 0;
                 const u32 aux = inside ? aux_row[x] : 0;
-                const unsigned cp = cursor_row && static_cast<int>(x) >= cursor_x0 && static_cast<int>(x) < cursor_x0 + cursor_size
-                                        ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
-                                        : 0;
+                const unsigned cp =
+                    (cursor_row && static_cast<int>(x) >= cursor_x0 && static_cast<int>(x) < cursor_x0 + cursor_size) ||
+                            (cursor_on && crosshair && (static_cast<int>(x) == cursor_x0 || static_cast<int>(y) == cursor_y0))
+                        ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
+                        : 0;
                 u32& o = out[x - kPipelineDelay];
                 if (cp || (aux & special) || underlay) o = special_colour(mode, pix, aux, cp);
                 else if (t.direct) o = direct_colour(mode, pix);
@@ -1720,7 +1870,7 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
     for (unsigned y = 0; y < height; ++y) {
         records.clear();
         if (dcr & kDcrDid) {
-            unsigned p = vc2_.ram[(vc2_.reg[kVc2DidEntry] + y) & 0x7FFF];
+            unsigned p = vc2_.ram[(shown_.did_entry + y) & 0x7FFF];
             for (int i = 0; i < 1024; ++i) {
                 const u16 r = vc2_.ram[p++ & 0x7FFF];
                 const int rx = r >> 5;

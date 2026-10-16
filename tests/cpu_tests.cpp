@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Andy Taylor
 // R4000 interpreter tests: hand-assembled programs run from kseg0 in kernel mode.
 #include <array>
+#include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <initializer_list>
 #include <iterator>
 #include <tuple>
@@ -28,9 +30,9 @@ struct Rig {
     static constexpr u64 kRamSize = 8u << 20;
     std::vector<u8> ram = std::vector<u8>(kRamSize);
     Bus bus;
-    R4000 cpu{bus};
+    R4000 cpu;
 
-    Rig() {
+    explicit Rig(const R4000::Options& options = R4000::Options{}) : cpu(bus, options) {
         bus.map_ram(0, kRamSize, ram.data());
         cpu.cp0_write(cop0::Status, 0);  // kernel mode, BEV=0, ERL=0, interrupts off
         cpu.set_pc(kCode);
@@ -480,7 +482,7 @@ TEST(cpu_idle_skip_nested_poll_loop_with_pure_device_read) {
     CHECK_EQ(fast.cpu.cp0_read(cop0::Cause), slow.cpu.cp0_read(cop0::Cause));
     CHECK_EQ(fast.cpu.gpr[t4], slow.cpu.gpr[t4]);
     CHECK(fast.cpu.idle_skipped_cycles() > 140000);
-    CHECK(dev_fast.reads < dev_slow.reads / 100);
+    CHECK(dev_fast.reads < dev_slow.reads / 50);  // found within a few spans of iterations
 }
 
 TEST(cpu_idle_skip_never_skips_impure_device_reads) {
@@ -586,6 +588,8 @@ namespace {
 // Final state of a run, for comparing the block cache with step().
 struct CpuState {
     std::array<u64, 32> gpr{};
+    std::array<u64, 32> fpr{};
+    u32 fcr31 = 0;
     u64 hi = 0, lo = 0, pc = 0, cycles = 0, epc = 0, cause = 0;
     std::vector<u8> data;
     bool operator==(const CpuState&) const = default;
@@ -594,6 +598,8 @@ struct CpuState {
 CpuState capture(Rig& t, u64 data_paddr, std::size_t data_size) {
     CpuState s;
     s.gpr = t.cpu.gpr;
+    s.fpr = t.cpu.fpr;
+    s.fcr31 = t.cpu.fcr31;
     s.hi = t.cpu.hi;
     s.lo = t.cpu.lo;
     s.pc = t.cpu.pc;
@@ -608,7 +614,7 @@ CpuState capture(Rig& t, u64 data_paddr, std::size_t data_size) {
 // A random straight-line program with forward branches, using every
 // instruction the block cache decodes ahead (and a few it does not).
 // Runs from `base` (kseg0), which may be anywhere in the first 64 KiB.
-std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
+std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode, bool mips4 = false) {
     u64 x = seed * 0x9E3779B97F4A7C15ull + 1;
     auto rnd = [&](u32 n) {
         x ^= x << 13;
@@ -625,9 +631,14 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
     };
     static constexpr unsigned kRFuncts[] = {0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x12, 0x18, 0x19,
                                             0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2F,
-                                            0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B};
-    static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19};
-    static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F, 0x22, 0x26};
+                                            0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B,
+                                            0x14, 0x16, 0x17, 0x1C, 0x1D, 0x1E, 0x1F, 0x34};
+    // ADD, SUB, DADD, DSUB; TGE, TGEU, TLT, TLTU, TNE
+    static constexpr unsigned kTrapping[] = {0x20, 0x22, 0x2C, 0x2E, 0x30, 0x31, 0x32, 0x33, 0x36};
+    static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19, 0x08, 0x18};
+    static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F,
+                                              0x22, 0x26, 0x2A, 0x2E, 0x1A, 0x1B, 0x2C, 0x2D};
+    auto merge_op = [](unsigned op) { return op == 0x22 || op == 0x26 || op == 0x2A || op == 0x2E || (op >= 0x1A && op <= 0x1B) || op == 0x2C || op == 0x2D; };
     static constexpr unsigned kBranches[] = {0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17};
 
     // The body runs several times, so that its blocks become hot.
@@ -638,6 +649,20 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
             case 0:
             case 1:
             case 2: {
+                if (rnd(16) == 0) {  // may overflow (and end the run): mostly with a zero operand
+                    const unsigned f = kTrapping[rnd(std::size(kTrapping))];
+                    prog.push_back(R(f, reg(), rnd(4) ? 0 : reg(), dst(), 0));
+                    break;
+                }
+                if (mips4 && rnd(4) == 0) {  // MOVZ, MOVN, MOVF/MOVT (on a random condition code), PREF
+                    switch (rnd(4)) {
+                        case 0: prog.push_back(R(0x0A, reg(), reg(), dst())); break;
+                        case 1: prog.push_back(R(0x0B, reg(), reg(), dst())); break;
+                        case 2: prog.push_back((reg() << 21) | (rnd(8) << 18) | (rnd(2) << 16) | (dst() << 11) | 0x01); break;
+                        default: prog.push_back(I(0x33, reg(), rnd(32), static_cast<s32>(rnd(65536)) - 32768)); break;
+                    }
+                    break;
+                }
                 const unsigned f = kRFuncts[rnd(std::size(kRFuncts))];
                 prog.push_back(R(f, reg(), reg(), dst(), rnd(32)));
                 break;
@@ -646,7 +671,7 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
             case 4: prog.push_back(I(kImmOps[rnd(std::size(kImmOps))], reg(), dst(), static_cast<s32>(rnd(65536)) - 32768)); break;
             case 5: {  // within the data area; rarely misaligned (an address error)
                 const unsigned op = kLoadStore[rnd(std::size(kLoadStore))];
-                const s32 skew = (op == 0x22 || op == 0x26) ? static_cast<s32>(rnd(4)) : rnd(150) == 0 ? 1 : 0;
+                const s32 skew = merge_op(op) ? static_cast<s32>(rnd(8)) : rnd(150) == 0 ? 1 : 0;
                 prog.push_back(I(op, s0, dst(), static_cast<s32>(rnd(128) * 8) + skew));
                 break;
             }
@@ -664,6 +689,11 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
                 } else if (rnd(3) == 0) {
                     static constexpr unsigned kRegimm[] = {0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13};
                     prog.push_back(I(0x01, reg(), kRegimm[rnd(std::size(kRegimm))], off));  // BLTZ/BGEZ(AL)(L)
+                    if (rnd(4) == 0) {  // TEQI or another immediate trap, mostly not taken
+                        static constexpr unsigned kTraps[] = {0x0C, 0x0C, 0x0C, 0x08, 0x09, 0x0A, 0x0B, 0x0E};
+                        prog.push_back(I(0x01, reg(), kTraps[rnd(std::size(kTraps))], static_cast<s32>(rnd(64))));
+                        break;
+                    }
                 } else {
                     prog.push_back(I(kBranches[rnd(std::size(kBranches))], reg(), reg(), off));
                 }
@@ -690,14 +720,28 @@ void use_engine(Rig& t, Engine engine) {
     t.cpu.set_jit(engine == Engine::Jit);
 }
 
-// Each engine runs `seeds` random programs from physical address `base`.
-static void check_random_programs(u32 seeds, unsigned length, u64 base) {
+R4000::Options r5000_options() {
+    R4000::Options o;
+    o.core = Core::R5000;
+    o.prid = 0x2321;
+    o.config = R4000::kR5000Config;
+    o.scache_bytes = 512u << 10;
+    return o;
+}
+
+// Each engine runs `seeds` random programs from physical address `base`;
+// on an R5000 (with the FPU usable, for MOVF/MOVT) with `mips4`.
+static void check_random_programs(u32 seeds, unsigned length, u64 base, bool mips4 = false) {
     constexpr u64 kData = 0x10000;
     for (u32 seed = 1; seed <= seeds; ++seed) {
-        const std::vector<u32> prog = random_program(seed, length, 0xFFFFFFFF80000000ull + base);
+        const std::vector<u32> prog = random_program(seed, length, 0xFFFFFFFF80000000ull + base, mips4);
         auto run = [&](Engine engine) {
-            Rig t;
+            Rig t(mips4 ? r5000_options() : R4000::Options{});
             use_engine(t, engine);
+            if (mips4) {
+                t.cpu.cp0_write(cop0::Status, sr::CU1);
+                t.cpu.fcr31 = static_cast<u32>(seed * 0x9E3779B9u) & 0xFE800000u;  // condition codes
+            }
             t.cpu.set_idle_skip(false);
             u64 x = seed;
             for (unsigned i = 1; i < 32; ++i) {
@@ -728,6 +772,546 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) { check_rando
 
 TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs_across_pages) {
     check_random_programs(60, 1500, 0x1E00);
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_mips4_programs) {
+    check_random_programs(150, 600, 0x1000, true);
+}
+
+namespace {
+
+// A random program of FPU operations: arithmetic, conversions, compares and
+// branches on the condition, moves and loads/stores, on values mostly in a
+// moderate range (sometimes special: zeros, infinities, NaNs, denormals),
+// with the FPU enabled in either register mode.
+std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base, bool mips4 = false) {
+    u64 x = seed * 0x9E3779B97F4A7C15ull + 7;
+    auto rnd = [&](u32 n) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        return static_cast<u32>(x % n);
+    };
+    auto dst = [&] {  // never s0 (the data pointer), s1 (the loop counter) or s2 (an index into the data)
+        unsigned r;
+        do r = rnd(32);
+        while (r == s0 || r == s1 || r == s2);
+        return r;
+    };
+    static constexpr unsigned kFuncs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D, 0x0E, 0x0F,
+                                          0x20, 0x21, 0x24, 0x25, 0x08, 0x09, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+                                          0x36, 0x37, 0x38, 0x3A, 0x3C, 0x3E, 0x3F};
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    const unsigned main_fmt = 16 + (seed & 1);  // S or D
+    std::vector<u32> prog{ADDIU(s1, zero, 12)};
+    while (prog.size() + 5 < length) {
+        const unsigned room = length - 5 - static_cast<unsigned>(prog.size());
+        if (mips4 && rnd(4) == 0) {
+            const unsigned fmt = rnd(6) ? main_fmt : 16 + rnd(2);
+            switch (rnd(8)) {
+                case 0: case 1: {  // LWXC1, LDXC1, SWXC1, SDXC1, PREFX through the index register
+                    static constexpr unsigned kOps[] = {0x00, 0x01, 0x08, 0x09, 0x0F};
+                    prog.push_back(ADDIU(s2, zero, static_cast<s32>(rnd(256) * 8 + (rnd(100) == 0 ? 4 : 0))));
+                    prog.push_back((0x13u << 26) | (s0 << 21) | (s2 << 16) | (rnd(32) << 11) | (rnd(32) << 6) |
+                                   kOps[rnd(std::size(kOps))]);
+                    break;
+                }
+                case 2: case 3:  // MADD, MSUB, NMADD, NMSUB
+                    prog.push_back((0x13u << 26) | (rnd(32) << 21) | (rnd(32) << 16) | (rnd(32) << 11) |
+                                   (rnd(32) << 6) | (0x20 + 8 * rnd(4) + (fmt & 1)));
+                    break;
+                case 4:  // C.cond to any condition code
+                    prog.push_back(cop1(fmt, rnd(32), rnd(32), rnd(8) << 2, 0x30 + rnd(16)));
+                    break;
+                case 5: {  // MOVF/MOVT.fmt, MOVZ/MOVN.fmt, RECIP, RSQRT
+                    static constexpr unsigned kOps[] = {0x11, 0x12, 0x13, 0x15, 0x16};
+                    prog.push_back(cop1(fmt, rnd(32), rnd(32), rnd(32), kOps[rnd(std::size(kOps))]));
+                    break;
+                }
+                default:  // BC1 on any condition code
+                    if (room < 12) break;
+                    prog.push_back((0x11u << 26) | (0x08u << 21) | (rnd(8) << 18) | (rnd(4) << 16) | (1 + rnd(8)));
+                    prog.push_back(cop1(main_fmt, rnd(32), rnd(32), rnd(32), rnd(8)));
+                    break;
+            }
+            continue;
+        }
+        switch (rnd(10)) {
+            case 0: case 1: case 2: case 3: {
+                const unsigned fmt = rnd(6) ? main_fmt : 16 + rnd(2);
+                prog.push_back(cop1(fmt, rnd(32), rnd(32), rnd(32), kFuncs[rnd(std::size(kFuncs))]));
+                break;
+            }
+            case 4:  // CVT.S/D.W or .L
+                prog.push_back(cop1(rnd(4) ? 20 : 21, 0, rnd(32), rnd(32), 0x20 + rnd(2)));
+                break;
+            case 5: {  // MFC1, DMFC1, CFC1, MTC1, DMTC1 (CTC1 rarely: it may set traps)
+                static constexpr unsigned kMoves[] = {0x00, 0x01, 0x02, 0x04, 0x05, 0x00, 0x04};
+                unsigned m = kMoves[rnd(std::size(kMoves))];
+                if (rnd(40) == 0) m = 0x06;
+                const unsigned rt = (m == 0x04 || m == 0x05 || m == 0x06) ? rnd(32) : dst();
+                prog.push_back(cop1(m, rt, m == 0x02 || m == 0x06 ? (rnd(2) ? 31 : 0) : rnd(32), 0, 0));
+                break;
+            }
+            case 6: {  // LWC1, LDC1, SWC1, SDC1 within the data area
+                static constexpr unsigned kOps[] = {0x31, 0x35, 0x39, 0x3D};
+                const unsigned op = kOps[rnd(4)];
+                prog.push_back(I(op, s0, rnd(32), static_cast<s32>(rnd(128) * 8 + (rnd(100) == 0 ? 4 : 0))));
+                break;
+            }
+            case 7: {  // BC1F, BC1T, BC1FL, BC1TL forwards; the delay slot is an FPU operation or a move
+                if (room < 12) break;
+                prog.push_back((0x11u << 26) | (0x08u << 21) | (rnd(4) << 16) | (1 + rnd(8)));
+                prog.push_back(rnd(2) ? cop1(main_fmt, rnd(32), rnd(32), rnd(32), rnd(8))
+                                      : I(0x09, rnd(32), dst(), static_cast<s32>(rnd(256))));
+                break;
+            }
+            default: prog.push_back(I(0x09, rnd(32), dst(), static_cast<s32>(rnd(65536)) - 32768)); break;
+        }
+    }
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, 1 - static_cast<s32>(prog.size() + 1)));
+    prog.push_back(NOP);
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    (void)base;
+    return prog;
+}
+
+}  // namespace
+
+// The x86-64 recompiler checks FPU results with FMA where the host has it,
+// else with the host's exception flags: both are run.
+static void check_random_fpu_programs(bool mips4 = false) {
+    constexpr u64 kData = 0x10000, kBase = 0x1000;
+    constexpr unsigned kLength = 400;
+    for (u32 seed = 1; seed <= 300; ++seed) {
+        const std::vector<u32> prog = random_fp_program(seed, kLength, kBase, mips4);
+        auto run = [&](Engine engine) {
+            Rig t(mips4 ? r5000_options() : R4000::Options{});
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            u64 x = seed;
+            auto next = [&] {
+                x = x * 6364136223846793005ull + 1442695040888963407ull;
+                return x;
+            };
+            auto value = [&](bool dbl) -> u64 {  // mostly a moderate number, sometimes special
+                const u64 r = next();
+                switch ((r >> 58) & 63) {
+                    case 0: return 0;
+                    case 1: return dbl ? 0x7FF0000000000000ull : 0x7F800000u;     // infinity
+                    case 2: return dbl ? 0x7FF8000000000001ull : 0x7FC00001u;     // NaN (signaling on MIPS)
+                    case 3: return dbl ? 0x7FF0000000000001ull : 0x7F800001u;     // NaN (quiet on MIPS)
+                    case 4: return dbl ? (r & 0x000FFFFFFFFFFFFFull) : (r & 0x007FFFFFu);  // denormal
+                    case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12: {
+                        // a small integer or a power of two: exact sums and products
+                        const double v = (r & 1) ? static_cast<double>(1 + (r >> 8) % 16)
+                                                 : std::ldexp(1.0, static_cast<int>((r >> 8) % 21) - 10);
+                        const double sv = (r & 2) ? -v : v;
+                        if (dbl) {
+                            u64 bits;
+                            std::memcpy(&bits, &sv, 8);
+                            return bits;
+                        }
+                        const float f = static_cast<float>(sv);
+                        u32 bits;
+                        std::memcpy(&bits, &f, 4);
+                        return bits;
+                    }
+                    default: {  // sign, exponent within 2^-20..2^20, random fraction
+                        const u64 sign = (r >> 59) & 1, exp = (r >> 32) % 41;
+                        if (dbl) return (sign << 63) | ((1003 + exp) << 52) | (r & 0x000FFFFFFFFFFFFFull);
+                        return (sign << 31) | ((107 + exp) << 23) | (r & 0x007FFFFFu);
+                    }
+                }
+            };
+            const bool fr = (seed >> 1) & 1;
+            for (unsigned i = 1; i < 32; ++i) t.cpu.gpr[i] = (i & 1) ? sext32(next() >> 17) : next();
+            for (unsigned i = 0; i < 32; ++i)
+                t.cpu.fpr[i] = (seed & 1) ? value(true) : (value(false) << 32) | value(false);
+            t.cpu.gpr[s0] = 0xFFFFFFFF80000000ull + kData;
+            t.cpu.gpr[s2] = 0;
+            for (u64 a = 0; a < 0x800; a += 8) store_be<u64>(&t.ram[kData + a], value(seed & 1));
+            // Mostly round to nearest without traps; sometimes another mode, FS, or a trap enabled.
+            u32 fcsr = 0;
+            if (seed % 5 == 0) fcsr |= 1 + seed / 5 % 3;
+            if (seed % 7 == 0) fcsr |= 1u << 24;
+            if (seed % 11 == 0) fcsr |= 0x80u << (seed / 11 % 5);
+            t.cpu.fcr31 = fcsr;
+            t.cpu.cp0_write(cop0::Status, sr::CU1 | (fr ? sr::FR : 0));
+            u64 paddr = kBase;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            // Exceptions are counted (in the data area) and the faulting
+            // instruction is skipped.
+            t.load({MFC0(k0, cop0::EPC), ADDIU(k0, k0, 4), MTC0(k0, cop0::EPC), LUI(k1, 0x8001),
+                    LW(k0, 0x7FC, k1), ADDIU(k0, k0, 1), SW(k0, 0x7FC, k1), ERET}, 0x180);
+            t.cpu.set_pc(0xFFFFFFFF80000000ull + kBase);
+            t.cpu.run_until(40 * kLength + 8000);
+            return capture(t, kData, 0x800);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        if (!(run(Engine::Blocks) == reference) || !(run(Engine::Jit) == reference)) {
+            CHECK_EQ(seed, 0u);  // report the failing seed
+            break;
+        }
+    }
+}
+
+// Each FPU operation the recompiler translates, on operands that give an
+// exact and an inexact result, with FCR31 (Cause and the flags) read right
+// after it: the same in every engine.
+TEST(cpu_jit_fpu_cause_matches_interpreter) {
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto cfc1 = [](unsigned rt) { return (0x11u << 26) | (0x02u << 21) | (rt << 16) | (31u << 11); };
+    auto dbits = [](double v) {
+        u64 b;
+        std::memcpy(&b, &v, 8);
+        return b;
+    };
+    auto fbits = [](float v) {
+        u32 b;
+        std::memcpy(&b, &v, 4);
+        return u64{b};
+    };
+    // f0..f7: doubles 3, 4, 1/3, 2, 16777217, 2^-1000; f8..f13 singles 3, 4, 1/3, 2, 9
+    const std::vector<u64> values = {dbits(3.0), dbits(4.0), dbits(1.0 / 3), dbits(2.0), dbits(16777217.0),
+                                     dbits(std::ldexp(1.0, -1000)), dbits(2.5), dbits(0.1), fbits(3.0f),
+                                     fbits(4.0f), fbits(1.0f / 3), fbits(2.0f), fbits(9.0f), fbits(0.1f),
+                                     // f14..f19: products of long operands that are exact, or just not
+                                     dbits(67108865.0), dbits(4503599761588225.0), dbits(134217729.0),
+                                     fbits(2049.0f), fbits(4097.0f), fbits(4198401.0f)};
+    std::vector<u32> body;
+    s32 slot = 0;
+    auto op = [&](u32 w) {  // the operation, then FCR31 to the next word of the data area
+        body.push_back(w);
+        body.push_back(cfc1(t0));
+        body.push_back(SW(t0, slot, s0));
+        slot += 4;
+    };
+    for (unsigned func : {0u, 1u, 2u, 3u}) {
+        op(cop1(17, 1, 0, 20, func));   // 3 op 4: exact
+        op(cop1(17, 2, 0, 20, func));   // 3 op 1/3
+        op(cop1(16, 9, 8, 20, func));   // single 3 op 4
+        op(cop1(16, 10, 8, 20, func));  // single 3 op 1/3
+    }
+    op(cop1(17, 0, 1, 20, 4));    // SQRT.D 4: exact
+    op(cop1(17, 0, 3, 20, 4));    // SQRT.D 2: inexact
+    op(cop1(16, 0, 9, 20, 4));    // SQRT.S 4
+    op(cop1(16, 0, 11, 20, 4));   // SQRT.S 2
+    op(cop1(17, 0, 0, 20, 0x20)); // CVT.S.D 3: exact
+    op(cop1(17, 0, 4, 20, 0x20)); // CVT.S.D 16777217: inexact
+    op(cop1(17, 0, 6, 20, 0x24)); // CVT.W.D 2.5: inexact (2)
+    op(cop1(17, 0, 0, 20, 0x0D)); // TRUNC.W.D 3: exact
+    op(cop1(16, 0, 13, 20, 0x0C)); // ROUND.W.S 0.1: inexact
+    op(cop1(17, 0, 7, 20, 0x0D)); // TRUNC.W.D 0.1
+    op(cop1(17, 14, 14, 20, 2));  // MUL.D (2^26 + 1)^2: exact
+    op(cop1(17, 16, 14, 20, 2));  // MUL.D (2^26 + 1)(2^27 + 1): inexact by one
+    op(cop1(17, 14, 15, 20, 3));  // DIV.D (2^26 + 1)^2 / (2^26 + 1): exact
+    op(cop1(17, 16, 15, 20, 3));  // DIV.D by 2^27 + 1: inexact
+    op(cop1(17, 0, 15, 20, 4));   // SQRT.D (2^26 + 1)^2: exact
+    op(cop1(17, 0, 16, 20, 4));   // SQRT.D 2^27 + 1: inexact
+    op(cop1(16, 18, 17, 20, 2));  // MUL.S 2049 * 4097: exact
+    op(cop1(16, 18, 18, 20, 2));  // MUL.S 4097^2: inexact
+    op(cop1(16, 17, 19, 20, 3));  // DIV.S 2049^2 / 2049: exact
+    op(cop1(16, 0, 19, 20, 4));   // SQRT.S 2049^2: exact
+    op(cop1(17, 0, 5, 20, 2));    // MUL.D tiny * 3: exact far down
+    op(cop1(17, 5, 5, 20, 2));    // tiny * tiny: underflow
+    std::vector<u32> prog = {ADDIU(s1, zero, 20)};
+    const s32 loop = static_cast<s32>(prog.size());
+    prog.insert(prog.end(), body.begin(), body.end());
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, loop - static_cast<s32>(prog.size()) - 1));
+    prog.push_back(NOP);
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    for (bool fma : {true, false}) {
+        R4000::set_jit_fma(fma);
+        auto run = [&](Engine engine) {
+            Rig t;
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::FR);
+            t.cpu.fcr31 = 1u << 24;  // FS: tiny results flushed rather than trapped
+            for (std::size_t i = 0; i < values.size(); ++i) t.cpu.fpr[i] = values[i];
+            t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+            u64 paddr = 0x1000;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.set_pc(0xFFFFFFFF80001000ull);
+            t.cpu.run_until(20000);
+            return capture(t, 0x10000, 0x100);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        CHECK(run(Engine::Blocks) == reference);
+        CHECK(run(Engine::Jit) == reference);
+        CHECK_EQ(reference.cause, 0u);  // no exception
+    }
+    R4000::set_jit_fma(true);
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
+    check_random_fpu_programs();
+    R4000::set_jit_fma(false);
+    check_random_fpu_programs();
+    R4000::set_jit_fma(true);
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_mips4_fpu_programs) {
+    check_random_fpu_programs(true);
+    R4000::set_jit_fma(false);
+    check_random_fpu_programs(true);
+    R4000::set_jit_fma(true);
+}
+
+// Each MIPS IV instruction the recompiler translates, both ways where it has
+// two outcomes, in a hot loop that stores what it did: the same in every
+// engine, with and without FMA.
+TEST(cpu_jit_mips4_operations_match_interpreter) {
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto cop1x = [](unsigned func, unsigned fr, unsigned ft, unsigned fs, unsigned fd) {
+        return (0x13u << 26) | (fr << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto movci = [](unsigned rd, unsigned rs, unsigned cc, unsigned tf) {
+        return (rs << 21) | (cc << 18) | (tf << 16) | (rd << 11) | 0x01u;
+    };
+    auto bc1 = [](unsigned cc, unsigned nd, unsigned tf, s32 off) {
+        return (0x11u << 26) | (0x08u << 21) | (cc << 18) | (nd << 17) | (tf << 16) | (static_cast<u32>(off) & 0xFFFF);
+    };
+    auto cfc1 = [](unsigned rt) { return (0x11u << 26) | (0x02u << 21) | (rt << 16) | (31u << 11); };
+    auto dbits = [](double v) {
+        u64 b;
+        std::memcpy(&b, &v, 8);
+        return b;
+    };
+    auto fbits = [](float v) {
+        u32 b;
+        std::memcpy(&b, &v, 4);
+        return u64{b};
+    };
+    std::vector<u32> body;
+    s32 slot = 0;
+    auto sw = [&](unsigned r) { body.push_back(SW(r, slot, s0)), slot += 4; };
+    auto sd1 = [&](unsigned f) {
+        slot = (slot + 7) & ~7;
+        body.push_back(I(0x3D, s0, f, slot)), slot += 8;
+    };
+    for (unsigned f : {0x0Au, 0x0Bu})  // MOVZ, MOVN: on a zero and a nonzero rt
+        for (unsigned rt : {t0, t1}) {
+            body.push_back(ADDIU(a0, zero, 7));
+            body.push_back(R(f, t2, rt, a0));
+            sw(a0);
+        }
+    body.push_back(cop1(17, 2, 0, 3 << 2, 0x3C));  // C.LT.D f0 < f2 -> FCC3 set
+    body.push_back(cop1(17, 2, 0, 5 << 2, 0x32));  // C.EQ.D -> FCC5 clear
+    body.push_back(cop1(17, 2, 0, 0, 0x3C));       // C.LT.D -> FCC0 set
+    body.push_back(cfc1(t4));
+    sw(t4);
+    for (unsigned cc : {0u, 3u, 5u})
+        for (unsigned tf : {0u, 1u}) {
+            body.push_back(ADDIU(a0, zero, 7));
+            body.push_back(movci(a0, t2, cc, tf));
+            sw(a0);
+        }
+    for (unsigned cc : {3u, 5u})
+        for (unsigned tf : {0u, 1u})
+            for (unsigned nd : {0u, 1u}) {
+                body.push_back(ADDIU(a1, zero, 1));
+                body.push_back(bc1(cc, nd, tf, 2));
+                body.push_back(ADDIU(a1, a1, 2));  // delay slot
+                body.push_back(ADDIU(a1, a1, 4));  // skipped if taken
+                sw(a1);
+            }
+    for (unsigned cc : {3u, 5u})
+        for (unsigned tf : {0u, 1u}) {
+            body.push_back(cop1(17, 0, 4, 20, 0x06));                // MOV.D f20, f4
+            body.push_back(cop1(17, (cc << 2) | tf, 2, 20, 0x11));   // MOVF/MOVT.D f20, f2
+            sd1(20);
+            body.push_back(cop1(16, 0, 13, 21, 0x06));               // MOV.S f21, f13
+            body.push_back(cop1(16, (cc << 2) | tf, 12, 21, 0x11));  // MOVF/MOVT.S f21, f12
+            sd1(21);
+        }
+    for (unsigned f : {0x12u, 0x13u})
+        for (unsigned rt : {t0, t1}) {
+            body.push_back(cop1(17, 0, 4, 20, 0x06));
+            body.push_back(cop1(17, rt, 2, 20, f));  // MOVZ/MOVN.D f20, f2, rt
+            sd1(20);
+        }
+    for (unsigned func : {0x21u, 0x29u, 0x31u, 0x39u}) {  // MADD/MSUB/NMADD/NMSUB.D: inexact and exact
+        body.push_back(cop1x(func, 10, 8, 6, 22));
+        sd1(22);
+        body.push_back(cfc1(t4));
+        sw(t4);
+        body.push_back(cop1x(func, 0, 2, 0, 22));
+        sd1(22);
+        body.push_back(cfc1(t4));
+        sw(t4);
+    }
+    for (unsigned func : {0x20u, 0x28u, 0x30u, 0x38u}) {  // .S
+        body.push_back(cop1x(func, 12, 13, 14, 23));
+        sd1(23);
+        body.push_back(cfc1(t4));
+        sw(t4);
+    }
+    for (unsigned fs : {2u, 4u}) {  // RECIP.D of 4 (exact) and 1/3
+        body.push_back(cop1(17, 0, fs, 24, 0x15));
+        sd1(24);
+        body.push_back(cfc1(t4));
+        sw(t4);
+    }
+    body.push_back(cop1(16, 0, 12, 25, 0x15));  // RECIP.S of 3
+    sd1(25);
+    body.push_back(cop1x(0x01, s0, t5, 0, 26));  // LDXC1 f26, t5(s0)
+    body.push_back(cop1x(0x00, s0, t6, 0, 27));  // LWXC1 f27, t6(s0)
+    body.push_back(cop1x(0x09, s0, t6, 2, 0));   // SDXC1 f2, t6(s0)
+    body.push_back(cop1x(0x08, s0, t5, 12, 0));  // SWXC1 f12, t5(s0)
+    body.push_back(cop1x(0x0F, s0, t5, 0, 0));   // PREFX
+    body.push_back(I(0x33, s0, 0, 0x40));        // PREF
+    sd1(26);
+    sd1(27);
+    std::vector<u32> prog = {ADDIU(s1, zero, 20)};
+    const s32 loop = static_cast<s32>(prog.size());
+    prog.insert(prog.end(), body.begin(), body.end());
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, loop - static_cast<s32>(prog.size()) - 1));
+    prog.push_back(NOP);
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    CHECK(slot + 0x200 < 0x800);
+    for (bool fma : {true, false}) {
+        R4000::set_jit_fma(fma);
+        auto run = [&](Engine engine) {
+            Rig t(r5000_options());
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::FR);
+            const double third = 1.0 / 3;
+            const u64 values[] = {dbits(3.0), 0, dbits(4.0), 0, dbits(third), 0, dbits(1.0 + std::ldexp(1.0, -30)), 0,
+                                  dbits(1.0 - std::ldexp(1.0, -30)), 0, dbits(-1.0), 0, fbits(3.0f), fbits(0.1f),
+                                  fbits(5.0f)};
+            for (std::size_t i = 0; i < std::size(values); ++i) t.cpu.fpr[i] = values[i];
+            t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+            t.cpu.gpr[t0] = 0, t.cpu.gpr[t1] = 5, t.cpu.gpr[t2] = 0x1234, t.cpu.gpr[t5] = 0x700, t.cpu.gpr[t6] = 0x708;
+            store_be<u64>(&t.ram[0x10700], dbits(2.5));
+            store_be<u64>(&t.ram[0x10708], fbits(1.5f) << 32);
+            u64 paddr = 0x1000;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.set_pc(0xFFFFFFFF80001000ull);
+            t.cpu.run_until(60000);
+            return capture(t, 0x10000, 0x800);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        CHECK_EQ(reference.cause, 0u);  // no exception
+        CHECK(run(Engine::Blocks) == reference);
+        CHECK(run(Engine::Jit) == reference);
+    }
+    R4000::set_jit_fma(true);
+}
+
+// A translation of MIPS IV code made in kernel mode runs again for the same
+// memory in user mode: reserved without Status.XX, allowed with it.
+TEST(cpu_jit_mips4_reserved_in_user_mode_without_xx) {
+    for (bool xx : {false, true})
+        for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+            Rig t(r5000_options());
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.load({NOP, R(0x0B, t0, t0, t1), ADDIU(t2, t2, -1), BNE(t2, zero, -3), NOP, SYSCALL}, 0x10000);
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.gpr[t0] = 9;
+            t.cpu.gpr[t2] = 20;
+            t.cpu.set_pc(0xFFFFFFFF80010000ull);
+            t.cpu.run_until(2000);
+            CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Sys));
+            CHECK_EQ(t.cpu.gpr[t1], 9u);
+            t.cpu.cp0_write(cop0::Index, 0);
+            t.cpu.cp0_write(cop0::EntryHi, 0x00010000);
+            t.cpu.cp0_write(cop0::EntryLo0, (0x10u << 6) | (3u << 3) | 7u);
+            t.cpu.cp0_write(cop0::EntryLo1, 1);
+            t.cpu.cp0_write(cop0::EPC, 0x10000);
+            t.cpu.cp0_write(cop0::Status, sr::KSU_USER | sr::EXL | (xx ? sr::XX : 0));
+            t.load({TLBWI, ERET}, 0x2000);
+            t.cpu.set_pc(0xFFFFFFFF80002000ull);
+            t.cpu.gpr[t1] = 0;
+            t.cpu.gpr[t2] = 5;
+            t.cpu.run_until(4000);
+            CHECK_EQ(t.exc_code(), static_cast<unsigned>(xx ? Exc::Sys : Exc::RI));
+            CHECK_EQ(t.cpu.gpr[t1], xx ? 9u : 0u);
+        }
+}
+
+// Trap instructions in translated code: not taken while the loop is hot,
+// then taken (Tr, with EPC at the trap) in every engine.
+TEST(cpu_jit_trap_instructions_trap) {
+    const u32 teq = R(0x34, t2, t3, 0);
+    const u32 tlti = I(0x01, t2, 0x0A, 3);
+    for (u32 trap : {teq, tlti}) {
+        for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+            Rig t;
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.load({NOP, ADDIU(t2, t2, -1), trap, BNE(t2, zero, -3), NOP, SYSCALL}, 0x1000);
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.gpr[t2] = 30;
+            t.cpu.gpr[t3] = 2;
+            t.cpu.set_pc(0xFFFFFFFF80001000ull);
+            t.cpu.run_until(4000);
+            CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Tr));
+            CHECK_EQ(t.cpu.cp0_read(cop0::EPC), 0xFFFFFFFF80001008ull);
+            CHECK_EQ(t.cpu.gpr[t2], 2u);
+        }
+    }
+}
+
+// A translation made in kernel mode runs again for the same memory in user
+// mode with 32-bit addressing, where its 64-bit operation is reserved.
+TEST(cpu_jit_64bit_operation_reserved_in_user_mode) {
+    for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        // The loop starts one instruction in: the first instruction on a page
+        // newly in the soft TLB is interpreted.
+        t.load({NOP, DADDU(t1, t0, t0), ADDIU(t2, t2, -1), BNE(t2, zero, -3), NOP, SYSCALL}, 0x10000);
+        t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+        t.cpu.gpr[t0] = 0x0000000100000001ull;
+        t.cpu.gpr[t2] = 20;
+        t.cpu.set_pc(0xFFFFFFFF80010000ull);
+        t.cpu.run_until(2000);
+        CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Sys));
+        CHECK_EQ(t.cpu.gpr[t1], 0x0000000200000002ull);
+        // Global, valid, dirty mapping of user VA 0x10000 -> PA 0x10000.
+        t.cpu.cp0_write(cop0::Index, 0);
+        t.cpu.cp0_write(cop0::EntryHi, 0x00010000);
+        t.cpu.cp0_write(cop0::EntryLo0, (0x10u << 6) | (3u << 3) | 7u);
+        t.cpu.cp0_write(cop0::EntryLo1, 1);
+        t.cpu.cp0_write(cop0::EPC, 0x10000);
+        t.cpu.cp0_write(cop0::Status, sr::KSU_USER | sr::EXL);
+        t.load({TLBWI, ERET}, 0x2000);
+        t.cpu.set_pc(0xFFFFFFFF80002000ull);
+        t.cpu.gpr[t1] = 0;
+        t.cpu.gpr[t2] = 5;
+        t.cpu.run_until(4000);
+        CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::RI));
+        CHECK_EQ(t.cpu.cp0_read(cop0::EPC), 0x10004ull);
+        CHECK_EQ(t.cpu.gpr[t1], 0u);
+    }
 }
 
 TEST(cpu_linked_blocks_and_jit_match_interpreter_with_timer_interrupts) {

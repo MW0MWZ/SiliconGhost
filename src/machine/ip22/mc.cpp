@@ -12,11 +12,15 @@ namespace sg::ip22 {
 
 namespace {
 
-constexpr u32 kSysIdIndy = 0x03;  // MC revision C, no EISA
+constexpr u32 kSysIdRevC = 0x03;     // MC revision C
+constexpr u32 kSysIdEisa = 1u << 4;  // EISA bus present
 
 constexpr u32 kCpuCtrl0SysInit = 1u << 9;
 constexpr u32 kErrStatAddr = 1u << 10;  // CPU: bad address; GIO: timeout uses the same bit position
-constexpr u32 kEeromSi = 1u << 4;
+constexpr u32 kEeromCs = 1u << 1;
+constexpr u32 kEeromSck = 1u << 2;
+constexpr u32 kEeromSo = 1u << 3;  // to the EEPROM
+constexpr u32 kEeromSi = 1u << 4;  // from the EEPROM
 
 // MEMCFG half-word fields
 constexpr u32 kBankValid = 1u << 13;
@@ -27,7 +31,11 @@ constexpr u32 kLowWindow = 0x08000000, kLowWindowEnd = 0x18000000;
 constexpr u32 kHighWindow = 0x20000000, kHighWindowEnd = 0x30000000;
 constexpr u32 kLowAliasSize = 0x80000;
 
+// GIO64 space: the graphics and expansion slots, and the EXP area below
+// the HPC3.
 constexpr u32 kGioSpaceStart = 0x1F000000, kGioSpaceEnd = 0x1FA00000;
+constexpr u32 kGioExpStart = 0x1FB00000, kGioExpEnd = 0x1FB80000;
+constexpr u32 kCpuCtrl1AbortEn = 1u << 4;
 
 // Virtual DMA
 constexpr u32 kDmaModeToMemory = 1u << 1;
@@ -41,13 +49,15 @@ constexpr u32 kTlbValid = 1u << 1, kPteValid = 1u << 1, kPteDirty = 1u << 2;
 
 }  // namespace
 
-Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz)
+Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa)
     : bus_(bus),
       scheduler_(scheduler),
+      eisa_(eisa),
       ram_(ram),
       cycles_per_sysclk_(cpu_hz / sysclk_hz),
       dma_timer_(scheduler, [this] { finish_dma(); }) {
     bus_.add_host_region(ram, ram_size);  // however the banks get mapped, it is one memory
+    std::fill(cpu_eeprom_.words().begin(), cpu_eeprom_.words().end(), u16{0});
     // Split installed memory into decodable banks, largest first.
     u64 remaining = ram_size, offset = 0;
     for (u64 size = u64{128} << 20; size >= (u64{4} << 20) && banks_.size() < 4;) {
@@ -71,13 +81,15 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
 
 void Mc::reset() {
     regs_.clear();
-    regs_[kCpuCtrl0] = 0;
-    regs_[kCpuCtrl1] = 0;
+    regs_[kCpuCtrl0] = 0x00100012;  // MUX_HWM 1, refresh on, 2 lines a burst
+    regs_[kCpuCtrl1] = 0xC;         // MC_HWM
     regs_[kRpssDivider] = 0x0104;
     regs_[kCtrld] = 0x0C30;
-    regs_[kGio64Arb] = 0x1;  // HPC64, from the boot configuration
-    regs_[kCpuTime] = 0x1000;
+    regs_[kGio64Arb] = 0x401;  // one GIO64 bus; HPC64, from the boot configuration
+    regs_[kCpuTime] = 0x100;
     regs_[kLbTime] = 0x200;
+    regs_[kCpuMemAcc] = 0x01454333;
+    regs_[kGioMemAcc] = 0x4333;
     regs_[kLockMemory] = 1;
     regs_[kEisaLock] = 1;
     regs_[kMemCfg0] = 0;
@@ -142,10 +154,10 @@ u32 Mc::read_reg(u32 reg) {
         return v;
     }
     switch (reg) {
-        case kSysId: return kSysIdIndy;
+        case kSysId: return kSysIdRevC | (eisa_ ? kSysIdEisa : 0);
         case kDogc: return 0;
         case kRefCtr: return regs_[kCtrld];
-        case kEerom: return regs_[kEerom] & ~kEeromSi;
+        case kEerom: return (regs_[kEerom] & ~kEeromSi) | (cpu_eeprom_.data_out() ? kEeromSi : 0);
         case kCpuErrorAddr: return cpu_error_addr_;
         case kCpuErrorStat: return cpu_error_stat_;
         case kGioErrorAddr: return gio_error_addr_;
@@ -196,6 +208,10 @@ void Mc::write_reg(u32 reg, u32 value) {
             dma_cause_ = value & 0xF;
             dma_run_ = (dma_run_ & kDmaRunActive) | dma_cause_;
             if (dma_cause_ == 0 && dma_irq_cb_) dma_irq_cb_(false);
+            return;
+        case kEerom:
+            regs_[kEerom] = value & (kEeromCs | kEeromSck | kEeromSo);
+            cpu_eeprom_.set_lines(value & kEeromCs, value & kEeromSck, value & kEeromSo);
             return;
         case kDmaCtl: dma_ctl_ = value; return;
         case kDmaMemAdr: dma_mem_addr_ = value; return;
@@ -281,6 +297,20 @@ void Mc::rebase_rpss() {
     rpss_cycle_base_ = scheduler_.now();
 }
 
+void Mc::map_banks_as_post() {
+    if (regs_[kMemCfg0] || regs_[kMemCfg1]) return;
+    u32 halves[4] = {}, base = kLowWindow;
+    for (std::size_t i = 0; i < banks_.size(); ++i) {
+        const u64 size = banks_[i].subbank_size * banks_[i].subbanks;
+        halves[i] = kBankValid | (banks_[i].subbanks == 2 ? kBankSubbanks : 0) |
+                    static_cast<u32>(((size >> 22) - 1) << 8) | (base >> 22);
+        base += static_cast<u32>(size);
+    }
+    regs_[kMemCfg0] = halves[0] << 16 | halves[1];
+    regs_[kMemCfg1] = halves[2] << 16 | halves[3];
+    remap_memory();
+}
+
 void Mc::remap_memory() {
     for (const auto& [base, size] : mapped_) bus_.unmap(base, size);
     mapped_.clear();
@@ -331,11 +361,13 @@ void Mc::remap_memory() {
 void Mc::report_bus_error(u64 paddr, unsigned size, bool is_write) {
     u32 lanes = 0;
     for (unsigned i = 0; i < size; ++i) lanes |= 1u << (7 - ((paddr + i) & 7));
-    const bool gio = paddr >= kGioSpaceStart && paddr < kGioSpaceEnd;
+    const bool gio = (paddr >= kGioSpaceStart && paddr < kGioSpaceEnd) || (paddr >= kGioExpStart && paddr < kGioExpEnd);
     if (gio) {
+        // A GIO timeout is recorded (TIME) only with ABORT_EN; without it the
+        // real bus hangs, which is not modelled: the access still fails.
         if (!gio_error_stat_) {
             gio_error_addr_ = static_cast<u32>(paddr);
-            gio_error_stat_ = kErrStatAddr | lanes;  // GIO timeout
+            gio_error_stat_ = (regs_[kCpuCtrl1] & kCpuCtrl1AbortEn ? kErrStatAddr : 0) | lanes;
         }
     } else if (!cpu_error_stat_) {
         cpu_error_addr_ = static_cast<u32>(paddr);

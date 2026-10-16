@@ -49,6 +49,10 @@ private:
         bool armed = false;       // mode 0/1/4/5: terminal count not yet reached
         u32 reload = 0x10000;     // effective count (0 is 65536 binary / 10000 BCD)
         double start_tick = 0;    // tick at which the current count was loaded
+        // Mode 2/3: a count written while counting, taken from switch_tick
+        // as if loaded at next_start (negative: none).
+        u32 next_reload = 0;
+        double switch_tick = -1, next_start = 0;
         double tick_base = 0;     // ticks accumulated before cycle_base at earlier clock rates
         u64 cycle_base = 0;
         // Register access state
@@ -63,6 +67,7 @@ private:
     };
 
     double now_ticks(unsigned c) const;
+    void take_pending(unsigned c, double now);
     u16 current_count(unsigned c) const;
     void load_count(unsigned c, u16 raw);
     void set_out(unsigned c, bool level);

@@ -50,6 +50,7 @@ add_library(sg_emu STATIC
   src/devices/pit8254.cpp
   src/devices/scsi_disk.cpp
   src/devices/seeq8003.cpp
+  src/devices/test_device.cpp
   src/devices/wd33c93.cpp
   src/devices/z85230.cpp
   src/machine/ip22/hal2.cpp
@@ -92,6 +93,7 @@ endif()
 # Front-end pieces without a window: settings, power control, terminal screen
 add_library(sg_app STATIC
   src/app/detach.cpp
+  src/app/proms.cpp
   src/app/session.cpp
   src/app/settings.cpp
   src/app/terminal.cpp
@@ -195,6 +197,7 @@ if(SG_BUILD_TESTS)
   add_executable(sg_tests
     tests/test_main.cpp
     tests/cpu_tests.cpp
+    tests/cpu_model_tests.cpp
     tests/misc_tests.cpp
     tests/device_tests.cpp
     tests/fpu_cache_tests.cpp

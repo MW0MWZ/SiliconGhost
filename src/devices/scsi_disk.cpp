@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <span>
 
 #include "core/log.h"
 
@@ -19,7 +20,7 @@ constexpr u8 kSenseNone = 0x0, kSenseNotReady = 0x2, kSenseMediumError = 0x3, kS
 constexpr u8 kSenseUnitAttention = 0x6, kSenseDataProtect = 0x7;
 constexpr u8 kAscMediumChanged = 0x28, kAscPowerOnReset = 0x29, kAscMediumNotPresent = 0x3A, kAscRemovalPrevented = 0x53;
 constexpr u8 kAscInvalidOpcode = 0x20, kAscLbaOutOfRange = 0x21, kAscWriteProtected = 0x27;
-constexpr u8 kAscUnrecoveredRead = 0x11, kAscInvalidParameter = 0x26;
+constexpr u8 kAscUnrecoveredRead = 0x11, kAscInvalidParameter = 0x26, kAscInvalidCdbField = 0x24;
 
 u32 be32(const u8* p) { return (u32{p[0]} << 24) | (u32{p[1]} << 16) | (u32{p[2]} << 8) | p[3]; }
 u16 be16(const u8* p) { return static_cast<u16>((p[0] << 8) | p[1]); }
@@ -114,8 +115,18 @@ std::vector<u8> ScsiDisk::inquiry(unsigned allocation) const {
     return d;
 }
 
+// The pages a drive of this kind has: the disk's error recovery, format,
+// geometry and caching pages; the CD-ROM's error recovery, CD parameters and
+// audio control pages. Page 0 (vendor) is the header alone; any other page
+// is an illegal request (empty result).
 std::vector<u8> ScsiDisk::mode_sense(const u8* cdb, bool ten_byte) const {
     const unsigned page = cdb[2] & 0x3F;
+    const bool cd = kind_ == Kind::CdRom;
+    static constexpr u8 kDiskPages[] = {0x00, 0x01, 0x03, 0x04, 0x08, 0x3F};
+    static constexpr u8 kCdPages[] = {0x00, 0x01, 0x0D, 0x0E, 0x3F};
+    bool known = false;
+    for (u8 p : cd ? std::span<const u8>(kCdPages) : std::span<const u8>(kDiskPages)) known |= p == page;
+    if (!known) return {};
     const bool no_block_descriptor = cdb[1] & 0x08;
     std::vector<u8> pages;
     auto add_page = [&](unsigned code, std::initializer_list<u8> body) {
@@ -124,13 +135,17 @@ std::vector<u8> ScsiDisk::mode_sense(const u8* cdb, bool ten_byte) const {
         pages.insert(pages.end(), body.begin(), body.end());
     };
     const u32 cylinders = static_cast<u32>(std::max<u64>(1, blocks() / (64 * 32)));
-    if (page == 0x01 || page == 0x3F) add_page(0x01, {0, 8, 0, 0, 0, 0, 0, 0, 0, 0});        // error recovery
-    if (page == 0x03 || page == 0x3F)                                                      // format: 64 sectors/track
+    if (page == 0x01 || page == 0x3F) add_page(0x01, {0, 8, 0, 0, 0, 0, 0, 0, 0, 0});  // error recovery
+    if (!cd && (page == 0x03 || page == 0x3F))                                       // format: 64 sectors/track
         add_page(0x03, {0, 1, 0, 0, 0, 0, 0, 1, 0, 64, 2, 0, 0, 1, 0, 0, 0, 0, 0x40, 0, 0, 0});
-    if (page == 0x04 || page == 0x3F)                                                      // geometry: 32 heads
+    if (!cd && (page == 0x04 || page == 0x3F))  // geometry: 32 heads
         add_page(0x04, {static_cast<u8>(cylinders >> 16), static_cast<u8>(cylinders >> 8), static_cast<u8>(cylinders),
                         32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15, 0x18, 0, 0});
-    if (page == 0x08 || page == 0x3F) add_page(0x08, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0});     // caching
+    if (!cd && (page == 0x08 || page == 0x3F)) add_page(0x08, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0});  // caching
+    // CD parameters: 60 seconds per minute, 75 frames per second
+    if (cd && (page == 0x0D || page == 0x3F)) add_page(0x0D, {0, 0, 0, 60, 0, 75});
+    // audio control: immediate; ports 0 and 1 play channels 0 and 1 at full volume
+    if (cd && (page == 0x0E || page == 0x3F)) add_page(0x0E, {0x04, 0, 0, 0, 0, 0, 0x01, 0xFF, 0x02, 0xFF, 0, 0, 0, 0});
 
     std::vector<u8> block_descriptor;
     if (!no_block_descriptor) {
@@ -216,10 +231,10 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
             r.data_in = inquiry(cdb[4]);
             return r;
         case 0x1A:  // MODE SENSE(6)
-            r.data_in = mode_sense(cdb, false);
-            return r;
         case 0x5A:  // MODE SENSE(10)
-            r.data_in = mode_sense(cdb, true);
+            r.data_in = mode_sense(cdb, op == 0x5A);
+            if (r.data_in.empty() && (op == 0x5A ? be16(&cdb[7]) : cdb[4]))
+                return check_condition(kSenseIllegalRequest, kAscInvalidCdbField);  // no such page
             return r;
         case 0x15:  // MODE SELECT(6)
             r.data_out_length = cdb[4];
@@ -257,12 +272,39 @@ ScsiTarget::Result ScsiDisk::command(const u8* cdb, unsigned length) {
             r.data_out_length = count * block_size_;
             return r;
         }
-        case 0x43: {  // READ TOC: one data track
+        case 0x43: {  // READ TOC: one data track, then the lead-out
             if (kind_ != Kind::CdRom) return check_condition(kSenseIllegalRequest, kAscInvalidOpcode);
-            std::vector<u8> t = {0, 18, 1, 1,  // length, first and last track
-                                 0, 0x14, 1, 0, 0, 0, 0, 0,          // track 1: data, LBA 0
-                                 0, 0x14, 0xAA, 0, 0, 0, 0, 0};       // lead-out
-            put32(&t[16], static_cast<u32>(blocks()));
+            const bool msf = cdb[1] & 0x02;
+            const unsigned format = cdb[9] >> 6, start = cdb[6];
+            // An address as a block number, or as minutes, seconds and frames
+            // (75 a second, two seconds of lead-in before block 0).
+            auto address = [&](u8* at, u64 block) {
+                if (!msf) {
+                    put32(at, static_cast<u32>(block));
+                    return;
+                }
+                const u64 frame = block * block_size_ / kCdBlockSize + 150;
+                at[0] = 0;
+                at[1] = static_cast<u8>(frame / (60 * 75));
+                at[2] = static_cast<u8>(frame / 75 % 60);
+                at[3] = static_cast<u8>(frame % 75);
+            };
+            std::vector<u8> t = {0, 0, 1, 1};  // length, first and last track (or session)
+            if (format == 1) {  // the first session starts with track 1
+                t.insert(t.end(), {0, 0x14, 1, 0, 0, 0, 0, 0});
+                address(&t[8], 0);
+            } else if (format == 0) {
+                if (start > 1 && start != 0xAA) return check_condition(kSenseIllegalRequest, kAscInvalidCdbField);
+                if (start <= 1) {
+                    t.insert(t.end(), {0, 0x14, 1, 0, 0, 0, 0, 0});
+                    address(&t[t.size() - 4], 0);
+                }
+                t.insert(t.end(), {0, 0x14, 0xAA, 0, 0, 0, 0, 0});
+                address(&t[t.size() - 4], blocks());
+            } else {
+                return check_condition(kSenseIllegalRequest, kAscInvalidCdbField);
+            }
+            t[1] = static_cast<u8>(t.size() - 2);
             t.resize(std::min<std::size_t>(t.size(), be16(&cdb[7])));
             r.data_in = std::move(t);
             return r;

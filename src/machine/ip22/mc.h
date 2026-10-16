@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/scheduler.h"
+#include "devices/eeprom93cxx.h"
 #include "mem/bus.h"
 
 namespace sg::ip22 {
@@ -67,7 +68,8 @@ public:
     // sizes the MC can decode (4..128 MiB, largest first, at most 4 banks).
     // 128, 32 and 8 MiB banks are built from double-sided SIMMs (two
     // sub-banks); 64, 16 and 4 MiB banks from single-sided ones.
-    Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz);
+    // `eisa`: the board has an EISA bus (the Indigo2), reported in SYSID.
+    Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa = false);
 
     void reset();
     const char* name() const override { return "mc"; }
@@ -90,6 +92,15 @@ public:
         unsigned subbanks = 0;  // 0 = slot empty
     };
     const std::vector<Bank>& banks() const { return banks_; }
+    // The CPU module's serial EEPROM (93CS56) behind the EEROM register: the
+    // processor's boot-mode bits, and (word 17) the size of a secondary
+    // cache the processor itself cannot report, in 4 KiB pages.
+    static constexpr unsigned kCpuEepromCacheSize = 17;
+    std::vector<u16>& cpu_eeprom() { return cpu_eeprom_.words(); }
+    // Programs the bank registers as the PROM's memory sizing leaves them
+    // (the fitted banks one after another from 0x08000000), for programs
+    // started without the PROM. Does nothing if they are already set.
+    void map_banks_as_post();
 
 private:
     u32 read_reg(u32 reg);
@@ -121,6 +132,8 @@ private:
     Bus& bus_;
     Scheduler& scheduler_;
     EmptyBank empty_bank_;
+    Eeprom93Cxx cpu_eeprom_;
+    bool eisa_;
     u8* ram_;
     std::vector<Bank> banks_;
     std::vector<std::pair<u32, u64>> mapped_;  // memory windows currently mapped

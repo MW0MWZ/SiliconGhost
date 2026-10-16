@@ -4,9 +4,11 @@
 // SCSI and Ethernet DMA channels, interrupt status, the serial EEPROM, the
 // PBUS device windows (IOC2 on channel 6) and the DS1386 RTC/NVRAM.
 //
-// SCSI channel 0 (WD33C93 plus its DMA channel), the PBUS DMA channels
-// serving the HAL2 audio processor and the Ethernet DMA channels with their
-// Seeq 8003 controller are modelled.
+// The SCSI channels (a WD33C93 plus its DMA channel each; the Indy wires
+// only channel 0), the PBUS DMA channels serving the HAL2 audio processor
+// and the Ethernet DMA channels with their Seeq 8003 controller are
+// modelled. On the Indigo2 the INT2 sits on PBUS channel 4 and the PROM
+// keeps its settings in the serial EEPROM.
 #pragma once
 
 #include <array>
@@ -30,7 +32,8 @@ namespace sg::ip22 {
 
 class Hpc3 final : public Device {
 public:
-    Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz);
+    // `full_house`: the Indigo2's wiring (second SCSI channel, INT2, DS1286).
+    Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz, bool full_house = false);
 
     void reset();
     const char* name() const override { return "hpc3"; }
@@ -39,8 +42,11 @@ public:
     bool read_is_pure(u32 offset, unsigned size) const override;
 
     Ds1386& rtc() { return rtc_; }
+    const Ds1386& rtc() const { return rtc_; }
     Eeprom93Cxx& eeprom() { return eeprom_; }
+    const Eeprom93Cxx& eeprom() const { return eeprom_; }
     Wd33c93& scsi0() { return scsi0_; }
+    Wd33c93& scsi1() { return scsi1_; }
     Hal2& hal2() { return hal2_; }
     Seeq8003& seeq() { return seeq_; }
     // Ethernet frames go to and come from `backend` (null: no cable).
@@ -71,8 +77,10 @@ private:
     u32 read_word(u32 offset);
     void write_word(u32 offset, u32 value);
 
-    // SCSI channel 0 DMA: walks descriptor chains {buffer, count/flags, next}.
-    u32 scsi_dma(const u8* src, u8* dst, u32 length);
+    // SCSI DMA: walks descriptor chains {buffer, count/flags, next}.
+    u32 scsi_dma(unsigned ch, const u8* src, u8* dst, u32 length);
+    u32 scsi_read(unsigned ch, u32 reg);
+    void scsi_write(unsigned ch, u32 reg, u32 value);
     void update_dma_irq();
 
     // PBUS DMA: a channel walks its descriptor chain as fast as the HAL2
@@ -116,14 +124,17 @@ private:
     Ioc2& ioc_;
     Scheduler& scheduler_;
     double cpu_hz_;
+    bool full_house_;
     struct ScsiDma {
         u32 ndbp = 0, cbp = 0, bc = 0, flags = 0, ctrl = 0;
         bool active = false, loaded = false, irq = false;
         bool in_reset = false;  // the reset bit is held
-    } scsi_dma_;
+    };
+    std::array<ScsiDma, 2> scsi_dma_{};
     Ds1386 rtc_;
     Eeprom93Cxx eeprom_;
-    Wd33c93 scsi0_;
+    Wd33c93 scsi0_, scsi1_;
+    std::array<Wd33c93*, 2> scsi_{&scsi0_, &scsi1_};
     Hal2 hal2_;
     std::array<PbusChannel, kPbusChannels> pbus_{};
     std::array<std::unique_ptr<Timer>, kPbusChannels> pbus_timer_;

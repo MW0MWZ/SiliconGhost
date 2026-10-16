@@ -49,6 +49,9 @@ std::string special(u32 i) {
         case 0x07: return fmt("srav %s, %s, %s", rd, rt, rs);
         case 0x08: return fmt("jr %s", rs);
         case 0x09: return fmt("jalr %s, %s", rd, rs);
+        case 0x01: return fmt("mov%c %s, %s, $fcc%u", (i >> 16) & 1 ? 't' : 'f', rd, rs, (i >> 18) & 7);
+        case 0x0A: return fmt("movz %s, %s, %s", rd, rs, rt);
+        case 0x0B: return fmt("movn %s, %s, %s", rd, rs, rt);
         case 0x0C: return "syscall";
         case 0x0D: return fmt("break 0x%x", (i >> 6) & 0xFFFFF);
         case 0x0F: return "sync";
@@ -137,6 +140,7 @@ std::string cop(u32 i, unsigned z) {
                 case 0x06: return "tlbwr";
                 case 0x08: return "tlbp";
                 case 0x18: return "eret";
+                case 0x20: return "wait";
             }
         }
     } else if (z == 1) {
@@ -149,6 +153,21 @@ std::string cop(u32 i, unsigned z) {
             case 0x06: return fmt("ctc1 %s, $%u", rt, rd);
         }
         return fmt("cop1 0x%07x", i & 0x1FFFFFF);
+    } else if (z == 3) {  // COP1X (MIPS IV)
+        const char* base = kGpr[(i >> 21) & 31];
+        const unsigned fs = (i >> 11) & 31, fd = (i >> 6) & 31;
+        static constexpr const char* kMadd[4] = {"madd", "msub", "nmadd", "nmsub"};
+        switch (i & 63) {
+            case 0x00: return fmt("lwxc1 $f%u, %s(%s)", fd, rt, base);
+            case 0x01: return fmt("ldxc1 $f%u, %s(%s)", fd, rt, base);
+            case 0x08: return fmt("swxc1 $f%u, %s(%s)", fs, rt, base);
+            case 0x09: return fmt("sdxc1 $f%u, %s(%s)", fs, rt, base);
+            case 0x0F: return fmt("prefx 0x%x, %s(%s)", fs, rt, base);
+            case 0x20: case 0x21: case 0x28: case 0x29:
+            case 0x30: case 0x31: case 0x38: case 0x39:
+                return fmt("%s.%c $f%u, $f%u, $f%u, $f%u", kMadd[((i >> 3) & 7) - 4], (i & 1) ? 'd' : 's', fd,
+                           (i >> 21) & 31, fs, (i >> 16) & 31);
+        }
     }
     return fmt("cop%u 0x%07x", z, i & 0x1FFFFFF);
 }
@@ -211,6 +230,7 @@ std::string disassemble(u32 i, u64 pc) {
         case 0x18: return fmt("daddi %s, %s, %d", rt, rs, simm);
         case 0x19: return fmt("daddiu %s, %s, %d", rt, rs, simm);
         case 0x2F: return fmt("cache 0x%x, %d(%s)", (i >> 16) & 31, simm, rs);
+        case 0x33: return fmt("pref 0x%x, %d(%s)", (i >> 16) & 31, simm, rs);
         case 0x31: return fmt("lwc1 $f%u, %d(%s)", (i >> 16) & 31, simm, rs);
         case 0x35: return fmt("ldc1 $f%u, %d(%s)", (i >> 16) & 31, simm, rs);
         case 0x39: return fmt("swc1 $f%u, %d(%s)", (i >> 16) & 31, simm, rs);

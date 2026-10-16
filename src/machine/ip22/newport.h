@@ -22,6 +22,10 @@ public:
     struct Options {
         bool xl24 = false;
         u8 monitor_id = 0xA;  // monitor sense: 0xA = 1280x1024 @ 60 Hz
+        // Board revision, 0-7, read from CMAP0; -1 for the usual one (2 for
+        // the XL8, 0 for the XL24). Drivers choose timings and cursor
+        // offsets by it, and see an 8-bit board only from revision 2.
+        int board_revision = -1;
     };
 
     // Frame buffer geometry: 1280 visible + 64 off-screen columns, 1024 rows.
@@ -52,8 +56,9 @@ public:
     // (screenshots; render() is checked against it).
     bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
     u64 frames() const { return frames_; }
-    // Where the VC2 shows the hardware cursor: the top left of its glyph in
-    // screen coordinates. False while the cursor is off.
+    // Where the system has put the hardware cursor (the VC2 shows it there
+    // from the next vertical retrace): the top left of its glyph in screen
+    // coordinates. False while the cursor is off.
     bool cursor_position(int& x, int& y) const;
     // Pixels the REX3 has drawn (a measure of how busy the board is).
     u64 pixels_drawn() const { return pixels_drawn_; }
@@ -78,12 +83,15 @@ private:
     static int int_part(u32 v) { return static_cast<s16>(v >> 11); }
     void set_color_index(u32 v);
     u32 ci_index() const;  // the colour index COLORRED holds
+    u32 ci_colour(int x, int y) const;  // that index rounded or dithered by its fraction
 
     u32 source_color(int x, int y);
     u32 host_color(u32* alpha = nullptr);
     u32 blend(u32 src, int px, int py) const;
     u32 default_color(u32 colour) const;
     u32 shaded_color(int x, int y) const;
+    u32 reduce_rgb(u32 c, int x, int y) const;  // 8-8-8 to the stored depth
+    u32 background_colour(int x, int y) const;  // COLORBACK for opaque patterns
     void iterate_shade();
     void reload_shade();
     void plot_source(int x, int y, u32 colour);
@@ -110,6 +118,7 @@ private:
     u8 xmap_read(unsigned which, unsigned crs);
     void cmap_write(unsigned which, unsigned crs, u8 b);
     u8 cmap_read(unsigned which, unsigned crs);
+    void ramdac_reset();
     void ramdac_write(unsigned crs, u8 b);
     u8 ramdac_read(unsigned crs);
 
@@ -121,7 +130,6 @@ private:
         ++display_version_;
         full_redraw_ = true;
     }
-    void cursor_moving();
     // Raw pixel value -> final colour for one XMAP mode, gamma included.
     struct ModeTable {
         u32 mode = ~0u;
@@ -163,17 +171,26 @@ private:
     u32 colorred_ = 0, coloralpha_ = 0, colorgrn_ = 0, colorblue_ = 0;
     s32 curr_red_ = 0, curr_alpha_ = 0, curr_grn_ = 0, curr_blue_ = 0;
     u32 src_alpha_ = 0xFF;  // alpha of the pixel being drawn, for blending
+    bool src_wide_ = false;  // and its colour is 8-8-8, to be blended then reduced
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
-    bool zfail_next_ = false, zfail_ = false;
-    bool fastclear_ = false;  // the primitive running writes COLORVRAM (fast clear)  // STEPZ: the next GO's first pixel fails the Z test
+    bool zfail_next_ = false, zfail_ = false;  // STEPZ: the next GO's first pixel fails the Z test
+    bool fastclear_ = false;                   // the primitive running writes COLORVRAM (fast clear)
+    u64 last_retrace_ = 0;                     // when the last vertical interrupt came
     int host_shift_ = 0;
     u32 dcbmode_ = 0;
     unsigned dcb_crs_ = 0;  // the DCB's register select, stepped by ENCRSINC until DCBMODE is written
     u32 topscan_ = 0, xywin_ = 0, clipmode_ = 0, config_ = 0;
     bool vrint_ = false;
     u64 dcb_busy_until_ = 0;  // an access to an absent slave is waiting for its acknowledge
+
+    // The cursor position and table pointers the VC2 scans out with: its
+    // copies of the registers, taken during vertical retrace.
+    struct Shown {
+        u16 cursor_x = 0, cursor_y = 0, cursor_entry = 0, did_entry = 0;
+    } shown_;
+    void latch_shown();
 
     u64 display_version_ = 0;
     bool full_redraw_ = true;
@@ -205,15 +222,23 @@ private:
         u16 addr = 0;
         unsigned rgb = 0;  // byte position within an R,G,B triple
         u32 pending = 0;
-        u8 command = 0, crs7 = 0;
+        u8 command = 3, crs7 = 0;  // command: reset value 3
     };
     std::array<Cmap, 2> cmap_;
+    // Bt445: the address register (CRS 0) selects within the group CRS
+    // names; palette, overlay palette and cursor colour accesses (CRS 1, 3
+    // and 7) go R, G, B and step the address, control registers do not.
     struct Ramdac {
         std::array<std::array<u8, 256>, 3> lut{};
+        std::array<std::array<u8, 16>, 3> overlay{};
+        std::array<std::array<u8, 4>, 3> cursor{};
         u8 addr = 0;
         unsigned rgb = 0;
-        std::array<u8, 8> regs{};
+        std::array<u8, 8> control{};    // CRS 2
+        std::array<u8, 0x24> channel{};  // CRS 5
+        std::array<u8, 16> config{};    // CRS 6
     } ramdac_;
+    bool gamma_bypassed(u32 mode) const;
 };
 
 }  // namespace sg::ip22

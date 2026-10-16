@@ -50,6 +50,30 @@ TEST(pit_mode2_rate_generator_period) {
     if (falls.size() >= 2) CHECK_EQ(falls[1] - falls[0], 1000ull);  // 10 ticks
 }
 
+// A count written while a mode 2 counter runs takes over when the current
+// period ends.
+TEST(pit_mode2_new_count_at_end_of_period) {
+    Clock clk;
+    Pit8254 pit(clk.sched, 100.0e6, {1.0e6, 1.0e6, 1.0e6});
+    std::vector<u64> falls;
+    pit.set_output_callback([&](unsigned c, bool level) {
+        if (c == 0 && !level) falls.push_back(clk.now);
+    });
+    pit.write(3, 0x34);  // counter 0, LSB+MSB, mode 2
+    pit.write(0, 10);
+    pit.write(0, 0);
+    clk.advance_to(100 * 4);
+    pit.write(0, 20);  // during the first period
+    pit.write(0, 0);
+    clk.advance_to(100 * 60);
+    CHECK(falls.size() >= 3);
+    if (falls.size() >= 3) {
+        CHECK_EQ(falls[0], 100ull * 10);           // the first period keeps its 10 ticks
+        CHECK_EQ(falls[1] - falls[0], 100ull * 20);  // then 20
+        CHECK_EQ(falls[2] - falls[1], 100ull * 20);
+    }
+}
+
 TEST(pit_mode0_terminal_count_and_latch) {
     Clock clk;
     Pit8254 pit(clk.sched, 1.0e6, {1.0e6, 1.0e6, 1.0e6});  // 1 cycle per tick
@@ -176,6 +200,53 @@ TEST(eeprom_write_enable_write_read) {
     CHECK_EQ(ee_read(ee, 0x10), 0xBEEF);
 }
 
+// With PRE high the instructions address the protect register; PRCLEAR is
+// not an erase of word 127.
+TEST(eeprom_protect_register) {
+    Eeprom93Cxx ee;
+    auto cmd = [&](u32 bits, bool pre) {
+        ee.set_lines(true, false, false, pre);
+        for (int i = 10; i >= 0; --i) {
+            const bool b = (bits >> i) & 1;
+            ee.set_lines(true, false, b, pre);
+            ee.set_lines(true, true, b, pre);
+        }
+    };
+    auto end = [&] { ee.set_lines(false, false, false); };
+    auto write = [&](unsigned addr, u16 v) {
+        ee_cmd(ee, (0b101u << 8) | addr, 11);
+        ee_cmd(ee, v, 16);
+        end();
+    };
+    ee_cmd(ee, (0b100u << 8) | 0xC0, 11);  // WEN
+    end();
+    write(0x7F, 0x1234);
+    write(0x20, 0x5555);
+    cmd((0b100u << 8) | 0xC0, true);  // PREN
+    end();
+    cmd((0b111u << 8) | 0xFF, true);  // PRCLEAR
+    end();
+    CHECK_EQ(ee_read(ee, 0x7F), 0x1234u);
+    cmd((0b100u << 8) | 0xC0, true);  // PREN, then PRWRITE 0x20: protect 0x20 and up
+    end();
+    cmd((0b101u << 8) | 0x20, true);
+    end();
+    write(0x20, 0xAAAA);
+    write(0x1F, 0xAAAA);
+    CHECK_EQ(ee_read(ee, 0x20), 0x5555u);
+    CHECK_EQ(ee_read(ee, 0x1F), 0xAAAAu);
+    cmd((0b110u << 8), true);  // PRREAD
+    CHECK(!ee.data_out());
+    u32 v = 0;
+    for (int i = 0; i < 8; ++i) {
+        ee.set_lines(true, false, false, true);
+        ee.set_lines(true, true, false, true);
+        v = (v << 1) | (ee.data_out() ? 1 : 0);
+    }
+    end();
+    CHECK_EQ(v, 0x20u);
+}
+
 TEST(scc_transmit_and_interrupts) {
     Clock clk;
     Z85230 scc(clk.sched, 50);
@@ -298,8 +369,37 @@ TEST(scsi_cdrom_inquiry_capacity_read) {
     CHECK_EQ(r.status, 0x02);  // write-protected medium
 }
 
-// MODE SELECT's block descriptor switches the CD-ROM to 2048-byte blocks
-// (as OpenBSD does); the disk stays at 512; a reset restores 512.
+// MODE SENSE has only the pages the drive does; READ TOC gives block
+// numbers or minutes, seconds and frames.
+TEST(scsi_mode_sense_pages_and_toc) {
+    const TempImage image(16);
+    ScsiDisk cd(ScsiDisk::Kind::CdRom, image.path);
+    const u8 geometry[6] = {0x1A, 0x08, 0x04, 0, 255, 0};
+    auto r = cd.command(geometry, 6);
+    CHECK_EQ(r.status, 0x02);  // no geometry page on a CD-ROM
+    const u8 sense[6] = {0x03, 0, 0, 0, 18, 0};
+    r = cd.command(sense, 6);
+    CHECK_EQ(r.data_in[2], 0x05);
+    CHECK_EQ(r.data_in[12], 0x24);
+    const u8 params[6] = {0x1A, 0x08, 0x0D, 0, 255, 0};
+    r = cd.command(params, 6);
+    CHECK_EQ(r.status, 0x00);
+    CHECK_EQ(r.data_in.size(), 12u);  // header, page 0D
+    CHECK_EQ(r.data_in[4], 0x0D);
+    const u8 toc_msf[10] = {0x43, 0x02, 0, 0, 0, 0, 0, 0, 20, 0};
+    r = cd.command(toc_msf, 10);
+    CHECK_EQ(r.data_in.size(), 20u);
+    CHECK_EQ(r.data_in[1], 18u);
+    CHECK_EQ(r.data_in[10], 2u);  // track 1 at 00:02:00
+    CHECK_EQ(r.data_in[14], 0xAAu);
+    CHECK_EQ(r.data_in[18], 2u);  // lead-out after four 2048-byte blocks: 00:02:04
+    CHECK_EQ(r.data_in[19], 4u);
+    const u8 toc_leadout[10] = {0x43, 0, 0, 0, 0, 0, 0xAA, 0, 20, 0};
+    r = cd.command(toc_leadout, 10);
+    CHECK_EQ(r.data_in.size(), 12u);
+    CHECK_EQ(r.data_in[11], 4u);
+}
+
 // MODE SELECT's block descriptor switches the CD-ROM between 2048-byte
 // blocks (its power-on size) and 512 (as the PROM and IRIX select); a bus
 // reset restores 2048 and reports UNIT ATTENTION. The disk stays at 512.

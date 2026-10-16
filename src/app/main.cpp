@@ -5,6 +5,7 @@
 // at once. With --headless (or without SDL3) both serial ports are connected
 // to this terminal.
 #include <atomic>
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "app/detach.h"
+#include "app/proms.h"
 #include "app/session.h"
 #include "app/settings.h"
 #include "core/log.h"
@@ -47,7 +49,9 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [options]\n"
                  "With no options the window opens with the machine off and the last settings.\n"
-                 "  --prom FILE      IP22 boot PROM image (raw, big-endian)\n"
+                 "  --prom-dir DIR   folder of boot PROM images; the one the machine needs is chosen\n"
+                 "                   (default: ./roms, else roms in the SiliconGhost folder)\n"
+                 "  --prom FILE      a specific boot PROM image instead (raw, big-endian)\n"
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved when it changes\n"
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media; give it\n"
@@ -77,11 +81,16 @@ void usage(const char* argv0) {
                    "                   interface to the guest (may be repeated)\n",
                    stderr);
     std::fprintf(stderr,
+                 "  --machine BOARD  indy (default) or indigo2\n"
                  "  --ram MB         memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256\n"
-                 "                   (one or two banks of 16, 32, 64 or 128; default 64)\n"
-                 "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc or r4000pc\n"
-                 "  --cpu-mhz N      pipeline clock (default 150)\n"
+                 "                   (one or two banks of 16, 32, 64 or 128; default 64); on the\n"
+                 "                   indigo2 up to three banks, to 384\n"
+                 "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc, r4000pc, r4600sc, r4600pc,\n"
+                 "                   r5000sc or r5000pc\n"
+                 "  --cpu-mhz N      pipeline clock: one the module shipped at (default 150)\n"
+                 "  --any-clock      allow a clock no such machine shipped with\n"
                  "  --graphics BOARD xl8 (8-bit Newport, the default), xl24 (24-bit) or none\n"
+                 "  --graphics-rev N the board revision it reports, 0-7 (default 2 for xl8, 0 for xl24)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only), as --graphics none\n"
                  "  --headless       no window: both serial ports use this terminal\n"
                  "  --foreground     keep the window's messages on this terminal (the window otherwise\n"
@@ -101,6 +110,10 @@ void usage(const char* argv0) {
                  "  --audio-in       let the machine record from the host's audio input\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --dump-state     print the CPU registers when the emulator stops\n"
+                 "  --load-elf F     run bare-metal MIPS ELF program F instead of the PROM (no PROM needed);\n"
+                 "                   implies --headless and, unless --timing is given, max\n"
+                 "  --test-device    fit the bare-metal test device (console, host clock, exit code)\n"
+                 "  --test-run-config N  value the test device reports in its run configuration register\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "In the window, the Machine and Media menus hold the same choices; Ctrl-C quits.\n",
                  sg::mips::R4000::jit_available()
@@ -226,6 +239,7 @@ int main(int argc, char** argv) {
     std::string screenshot, settings_file;
     unsigned long long max_cycles = ~0ull;
     bool trace = false, dump = false, headless = false, timing_given = false, foreground = false, log_given = false;
+    bool any_clock = false, cpu_given = false, mhz_given = false;
     sg::log::set_level(sg::log::Level::Warn);
 
     // Options that describe a machine. Finder on older macOS passes a process
@@ -247,10 +261,11 @@ int main(int argc, char** argv) {
         static const struct {
             const char* flag;
             const char* key;
-        } kValued[] = {{"--prom", "prom"},   {"--nvram", "nvram"},     {"--disk", "disk"},
+        } kValued[] = {{"--prom", "prom"},   {"--prom-dir", "prom_dir"},  {"--nvram", "nvram"},     {"--disk", "disk"},
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
-                       {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},
-                       {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"}, {"--timing", "timing"}, {"--max-speed", "max_speed"},
+                       {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},  {"--machine", "machine"},
+                       {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"},
+                       {"--graphics-rev", "graphics_rev"}, {"--timing", "timing"}, {"--max-speed", "max_speed"},
                        {"--log", "log"}};
         static const struct {
             const char* flag;
@@ -266,6 +281,8 @@ int main(int argc, char** argv) {
             if (!std::strcmp(a, v.flag)) key = v.key, value = v.value;
         if (!key.empty()) {
             if (key == "timing") timing_given = true;
+            if (key == "cpu") cpu_given = true;
+            if (key == "cpu_mhz") mhz_given = true;
             if (!sg::app::set_option(settings, key, value, error)) {
                 std::fprintf(stderr, "error: %s %s\n", a, error.c_str());
                 return 2;
@@ -280,9 +297,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "error: %s\n", error.c_str());
                 return 2;
             }
-        } else if (!std::strcmp(a, "--screenshot")) screenshot = next();
+        } else if (!std::strcmp(a, "--load-elf")) settings.load_elf = next();
+        else if (!std::strcmp(a, "--test-device")) settings.test_device = true;
+        else if (!std::strcmp(a, "--test-run-config"))
+            settings.test_run_config = static_cast<sg::u32>(std::strtoul(next().c_str(), nullptr, 0));
+        else if (!std::strcmp(a, "--screenshot")) screenshot = next();
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next().c_str(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
+        else if (!std::strcmp(a, "--any-clock")) any_clock = true;
         else if (!std::strcmp(a, "--dump-state")) dump = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
         else if (!std::strcmp(a, "--foreground")) foreground = true;
@@ -293,6 +315,29 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 2;
         }
+    }
+    // A module chosen here without a clock runs at the one it shipped with.
+    if (cpu_given && !mhz_given)
+        if (const sg::app::CpuModel* m = sg::app::find_cpu_model(settings.cpu))
+            if (const auto& mhz = m->mhz(sg::app::board_of(settings)); !mhz.empty() &&
+                std::find(mhz.begin(), mhz.end(), settings.cpu_mhz) == mhz.end())
+                settings.cpu_mhz = mhz.front();
+    {
+        std::string error;
+        if (!sg::app::check_hardware(settings, any_clock, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 2;
+        }
+        // A machine described here needs its PROM: say so before anything starts.
+        sg::app::PromImage prom;
+        if ((real_args > 0 || headless) && settings.load_elf.empty() && !sg::app::select_prom(settings, prom, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 2;
+        }
+    }
+    if (!settings.load_elf.empty()) {  // a bare-metal program: console only, as fast as possible
+        headless = true;
+        if (!timing_given) settings.timing = sg::Pacer::Mode::Max;
     }
     if (max_cycles != ~0ull) {
         headless = true;
@@ -339,10 +384,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "note: this build has no window or sound (SDL3 was not found when it was built); "
                              "using the serial console\n");
 #endif
-    if (settings.prom.empty()) {
-        usage(argv[0]);
-        return 2;
-    }
 
     sg::app::Session session(settings);
     session.set_serial_output([](unsigned, sg::u8 byte) {
@@ -379,6 +420,7 @@ int main(int argc, char** argv) {
         if (!screenshot.empty() && !session.save_screenshot(screenshot))
             std::fprintf(stderr, "screenshot: no video signal\n");
     }
+    const int exit_code = session.machine()->exit_code();
     session.power_off();
-    return 0;
+    return exit_code >= 0 ? exit_code : 0;
 }

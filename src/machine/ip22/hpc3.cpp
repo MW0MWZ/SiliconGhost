@@ -22,15 +22,16 @@ constexpr u32 kEepromReg = 0x30008;
 constexpr u32 kIntStat1 = 0x3000C;
 constexpr u32 kBeStat = 0x30010;
 
+constexpr u32 kInt2Window = 0x59000;  // PBUS PIO channel 4 (Indigo2: INT2)
+constexpr u32 kInt2WindowEnd = kInt2Window + 0x400;
 constexpr u32 kIocWindow = 0x59800;  // PBUS PIO channel 6
 constexpr u32 kIocWindowEnd = kIocWindow + 0x400;
-constexpr u32 kScsi0Window = 0x40000;  // WD33C93: SASR at word 0, data at word 1
-constexpr u32 kScsi0WindowEnd = 0x48000;
-constexpr u32 kScsi1WindowEnd = 0x50000;  // second WD33C93 port: not connected on the Indy
-constexpr u32 kScsi0Cbp = 0x10000;
-constexpr u32 kScsi0Ndbp = 0x10004;
-constexpr u32 kScsi0Bc = 0x11000;
-constexpr u32 kScsi0Ctrl = 0x11004;
+constexpr u32 kExtIo = kIocWindow + 4 * Ioc2::kExtIoIndex;  // Indigo2: 16 bits, in the low half of the word
+constexpr u32 kScsiWindow = 0x40000;  // WD33C93s, 0x8000 apart: SASR at word 0, data at word 1
+constexpr u32 kScsiWindowSize = 0x8000;
+constexpr u32 kScsiRegs = 0x10000;  // channel n's DMA registers at + n * 0x2000
+constexpr u32 kScsiRegsEnd = 0x14000;
+constexpr u32 kScsiCbp = 0x0000, kScsiNdbp = 0x0004, kScsiBc = 0x1000, kScsiCtrl = 0x1004;
 // SCSI DMA control bits
 constexpr u32 kScsiCtrlIrq = 1u << 0;
 constexpr u32 kScsiCtrlEndian = 1u << 1;
@@ -43,7 +44,7 @@ constexpr u32 kScsiCtrlReset = 1u << 6;
 constexpr u32 kDescEox = 1u << 31;
 constexpr u32 kDescXie = 1u << 29;
 constexpr u32 kDescCountMask = 0x3FFF;
-constexpr u32 kIntStatScsi0 = 1u << 8;
+constexpr u32 kIntStatScsi0 = 1u << 8;  // and channel 1 at bit 9
 constexpr u32 kHal2Window = 0x58000;  // PBUS PIO channels 0-3
 constexpr u32 kHal2WindowEnd = 0x59000;
 // PBUS DMA channel n: buffer and descriptor pointers at n * 0x2000, control at +0x1000
@@ -52,6 +53,7 @@ constexpr u32 kPbusStride = 0x2000;
 constexpr u32 kPbusCtrl = 0x1000;
 // Control register: written...
 constexpr u32 kPbusCtrlLittleEndian = 1u << 1;
+constexpr u32 kPbusCtrlReceive = 1u << 2;  // device to memory
 constexpr u32 kPbusCtrlAct = 1u << 4;
 constexpr u32 kPbusCtrlLoad = 1u << 5;  // ACT is written only with this set
 // ...and read
@@ -84,6 +86,7 @@ constexpr u32 kRtcWindow = 0x60000;
 constexpr u32 kRtcWindowEnd = 0x68000;
 
 // EEPROM register bits
+constexpr u32 kEepromPre = 1u << 0;  // protect register enable
 constexpr u32 kEepromCs = 1u << 1;
 constexpr u32 kEepromClk = 1u << 2;
 constexpr u32 kEepromDataOut = 1u << 3;  // CPU -> EEPROM
@@ -91,16 +94,20 @@ constexpr u32 kEepromDataIn = 1u << 4;   // EEPROM -> CPU
 
 }  // namespace
 
-Hpc3::Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz)
-    : bus_(bus), ioc_(ioc), scheduler_(scheduler), cpu_hz_(cpu_hz), scsi0_(scheduler, cpu_hz / 1000.0) {
+Hpc3::Hpc3(Bus& bus, Ioc2& ioc, Scheduler& scheduler, double cpu_hz, bool full_house)
+    : bus_(bus), ioc_(ioc), scheduler_(scheduler), cpu_hz_(cpu_hz), full_house_(full_house),
+      scsi0_(scheduler, cpu_hz / 1000.0), scsi1_(scheduler, cpu_hz / 1000.0) {
     for (unsigned ch = 0; ch < kPbusChannels; ++ch)
         pbus_timer_[ch] = std::make_unique<Timer>(scheduler, [this, ch] { pbus_complete(ch); });
     hal2_.set_change_callback([this] { pbus_reconfigure(); });
     enet_tx_timer_ = std::make_unique<Timer>(scheduler, [this] { enet_transmit(); });
     enet_poll_timer_ = std::make_unique<Timer>(scheduler, [this] { enet_poll(); });
-    scsi0_.set_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0Scsi0, level); });
-    scsi0_.set_dma([this](const u8* data, u32 n) { return scsi_dma(data, nullptr, n); },
-                   [this](u8* data, u32 n) { return scsi_dma(nullptr, data, n); });
+    for (unsigned ch = 0; ch < 2; ++ch) {
+        scsi_[ch]->set_irq_callback(
+            [this, ch](bool level) { ioc_.set_local0(ch ? Ioc2::kL0Scsi1 : Ioc2::kL0Scsi0, level); });
+        scsi_[ch]->set_dma([this, ch](const u8* data, u32 n) { return scsi_dma(ch, data, nullptr, n); },
+                           [this, ch](u8* data, u32 n) { return scsi_dma(ch, nullptr, data, n); });
+    }
     reset();
 }
 
@@ -109,9 +116,11 @@ void Hpc3::reset() {
     written_.clear();
     eeprom_reg_ = 0;
     eeprom_.set_lines(false, false, false);
-    scsi0_.reset();
-    scsi_dma_ = ScsiDma{};
-    scsi_dma_.in_reset = true;  // the channel reset bit is set at power-on
+    for (unsigned ch = 0; ch < 2; ++ch) {
+        scsi_[ch]->reset();
+        scsi_dma_[ch] = ScsiDma{};
+        scsi_dma_[ch].in_reset = true;  // the channel reset bit is set at power-on
+    }
     for (unsigned ch = 0; ch < kPbusChannels; ++ch) {
         pbus_timer_[ch]->cancel();
         pbus_[ch] = PbusChannel{};
@@ -392,7 +401,8 @@ void Hpc3::pbus_complete(unsigned ch) {
 void Hpc3::play(unsigned ch, u32 addr, u32 frames, const Hal2::PortConfig& dac) {
     const unsigned size = pbus_sample_bytes(ch);
     std::vector<s16> samples(static_cast<std::size_t>(frames) * dac.voices);
-    const bool little = dac.little_endian || (pbus_[ch].ctrl & kPbusCtrlLittleEndian);
+    // HAL2 and the HPC3 each swap bytes when set for little-endian: both cancel.
+    const bool little = dac.little_endian != ((pbus_[ch].ctrl & kPbusCtrlLittleEndian) != 0);
     for (u32 i = 0; i < samples.size(); ++i) {
         u8 b[4] = {0, 0, 0, 0};
         for (u32 k = 0; k < size; ++k) bus_.read<u8>(addr + size * i + k, b[k]);
@@ -426,8 +436,9 @@ const Hal2::Port* Hpc3::pbus_port(unsigned ch) const {
 // (whole frames; with `last`, the rest of it). As on the hardware, data moves
 // as the transfer goes: software that follows the buffer pointer refills
 // (or empties) the memory behind it, so it must be done with by then.
-// The codec input (ADC) records from the host when a source is set and the
-// digital input (AES) has nothing connected: silence otherwise. What the DAC
+// The channel's receive bit sets the direction. The codec input (ADC)
+// records from the host when a source is set and the digital input (AES) has
+// nothing connected: silence otherwise, as from an output port. What the DAC
 // plays goes to the audio sink.
 void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
     PbusChannel& c = pbus_[ch];
@@ -439,16 +450,16 @@ void Hpc3::pbus_transfer(unsigned ch, u32 upto, bool last) {
     upto = last ? c.bc : std::min(upto, c.bc) / frame * frame;
     if (upto <= c.filled) return;
     const u32 n = upto - c.filled;
-    if (!in.input) {
+    if (!(c.ctrl & kPbusCtrlReceive)) {
         if (*port == Hal2::kDac && audio_sink_ && n >= frame) play(ch, c.bptr + c.filled, n / frame, in);
         c.filled = upto;
         return;
     }
     std::vector<u8> bytes(n, 0);
-    if (audio_source_ && *port == Hal2::kAdc && in.voices && n >= frame) {
+    if (audio_source_ && *port == Hal2::kAdc && in.input && in.voices && n >= frame) {
         std::vector<s16> samples(n / frame * in.voices, 0);
         audio_source_(samples.data(), samples.size() / in.voices, in.voices, in.rate);
-        const bool little = in.little_endian || (c.ctrl & kPbusCtrlLittleEndian);
+        const bool little = in.little_endian != ((c.ctrl & kPbusCtrlLittleEndian) != 0);
         double gain[2];
         hal2_.input_gain(gain[0], gain[1]);
         const bool unity = gain[0] == 1.0 && gain[1] == 1.0;
@@ -539,8 +550,8 @@ void Hpc3::pbus_write(u32 offset, u32 value) {
 
 // Moves bytes between the SCSI controller and memory along the descriptor
 // chain: `src` set = device to memory, `dst` set = memory to device.
-u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
-    ScsiDma& d = scsi_dma_;
+u32 Hpc3::scsi_dma(unsigned ch, const u8* src, u8* dst, u32 length) {
+    ScsiDma& d = scsi_dma_[ch];
     if (!d.active) return 0;  // not started yet: the controller waits for it
     u32 moved = 0;
     while (moved < length && d.active) {
@@ -589,7 +600,7 @@ u32 Hpc3::scsi_dma(const u8* src, u8* dst, u32 length) {
 void Hpc3::update_dma_irq() {
     bool pbus = false;
     for (const PbusChannel& c : pbus_) pbus |= c.irq;
-    ioc_.set_local1(Ioc2::kL1HpcDma, scsi_dma_.irq || pbus);
+    ioc_.set_local1(Ioc2::kL1HpcDma, scsi_dma_[0].irq || scsi_dma_[1].irq || pbus);
 }
 
 int Hpc3::byte_index(u32 offset, unsigned size, u32 window_base) {
@@ -600,14 +611,26 @@ int Hpc3::byte_index(u32 offset, unsigned size, u32 window_base) {
 }
 
 bool Hpc3::read(u32 offset, unsigned size, u64& value) {
-    if (offset >= kScsi0Window && offset < kScsi0WindowEnd) {
+    if (offset >= kScsiWindow && offset < kScsiWindow + 2 * kScsiWindowSize) {
+        const unsigned ch = (offset - kScsiWindow) / kScsiWindowSize;
+        if (ch == 1 && !full_house_) {  // no chip: reads float low
+            value = 0;
+            return true;
+        }
         const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kScsi0Window);
-        value = idx < 0 ? 0 : (idx & 1) ? scsi0_.read_data() : scsi0_.read_aux_status();
+        const int idx = byte_index(o, size == 8 ? 4 : size, kScsiWindow + ch * kScsiWindowSize);
+        value = idx < 0 ? 0 : (idx & 1) ? scsi_[ch]->read_data() : scsi_[ch]->read_aux_status();
         return true;
     }
-    if (offset >= kScsi0WindowEnd && offset < kScsi1WindowEnd) {  // no chip: reads float low
-        value = 0;
+    if (full_house_ && offset >= kInt2Window && offset < kInt2WindowEnd) {
+        const u32 o = size == 8 ? offset + 4 : offset;
+        const int idx = byte_index(o, size == 8 ? 4 : size, kInt2Window);
+        value = idx >= 0 ? ioc_.int2_read(static_cast<unsigned>(idx)) : 0;
+        return true;
+    }
+    if (full_house_ && (offset & ~3u) == kExtIo) {
+        const u32 w = ioc_.ext_io();
+        value = size >= 4 ? w : size == 2 ? ((offset & 2) ? w : 0) : ((offset & 3) == 3 ? w & 0xFF : (offset & 3) == 2 ? w >> 8 : 0);
         return true;
     }
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
@@ -637,6 +660,12 @@ bool Hpc3::read(u32 offset, unsigned size, u64& value) {
 }
 
 bool Hpc3::read_is_pure(u32 offset, unsigned size) const {
+    if (full_house_ && offset >= kInt2Window && offset < kInt2WindowEnd) {
+        const u32 o = size == 8 ? offset + 4 : offset;
+        const int idx = byte_index(o, size == 8 ? 4 : size, kInt2Window);
+        return idx < 0 || ioc_.int2_read_is_pure(static_cast<unsigned>(idx));
+    }
+    if (full_house_ && (offset & ~3u) == kExtIo) return true;
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
@@ -646,16 +675,27 @@ bool Hpc3::read_is_pure(u32 offset, unsigned size) const {
 }
 
 bool Hpc3::write(u32 offset, unsigned size, u64 value) {
-    if (offset >= kScsi0Window && offset < kScsi0WindowEnd) {
+    if (offset >= kScsiWindow && offset < kScsiWindow + 2 * kScsiWindowSize) {
+        const unsigned ch = (offset - kScsiWindow) / kScsiWindowSize;
+        if (ch == 1 && !full_house_) return true;
         const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kScsi0Window);
+        const int idx = byte_index(o, size == 8 ? 4 : size, kScsiWindow + ch * kScsiWindowSize);
         if (idx >= 0) {
-            if (idx & 1) scsi0_.write_data(static_cast<u8>(value));
-            else scsi0_.write_address(static_cast<u8>(value));
+            if (idx & 1) scsi_[ch]->write_data(static_cast<u8>(value));
+            else scsi_[ch]->write_address(static_cast<u8>(value));
         }
         return true;
     }
-    if (offset >= kScsi0WindowEnd && offset < kScsi1WindowEnd) return true;
+    if (full_house_ && offset >= kInt2Window && offset < kInt2WindowEnd) {
+        const u32 o = size == 8 ? offset + 4 : offset;
+        const int idx = byte_index(o, size == 8 ? 4 : size, kInt2Window);
+        if (idx >= 0) ioc_.int2_write(static_cast<unsigned>(idx), static_cast<u8>(value));
+        return true;
+    }
+    if (full_house_ && (offset & ~3u) == kExtIo) {
+        ioc_.ext_io_write(static_cast<u16>(value));
+        return true;
+    }
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
@@ -689,8 +729,70 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
     return true;
 }
 
+u32 Hpc3::scsi_read(unsigned ch, u32 reg) {
+    ScsiDma& d = scsi_dma_[ch];
+    switch (reg) {
+        case kScsiCbp: return d.cbp;
+        case kScsiNdbp: return d.ndbp;
+        case kScsiBc: return (d.flags & ~kDescCountMask) | d.bc;
+        case kScsiCtrl: {
+            const u32 v = (d.ctrl & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush)) |
+                          (d.active ? kScsiCtrlActive : 0) | (d.irq ? kScsiCtrlIrq : 0) |
+                          (d.in_reset ? kScsiCtrlReset : 0);
+            d.irq = false;  // reading the control register acknowledges the interrupt
+            update_dma_irq();
+            return v;
+        }
+        default: {
+            const auto it = regs_.find(kScsiRegs + ch * 0x2000 + reg);
+            return it != regs_.end() ? it->second : 0;
+        }
+    }
+}
+
+void Hpc3::scsi_write(unsigned ch, u32 reg, u32 value) {
+    ScsiDma& d = scsi_dma_[ch];
+    Wd33c93& wd = *scsi_[ch];
+    switch (reg) {
+        case kScsiNdbp:  // the descriptor in use, if any, is finished first
+            d.ndbp = value;
+            if (!d.active) {
+                d.bc = 0;
+                d.loaded = false;
+            }
+            return;
+        case kScsiCtrl:
+            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset, and resets the bus
+                if (!d.in_reset) wd.bus_reset();
+                wd.reset();
+                d = ScsiDma{};
+                d.in_reset = true;
+                update_dma_irq();
+                return;
+            }
+            if (d.in_reset) {
+                d.in_reset = false;
+                wd.reset_released();
+            }
+            d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush);
+            if (!(value & kScsiCtrlActiveMask)) {
+                const bool start = (value & kScsiCtrlActive) && !d.active;
+                d.active = value & kScsiCtrlActive;
+                if (start) {  // (re)start from the descriptor at NDBP
+                    d.bc = 0;
+                    d.loaded = false;
+                }
+            }
+            if (value & kScsiCtrlFlush) d.active = false;
+            if (d.active) wd.dma_kick();  // the controller may be waiting for it
+            return;
+        default: regs_[kScsiRegs + ch * 0x2000 + reg] = value; return;
+    }
+}
+
 u32 Hpc3::read_word(u32 offset) {
     if (offset < kPbusDmaEnd) return pbus_read(offset);
+    if (offset >= kScsiRegs && offset < kScsiRegsEnd) return scsi_read((offset - kScsiRegs) / 0x2000, offset & 0x1FFF);
     if (offset >= kEnetStart && offset < kEnetEnd) return enet_read(offset);
     if (offset == kEnetRxCurDesc) return enet_rx_.cdp;
     if (offset >= kSeeqWindow && offset < kSeeqWindowEnd) return seeq_.read((offset - kSeeqWindow) >> 2);
@@ -698,20 +800,9 @@ u32 Hpc3::read_word(u32 offset) {
     switch (offset) {
         case kIntStat0:
         case kIntStat1: {
-            u32 v = scsi_dma_.irq ? kIntStatScsi0 : 0;
+            u32 v = (scsi_dma_[0].irq ? kIntStatScsi0 : 0) | (scsi_dma_[1].irq ? kIntStatScsi0 << 1 : 0);
             for (unsigned ch = 0; ch < kPbusChannels; ++ch)
                 if (pbus_[ch].irq) v |= 1u << ch;
-            return v;
-        }
-        case kScsi0Cbp: return scsi_dma_.cbp;
-        case kScsi0Ndbp: return scsi_dma_.ndbp;
-        case kScsi0Bc: return (scsi_dma_.flags & ~kDescCountMask) | scsi_dma_.bc;
-        case kScsi0Ctrl: {
-            const u32 v = (scsi_dma_.ctrl & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush)) |
-                          (scsi_dma_.active ? kScsiCtrlActive : 0) | (scsi_dma_.irq ? kScsiCtrlIrq : 0) |
-                          (scsi_dma_.in_reset ? kScsiCtrlReset : 0);
-            scsi_dma_.irq = false;  // reading the control register acknowledges the interrupt
-            update_dma_irq();
             return v;
         }
         case kEepromReg: return (eeprom_reg_ & ~kEepromDataIn) | (eeprom_.data_out() ? kEepromDataIn : 0);
@@ -727,6 +818,7 @@ u32 Hpc3::read_word(u32 offset) {
 
 void Hpc3::write_word(u32 offset, u32 value) {
     if (offset < kPbusDmaEnd) return pbus_write(offset, value);
+    if (offset >= kScsiRegs && offset < kScsiRegsEnd) return scsi_write((offset - kScsiRegs) / 0x2000, offset & 0x1FFF, value);
     if (offset >= kEnetStart && offset < kEnetEnd) return enet_write(offset, value);
     if (offset >= kSeeqWindow && offset < kSeeqWindowEnd) return seeq_.write((offset - kSeeqWindow) >> 2, static_cast<u8>(value));
     if (offset >= kHal2Window && offset < kHal2WindowEnd) return hal2_.write(offset - kHal2Window, value);
@@ -738,43 +830,9 @@ void Hpc3::write_word(u32 offset, u32 value) {
     switch (offset) {
         case kEepromReg:
             eeprom_reg_ = value & 0x1F;
-            eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut);
+            eeprom_.set_lines(value & kEepromCs, value & kEepromClk, value & kEepromDataOut, value & kEepromPre);
             return;
         case kGioMisc: regs_[offset] = value & 3; return;
-        case kScsi0Ndbp:  // the descriptor in use, if any, is finished first
-            scsi_dma_.ndbp = value;
-            if (!scsi_dma_.active) {
-                scsi_dma_.bc = 0;
-                scsi_dma_.loaded = false;
-            }
-            return;
-        case kScsi0Ctrl: {
-            ScsiDma& d = scsi_dma_;
-            if (value & kScsiCtrlReset) {  // holds the channel and the WD33C93 in reset, and resets the bus
-                if (!d.in_reset) scsi0_.bus_reset();
-                scsi0_.reset();
-                d = ScsiDma{};
-                d.in_reset = true;
-                update_dma_irq();
-                return;
-            }
-            if (d.in_reset) {
-                d.in_reset = false;
-                scsi0_.reset_released();
-            }
-            d.ctrl = value & (kScsiCtrlEndian | kScsiCtrlDir | kScsiCtrlFlush);
-            if (!(value & kScsiCtrlActiveMask)) {
-                const bool start = (value & kScsiCtrlActive) && !d.active;
-                d.active = value & kScsiCtrlActive;
-                if (start) {  // (re)start from the descriptor at NDBP
-                    d.bc = 0;
-                    d.loaded = false;
-                }
-            }
-            if (value & kScsiCtrlFlush) d.active = false;
-            if (d.active) scsi0_.dma_kick();  // the controller may be waiting for it
-            return;
-        }
         case kIntStat0:
         case kIntStat1:
         case kBeStat: return;

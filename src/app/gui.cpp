@@ -17,6 +17,7 @@
 
 #include "app/display_sdl.h"
 #include "app/menu_model.h"
+#include "app/proms.h"
 #include "app/sdl_common.h"
 #include "app/session.h"
 #include "app/terminal.h"
@@ -72,7 +73,7 @@ std::string old_user_file(const std::string& name) {
 }
 
 // What a file chooser was opened for.
-enum class Pick { Prom, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
+enum class Pick { Prom, PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
 
 constexpr SDL_DialogFileFilter kPromFilters[] = {{"PROM images", "bin;rom;img"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kNvramFilters[] = {{"NVRAM images", "bin;nvram;nvr"}, {"All files", "*"}};
@@ -80,7 +81,6 @@ constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd
 constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
 
-constexpr std::array<double, 6> kClockPresets = {100, 133, 150, 175, 200, 250};
 constexpr std::array<u64, 7> kDiskSizesMiB = {512, 1024, 2048, 4096, 8192, 16384, 32768};
 
 // An activity light: lit for a moment whenever its counter moves.
@@ -220,7 +220,31 @@ private:
     int new_disk_size_ = 3;  // index into kDiskSizesMiB
     std::mutex picks_mutex_;
     std::deque<PickResult> picks_;
+
+    // The PROM the settings being edited would start with (or why there is
+    // none), worked out again only when a setting it depends on changes.
+    struct PromChoice {
+        std::string key, text;
+        bool ok = false;
+    } prom_choice_;
+    const PromChoice& prom_choice(const Settings& s);
 };
+
+const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
+    const std::string key = s.prom_dir + '\n' + s.prom + '\n' + s.machine + '\n' + s.cpu + (s.graphics ? "\ng" : "");
+    if (key == prom_choice_.key) return prom_choice_;
+    prom_choice_.key = key;
+    PromImage p;
+    std::string error;
+    prom_choice_.ok = select_prom(s, p, error);
+    if (prom_choice_.ok) {
+        prom_choice_.text = "Boot PROM: " + std::filesystem::path(p.path).filename().string() + " (" +
+                            (p.part.empty() ? std::string() : p.part + ", ") + "version " + p.version + ")";
+    } else {
+        prom_choice_.text = error;
+    }
+    return prom_choice_;
+}
 
 int Gui::run() {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -319,7 +343,7 @@ int Gui::run() {
                                          [this](std::function<void()> a) { posted_.push_back(std::move(a)); });
 
     if (options_.power_on) power_on();
-    else if (session_.settings().prom.empty()) open_settings();
+    else if (!prom_choice(session_.settings()).ok) open_settings();  // no PROM for the machine yet
     update_title();
 
     constexpr u64 kFrameNs = 1000000000ull / 60;
@@ -1017,7 +1041,8 @@ void Gui::draw_status_bar() {
     const Settings& s = session_.settings();
     const CpuModel* model = find_cpu_model(s.cpu);
     char right[96];
-    std::snprintf(right, sizeof right, "%s %.0f MHz, %u MiB", model ? model->label : s.cpu.c_str(), s.cpu_mhz, s.ram_mb);
+    std::snprintf(right, sizeof right, "%s%s %.0f MHz, %u MiB", s.machine == "indigo2" ? "Indigo2, " : "",
+                  model ? model->label : s.cpu.c_str(), s.cpu_mhz, s.ram_mb);
     // Only the model name, before any detail in parentheses.
     std::string text = right;
     if (const auto paren = text.find(" ("); paren != std::string::npos) {
@@ -1040,6 +1065,7 @@ void Gui::draw_status_bar() {
 
 void Gui::open_settings() {
     edit_ = session_.settings();
+    make_consistent(edit_, false);  // a processor or memory size the platform cannot take is replaced
     if (auto* m = session_.machine()) edit_.cdroms = m->discs();
     net_mode_ = edit_.net == "none" ? 2 : edit_.net.rfind("tap:", 0) == 0 ? 1 : 0;
     tap_name_ = net_mode_ == 1 ? edit_.net.substr(4) : std::string();
@@ -1133,30 +1159,51 @@ void Gui::draw_settings() {
     ImGui::BeginChild("##tabs", ImVec2(0, -footer));
     if (ImGui::BeginTabBar("##settings")) {
         if (ImGui::BeginTabItem("Machine")) {
+            // Each choice limits the next: the platform the processors, the
+            // processor its clocks; the platform the memory sizes.
+            const ip22::Board board = board_of(edit_);
+            label("Hardware platform");
+            ImGui::SetNextItemWidth(-1);
+            const Platform* platform = find_platform(edit_.machine);
+            if (ImGui::BeginCombo("##machine", platform ? platform->label : edit_.machine.c_str())) {
+                for (const auto& p : platforms())
+                    if (ImGui::Selectable(p.label, edit_.machine == p.id) && edit_.machine != p.id) {
+                        edit_.machine = p.id;
+                        make_consistent(edit_, false);
+                    }
+                ImGui::EndCombo();
+            }
             label("Processor");
             ImGui::SetNextItemWidth(-1);
             const CpuModel* current = find_cpu_model(edit_.cpu);
             if (ImGui::BeginCombo("##cpu", current ? current->label : edit_.cpu.c_str())) {
                 for (const auto& model : cpu_models())
-                    if (ImGui::Selectable(model.label, edit_.cpu == model.id)) edit_.cpu = model.id;
+                    if (model.fits(board) && ImGui::Selectable(model.label, edit_.cpu == model.id) &&
+                        edit_.cpu != model.id) {
+                        edit_.cpu = model.id;
+                        make_consistent(edit_, true);
+                    }
                 ImGui::EndCombo();
             }
-            label("Clock (MHz)");
-            ImGui::SetNextItemWidth(120 * scale_);
-            ImGui::InputDouble("##mhz", &edit_.cpu_mhz, 0, 0, "%.0f");
-            edit_.cpu_mhz = std::clamp(edit_.cpu_mhz, 10.0, 1000.0);
-            for (double mhz : kClockPresets) {
-                ImGui::SameLine();
-                char text[8];
-                std::snprintf(text, sizeof text, "%.0f", mhz);
-                if (ImGui::SmallButton(text)) edit_.cpu_mhz = mhz;
+            current = find_cpu_model(edit_.cpu);
+            label("Clock");
+            ImGui::SetNextItemWidth(160 * scale_);
+            char clock[32];
+            std::snprintf(clock, sizeof clock, "%.0f MHz", edit_.cpu_mhz);
+            if (ImGui::BeginCombo("##mhz", clock)) {
+                if (current)
+                    for (double mhz : current->mhz(board)) {
+                        std::snprintf(clock, sizeof clock, "%.0f MHz", mhz);
+                        if (ImGui::Selectable(clock, edit_.cpu_mhz == mhz)) edit_.cpu_mhz = mhz;
+                    }
+                ImGui::EndCombo();
             }
             label("Memory");
-            ImGui::SetNextItemWidth(120 * scale_);
+            ImGui::SetNextItemWidth(160 * scale_);
             const std::string ram = std::to_string(edit_.ram_mb) + " MiB";
             if (ImGui::BeginCombo("##ram", ram.c_str())) {
-                for (unsigned mb = 16; mb <= 256; mb += 16)
-                    if (ip22::ram_size_fits(mb) && ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
+                for (unsigned mb : ram_sizes(board, current))
+                    if (ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
                 ImGui::EndCombo();
             }
             label("Graphics");
@@ -1165,10 +1212,38 @@ void Gui::draw_settings() {
             ImGui::Combo("##gfx", &gfx, "Newport XL8 (8-bit)\0Newport XL24 (24-bit)\0None (serial console only)\0");
             edit_.graphics = gfx != 2;
             edit_.xl24 = gfx == 1;
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(0.0f);
+            {
+                const PromChoice& pc = prom_choice(edit_);
+                ImGui::Bullet();
+                if (pc.ok) ImGui::TextDisabled("%s", pc.text.c_str());
+                else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.text.c_str());
+            }
+            for (const std::string& note : configuration_notes(edit_)) {
+                ImGui::Bullet();
+                ImGui::TextDisabled("%s", note.c_str());
+            }
+            ImGui::PopTextWrapPos();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Storage")) {
-            path_row("Boot PROM", "prom", edit_.prom, Pick::Prom, std::nullopt);
+            path_row("PROM folder", "promdir", edit_.prom_dir, Pick::PromDir, std::nullopt);
+            ImGui::SetCursorPosX(label_w);
+            ImGui::TextDisabled("Empty: %s", prom_folder(Settings{}).c_str());
+            path_row("Specific PROM", "prom", edit_.prom, Pick::Prom, std::nullopt);
+            ImGui::SetCursorPosX(label_w);
+            ImGui::TextDisabled("Optional: leave empty to use the right one from the folder");
+            {
+                const PromChoice& pc = prom_choice(edit_);
+                ImGui::SetCursorPosX(label_w);
+                ImGui::PushTextWrapPos(0.0f);
+                if (pc.ok) ImGui::TextUnformatted(pc.text.c_str());
+                else ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", pc.text.c_str());
+                ImGui::PopTextWrapPos();
+            }
             path_row("NVRAM", "nvram", edit_.nvram, Pick::Nvram, Pick::NewNvram);
             ImGui::SetCursorPosX(label_w);
             ImGui::TextDisabled("Saved whenever the system changes it; a new one starts blank");
@@ -1447,7 +1522,7 @@ void Gui::choose(Pick what, const std::string& current) {
     // SiliconGhost folder.
     std::string start = folder_of(current);
     if (start.empty() && !user_data_folder().empty()) {
-        const char* sub = what == Pick::Prom                          ? "roms"
+        const char* sub = what == Pick::Prom || what == Pick::PromDir ? "roms"
                           : what == Pick::Nvram || what == Pick::NewNvram ? "nvram"
                           : what == Pick::OpenSettings || what == Pick::SaveSettings ? ""
                                                                          : "diskImages";
@@ -1459,6 +1534,7 @@ void Gui::choose(Pick what, const std::string& current) {
     const char* location = req->location.empty() ? nullptr : req->location.c_str();
     switch (what) {
         case Pick::Prom: SDL_ShowOpenFileDialog(on_chosen, req, window_, kPromFilters, 2, location, false); break;
+        case Pick::PromDir: SDL_ShowOpenFolderDialog(on_chosen, req, window_, location, false); break;
         case Pick::Nvram: SDL_ShowOpenFileDialog(on_chosen, req, window_, kNvramFilters, 2, location, false); break;
         case Pick::NewNvram: SDL_ShowSaveFileDialog(on_chosen, req, window_, kNvramFilters, 2, location); break;
         case Pick::Disk: SDL_ShowOpenFileDialog(on_chosen, req, window_, kDiskFilters, 2, location, false); break;
@@ -1485,6 +1561,7 @@ void Gui::apply_choice(const PickResult& r) {
     std::string error;
     switch (r.what) {
         case Pick::Prom: edit_.prom = r.path; break;
+        case Pick::PromDir: edit_.prom_dir = r.path; break;
         case Pick::Nvram: edit_.nvram = r.path; break;
         case Pick::NewNvram:
             if (create_blank_image(r.path, kNvramBytes, error)) edit_.nvram = r.path;

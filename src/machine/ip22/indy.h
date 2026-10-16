@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/scheduler.h"
+#include "devices/test_device.h"
 #include "cpu/r4000/r4000.h"
 #include "machine/ip22/hpc3.h"
 #include "machine/ip22/ioc2.h"
@@ -23,19 +24,28 @@
 
 namespace sg::ip22 {
 
-// Whether `mb` MiB of RAM can be fitted: one or two banks of 16, 32, 64
-// or 128 MiB.
-bool ram_size_fits(unsigned mb);
+// The IP22 boards: the Indy ("Guinness", IP24 PROM) and the Indigo2
+// ("Full House"). They share the chipset; the Indigo2 adds an EISA bus, a
+// second SCSI channel, a third memory bank and slot interrupt routing, and
+// keeps the PROM's settings in a serial EEPROM.
+enum class Board { Indy, Indigo2 };
+
+// Whether `mb` MiB of RAM can be fitted: one or two banks (three on the
+// Indigo2) of 16, 32, 64 or 128 MiB.
+bool ram_size_fits(unsigned mb, Board board = Board::Indy);
 
 struct IndyConfig {
+    Board board = Board::Indy;
     unsigned ram_mb = 64;       // 16..256, multiple of 16
     double cpu_hz = 150.0e6;    // pipeline clock
     double sysclk_hz = 50.0e6;  // SysAD bus clock
+    mips::Core cpu_core = mips::Core::R4000;
     u32 prid = 0x00000450;      // R4400 revision 5.0
     u32 cpu_config = mips::R4000::kDefaultConfig;  // Config register at reset (cache geometry)
     u32 scache_bytes = 1u << 20;                    // secondary cache; 0 for a PC module
     bool graphics = true;       // a Newport board in the GFX slot
     bool xl24 = false;          // the 24-bit board (XL24) rather than the 8-bit XL8
+    int graphics_revision = -1;  // its board revision, 0-7; -1 for the usual one
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
     // SCSI CD-ROM (ID 4) discs, raw 512-byte blocks (IRIX media layout). The
     // first is in the drive at power-on; ejecting moves on to the next.
@@ -44,6 +54,10 @@ struct IndyConfig {
     // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
     // use a default when the NVRAM has none (IRIX requires one).
     std::optional<std::array<u8, 6>> mac;
+    // The bare-metal test device in GIO expansion slot 0 (see TestDevice),
+    // and the run configuration it reports.
+    bool test_device = false;
+    u32 test_run_config = 0;
 };
 
 class Indy {
@@ -59,9 +73,15 @@ public:
     void load_prom_image(const u8* data, std::size_t size);
 
     void reset();
+    // Loads a static big-endian MIPS ELF executable into memory and starts
+    // the CPU at its entry point instead of the PROM, with the memory banks
+    // set up as the PROM would leave them. Call after reset().
+    bool load_elf(const std::string& path, std::string& error);
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+    // The code a program gave the test device's exit register, or -1.
+    int exit_code() const { return exit_code_; }
     // True while software is timing the CPU against the 8254 (the PROM and
     // the kernels calibrate their delay loops at boot by latching counter 2),
     // and for half a second of guest time after its last latch. Each such
@@ -103,6 +123,14 @@ public:
     Bus& bus() { return bus_; }
     Scheduler& scheduler() { return scheduler_; }
     Ds1386& rtc() { return hpc3_.rtc(); }
+    Board board() const { return config_.board; }
+    // What the machine keeps when powered off, as one image: the DS1386's
+    // memory, after the serial EEPROM (big-endian words) on the Indigo2.
+    // load_nvram_image() takes a shorter image as the start of one.
+    std::size_t nvram_size() const;
+    std::vector<u8> nvram_image();
+    void load_nvram_image(const std::vector<u8>& image);
+    u64 nvram_changes() const { return hpc3_.rtc().nvram_changes() + hpc3_.eeprom().changes(); }
     Hpc3& hpc3() { return hpc3_; }
     // The host side of the Ethernet port (null: unplugged); it must outlive
     // the machine or be detached first.
@@ -146,6 +174,36 @@ private:
     GfxSlot gfx_slot_{newport_};
     Timer serial_timer_;
     std::unique_ptr<ScsiDisk> disk_, cdrom_;
+    std::unique_ptr<TestDevice> test_device_;
+    // An R4600SC module's secondary cache controller: the processor has no
+    // cache interface of its own, so the module answers uncached accesses at
+    // physical 0x80000000 | address (a byte store enables the cache, a
+    // halfword store disables it, a word store invalidates a line). The
+    // cache holds no data here, so they only need to complete.
+    class ScacheControl final : public Device {
+    public:
+        const char* name() const override { return "r4600sc-cache-control"; }
+        bool read(u32, unsigned, u64& value) override {
+            value = 0;
+            return true;
+        }
+        bool write(u32, unsigned, u64) override { return true; }
+    };
+    ScacheControl scache_control_;
+    // The Indigo2's EISA I/O space with no cards: reads float high (all
+    // ones), writes go nowhere.
+    class EisaIo final : public Device {
+    public:
+        const char* name() const override { return "eisa-io"; }
+        bool read(u32, unsigned size, u64& value) override {
+            value = size == 8 ? ~u64{0} : (u64{1} << (size * 8)) - 1;
+            return true;
+        }
+        bool write(u32, unsigned, u64) override { return true; }
+        bool read_is_pure(u32, unsigned) const override { return true; }
+    };
+    EisaIo eisa_io_;
+    int exit_code_ = -1;
 
     SerialOutput serial_out_;
     std::mutex serial_mutex_;

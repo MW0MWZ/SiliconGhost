@@ -55,13 +55,25 @@ void Pit8254::set_out(unsigned c, bool level) {
     if (on_output_) on_output_(c, level);
 }
 
+// A count written during a mode 2 or 3 cycle replaces the old one when the
+// cycle (mode 3: the half-cycle) ends.
+void Pit8254::take_pending(unsigned c, double now) {
+    Counter& k = counters_[c];
+    if (k.switch_tick < 0 || now < k.switch_tick) return;
+    k.reload = k.next_reload;
+    k.start_tick = k.next_start;
+    k.switch_tick = -1;
+}
+
 u16 Pit8254::current_count(unsigned c) const {
     const Counter& k = counters_[c];
-    if (!k.running) return static_cast<u16>(k.reload);
-    const double e = now_ticks(c) - k.start_tick;
-    if (e < 0) return static_cast<u16>(k.reload);
+    const double now = now_ticks(c);
+    const bool next = k.switch_tick >= 0 && now >= k.switch_tick;  // see take_pending()
+    const u64 n = next ? k.next_reload : k.reload;
+    if (!k.running) return static_cast<u16>(n);
+    const double e = now - (next ? k.next_start : k.start_tick);
+    if (e < 0) return static_cast<u16>(n);
     const u64 el = static_cast<u64>(e);
-    const u64 n = k.reload;
     switch (k.mode) {
         case 2: return static_cast<u16>(n - el % n);
         case 3: {
@@ -74,8 +86,26 @@ u16 Pit8254::current_count(unsigned c) const {
 
 void Pit8254::load_count(unsigned c, u16 raw) {
     Counter& k = counters_[c];
-    k.reload = raw ? raw : (k.bcd ? 10000u : 0x10000u);
-    if ((k.mode == 2 || k.mode == 3) && k.reload < 2) k.reload = 2;
+    u32 count = raw ? raw : (k.bcd ? 10000u : 0x10000u);
+    if ((k.mode == 2 || k.mode == 3) && count < 2) count = 2;
+    const double now = now_ticks(c);
+    take_pending(c, now);
+    if ((k.mode == 2 || k.mode == 3) && k.running && !k.null_count && now >= k.start_tick) {
+        // Counting goes on; the new count waits for the end of the cycle.
+        const u64 n = k.reload, el = static_cast<u64>(now - k.start_tick), base = el - el % n;
+        const u64 high = (n + 1) / 2;
+        k.next_reload = count;
+        if (k.mode == 3 && el % n < high) {  // in the high half: the new count's low half follows
+            k.switch_tick = k.start_tick + static_cast<double>(base + high);
+            k.next_start = k.switch_tick - static_cast<double>((count + 1) / 2);
+        } else {
+            k.switch_tick = k.next_start = k.start_tick + static_cast<double>(base + n);
+        }
+        schedule_next(c);
+        return;
+    }
+    k.switch_tick = -1;
+    k.reload = count;
     k.null_count = false;
     k.start_tick = now_ticks(c) + 1;  // a written count is loaded on the next clock
     switch (k.mode) {
@@ -111,6 +141,7 @@ void Pit8254::schedule_next(unsigned c) {
         return;
     }
     const double now = now_ticks(c);
+    take_pending(c, now);
     const double e = std::max(0.0, now - k.start_tick);
     const u64 n = k.reload;
     const u64 el = static_cast<u64>(e);
@@ -151,6 +182,7 @@ void Pit8254::schedule_next(unsigned c) {
 
 void Pit8254::on_timer(unsigned c) {
     Counter& k = counters_[c];
+    take_pending(c, now_ticks(c));
     const double e = now_ticks(c) - k.start_tick;
     const u64 n = k.reload;
     if (e >= 0) {
@@ -196,7 +228,11 @@ void Pit8254::set_gate(unsigned c, bool level) {
             break;
         case 2:
         case 3:
-            if (rising) {
+            if (rising) {  // a trigger loads a count waiting for the cycle's end at once
+                if (k.switch_tick >= 0) {
+                    k.reload = k.next_reload;
+                    k.switch_tick = -1;
+                }
                 k.start_tick = now_ticks(c) + 1;
                 k.running = true;
             } else if (!level) {
@@ -281,6 +317,7 @@ void Pit8254::write(unsigned reg, u8 value) {
         k.null_count = true;
         k.running = false;
         k.armed = false;
+        k.switch_tick = -1;
         k.latched = false;
         k.write_msb_next = false;
         k.read_msb_next = false;

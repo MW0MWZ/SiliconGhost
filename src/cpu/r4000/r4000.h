@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
-// MIPS R4000/R4400 CPU - reference interpreter.
+// MIPS R4000/R4400, R4600 and R5000 CPUs - reference interpreter.
 //
 // This interpreter is the correctness baseline for the whole project: the
 // future JIT is validated against it instruction-for-instruction. It favours
@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -79,6 +80,7 @@ constexpr u32 CU0 = 1u << 28;
 constexpr u32 CU1 = 1u << 29;
 constexpr u32 CU2 = 1u << 30;
 constexpr u32 CU3 = 1u << 31;
+constexpr u32 XX = CU3;  // R5000: MIPS IV instructions in user mode
 }  // namespace sr
 
 enum class Exc : u32 {
@@ -102,6 +104,14 @@ enum class Exc : u32 {
     VCED = 31,
 };
 
+// The processor implementations the core can present. They share the
+// pipeline model and differ in instruction set, CP0 details and caches.
+enum class Core : u8 {
+    R4000,  // R4000 / R4400: MIPS III, direct-mapped primary caches, on-chip secondary cache control
+    R4600,  // MIPS III, 2-way 16 KiB primary caches, no secondary cache interface, WAIT
+    R5000,  // MIPS IV, 2-way 32 KiB primary caches, its own secondary cache interface, WAIT
+};
+
 struct TlbEntry {
     u64 mask = 0;  // PageMask bits 24:13
     u64 hi = 0;    // R | VPN2 | ASID
@@ -120,10 +130,18 @@ public:
     static constexpr u32 kDefaultConfig = 0x10C084A3u;
 
     struct Options {
+        Core core = Core::R4000;
         u32 prid = 0x00000450;          // R4400 rev 5.0 (150 MHz Indy)
         u32 config = kDefaultConfig;
         u32 scache_bytes = 1u << 20;    // 0 = no secondary cache (R4x00PC)
     };
+    // Config at reset for the R4600 and R5000 (Indy modules): 32-byte
+    // primary lines, parity, sub-block ordering, big-endian, SysClock =
+    // PClock/3. The R4600 has no secondary cache interface (SC is always
+    // set: an Indy R4600SC's cache is driven by the module); the R5000's SC
+    // and SS fields are derived from scache_bytes.
+    static constexpr u32 kR4600Config = 0x1002E4B3u;
+    static constexpr u32 kR5000Config = 0x1041E6F3u;
 
     explicit R4000(Bus& bus) : R4000(bus, Options{}) {}
     R4000(Bus& bus, const Options& options);
@@ -149,6 +167,7 @@ public:
         next_delay_ = false;
     }
 
+    Core core() const { return opts_.core; }
     // COP0 access with DMFC0/DMTC0 semantics (masks applied, side effects included).
     u64 cp0_read(unsigned reg) const;
     void cp0_write(unsigned reg, u64 value);
@@ -192,6 +211,9 @@ public:
     void set_jit(bool enabled);
     // Whether this build can translate to host code (x86-64 and AArch64).
     static bool jit_available() { return jit_compile_supported(); }
+    // x86-64: use FMA3 for exact FPU results in translated code where the
+    // host has it (off: the host's exception flags; for testing both).
+    static void set_jit_fma(bool enabled);
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
     u64 change_epoch() const { return change_epoch_; }
@@ -255,6 +277,20 @@ private:
     // of instructions completed (see jit_x64.cpp).
     using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 time_fp);
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
+    // A region's other blocks (see jit_region()): where they are, and a hash
+    // of their instructions, so that its code can be taken back.
+    static constexpr unsigned kJitRegionBlocks = 32, kJitRegionOps = 512;
+    // Most code runs too few times to repay translating much of it together:
+    // a region is kept small unless it is a busy loop's (Block::hot).
+    static constexpr unsigned kJitSmallRegionBlocks = 8, kJitSmallRegionOps = 160;
+    struct JitRegion {
+        u8 n = 0;  // other blocks
+        std::array<u16, kJitRegionBlocks - 1> offset{};
+        std::array<u8, kJitRegionBlocks - 1> count{};
+        u64 hash = 0;
+    };
+    // FNV-1a of the region's other blocks' instructions in the page at `page`.
+    static u64 jit_region_hash(const u8* page, const JitRegion& r);
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 offset = 0;            // of the first instruction within its 4 KiB page
@@ -263,7 +299,14 @@ private:
         u32 runs = 0;
         JitFn code = nullptr;
         bool jit_addr64 = false;  // addressing mode the code was translated for
+        bool jit_region = false;  // the code also runs other blocks of the page (see jit_region())
+        bool hot = false;         // the head of a loop that keeps running: translated as a large region
+        JitRegion region;
         const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
+        // Where its jump through a register (JR, JALR) went within the page,
+        // seen while it was interpreted: likely successors for a translation.
+        u8 jr_n = 0;
+        std::array<u16, 8> jr_to{};
         Op ops[kMaxBlockLength];
     };
     static bool is_branch_word(u32 w);
@@ -277,27 +320,65 @@ private:
         bool self_loop = false;
     };
     static JitPlan jit_plan(const Block& b);
+    // A translation's region: the block and up to kJitRegionBlocks - 1 more
+    // of its page that it reaches through branches with a fixed target or
+    // by falling through, decoded into `members`; `region` lists them all,
+    // the block first. One plan covers them all.
+    void jit_region(const Block& b, std::vector<Block>& members, std::vector<const Block*>& region);
+    static JitPlan jit_plan(const std::vector<const Block*>& region);
+    // Successors of a decoded block within its page that a translation can
+    // reach without a lookup: the offsets of the taken target of its
+    // conditional branch and of the instruction after it (not after a
+    // branch-likely, whose untaken path leaves the translation).
+    void jit_successors(const Block& b, std::vector<u32>& offsets) const;
+    // The page offsets recorded for `b`'s jump through a register (b may be
+    // a copy decoded for a region: the recording is in its slot).
+    void jr_targets(const Block& b, std::vector<u32>& offsets) const;
+    // The FPU registers an instruction the back ends translate inline reads
+    // and writes: use(register, as a double, written).
+    static void jit_fp_uses(u32 inst, const std::function<void(unsigned, bool, bool)>& use);
     bool jit_compile(Block& b);  // false if the code buffer is full
     static bool jit_compile_supported();
+    static bool jit_fma_;
     void jit_flush();
     static unsigned block_index(const u8* host) {
         return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
     }
     void run_block(u64 cycle, const u64* limit);
     void build_block(Block& b, const u8* host, u32 page_offset);
+    void decode_ops(Block& b, const u8* host, u32 page_offset);  // the instructions, nothing else
     void invalidate_code_page(const u8* page);
     void flush_blocks();
+    static bool note_jr(Block& b, u32 offset) {  // true if it is new
+        for (unsigned i = 0; i < b.jr_n; ++i)
+            if (b.jr_to[i] == offset) return false;
+        if (b.jr_n == b.jr_to.size()) return false;
+        b.jr_to[b.jr_n++] = static_cast<u16>(offset);
+        return true;
+    }
     void execute(u32 inst);
     void execute_special(u32 inst);
     void execute_regimm(u32 inst);
     void execute_cop0(u32 inst);
     void execute_cop1(u32 inst);
+    void execute_cop1x(u32 inst);  // MIPS IV indexed FPU loads and stores, multiply-add
     void execute_cache(u32 inst);
+    void cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 paddr);
+    void execute_wait();
+    void wait_for_interrupt(u64 limit_cycle);
+    // MIPS IV instructions: on an R5000, in kernel mode or with Status.XX.
+    bool mips4_enabled() const {
+        return mips4_ && (mode_ == kKernel || mode_ == kKernelErl || (status_ & sr::XX));
+    }
+    // FPU condition code n (MIPS IV has eight; the R4000 only code 0): its FCR31 bit.
+    static u32 fcc_bit(unsigned n) { return n ? 1u << (24 + n) : 1u << 23; }
 
     // FPU (fpu.cpp)
     template <typename F>
     void fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd);
     void fp_convert_from_int(unsigned fmt, unsigned func, unsigned fs, unsigned fd);
+    template <typename F>
+    void fp_multiply_add(unsigned func, unsigned fr, unsigned ft, unsigned fs, unsigned fd);  // COP1X
     bool fp_commit(u32 cause);  // updates FCR31; false if an FPE was raised
     void fp_unimplemented();
     void fp_check_ctc1_trap();
@@ -384,9 +465,16 @@ private:
     void fpr_write32(unsigned n, u32 v);
     u64 fpr_read64(unsigned n) const;
     void fpr_write64(unsigned n, u64 v);
+    // The host's FP control word as FP operations start from it: no exception
+    // flags, rounding to nearest (x86-64 MXCSR; fpu.cpp).
+    static u32 host_fp_control();
 
     Bus& bus_;
     Options opts_;
+    bool mips4_ = false;   // the R5000's MIPS IV instructions
+    bool two_way_ = false;  // 2-way set-associative primary caches (R4600, R5000)
+    u32 fir_ = 0;          // FCR0
+    bool waiting_ = false;  // stalled in WAIT until an interrupt is requested
     bool block_cache_ = true;
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
@@ -403,6 +491,8 @@ private:
         u32 count = 0;
         bool addr64 = false;
         std::array<u32, kMaxBlockLength> words{};
+        bool is_region = false;
+        JitRegion region;
     };
     std::vector<std::array<JitVictim, kJitVictims>> jit_victims_;
     u32 jit_generation_ = 1;  // bumped whenever the code buffer is emptied
@@ -413,10 +503,30 @@ private:
     u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
     // Where translated code stopped: the block it was running (it may have
     // gone on into other blocks) and that block's entry pc.
+    // Operations of a region's other blocks that translated code passes to
+    // their handlers (the blocks are decoded only while translating): kept
+    // until the code buffer is emptied.
+    std::deque<Op> jit_ops_;
+    const Op* jit_op(const Block& b, const Op& op) {
+        if (&op >= b.ops && &op < b.ops + kMaxBlockLength) return &op;
+        jit_ops_.push_back(op);
+        return &jit_ops_.back();
+    }
     Block* jit_block_ = nullptr;
+    const u8* jit_block_host_ = nullptr;  // the block it should hold (it may need decoding again)
     u64 jit_entry_pc_ = 0;
     std::size_t jit_link_offset_ = 0;  // offset of the linked entry point in every translation
     static void jit_backward_branch(R4000* cpu, u64 target) { cpu->backward_branch(target); }
+    // Translated code jumped through a register (in `jr`, the slot of the
+    // block doing it) to a place in its page it had no link for: learn it,
+    // and have the translation (in `head`'s slot) made again to include it.
+    static void jit_jr_miss(R4000* cpu, Block* jr, Block* head) {
+        if (note_jr(*jr, static_cast<u32>(cpu->pc & 0xFFF)) && head->code && head->jit_host == head->host) {
+            head->code = nullptr;
+            head->jit_host = nullptr;
+            head->runs = kJitThreshold - 1;
+        }
+    }
     u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 
@@ -432,8 +542,12 @@ private:
 
     // Loops are tracked per backward branch (nested loops each get an entry),
     // in a small direct-mapped table.
-    // Every RAM store is logged (address and size) in a ring; an iteration's
-    // stores are the entries made since its loop's previous visit.
+    // While a loop is being checked, every RAM store is logged (address and
+    // size) in a ring; an iteration's stores are the entries made since its
+    // loop's previous visit. Logging is switched on by a visit and off when
+    // a loop proves to make progress; log_epoch_ counts the times it was
+    // switched on, so a visit knows whether the log covers the whole time
+    // since the previous one.
     static constexpr unsigned kStoreLogBits = 7;
     struct StoreRec {
         const u8* host = nullptr;
@@ -446,13 +560,21 @@ private:
         u64 epoch = 0;      // change_epoch_ at the previous visit
         u64 weight_epoch = 0;
         u64 store_pos = 0;  // store_count_ at the previous visit
+        u64 log_epoch = 0;  // log_epoch_ at the previous visit
         u64 period_fp = 0;  // length of the iteration the snapshot belongs to
-        unsigned cooldown = 0;
-        bool have_snapshot = false;
+        unsigned cooldown = 0;  // visits to let pass without a look
+        bool have_snapshot = false;  // in snaps_[snap], while that is still its own
+        u8 snap = 0;
+    };
+    // What a loop's iteration span left behind, for the next to compare;
+    // few loops are being compared at a time, so a few are kept.
+    struct LoopSnapshot {
+        const LoopEntry* owner = nullptr;
         std::array<u64, 34> regs{};  // GPRs, HI, LO
         unsigned nstores = 0;
         std::array<StoreRec, 1u << kStoreLogBits> stores{};
     };
+    static constexpr unsigned kLoopSnapshots = 8;
     void log_store(const u8* host, unsigned size) {
         store_log_[store_count_ & ((1u << kStoreLogBits) - 1)] = {host, size, 0};
         ++store_count_;
@@ -460,20 +582,28 @@ private:
     bool snapshot_matches(const LoopEntry& e, u64 period, unsigned nstores) const;
     void take_snapshot(LoopEntry& e, u64 period, unsigned nstores);
     void backward_branch(u64 target) {
-        // Loops known to make progress are left alone for a while, cheaply.
+        // Loops just seen, or known to make progress, are left alone for a
+        // while, cheaply.
         LoopEntry& e = loops_[(cur_pc_ >> 2) & ((1u << kLoopTableBits) - 1)];
         if (e.branch_pc == cur_pc_ && e.cooldown) {
-            if (--e.cooldown == 0) e.branch_pc = ~u64{0};  // start afresh afterwards
+            --e.cooldown;
             return;
         }
         loop_visit(e, target);
     }
     void loop_visit(LoopEntry& e, u64 target);
-    static constexpr unsigned kLoopTableBits = 4;
+    void promote_loop(u64 target);
+    static constexpr unsigned kLoopTableBits = 8;
     bool idle_skip_ = true;
     u64 change_epoch_ = 0;  // bumped by every side effect
+    u64 jit_scratch_ = 0;   // translated code's spill slot
+    u32 jit_fp_control_ = 0;  // the host FP control word translated FP operations start from
+    double jit_split_d_ = 134217729.0;  // 2^27 + 1 and 2^12 + 1: Dekker's splitting factors
+    float jit_split_s_ = 4097.0f;
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
+    u64 log_epoch_ = 0;
+    bool log_stores_ = false;
     // Fields translated code uses come before the large arrays, so they lie
     // within reach of a single load or store on every host.
     bool idle_ready_ = false;  // confirmed spin: skip once the branch has executed
@@ -482,6 +612,8 @@ private:
     u64 asid_tag_ = 0;     // EntryHi's ASID, placed as in FastEntry::tag
     std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
     std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    std::array<LoopSnapshot, kLoopSnapshots> snaps_{};
+    unsigned next_snap_ = 0;
     u64 idle_period_fp_ = 0;
     u64 idle_skipped_fp_ = 0;
 
@@ -498,6 +630,7 @@ private:
     // Cache tag arrays (no data is cached; tags exist for CACHE-instruction
     // diagnostics and size probing).
     std::vector<u32> itag_, dtag_, stag_;
+    std::vector<u8> ilru_, dlru_;  // 2-way caches: the way to replace next in each set
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
 
     // Separate tables for fetch, load and store (indexed by Access), so code

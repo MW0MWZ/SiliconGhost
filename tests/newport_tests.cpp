@@ -285,9 +285,15 @@ TEST(newport_render_matches_the_reference_conversion) {
         t.vc2_reg(0x05, 0x600);  // DID entry
         t.vc2_reg(0x1F, 1);
         t.vc2_reg(0x00, 0x400);
-        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080 | (round % 2 ? 0x0200 : 0));  // display, timing, DID, cursor
+        // display, timing, DID, cursor; large or crosshair in some rounds
+        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080 | (round % 2 ? 0x0200 : 0) | (round % 3 == 2 ? 0x0100 : 0));
         t.w(kTopScan, 0x3FF);
         t.w(kXYWin, 0x10001000);
+        auto retrace = [&] {  // the VC2 takes cursor and DID pointers then
+            t.now += 150000000 / 60 + 1;
+            t.sched.run_due(t.now);
+        };
+        retrace();
         auto draw = [&](int n) {
             for (int i = 0; i < n; ++i) {
                 static constexpr u32 kPlanes[] = {1, 1, 1, 4, 5, 6};
@@ -315,7 +321,10 @@ TEST(newport_render_matches_the_reference_conversion) {
         for (int step = 0; step < 12; ++step) {
             switch (rnd(5)) {
                 case 0: draw(1 + static_cast<int>(rnd(5))); break;
-                case 1: move_cursor(); break;
+                case 1:
+                    move_cursor();
+                    retrace();
+                    break;
                 case 2: t.cmap_entry(rnd(0x2000), rnd(0x1000000)); break;
                 case 3: gamma(); break;
                 default: t.w(kTopScan, (0x3FF + rnd(8)) & 0x3FF); break;
@@ -367,6 +376,24 @@ TEST(newport_blend_source_alpha_over_frame_buffer_and_colorback) {
     CHECK_EQ(read24(t, 12, 10), 0xFFFFFFu);
 }
 
+// Below 24 bits an RGB colour is rounded to the nearest stored value, after
+// blending on 8-bit channels; COLORBACK is 8-8-8 in RGB mode.
+TEST(newport_rgb_rounding_blend_and_colorback) {
+    Rig t(Newport::Options{true, 0xA});
+    constexpr u32 kRgb12 = (kRgb24 & ~(3u << 3)) | (2u << 3);
+    point24(t, 10, 10, 0x080808, kRgb12);  // half a step rounds up
+    CHECK_EQ(read24(t, 10, 10), 0x111111u);
+    point24(t, 11, 10, 0x070707, kRgb12);  // less rounds down
+    CHECK_EQ(read24(t, 11, 10), 0u);
+    t.w(0x204, 0xFFu << 11);  // COLORALPHA 1.0
+    point24(t, 12, 10, 0x7F7F7F, kRgb12 | kBlend | factors(kSa, kMsa));  // 0x7F blended, then rounded
+    CHECK_EQ(read24(t, 12, 10), 0x888888u);
+    t.w(0x018, 0x0000FF);  // COLORBACK red
+    t.w(0x014, 0);         // ZPATTERN: background everywhere
+    point24(t, 13, 10, 0xFFFFFF, kRgb12, (1u << 12) | (1u << 16));  // ENZPATTERN ZPOPAQUE
+    CHECK_EQ(read24(t, 13, 10), 0x00F00Fu);
+}
+
 // A slope written as minus zero leaves the iterator where it is.
 TEST(newport_minus_zero_slope_keeps_alpha) {
     Rig t(Newport::Options{true, 0xA});
@@ -390,21 +417,28 @@ TEST(newport_antialiased_line_coverage) {
         t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
         t.w(kWrMask, 0xFFFFFF);
         t.w(kColorI, 0xFFFFFF);
-        t.w(0x130, 0x76543210);  // AWEIGHT: entry i = i
-        t.w(0x134, 0xFEDCBA98);
+        t.w(0x130, 0xFEDCBA98);  // AWEIGHT: entry i = i
+        t.w(0x134, 0x76543210);
         t.w(0x100, fixed(x1));
         t.w(0x104, fixed(y1));
         t.w(0x108, fixed(x2));
         t.w(0x10C, fixed(y2));
         t.w(kDrawMode0 | kGo, 2u | (4u << 2) | (1u << 5) | (1u << 8));  // DRAW A_LINE DOSETUP STOPX
     };
-    line(10, 20, 20, 20);  // on the pixel row: full coverage there, none above
+    line(10, 20.5, 20, 20.5);  // through the row's centres: all there, none above
     CHECK_EQ(read24(t, 15, 20), 0xFFFFFFu);
     CHECK_EQ(read24(t, 15, 21), 0u);
-    line(10, 40.5, 20, 40.5);  // between two rows: half each (entry 8 -> alpha 0x88)
+    line(10, 41, 20, 41);  // between two rows: S takes entry 7 (0x77 blends to 0x76), T entry 8
     CHECK_EQ(t.r(0x100) >> 11, 20u);  // XSTART rests at the end point
-    CHECK_EQ(read24(t, 15, 40), 0x888888u);
+    CHECK_EQ(read24(t, 15, 40), 0x767676u);
     CHECK_EQ(read24(t, 15, 41), 0x888888u);
+    line(30, 61, 30, 51);  // y major, falling: the same pair across the columns
+    CHECK_EQ(read24(t, 29, 55), 0x767676u);
+    CHECK_EQ(read24(t, 30, 55), 0x888888u);
+    line(40.5, 71, 40.5, 61);
+    CHECK_EQ(read24(t, 40, 65), 0xFFFFFFu);
+    CHECK_EQ(read24(t, 39, 65), 0u);
+    CHECK_EQ(read24(t, 41, 65), 0u);
 }
 
 // LENGTH32 lines draw 32 pixels a GO, each GO carrying on from the next
@@ -562,4 +596,80 @@ TEST(newport_xyoffset_and_ystride) {
     t.w(kXYEndI, (20u << 16) | 15u);
     t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 23));  // block, YSTRIDE
     for (int y = 10; y <= 16; ++y) CHECK_EQ(pixel8(t, 20, y), (y % 2 == 0 && y <= 15) ? 0x33u : 0u);
+}
+
+// A colour index with a fraction of a half or more rounds up.
+TEST(newport_ci_rounding) {
+    Rig t;
+    t.w(kDrawMode1, (3u << 28) | (1u << 3) | 1u | 0x7000u);
+    t.w(kWrMask, 0xFF);
+    t.w(0x200, (5u << 11) | (8u << 7));  // COLORRED index 5.5
+    t.w(kXYStartI, (3u << 16) | 3u);
+    t.w(kXYEndI, (3u << 16) | 3u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 5));
+    CHECK_EQ(pixel8(t, 3, 3), 6u);
+}
+
+// A double-buffered logic op takes its destination from the DBLSRC buffer.
+TEST(newport_logic_op_destination_from_dblsrc) {
+    Rig t(Newport::Options{true, 0xA});
+    auto point = [&](u32 dm1, u32 mask, u32 ci) {
+        t.w(kDrawMode1, dm1);
+        t.w(kWrMask, mask);
+        t.w(kColorI, ci);
+        t.w(kXYStartI, (4u << 16) | 4u);
+        t.w(kXYEndI, (4u << 16) | 4u);
+        t.w(kDrawMode0 | kGo, 2u | (1u << 5));
+    };
+    constexpr u32 k8 = (1u << 3) | 1u | 0x7000u;  // 8bpp, RGB/CI planes, compare always
+    point((3u << 28) | k8, 0xFFFF, 0x00);        // both buffers 0
+    point((3u << 28) | k8, 0xFF00, 0x0F);        // buffer 1 0x0F
+    point((6u << 28) | k8 | (1u << 5), 0xFF, 0xF0);  // XOR into buffer 0 against buffer 1
+    CHECK_EQ(pixel8(t, 4, 4), 0xFFu);
+}
+
+// CMAP0 reports the board revision in bits 6:4, with the 8-bit flag.
+TEST(newport_board_revision) {
+    auto revision = [](Newport::Options o) {
+        Rig t(o);
+        t.w(kDcbMode, width(0) | crs(6) | slave(1));
+        return t.r(kDcbData0) >> 24;
+    };
+    CHECK_EQ(revision({}), 0xA1u);
+    CHECK_EQ(revision({true, 0xA}), 0x02u);
+    CHECK_EQ(revision({false, 0xA, 6}), 0xE1u);
+    CHECK_EQ(revision({true, 0xA, 4}), 0x42u);
+}
+
+// The VC2 takes a new cursor position, and DID table, at vertical retrace.
+TEST(newport_cursor_and_did_latched_at_retrace) {
+    Rig t;
+    t.vc2_ram(0x000, {static_cast<u16>(0x8080 | (62u << 7))});  // 60 x 40
+    t.vc2_ram(0x400, {0x000, 40, 0, 0});
+    for (u16 a = 0; a < 128; ++a) t.vc2_ram(static_cast<u16>(0x3000 + a), {0xFFFF});  // solid glyph
+    for (u32 i = 0; i < 0x2000; i += 0x100) t.cmap_entry(i, 0xFFFFFF);  // a white screen; the cursor is black
+    t.vc2_reg(0x01, 0x3000);
+    t.vc2_reg(0x1F, 1);
+    t.vc2_reg(0x00, 0x400);
+    t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080);  // display, timing, cursor
+    auto retrace = [&] {
+        t.now += 150000000 / 60 + 1;
+        t.sched.run_due(t.now);
+    };
+    retrace();
+    std::vector<u32> before, after;
+    unsigned w = 0, h = 0;
+    CHECK(t.np.render(before, w, h));
+    t.vc2_reg(0x02, 40);  // CURSX, then CURSY: on screen
+    t.vc2_reg(0x03, 40);
+    int x = 0, y = 0;
+    CHECK(t.np.cursor_position(x, y));
+    CHECK_EQ(x, 40 - 29);
+    CHECK_EQ(y, 40 - 31);
+    after = before;
+    CHECK(t.np.render(after, w, h));
+    CHECK(after == before);  // not shown before the retrace
+    retrace();
+    CHECK(t.np.render(after, w, h));
+    CHECK(after != before);
 }

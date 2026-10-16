@@ -5,8 +5,9 @@
 
 # SiliconGhost
 
-An open-source emulator for the SGI **Indy** (IP22): MIPS R4400 CPU, the
-MC/HPC3/IOC2 chipset and **Newport (REX3)** graphics. The aim is to run the
+An open-source emulator for the SGI **Indy** and **Indigo²** (IP22): MIPS
+R4000, R4400, R4600 and R5000 processor modules, the MC/HPC3/IOC2 chipset
+and **Newport (REX3)** graphics. The aim is to run the
 original boot PROM and IRIX unmodified, at or above the speed of the real
 machine. Linux is the primary host; it also builds and runs on macOS, and
 builds for Windows.
@@ -15,8 +16,8 @@ builds for Windows.
 
 SiliconGhost is under active development. What works today:
 
-- **Boot PROM:** the IP24 PROM (5.3) passes its power-on tests, plays the
-  start-up chime and reaches the System Maintenance Menu, on the serial
+- **Boot PROM:** the IP24 PROMs (5.0 and 5.3) pass their power-on tests, play the
+  start-up chime and reach the System Maintenance Menu, on the serial
   console or on the Newport graphics console.
 - **IRIX 5.3:** installs from its CD onto a blank disk image (labelled with
   `fx`, as on real hardware) and boots multi-user, on the serial console or
@@ -39,8 +40,14 @@ SiliconGhost is under active development. What works today:
 - **Networking:** the Ethernet port works (DHCP, ping, DNS, telnet, ssh,
   file transfers in both directions), through user-mode NAT on the host (no
   privileges needed) or a Linux TAP interface.
-- **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
-  TLB, exceptions, 32/64-bit addressing and cache tag operations.
+- **Indigo² (IP22 "Full House"):** with `--machine indigo2` and the Indigo²
+  PROM (5.1), IRIX 5.3 and 6.5 boot from the same disks as on the Indy, to
+  the graphical desktop on a Newport (XL) board; IRIX finds the EISA bus and
+  both SCSI controllers. Up to 384 MiB of memory in three banks.
+- **CPU:** the full R4000/R4400 and R4600 (MIPS III) and R5000 (MIPS IV)
+  integer and floating-point instruction sets, TLB, exceptions, 32/64-bit
+  addressing and cache tag operations, with or without a secondary cache.
+  IRIX 5.3 and 6.5, NetBSD and OpenBSD boot on the R4600 and the R5000.
 - **Speed:** hot code is translated to x86-64 or AArch64 machine code, and idle loops
   are skipped exactly. On a modest host, IRIX runs at about one and a half
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
@@ -52,13 +59,14 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 
 | Component | Model | State |
 |---|---|---|
-| CPU | MIPS R4400 (R4000 family), FPU, 48-entry TLB | complete |
+| CPU | MIPS R4000, R4400, R4600 or R5000 (PC or SC module), FPU, 48-entry TLB | complete |
 | Memory controller | MC: memory configuration, GIO bus errors | working |
 | Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
-| Interrupts/timers | IOC2 / INT3, 8254 PIT | working |
+| Interrupts/timers | IOC2 / INT3 (Indy), INT2 and EXTIO (Indigo²), 8254 PIT | working |
 | Serial | Zilog 85230 SCC (two ports) | working |
-| Real-time clock/NVRAM | Dallas DS1386 | working, NVRAM saved as it changes |
-| SCSI | WD33C93 with disk and CD-ROM targets | working |
+| Real-time clock/NVRAM | Dallas DS1386; on the Indigo², settings in the 93CS56 serial EEPROM | working, saved as it changes |
+| SCSI | WD33C93 with disk and CD-ROM targets (a second controller on the Indigo²) | working |
+| EISA (Indigo²) | the bus, with no cards fitted | working |
 | Graphics | Newport XL8 and XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit and 24-bit boards) |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
@@ -130,34 +138,51 @@ Check the configure output: it says if SDL3 or libslirp was not found.
 
 ## Running
 
-SiliconGhost does not include any SGI software. You need your own dump of
-the Indy boot PROM and, for IRIX, your own installation media.
+SiliconGhost does not include any SGI software. You need your own dumps of
+the boot PROMs and, for IRIX, your own installation media.
+
+Put your PROM dumps, under any names, in a `roms` folder: the one in the
+SiliconGhost folder (below), or one in the folder you start it from, or one
+named with `--prom-dir`. SiliconGhost recognises each dump (by its checksum,
+or else the version string inside it) and starts each machine with the
+newest one that suits it: an Indy (IP24) PROM for the Indy, 5.3 Rev B10
+(070-9101-011) or later with an R5000, 5.0 Rev B6 (070-9101-007) or later
+with an R4600, an IP22 PROM for the Indigo². An Indy without a graphics
+board needs a 5.3 PROM: earlier ones set up the graphics board without first
+checking that one is fitted, and stop with a bus error. If there is none
+that fits, it says which it needs. Dumps read with each pair of
+bytes swapped are recognised and put right as they are loaded. `--prom FILE`
+(*Specific PROM* in the settings) chooses one by hand; it must suit the
+machine too.
 
 Started with no arguments, SiliconGhost opens its window with the machine
-powered off: choose the PROM, NVRAM, disk and CD-ROM images and the rest in
+powered off: choose the NVRAM, disk and CD-ROM images and the rest in
 *Machine > Settings*, then power on. The settings are kept for next time.
 Given options on the command line, it powers on at once with them:
 
 ```sh
-# The PROM, with the serial console on the terminal
-build/siliconghost --prom ip24prom.bin --nvram indy.nvram --no-graphics --headless
+# The PROM (from ./roms), with the serial console on the terminal
+build/siliconghost --nvram indy.nvram --no-graphics --headless
 
 # IRIX from an installed disk, with the CD available
-build/siliconghost --prom ip24prom.bin --nvram indy.nvram \
-    --disk irix.img --cdrom irix53.img --cpu-mhz 175
+build/siliconghost --nvram indy.nvram --disk irix.img --cdrom irix53.img --cpu-mhz 175
 ```
 
 Main options (`siliconghost --help` lists them all):
 
 | Option | Meaning |
 |---|---|
-| `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
-| `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
+| `--prom-dir DIR` | folder of boot PROM dumps, from which the one the machine needs is chosen (default `./roms`, else `roms` in the SiliconGhost folder) |
+| `--prom FILE` | a specific boot PROM image instead (raw, big-endian); it must suit the machine |
+| `--machine indy\|indigo2` | the system board (default Indy); the Indigo² needs its own PROM and takes R4000/R4400 modules. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
+| `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
-| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64) |
-| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
-| `--cpu-mhz N` | CPU clock (default 150) |
+| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384) |
+| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc` | processor module (default R4400SC) |
+| `--cpu-mhz N` | CPU clock: one the module shipped at on that platform (default: the module's usual clock) |
+| `--any-clock` | allow a `--cpu-mhz` no such machine shipped with |
 | `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
+| `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 2 for the XL8, 0 for the XL24); drivers pick timings and cursor offsets by it, and see an 8-bit board only from revision 2 |
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
@@ -169,6 +194,9 @@ Main options (`siliconghost --help` lists them all):
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
+| `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `max` |
+| `--test-device` | fit the bare-metal test device in GIO expansion slot 0: console output, a host clock, an instruction count and an exit code, for bare-metal test and benchmark programs |
+| `--test-run-config N` | the value the test device reports in its run configuration register |
 
 ### The window
 
@@ -427,7 +455,8 @@ with performance layers on top that must give exactly the same results:
   revision directly, finds the board and runs its console on both the 8-bit
   and the 24-bit board. With 9.0 or 11.0, use the serial console.
 - IRIX 5.3, IRIX 6.5, NetBSD 9.0 and 11.0 and OpenBSD 6.9 are the systems
-  tested so far; Linux has not been tried. (Current Debian releases no longer include
+  tested so far (on the Indigo², IRIX: its 5.1 PROM loads only ECOFF
+  programs, and the NetBSD and OpenBSD boot loaders are ELF); Linux has not been tried. (Current Debian releases no longer include
   Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
 - The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
@@ -440,7 +469,8 @@ with performance layers on top that must give exactly the same results:
 
 - Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
-- Indigo² (IP22 "Fullhouse") machine profile
+- Indigo² graphics other than Newport (GR2 XZ/Extreme, IMPACT), EISA cards
+- Other SGI machines from the same PROM set (Indigo IP20, Indigo² R8000 and R10000)
 
 ## Legal
 
