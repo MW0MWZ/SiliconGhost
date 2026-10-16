@@ -171,4 +171,40 @@ R4000::JitPlan R4000::jit_plan(const Block& b) {
     return p;
 }
 
+void R4000::jit_fp_uses(u32 w, const std::function<void(unsigned, bool, bool)>& use) {
+    const unsigned opc = w >> 26, fmt = f_rs(w), ft = f_rt(w), fs = f_rd(w), fd = (w >> 6) & 31, func = w & 63;
+    switch (opc) {
+        case 0x31: return use(ft, false, true);  // LWC1
+        case 0x35: return use(ft, true, true);   // LDC1
+        case 0x39: return use(ft, false, false);  // SWC1
+        case 0x3D: return use(ft, true, false);   // SDC1
+        case 0x11: break;
+        default: return;
+    }
+    switch (fmt) {
+        case 0x00:
+        case 0x01: return use(fs, fmt == 0x01, false);  // MFC1, DMFC1
+        case 0x04:
+        case 0x05: return use(fs, fmt == 0x05, true);  // MTC1, DMTC1
+        case 0x14:  // CVT.S.W, CVT.D.W
+            if (func == 0x20 || func == 0x21) use(fs, false, false), use(fd, func == 0x21, true);
+            return;
+        case 0x10:
+        case 0x11: break;
+        default: return;
+    }
+    const bool dbl = fmt == 0x11;
+    if (func <= 0x03) {
+        use(fs, dbl, false), use(ft, dbl, false), use(fd, dbl, true);
+    } else if (func <= 0x07) {  // SQRT, ABS, MOV, NEG
+        use(fs, dbl, false), use(fd, dbl, true);
+    } else if ((func == 0x20 && dbl) || (func == 0x21 && !dbl)) {  // CVT.S.D, CVT.D.S
+        use(fs, dbl, false), use(fd, !dbl, true);
+    } else if (func == 0x0C || func == 0x0D || func == 0x24) {  // ROUND.W, TRUNC.W, CVT.W
+        use(fs, dbl, false), use(fd, false, true);
+    } else if (func >= 0x30) {  // C.cond
+        use(fs, dbl, false), use(ft, dbl, false);
+    }
+}
+
 }  // namespace sg::mips

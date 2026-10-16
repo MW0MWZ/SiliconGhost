@@ -192,6 +192,9 @@ public:
     void set_jit(bool enabled);
     // Whether this build can translate to host code (x86-64 and AArch64).
     static bool jit_available() { return jit_compile_supported(); }
+    // x86-64: use FMA3 for exact FPU results in translated code where the
+    // host has it (off: the host's exception flags; for testing both).
+    static void set_jit_fma(bool enabled);
     u64 idle_skipped_cycles() const { return idle_skipped_fp_ >> kCycleFracBits; }
     // Debugger view: bumped by every side effect that rules out idle skipping.
     u64 change_epoch() const { return change_epoch_; }
@@ -277,8 +280,12 @@ private:
         bool self_loop = false;
     };
     static JitPlan jit_plan(const Block& b);
+    // The FPU registers an instruction the back ends translate inline reads
+    // and writes: use(register, as a double, written).
+    static void jit_fp_uses(u32 inst, const std::function<void(unsigned, bool, bool)>& use);
     bool jit_compile(Block& b);  // false if the code buffer is full
     static bool jit_compile_supported();
+    static bool jit_fma_;
     void jit_flush();
     static unsigned block_index(const u8* host) {
         return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);

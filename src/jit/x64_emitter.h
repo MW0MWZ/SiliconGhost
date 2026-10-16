@@ -202,6 +202,16 @@ public:
         xmm_rr(dbl ? 0xF2 : 0xF3, false, truncate ? 0x2C : 0x2D, dst, src);
     }
     void cvt_from_int(bool dbl, unsigned dst, Reg src) { xmm_rr(dbl ? 0xF2 : 0xF3, false, 0x2A, dst, src); }
+    // xmm loads and stores of the low 32 or 64 bits, and a register copy.
+    void movq_load(unsigned x, Mem m) { xmm_mem(0xF3, 0x7E, x, m); }
+    void movd_load(unsigned x, Mem m) { xmm_mem(0x66, 0x6E, x, m); }
+    void movq_store(Mem m, unsigned x) { xmm_mem(0x66, 0xD6, x, m); }
+    void movd_store(Mem m, unsigned x) { xmm_mem(0x66, 0x7E, x, m); }
+    void movapd(unsigned dst, unsigned src) { xmm_rr(0x66, false, 0x28, dst, src); }
+    // FMA3 (VEX): dst = a * b - dst (vfmsub231) or dst = dst - a * b
+    // (vfnmadd231), scalar double or single.
+    void fmsub231(bool dbl, unsigned dst, unsigned a, unsigned b) { fma(dbl, 0xBB, dst, a, b); }
+    void fnmadd231(bool dbl, unsigned dst, unsigned a, unsigned b) { fma(dbl, 0xBD, dst, a, b); }
     void ldmxcsr(Mem m) {
         rex_opt(false, 0, m.base);
         byte(0x0F);
@@ -266,6 +276,19 @@ private:
         if (prefix) byte(prefix);
         rex_opt(w, reg, rm);
         byte(0x0F), byte(op), byte(0xC0 | ((reg & 7) << 3) | (rm & 7));
+    }
+    void fma(bool dbl, unsigned op, unsigned dst, unsigned a, unsigned b) {
+        byte(0xC4);
+        byte(((~dst >> 3) & 1) << 7 | 1u << 6 | ((~b >> 3) & 1) << 5 | 0x02);  // map 0F38
+        byte((dbl ? 0x80 : 0) | ((~a & 15) << 3) | 0x01);                        // W, vvvv = a, 66
+        byte(op);
+        byte(0xC0 | ((dst & 7) << 3) | (b & 7));
+    }
+    void xmm_mem(unsigned prefix, unsigned op, unsigned x, Mem m) {
+        byte(prefix);
+        rex_opt(false, x, m.base);
+        byte(0x0F);
+        modrm_mem(op, Reg(x), m);
     }
     void group3(unsigned ext, Reg r, bool w) {
         rex_opt(w, 0, r);

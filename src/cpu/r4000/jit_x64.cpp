@@ -42,6 +42,23 @@ constexpr Reg kPc = r14;    // pc at entry (blocks are shared by aliases)
 constexpr Reg kTlb = rbp;   // this mode's soft-TLB load table (fetch before it, store after it)
 // Host registers that hold guest registers; rax, rcx and rdx are scratch.
 constexpr Reg kCacheRegs[] = {rsi, rdi, r8, r9, r10, r11, r13, r15};
+// xmm registers that hold FPU registers; xmm0-xmm4 are scratch. (Windows
+// keeps xmm6-xmm15 for the caller.)
+#if defined(_WIN32)
+constexpr unsigned kFpCacheRegs[] = {5};
+#else
+constexpr unsigned kFpCacheRegs[] = {5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+#endif
+
+// FMA3, for exact rounding errors of products, quotients and roots.
+bool host_has_fma() {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
 
 // Calling convention. Windows (x64): arguments in rcx, rdx, r8; rsi and rdi
 // are callee-saved; every call needs 32 bytes of shadow space above the
@@ -69,6 +86,9 @@ static s32 offset_of(const R4000* cpu, const T* member) {
 }
 
 bool R4000::jit_compile_supported() { return true; }
+
+bool R4000::jit_fma_ = host_has_fma();
+void R4000::set_jit_fma(bool enabled) { jit_fma_ = enabled && host_has_fma(); }
 
 bool R4000::jit_compile(Block& b) {
     Emitter e;
@@ -122,14 +142,65 @@ bool R4000::jit_compile(Block& b) {
     Reg host_of[32] = {};
     for (unsigned g = 1; g < 32; ++g)
         if (plan.slot[g] >= 0) host_of[g] = kCacheRegs[plan.slot[g]];
-    const u32 alloc = plan.alloc, written = plan.written;
+    // FPU register cache: the FPU registers the block's inline operations
+    // use at least twice, each always in the same width (storage that is
+    // seen both as a single and as a double stays in memory), held in xmm
+    // registers. Status.FR as at translation fixes where each register
+    // lives (the code checks it before every FPU operation). In the masks
+    // below their bits follow the 32 guest registers'.
+    const bool fr = (status_ & sr::FR) != 0;
+    const s32 fpr_base = offset_of(this, &fpr[0]);
+    auto fp_storage = [&](unsigned n, bool dbl) -> s32 {  // byte offset of the register within fpr
+        if (fr) return static_cast<s32>(8 * n);
+        return static_cast<s32>(8 * (n & ~1u) + (dbl ? 0 : 4 * (n & 1)));  // little-endian host
+    };
+    struct FpKey {
+        s32 off;
+        unsigned width;
+        unsigned uses;
+        bool written;
+    };
+    std::vector<FpKey> fp_keys;
+    {
+        std::vector<FpKey> all;  // every inline FPU access
+        for (u32 i = 0; i < b.count; ++i) {
+            if (i > 0 && is_branch_word(b.ops[i - 1].inst) && is_branch_word(b.ops[i].inst)) continue;
+            jit_fp_uses(b.ops[i].inst, [&](unsigned n, bool dbl, bool write_access) {
+                all.push_back({fp_storage(n, dbl), dbl ? 8u : 4u, 1, write_access});
+            });
+        }
+        for (const FpKey& a : all) {
+            bool clash = false, seen = false;
+            for (const FpKey& o : all)
+                if (o.off < a.off + static_cast<s32>(a.width) && a.off < o.off + static_cast<s32>(o.width) &&
+                    (o.off != a.off || o.width != a.width))
+                    clash = true;
+            if (clash) continue;
+            for (FpKey& k : fp_keys)
+                if (k.off == a.off) {
+                    ++k.uses;
+                    k.written |= a.written;
+                    seen = true;
+                }
+            if (!seen) fp_keys.push_back(a);
+        }
+        std::stable_sort(fp_keys.begin(), fp_keys.end(), [](const FpKey& x, const FpKey& y) { return x.uses > y.uses; });
+        while (!fp_keys.empty() && fp_keys.back().uses < 2) fp_keys.pop_back();
+        if (fp_keys.size() > std::size(kFpCacheRegs)) fp_keys.resize(std::size(kFpCacheRegs));
+    }
+    auto fp_bit = [](std::size_t k) { return u64{1} << (32 + k); };
+    u64 alloc = plan.alloc, written = plan.written;
+    for (std::size_t k = 0; k < fp_keys.size(); ++k) {
+        alloc |= fp_bit(k);
+        if (fp_keys[k].written) written |= fp_bit(k);
+    }
     const bool self_loop = plan.self_loop;
-    u32 loaded = 0, dirty = 0;
+    u64 loaded = 0, dirty = 0;
     auto cached = [&](unsigned g) { return ((alloc >> g) & 1) != 0; };
     auto ensure = [&](unsigned g) {  // load a cached register on first use
         if (cached(g) && !((loaded >> g) & 1)) {
             e.mov(host_of[g], gpr_at(g));
-            loaded |= 1u << g;
+            loaded |= u64{1} << g;
         }
     };
     auto read = [&](Reg dst, unsigned g, bool w64 = true) {  // 32-bit reads zero-extend
@@ -151,22 +222,92 @@ bool R4000::jit_compile(Block& b) {
     auto write = [&](unsigned g, Reg src) {
         if (!cached(g)) return e.mov(gpr_at(g), src);
         e.mov(host_of[g], src);
-        loaded |= 1u << g;
-        dirty |= 1u << g;
+        loaded |= u64{1} << g;
+        dirty |= u64{1} << g;
     };
     auto write_imm = [&](unsigned g, s32 v) {  // sign-extended
         if (!cached(g)) return e.mov_store_imm(gpr_at(g), v);
         e.mov_imm64(host_of[g], static_cast<u64>(static_cast<s64>(v)));
-        loaded |= 1u << g;
-        dirty |= 1u << g;
+        loaded |= u64{1} << g;
+        dirty |= u64{1} << g;
     };
-    auto flush = [&](u32 mask) {  // write back
+    auto fp_store_key = [&](std::size_t k) {
+        const Mem m{kCpu, fpr_base + fp_keys[k].off};
+        if (fp_keys[k].width == 8) e.movq_store(m, kFpCacheRegs[k]);
+        else e.movd_store(m, kFpCacheRegs[k]);
+    };
+    auto fp_load_key = [&](std::size_t k) {
+        const Mem m{kCpu, fpr_base + fp_keys[k].off};
+        if (fp_keys[k].width == 8) e.movq_load(kFpCacheRegs[k], m);
+        else e.movd_load(kFpCacheRegs[k], m);
+    };
+    auto flush = [&](u64 mask) {  // write back
         for (unsigned g = 1; g < 32; ++g)
             if ((mask >> g) & 1) e.mov(gpr_at(g), host_of[g]);
+        for (std::size_t k = 0; k < fp_keys.size(); ++k)
+            if (mask & fp_bit(k)) fp_store_key(k);
     };
-    auto restore = [&](u32 mask) {  // reload after a call
+    auto restore = [&](u64 mask) {  // reload after a call
         for (unsigned g = 1; g < 32; ++g)
             if ((mask >> g) & 1) e.mov(host_of[g], gpr_at(g));
+        for (std::size_t k = 0; k < fp_keys.size(); ++k)
+            if (mask & fp_bit(k)) fp_load_key(k);
+    };
+    // FPU register n as a single or a double: its cache slot, or -1 (then
+    // any cached register sharing its storage is written back and dropped,
+    // which the planning above should make unnecessary).
+    auto fp_slot = [&](unsigned n, bool dbl) -> int {
+        const s32 off = fp_storage(n, dbl);
+        const unsigned width = dbl ? 8 : 4;
+        for (std::size_t k = 0; k < fp_keys.size(); ++k) {
+            const FpKey& key = fp_keys[k];
+            if (key.off == off && key.width == width) {
+                if (!(loaded & fp_bit(k))) {
+                    fp_load_key(k);
+                    loaded |= fp_bit(k);
+                }
+                return static_cast<int>(k);
+            }
+            if (key.off < off + static_cast<s32>(width) && off < key.off + static_cast<s32>(key.width)) {
+                if (dirty & fp_bit(k)) fp_store_key(k);
+                loaded &= ~fp_bit(k);
+                dirty &= ~fp_bit(k);
+            }
+        }
+        return -1;
+    };
+    auto fp_mem = [&](unsigned n, bool dbl) { return Mem{kCpu, fpr_base + fp_storage(n, dbl)}; };
+    auto fp_read_gpr = [&](Reg r, unsigned n, bool dbl) {  // the bits, zero-extended
+        const int k = fp_slot(n, dbl);
+        if (k >= 0) e.movq_from_xmm(r, kFpCacheRegs[k], dbl);
+        else e.mov(r, fp_mem(n, dbl), dbl);
+    };
+    auto fp_write_gpr = [&](unsigned n, bool dbl, Reg r) {
+        const int k = fp_slot(n, dbl);
+        if (k < 0) return e.mov(fp_mem(n, dbl), r, dbl);
+        e.movq_to_xmm(kFpCacheRegs[k], r, dbl);
+        loaded |= fp_bit(k);
+        dirty |= fp_bit(k);
+    };
+    // An xmm register holding FPU register n: its cache register, or
+    // `scratch` loaded from memory.
+    auto fp_src = [&](unsigned n, bool dbl, unsigned scratch) -> unsigned {
+        const int k = fp_slot(n, dbl);
+        if (k >= 0) return kFpCacheRegs[k];
+        if (dbl) e.movq_load(scratch, fp_mem(n, dbl));
+        else e.movd_load(scratch, fp_mem(n, dbl));
+        return scratch;
+    };
+    auto fp_write_xmm = [&](unsigned n, bool dbl, unsigned x) {
+        const int k = fp_slot(n, dbl);
+        if (k < 0) {
+            if (dbl) e.movq_store(fp_mem(n, dbl), x);
+            else e.movd_store(fp_mem(n, dbl), x);
+            return;
+        }
+        e.movapd(kFpCacheRegs[k], x);
+        loaded |= fp_bit(k);
+        dirty |= fp_bit(k);
     };
     // A block that branches to itself loops in place with the registers
     // held, so every pass starts with all of them loaded.
@@ -310,21 +451,15 @@ bool R4000::jit_compile(Block& b) {
         }
     };
     // COP1, inline for the common case: the coprocessor usable, Status.FR as
-    // it was when the block was translated (it fixes where each register
-    // lives), rounding to nearest with the inexact trap off, and operands the
-    // FPU handles in hardware. The host computes the result from a clean
-    // MXCSR; any flag but inexact, or a denormal result, leaves the result
-    // to the handler, which works it out again exactly.
-    const bool fr = (status_ & sr::FR) != 0;
+    // at translation, rounding to nearest with the inexact trap off, and
+    // operands the FPU handles in hardware. The host computes the result
+    // from a clean MXCSR; any flag but inexact, or a denormal result, leaves
+    // the result to the handler, which works it out again exactly.
     jit_fp_control_ = host_fp_control();
     const Mem m_status{kCpu, offset_of(this, &status_)};
     const Mem m_fcr31{kCpu, offset_of(this, &fcr31)};
     const Mem m_fp_control{kCpu, offset_of(this, &jit_fp_control_)};
     constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u, kCond = 1u << 23;
-    auto fpr_mem = [&](unsigned n, bool dbl) -> Mem {
-        if (fr) return {kCpu, offset_of(this, &fpr[n])};
-        return {kCpu, offset_of(this, &fpr[n & ~1u]) + (dbl ? 0 : 4 * static_cast<s32>(n & 1))};  // little-endian host
-    };
     auto fp_usable = [&](std::vector<std::size_t>& slow) {
         e.mov(rax, m_status, false);
         e.alu_imm(Alu::And, rax, static_cast<s32>(sr::CU1 | sr::FR), false);
@@ -347,6 +482,13 @@ bool R4000::jit_compile(Block& b) {
         e.alu_imm(Alu::Cmp, rcx, dbl ? 0x7FD : 0xFD, false);
         slow.push_back(e.jcc(Cond::A));
         e.bind(zero);
+    };
+    // FPU register n (zero or normal) into rax, and as an xmm register.
+    auto fp_operand = [&](unsigned n, bool dbl, unsigned scratch, std::vector<std::size_t>& slow) -> unsigned {
+        const unsigned x = fp_src(n, dbl, scratch);
+        e.movq_from_xmm(rax, x, dbl);
+        fp_ordinary(rax, dbl, slow);
+        return x;
     };
     auto fp_not_denormal = [&](Reg r, bool dbl, std::vector<std::size_t>& slow) {  // rcx is clobbered
         e.mov(rcx, r);
@@ -384,8 +526,8 @@ bool R4000::jit_compile(Block& b) {
             case 0x01:  // DMFC1
                 if (fmt == 0x01) need64(slow);
                 fp_usable(slow);
-                if (fmt == 0x00) e.movsxd(rax, fpr_mem(fs, false));
-                else e.mov(rax, fpr_mem(fs, true));
+                fp_read_gpr(rax, fs, fmt == 0x01);
+                if (fmt == 0x00) e.movsxd(rax, rax);
                 write_nz(ft, rax);
                 touch_();
                 return true;
@@ -395,7 +537,7 @@ bool R4000::jit_compile(Block& b) {
                 fp_usable(slow);
                 ensure(ft);
                 read(rax, ft, fmt == 0x05);
-                e.mov(fpr_mem(fs, fmt == 0x05), rax, fmt == 0x05);
+                fp_write_gpr(fs, fmt == 0x05, rax);
                 touch_();
                 return true;
             case 0x10:
@@ -405,54 +547,177 @@ bool R4000::jit_compile(Block& b) {
             default: return false;
         }
         const bool dbl = fmt == 0x11;
-        auto load = [&](Reg r, unsigned n, bool d) { e.mov(r, fpr_mem(n, d), d); };
-        auto store = [&](unsigned n, Reg r, bool d) { e.mov(fpr_mem(n, d), r, d); };
         if (fmt == 0x14) {  // CVT.S.W, CVT.D.W
             if (func != 0x20 && func != 0x21) return false;
+            const bool to_d = func == 0x21;
             fp_usable(slow);
             fp_nearest(slow);
-            load(rax, fs, false);
-            const bool to_d = func == 0x21;
-            fp_host([&] { e.cvt_from_int(to_d, 0, rax); }, slow);
-            e.movq_from_xmm(rax, 0, to_d);
-            fp_commit_inexact();
-            store(fd, rax, to_d);
+            fp_read_gpr(rax, fs, false);
+            e.cvt_from_int(to_d, 0, rax);
+            if (to_d) {  // exact
+                fp_commit_exact();
+            } else {  // inexact if the single differs from the integer
+                e.sse(Emitter::Sse::Cvt, false, 1, 0);
+                e.cvt_from_int(true, 2, rax);
+                e.ucomis(true, 1, 2);
+                e.setcc(Cond::Ne, rcx);
+                e.movzx8(rcx, rcx);
+                e.mov(rdx, m_fcr31, false);
+                e.alu_imm(Alu::And, rdx, static_cast<s32>(~kCauseMask), false);
+                e.imul_imm(rcx, rcx, static_cast<s32>(kCauseInexact | kFlagInexact));
+                e.alu(Alu::Or, rdx, rcx, false);
+                e.mov(m_fcr31, rdx, false);
+            }
+            fp_write_xmm(fd, to_d, 0);
             touch_();
             return true;
         }
-        if (func <= 0x04) {  // ADD, SUB, MUL, DIV, SQRT
+        // Exponent field of the value in `r` into rcx.
+        auto exponent = [&](Reg r) {
+            e.mov(rcx, r);
+            e.shift_imm(Shift::Shl, rcx, 1, dbl);
+            e.shift_imm(Shift::Shr, rcx, dbl ? 53 : 24, dbl);
+        };
+        const s32 exp_max = dbl ? 0x7FF : 0xFF;
+        // A zero result passes only if one of `zeros` is zero; a nonzero
+        // one needs an exponent of at least `min_exp` and below the maximum.
+        auto result_check = [&](std::initializer_list<unsigned> zeros, s32 min_exp) {
+            e.mov(rcx, rax);
+            e.shift_imm(Shift::Shl, rcx, 1, dbl);
+            const std::size_t zero = e.jcc(Cond::E);
+            e.shift_imm(Shift::Shr, rcx, dbl ? 53 : 24, dbl);
+            e.alu_imm(Alu::Cmp, rcx, min_exp, false);
+            slow.push_back(e.jcc(Cond::B));
+            e.alu_imm(Alu::Cmp, rcx, exp_max, false);
+            slow.push_back(e.jcc(Cond::E));
+            const std::size_t ok = e.jmp();
+            e.bind(zero);
+            std::vector<std::size_t> exact;
+            for (unsigned x : zeros) {
+                e.movq_from_xmm(rcx, x, dbl);
+                e.shift_imm(Shift::Shl, rcx, 1, dbl);
+                exact.push_back(e.jcc(Cond::E));
+            }
+            slow.push_back(e.jmp());
+            for (std::size_t site : exact) e.bind(site);
+            e.bind(ok);
+        };
+        // rcx = 1 if the error term in xmm `x` is nonzero.
+        auto nonzero = [&](unsigned x) {
+            e.movq_from_xmm(rcx, x, dbl);
+            e.shift_imm(Shift::Shl, rcx, 1, dbl);
+            e.setcc(Cond::Ne, rcx);
+            e.movzx8(rcx, rcx);
+        };
+        // fp_commit() with rcx = 1 for an inexact result.
+        auto commit_inexact_rcx = [&] {
+            e.mov(rdx, m_fcr31, false);
+            e.alu_imm(Alu::And, rdx, static_cast<s32>(~kCauseMask), false);
+            e.imul_imm(rcx, rcx, static_cast<s32>(kCauseInexact | kFlagInexact));
+            e.alu(Alu::Or, rdx, rcx, false);
+            e.mov(m_fcr31, rdx, false);
+        };
+        // Exact results and rounding errors leave nothing in doubt at these
+        // exponents (far from overflow, and from underflow of the error).
+        const s32 min_result = dbl ? 64 : 32, min_dividend = dbl ? 128 : 64;
+        if (func <= 0x01 || (func <= 0x04 && jit_fma_)) {  // ADD, SUB; MUL, DIV, SQRT with FMA
             fp_usable(slow);
             fp_nearest(slow);
-            load(rax, fs, dbl);
-            fp_ordinary(rax, dbl, slow);
-            e.movq_to_xmm(0, rax, dbl);
-            if (func != 0x04) {
-                load(rax, ft, dbl);
-                fp_ordinary(rax, dbl, slow);
-                e.movq_to_xmm(1, rax, dbl);
+            const unsigned a = fp_operand(fs, dbl, 4, slow);
+            if (func == 0x04) {  // SQRT: a zero or a positive number not too small
+                e.test(rax, rax);
+                if (!dbl) e.test_imm(rax, 0x80000000u);
+                const std::size_t positive = e.jcc(dbl ? Cond::Ge : Cond::E);
+                e.mov(rcx, rax);
+                e.shift_imm(Shift::Shl, rcx, 1, dbl);
+                slow.push_back(e.jcc(Cond::Ne));  // the root of a negative number is invalid
+                e.bind(positive);
+                e.mov(rcx, rax);
+                e.shift_imm(Shift::Shl, rcx, 1, dbl);
+                const std::size_t zero = e.jcc(Cond::E);
+                exponent(rax);
+                e.alu_imm(Alu::Cmp, rcx, min_dividend, false);
+                slow.push_back(e.jcc(Cond::B));
+                e.bind(zero);
+                e.movapd(0, a);
+                e.sse(Emitter::Sse::Sqrt, dbl, 0, 0);
+                e.movapd(1, a);
+                e.fnmadd231(dbl, 1, 0, 0);  // a - r * r
+            } else {
+                const unsigned c = fp_operand(ft, dbl, 3, slow);
+                if (func == 0x03) {  // DIV: a nonzero divisor, a dividend zero or not too small
+                    e.mov(rcx, rax);
+                    e.shift_imm(Shift::Shl, rcx, 1, dbl);
+                    slow.push_back(e.jcc(Cond::E));
+                    e.movq_from_xmm(rax, a, dbl);
+                    e.mov(rcx, rax);
+                    e.shift_imm(Shift::Shl, rcx, 1, dbl);
+                    const std::size_t zero = e.jcc(Cond::E);
+                    exponent(rax);
+                    e.alu_imm(Alu::Cmp, rcx, min_dividend, false);
+                    slow.push_back(e.jcc(Cond::B));
+                    e.bind(zero);
+                }
+                static constexpr Emitter::Sse kOps[] = {Emitter::Sse::Add, Emitter::Sse::Sub, Emitter::Sse::Mul,
+                                                        Emitter::Sse::Div};
+                e.movapd(0, a);
+                e.sse(kOps[func], dbl, 0, c);
+                if (func == 0x00) {  // TwoSum: (a - (s - (s - a))) + (b - (s - a))
+                    e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, a);
+                    e.movapd(2, c), e.sse(Emitter::Sse::Sub, dbl, 2, 1);
+                    e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
+                    e.movapd(1, a), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
+                    e.sse(Emitter::Sse::Add, dbl, 1, 2);
+                } else if (func == 0x01) {  // (a - (s - (s - a))) - (b + (s - a))
+                    e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, a);
+                    e.movapd(2, c), e.sse(Emitter::Sse::Add, dbl, 2, 1);
+                    e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
+                    e.movapd(1, a), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
+                    e.sse(Emitter::Sse::Sub, dbl, 1, 2);
+                } else if (func == 0x02) {
+                    e.movapd(1, 0);
+                    e.fmsub231(dbl, 1, a, c);  // a * b - p
+                } else {
+                    e.movapd(1, a);
+                    e.fnmadd231(dbl, 1, 0, c);  // a - q * b
+                }
             }
+            e.movq_from_xmm(rax, 0, dbl);
+            if (func <= 0x01) result_check({0}, 1);  // a zero sum is exact
+            else if (func == 0x02) result_check({a, fp_src(ft, dbl, 3)}, min_result);
+            else if (func == 0x03) result_check({a}, min_result);
+            nonzero(1);
+            commit_inexact_rcx();
+            fp_write_xmm(fd, dbl, 0);
+            touch_();
+            return true;
+        }
+        if (func <= 0x04) {  // MUL, DIV, SQRT without FMA: the host's flags
+            fp_usable(slow);
+            fp_nearest(slow);
+            const unsigned a = fp_operand(fs, dbl, 4, slow);
+            const unsigned c = func == 0x04 ? a : fp_operand(ft, dbl, 3, slow);
+            e.movapd(0, a);
             static constexpr Emitter::Sse kOps[] = {Emitter::Sse::Add, Emitter::Sse::Sub, Emitter::Sse::Mul,
                                                     Emitter::Sse::Div, Emitter::Sse::Sqrt};
-            fp_host([&] { e.sse(kOps[func], dbl, 0, func == 0x04 ? 0 : 1); }, slow);
+            fp_host([&] { e.sse(kOps[func], dbl, 0, func == 0x04 ? 0 : c); }, slow);
             e.movq_from_xmm(rax, 0, dbl);
             fp_not_denormal(rax, dbl, slow);
             fp_commit_inexact();
-            store(fd, rax, dbl);
+            fp_write_xmm(fd, dbl, 0);
             touch_();
             return true;
         }
         switch (func) {
             case 0x06:  // MOV: a plain copy, Cause untouched
                 fp_usable(slow);
-                load(rax, fs, dbl);
-                store(fd, rax, dbl);
+                fp_write_xmm(fd, dbl, fp_src(fs, dbl, 0));
                 touch_();
                 return true;
             case 0x05:  // ABS
             case 0x07: {  // NEG
                 fp_usable(slow);
-                load(rax, fs, dbl);
-                fp_ordinary(rax, dbl, slow);
+                fp_operand(fs, dbl, 0, slow);
                 if (dbl) e.mov_imm64(rcx, u64{1} << 63);
                 else e.mov_imm32(rcx, 0x80000000u);
                 if (func == 0x05) {
@@ -462,7 +727,7 @@ bool R4000::jit_compile(Block& b) {
                     e.alu(Alu::Xor, rax, rcx, dbl);
                 }
                 fp_commit_exact();
-                store(fd, rax, dbl);
+                fp_write_gpr(fd, dbl, rax);
                 touch_();
                 return true;
             }
@@ -471,20 +736,33 @@ bool R4000::jit_compile(Block& b) {
                 if ((func == 0x20) != dbl) return false;  // CVT.S.S and CVT.D.D are unimplemented
                 fp_usable(slow);
                 if (dbl) fp_nearest(slow);
-                load(rax, fs, dbl);
-                fp_ordinary(rax, dbl, slow);
-                e.movq_to_xmm(0, rax, dbl);
-                if (dbl) {
-                    fp_host([&] { e.sse(Emitter::Sse::Cvt, true, 0, 0); }, slow);
+                const unsigned x = fp_operand(fs, dbl, 4, slow);
+                if (dbl) {  // a zero, or a normal single, inexact if it differs from the double
+                    e.sse(Emitter::Sse::Cvt, true, 0, x);
                     e.movq_from_xmm(rax, 0, false);
-                    fp_not_denormal(rax, false, slow);
-                    fp_commit_inexact();
+                    e.mov(rcx, rax);
+                    e.shift_imm(Shift::Shl, rcx, 1, false);
+                    const std::size_t zero = e.jcc(Cond::E);
+                    e.shift_imm(Shift::Shr, rcx, 24, false);
+                    slow.push_back(e.jcc(Cond::E));
+                    e.alu_imm(Alu::Cmp, rcx, 0xFF, false);
+                    slow.push_back(e.jcc(Cond::E));
+                    const std::size_t ok = e.jmp();
+                    e.bind(zero);
+                    e.movq_from_xmm(rcx, x, true);
+                    e.shift_imm(Shift::Shl, rcx, 1, true);
+                    slow.push_back(e.jcc(Cond::Ne));  // underflow
+                    e.bind(ok);
+                    e.sse(Emitter::Sse::Cvt, false, 1, 0);
+                    e.ucomis(true, 1, x);
+                    e.setcc(Cond::Ne, rcx);
+                    e.movzx8(rcx, rcx);
+                    commit_inexact_rcx();
                 } else {
-                    e.sse(Emitter::Sse::Cvt, false, 0, 0);
-                    e.movq_from_xmm(rax, 0, true);
+                    e.sse(Emitter::Sse::Cvt, false, 0, x);
                     fp_commit_exact();
                 }
-                store(fd, rax, !dbl);
+                fp_write_xmm(fd, !dbl, 0);
                 touch_();
                 return true;
             }
@@ -493,12 +771,21 @@ bool R4000::jit_compile(Block& b) {
             case 0x24: {  // CVT.W (RM, here nearest)
                 fp_usable(slow);
                 fp_nearest(slow);
-                load(rax, fs, dbl);
-                fp_ordinary(rax, dbl, slow);
-                e.movq_to_xmm(0, rax, dbl);
-                fp_host([&] { e.cvt_to_int(dbl, func == 0x0D, rax, 0); }, slow);  // out of range: invalid
-                fp_commit_inexact();
-                store(fd, rax, false);
+                const unsigned x = fp_operand(fs, dbl, 4, slow);
+                e.cvt_to_int(dbl, func == 0x0D, rax, x);
+                e.alu_imm(Alu::Cmp, rax, static_cast<s32>(0x80000000u), false);
+                slow.push_back(e.jcc(Cond::E));  // out of range (or exactly -2^31: the handler sorts it out)
+                e.cvt_from_int(true, 1, rax);    // inexact if the integer differs from the operand
+                if (dbl) {
+                    e.ucomis(true, 1, x);
+                } else {
+                    e.sse(Emitter::Sse::Cvt, false, 2, x);
+                    e.ucomis(true, 1, 2);
+                }
+                e.setcc(Cond::Ne, rcx);
+                e.movzx8(rcx, rcx);
+                commit_inexact_rcx();
+                fp_write_gpr(fd, false, rax);
                 touch_();
                 return true;
             }
@@ -508,21 +795,20 @@ bool R4000::jit_compile(Block& b) {
         if (func >= 0x30) {  // C.cond: no NaN operand, so ordered and no exception
             const unsigned cond = func & 6;  // less (4), equal (2)
             fp_usable(slow);
-            auto not_nan = [&](unsigned n, unsigned x) {
-                load(rax, n, dbl);
-                e.mov(rcx, rax);
+            auto not_nan = [&](unsigned n, unsigned scratch) {
+                const unsigned x = fp_src(n, dbl, scratch);
+                e.movq_from_xmm(rcx, x, dbl);
                 e.shift_imm(Shift::Shl, rcx, 1, dbl);
                 if (dbl) e.mov_imm64(rdx, 0xFFE0000000000000ull);
                 else e.mov_imm32(rdx, 0xFF000000u);
                 e.alu(Alu::Cmp, rcx, rdx, dbl);
                 slow.push_back(e.jcc(Cond::A));
-                e.movq_to_xmm(x, rax, dbl);
+                return x;
             };
-            not_nan(fs, 0);
-            not_nan(ft, 1);
+            const unsigned xa = not_nan(fs, 0), xb = not_nan(ft, 1);
             e.alu(Alu::Xor, rax, rax, false);
             if (cond) {
-                e.ucomis(dbl, 0, 1);
+                e.ucomis(dbl, xa, xb);
                 e.setcc(cond == 6 ? Cond::Be : cond == 4 ? Cond::B : Cond::E, rax);
                 e.movzx8(rax, rax);
                 e.shift_imm(Shift::Shl, rax, 23, false);
@@ -605,7 +891,7 @@ bool R4000::jit_compile(Block& b) {
                 e.mov(rax, Mem{rdx, 0}, size == 8);
                 if (size == 8) e.bswap64(rax);
                 else e.bswap32(rax);
-                e.mov(fpr_mem(rt, size == 8), rax, size == 8);
+                fp_write_gpr(rt, size == 8, rax);
                 touch_();
                 return true;
             }
@@ -722,7 +1008,7 @@ bool R4000::jit_compile(Block& b) {
         e.mov(Mem{rdx, log_host}, rcx);
         e.mov_store_imm32(Mem{rdx, log_size}, size);
         e.mov_store_imm(Mem{rdx, log_value}, 0);
-        if (fp) e.mov(rax, fpr_mem(rt, size == 8), size == 8);
+        if (fp) fp_read_gpr(rax, rt, size == 8);
         else read(rax, rt, size == 8);
         switch (size) {
             case 1: e.mov8(Mem{rcx, 0}, rax); break;
@@ -902,10 +1188,10 @@ bool R4000::jit_compile(Block& b) {
     struct Exit {
         std::size_t site;
         u32 completed;
-        u32 flush;  // cached registers to write back
+        u64 flush;  // cached registers to write back
     };
     std::vector<Exit> exits;
-    auto exit_if = [&](Cond c, u32 completed, u32 mask) { exits.push_back({e.jcc(c), completed, mask}); };
+    auto exit_if = [&](Cond c, u32 completed, u64 mask) { exits.push_back({e.jcc(c), completed, mask}); };
     // Leave when run_block() would after ops[i]: a device or CP0 access, the
     // block's memory written, a confirmed idle loop, or control leaving the
     // straight line (an exception, or a taken branch after its delay slot).
@@ -1101,9 +1387,9 @@ bool R4000::jit_compile(Block& b) {
             // Loads and stores try the inline path first.
             std::vector<std::size_t> slow;
             std::size_t skip_slow = 0;
-            const u32 dirty_before = dirty;
+            const u64 dirty_before = dirty;
             const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
-            const u32 loaded_after = loaded;
+            const u64 loaded_after = loaded;
             if (fast) {
                 if (delay_slot) leave_delay_slot();
                 skip_slow = e.jmp();
@@ -1186,7 +1472,7 @@ bool R4000::jit_compile(Block& b) {
         e.jmp_to(body);
         e.bind(other);
     }
-    const u32 dirty_end = dirty;
+    const u64 dirty_end = dirty;
     flush(dirty_end);
     // Enters the translation at rsi + top for pc rax if the block (at rcx)
     // fits; the registers are written back.

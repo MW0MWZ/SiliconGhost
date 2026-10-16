@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Andy Taylor
 // R4000 interpreter tests: hand-assembled programs run from kseg0 in kernel mode.
 #include <array>
+#include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <initializer_list>
 #include <iterator>
 #include <tuple>
@@ -817,7 +819,9 @@ std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base) {
 
 }  // namespace
 
-TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
+// The x86-64 recompiler checks FPU results with FMA where the host has it,
+// else with the host's exception flags: both are run.
+static void check_random_fpu_programs() {
     constexpr u64 kData = 0x10000, kBase = 0x1000;
     constexpr unsigned kLength = 400;
     for (u32 seed = 1; seed <= 300; ++seed) {
@@ -839,6 +843,21 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
                     case 2: return dbl ? 0x7FF8000000000001ull : 0x7FC00001u;     // NaN (signaling on MIPS)
                     case 3: return dbl ? 0x7FF0000000000001ull : 0x7F800001u;     // NaN (quiet on MIPS)
                     case 4: return dbl ? (r & 0x000FFFFFFFFFFFFFull) : (r & 0x007FFFFFu);  // denormal
+                    case 5: case 6: case 7: case 8: case 9: case 10: case 11: case 12: {
+                        // a small integer or a power of two: exact sums and products
+                        const double v = (r & 1) ? static_cast<double>(1 + (r >> 8) % 16)
+                                                 : std::ldexp(1.0, static_cast<int>((r >> 8) % 21) - 10);
+                        const double sv = (r & 2) ? -v : v;
+                        if (dbl) {
+                            u64 bits;
+                            std::memcpy(&bits, &sv, 8);
+                            return bits;
+                        }
+                        const float f = static_cast<float>(sv);
+                        u32 bits;
+                        std::memcpy(&bits, &f, 4);
+                        return bits;
+                    }
                     default: {  // sign, exponent within 2^-20..2^20, random fraction
                         const u64 sign = (r >> 59) & 1, exp = (r >> 32) % 41;
                         if (dbl) return (sign << 63) | ((1003 + exp) << 52) | (r & 0x000FFFFFFFFFFFFFull);
@@ -878,6 +897,97 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
             break;
         }
     }
+}
+
+// Each FPU operation the recompiler translates, on operands that give an
+// exact and an inexact result, with FCR31 (Cause and the flags) read right
+// after it: the same in every engine.
+TEST(cpu_jit_fpu_cause_matches_interpreter) {
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto cfc1 = [](unsigned rt) { return (0x11u << 26) | (0x02u << 21) | (rt << 16) | (31u << 11); };
+    auto dbits = [](double v) {
+        u64 b;
+        std::memcpy(&b, &v, 8);
+        return b;
+    };
+    auto fbits = [](float v) {
+        u32 b;
+        std::memcpy(&b, &v, 4);
+        return u64{b};
+    };
+    // f0..f7: doubles 3, 4, 1/3, 2, 16777217, 2^-1000; f8..f13 singles 3, 4, 1/3, 2, 9
+    const std::vector<u64> values = {dbits(3.0), dbits(4.0), dbits(1.0 / 3), dbits(2.0), dbits(16777217.0),
+                                     dbits(std::ldexp(1.0, -1000)), dbits(2.5), dbits(0.1), fbits(3.0f),
+                                     fbits(4.0f), fbits(1.0f / 3), fbits(2.0f), fbits(9.0f), fbits(0.1f)};
+    std::vector<u32> body;
+    s32 slot = 0;
+    auto op = [&](u32 w) {  // the operation, then FCR31 to the next word of the data area
+        body.push_back(w);
+        body.push_back(cfc1(t0));
+        body.push_back(SW(t0, slot, s0));
+        slot += 4;
+    };
+    for (unsigned func : {0u, 1u, 2u, 3u}) {
+        op(cop1(17, 1, 0, 20, func));   // 3 op 4: exact
+        op(cop1(17, 2, 0, 20, func));   // 3 op 1/3
+        op(cop1(16, 9, 8, 20, func));   // single 3 op 4
+        op(cop1(16, 10, 8, 20, func));  // single 3 op 1/3
+    }
+    op(cop1(17, 0, 1, 20, 4));    // SQRT.D 4: exact
+    op(cop1(17, 0, 3, 20, 4));    // SQRT.D 2: inexact
+    op(cop1(16, 0, 9, 20, 4));    // SQRT.S 4
+    op(cop1(16, 0, 11, 20, 4));   // SQRT.S 2
+    op(cop1(17, 0, 0, 20, 0x20)); // CVT.S.D 3: exact
+    op(cop1(17, 0, 4, 20, 0x20)); // CVT.S.D 16777217: inexact
+    op(cop1(17, 0, 6, 20, 0x24)); // CVT.W.D 2.5: inexact (2)
+    op(cop1(17, 0, 0, 20, 0x0D)); // TRUNC.W.D 3: exact
+    op(cop1(16, 0, 13, 20, 0x0C)); // ROUND.W.S 0.1: inexact
+    op(cop1(17, 0, 7, 20, 0x0D)); // TRUNC.W.D 0.1
+    op(cop1(17, 0, 5, 20, 2));    // MUL.D tiny * 3: exact far down
+    op(cop1(17, 5, 5, 20, 2));    // tiny * tiny: underflow
+    std::vector<u32> prog = {ADDIU(s1, zero, 20)};
+    const s32 loop = static_cast<s32>(prog.size());
+    prog.insert(prog.end(), body.begin(), body.end());
+    prog.push_back(ADDIU(s1, s1, -1));
+    prog.push_back(BNE(s1, zero, loop - static_cast<s32>(prog.size()) - 1));
+    prog.push_back(NOP);
+    prog.push_back(BEQ(zero, zero, -1));
+    prog.push_back(NOP);
+    for (bool fma : {true, false}) {
+        R4000::set_jit_fma(fma);
+        auto run = [&](Engine engine) {
+            Rig t;
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::FR);
+            t.cpu.fcr31 = 1u << 24;  // FS: tiny results flushed rather than trapped
+            for (std::size_t i = 0; i < values.size(); ++i) t.cpu.fpr[i] = values[i];
+            t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+            u64 paddr = 0x1000;
+            for (u32 w : prog) {
+                t.w32(paddr, w);
+                paddr += 4;
+            }
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.set_pc(0xFFFFFFFF80001000ull);
+            t.cpu.run_until(20000);
+            return capture(t, 0x10000, 0x100);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        CHECK(run(Engine::Blocks) == reference);
+        CHECK(run(Engine::Jit) == reference);
+        CHECK_EQ(reference.cause, 0u);  // no exception
+    }
+    R4000::set_jit_fma(true);
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
+    check_random_fpu_programs();
+    R4000::set_jit_fma(false);
+    check_random_fpu_programs();
+    R4000::set_jit_fma(true);
 }
 
 // A translation made in kernel mode runs again for the same memory in user
