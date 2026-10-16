@@ -43,7 +43,7 @@ constexpr unsigned int2_to_int3(unsigned i) {
     return i <= 6 ? kL0Status + i : i == 8 ? static_cast<unsigned>(kTimerClear) : ~0u;
 }
 // PORT_CONFIG: the retrace latch clear lines are active low.
-constexpr u8 kPconClrSgRetrace = 1u << 3, kPconClrS0Retrace = 1u << 4;
+constexpr u8 kPconClrSgRetrace = 1u << 3;  // the expansion slot's is bit 4
 
 }  // namespace
 
