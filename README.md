@@ -160,12 +160,13 @@ Main options (`siliconghost --help` lists them all):
 | Option | Meaning |
 |---|---|
 | `--prom FILE` | IP22 boot PROM image (raw, big-endian) |
-| `--machine indy\|indigo2` | the system board (default Indy); the Indigo² needs its own PROM and takes R4000/R4400 modules |
+| `--machine indy\|indigo2` | the system board (default Indy); the Indigo² needs its own PROM and takes R4000/R4400 modules. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
 | `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
 | `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384) |
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc` | processor module (default R4400SC) |
-| `--cpu-mhz N` | CPU clock (default 150) |
+| `--cpu-mhz N` | CPU clock: one the module shipped at on that platform (default: the module's usual clock) |
+| `--any-clock` | allow a `--cpu-mhz` no such machine shipped with |
 | `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
 | `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 2 for the XL8, 0 for the XL24); drivers pick timings and cursor offsets by it, and see an 8-bit board only from revision 2 |
 | `--headless` | no window: both serial ports use the terminal |

@@ -5,6 +5,7 @@
 // at once. With --headless (or without SDL3) both serial ports are connected
 // to this terminal.
 #include <atomic>
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -83,7 +84,8 @@ void usage(const char* argv0) {
                  "                   indigo2 up to three banks, to 384\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc, r4000pc, r4600sc, r4600pc,\n"
                  "                   r5000sc or r5000pc\n"
-                 "  --cpu-mhz N      pipeline clock (default 150)\n"
+                 "  --cpu-mhz N      pipeline clock: one the module shipped at (default 150)\n"
+                 "  --any-clock      allow a clock no such machine shipped with\n"
                  "  --graphics BOARD xl8 (8-bit Newport, the default), xl24 (24-bit) or none\n"
                  "  --graphics-rev N the board revision it reports, 0-7 (default 2 for xl8, 0 for xl24)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only), as --graphics none\n"
@@ -234,6 +236,7 @@ int main(int argc, char** argv) {
     std::string screenshot, settings_file;
     unsigned long long max_cycles = ~0ull;
     bool trace = false, dump = false, headless = false, timing_given = false, foreground = false, log_given = false;
+    bool any_clock = false, cpu_given = false, mhz_given = false;
     sg::log::set_level(sg::log::Level::Warn);
 
     // Options that describe a machine. Finder on older macOS passes a process
@@ -275,6 +278,8 @@ int main(int argc, char** argv) {
             if (!std::strcmp(a, v.flag)) key = v.key, value = v.value;
         if (!key.empty()) {
             if (key == "timing") timing_given = true;
+            if (key == "cpu") cpu_given = true;
+            if (key == "cpu_mhz") mhz_given = true;
             if (!sg::app::set_option(settings, key, value, error)) {
                 std::fprintf(stderr, "error: %s %s\n", a, error.c_str());
                 return 2;
@@ -296,6 +301,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--screenshot")) screenshot = next();
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next().c_str(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
+        else if (!std::strcmp(a, "--any-clock")) any_clock = true;
         else if (!std::strcmp(a, "--dump-state")) dump = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
         else if (!std::strcmp(a, "--foreground")) foreground = true;
@@ -304,6 +310,19 @@ int main(int argc, char** argv) {
             return 0;
         } else {
             usage(argv[0]);
+            return 2;
+        }
+    }
+    // A module chosen here without a clock runs at the one it shipped with.
+    if (cpu_given && !mhz_given)
+        if (const sg::app::CpuModel* m = sg::app::find_cpu_model(settings.cpu))
+            if (const auto& mhz = m->mhz(sg::app::board_of(settings)); !mhz.empty() &&
+                std::find(mhz.begin(), mhz.end(), settings.cpu_mhz) == mhz.end())
+                settings.cpu_mhz = mhz.front();
+    {
+        std::string error;
+        if (!sg::app::check_hardware(settings, any_clock, error)) {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
             return 2;
         }
     }

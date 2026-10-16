@@ -141,6 +141,64 @@ TEST(settings_round_trip_and_validation) {
     std::filesystem::remove(path);
 }
 
+TEST(settings_platform_limits_processor_clock_and_memory) {
+    using ip22::Board;
+    // Only the modules each platform shipped with, at the clocks it shipped them.
+    CHECK(app::find_cpu_model("r5000sc")->fits(Board::Indy));
+    CHECK(!app::find_cpu_model("r5000sc")->fits(Board::Indigo2));
+    CHECK(!app::find_cpu_model("r4600pc")->fits(Board::Indigo2));
+    CHECK(app::find_cpu_model("r4400sc")->fits(Board::Indigo2));
+    CHECK_EQ(app::find_cpu_model("r4400sc")->mhz(Board::Indigo2).back(), 250.0);
+    CHECK_EQ(app::find_cpu_model("r4400sc")->mhz(Board::Indy).back(), 200.0);
+    CHECK_EQ(app::ram_sizes(Board::Indy, nullptr).back(), 256u);
+    CHECK_EQ(app::ram_sizes(Board::Indigo2, nullptr).back(), 384u);
+
+    // Indy R5000SC at 180 MHz with 256 MiB moved to the Indigo2: an R4400SC
+    // at its first clock; the memory fits as it is.
+    app::Settings s;
+    s.cpu = "r5000sc", s.cpu_mhz = 180, s.ram_mb = 256;
+    s.machine = "indigo2";
+    app::make_consistent(s, false);
+    CHECK_STR(s.cpu, std::string("r4400sc"));
+    CHECK_EQ(s.cpu_mhz, 150.0);
+    CHECK_EQ(s.ram_mb, 256u);
+    // Back to the Indy with 384 MiB: the largest size that fits there.
+    s.ram_mb = 384, s.cpu_mhz = 250;
+    s.machine = "indy";
+    app::make_consistent(s, false);
+    CHECK_EQ(s.ram_mb, 256u);
+    CHECK_EQ(s.cpu_mhz, 250.0);  // kept: the processor did not change
+    bool noted = false;
+    for (const auto& n : app::configuration_notes(s)) noted |= n.find("250 MHz") != std::string::npos;
+    CHECK(noted);
+    // A new processor takes a clock it shipped at.
+    s.cpu = "r4600sc";
+    app::make_consistent(s, true);
+    CHECK_EQ(s.cpu_mhz, 133.0);
+    s.machine = "indigo2";
+    bool ecoff = false;
+    for (const auto& n : app::configuration_notes(s)) ecoff |= n.find("ECOFF") != std::string::npos;
+    CHECK(ecoff);
+}
+
+TEST(settings_check_hardware_refuses_impossible_combinations) {
+    std::string error;
+    app::Settings s;
+    CHECK(app::check_hardware(s, false, error));  // the defaults
+    s.machine = "indigo2", s.cpu = "r5000sc";
+    CHECK(!app::check_hardware(s, false, error));
+    CHECK(error.find("r4400sc, r4000sc") != std::string::npos);
+    s.cpu = "r4400sc", s.cpu_mhz = 250, s.ram_mb = 384;
+    CHECK(app::check_hardware(s, false, error));
+    s.machine = "indy";
+    CHECK(!app::check_hardware(s, false, error));  // 250 MHz: not an Indy clock
+    CHECK(error.find("150 MHz, 175 MHz, 200 MHz") != std::string::npos);
+    CHECK(!app::check_hardware(s, true, error));  // and 384 MiB does not fit
+    CHECK(error.find("384 MiB") != std::string::npos);
+    s.ram_mb = 256;
+    CHECK(app::check_hardware(s, true, error));
+}
+
 TEST(blank_images_are_created_once) {
     const std::string path = temp_path("sg_blank_test.img");
     std::filesystem::remove(path);

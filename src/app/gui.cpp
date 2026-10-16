@@ -80,7 +80,6 @@ constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd
 constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
 
-constexpr std::array<double, 7> kClockPresets = {100, 133, 150, 175, 180, 200, 250};
 constexpr std::array<u64, 7> kDiskSizesMiB = {512, 1024, 2048, 4096, 8192, 16384, 32768};
 
 // An activity light: lit for a moment whenever its counter moves.
@@ -1041,6 +1040,7 @@ void Gui::draw_status_bar() {
 
 void Gui::open_settings() {
     edit_ = session_.settings();
+    make_consistent(edit_, false);  // a processor or memory size the platform cannot take is replaced
     if (auto* m = session_.machine()) edit_.cdroms = m->discs();
     net_mode_ = edit_.net == "none" ? 2 : edit_.net.rfind("tap:", 0) == 0 ? 1 : 0;
     tap_name_ = net_mode_ == 1 ? edit_.net.substr(4) : std::string();
@@ -1134,46 +1134,51 @@ void Gui::draw_settings() {
     ImGui::BeginChild("##tabs", ImVec2(0, -footer));
     if (ImGui::BeginTabBar("##settings")) {
         if (ImGui::BeginTabItem("Machine")) {
-            const bool indigo2 = edit_.machine == "indigo2";
-            const ip22::Board board = indigo2 ? ip22::Board::Indigo2 : ip22::Board::Indy;
-            label("System");
+            // Each choice limits the next: the platform the processors, the
+            // processor its clocks; the platform the memory sizes.
+            const ip22::Board board = board_of(edit_);
+            label("Hardware platform");
             ImGui::SetNextItemWidth(-1);
-            int system = indigo2 ? 1 : 0;
-            if (ImGui::Combo("##machine", &system, "Indy\0Indigo2\0")) {
-                edit_.machine = system ? "indigo2" : "indy";
-                const CpuModel* m = find_cpu_model(edit_.cpu);
-                if (system && m && m->core != mips::Core::R4000) edit_.cpu = "r4400sc";  // the Indigo2's modules
-                if (!ip22::ram_size_fits(edit_.ram_mb, system ? ip22::Board::Indigo2 : ip22::Board::Indy))
-                    edit_.ram_mb = 256;
+            const Platform* platform = find_platform(edit_.machine);
+            if (ImGui::BeginCombo("##machine", platform ? platform->label : edit_.machine.c_str())) {
+                for (const auto& p : platforms())
+                    if (ImGui::Selectable(p.label, edit_.machine == p.id) && edit_.machine != p.id) {
+                        edit_.machine = p.id;
+                        make_consistent(edit_, false);
+                    }
+                ImGui::EndCombo();
             }
             label("Processor");
             ImGui::SetNextItemWidth(-1);
             const CpuModel* current = find_cpu_model(edit_.cpu);
             if (ImGui::BeginCombo("##cpu", current ? current->label : edit_.cpu.c_str())) {
                 for (const auto& model : cpu_models())
-                    if ((!indigo2 || model.core == mips::Core::R4000) &&
-                        ImGui::Selectable(model.label, edit_.cpu == model.id) && edit_.cpu != model.id) {
+                    if (model.fits(board) && ImGui::Selectable(model.label, edit_.cpu == model.id) &&
+                        edit_.cpu != model.id) {
                         edit_.cpu = model.id;
-                        edit_.cpu_mhz = model.mhz;
+                        make_consistent(edit_, true);
                     }
                 ImGui::EndCombo();
             }
-            label("Clock (MHz)");
-            ImGui::SetNextItemWidth(120 * scale_);
-            ImGui::InputDouble("##mhz", &edit_.cpu_mhz, 0, 0, "%.0f");
-            edit_.cpu_mhz = std::clamp(edit_.cpu_mhz, 10.0, 1000.0);
-            for (double mhz : kClockPresets) {
-                ImGui::SameLine();
-                char text[8];
-                std::snprintf(text, sizeof text, "%.0f", mhz);
-                if (ImGui::SmallButton(text)) edit_.cpu_mhz = mhz;
+            current = find_cpu_model(edit_.cpu);
+            label("Clock");
+            ImGui::SetNextItemWidth(160 * scale_);
+            char clock[32];
+            std::snprintf(clock, sizeof clock, "%.0f MHz", edit_.cpu_mhz);
+            if (ImGui::BeginCombo("##mhz", clock)) {
+                if (current)
+                    for (double mhz : current->mhz(board)) {
+                        std::snprintf(clock, sizeof clock, "%.0f MHz", mhz);
+                        if (ImGui::Selectable(clock, edit_.cpu_mhz == mhz)) edit_.cpu_mhz = mhz;
+                    }
+                ImGui::EndCombo();
             }
             label("Memory");
-            ImGui::SetNextItemWidth(120 * scale_);
+            ImGui::SetNextItemWidth(160 * scale_);
             const std::string ram = std::to_string(edit_.ram_mb) + " MiB";
             if (ImGui::BeginCombo("##ram", ram.c_str())) {
-                for (unsigned mb = 16; mb <= 384; mb += 16)
-                    if (ip22::ram_size_fits(mb, board) && ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
+                for (unsigned mb : ram_sizes(board, current))
+                    if (ImGui::Selectable((std::to_string(mb) + " MiB").c_str(), edit_.ram_mb == mb)) edit_.ram_mb = mb;
                 ImGui::EndCombo();
             }
             label("Graphics");
@@ -1182,6 +1187,15 @@ void Gui::draw_settings() {
             ImGui::Combo("##gfx", &gfx, "Newport XL8 (8-bit)\0Newport XL24 (24-bit)\0None (serial console only)\0");
             edit_.graphics = gfx != 2;
             edit_.xl24 = gfx == 1;
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(0.0f);
+            for (const std::string& note : configuration_notes(edit_)) {
+                ImGui::Bullet();
+                ImGui::TextDisabled("%s", note.c_str());
+            }
+            ImGui::PopTextWrapPos();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Storage")) {

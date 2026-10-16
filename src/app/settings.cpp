@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Andy Taylor
 #include "app/settings.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -19,17 +20,21 @@ namespace sg::app {
 
 const std::vector<CpuModel>& cpu_models() {
     // R4000 and R4400 share the pipeline; the R4000 has 8 KiB primary caches.
+    // The Indigo2 shipped with R4000SC and R4400SC modules only.
     using mips::Core;
     using mips::R4000;
     static const std::vector<CpuModel> models = {
-        {"r4400sc", "R4400SC (1 MiB secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 1u << 20, 150},
-        {"r4400pc", "R4400PC (no secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 0, 100},
-        {"r4000sc", "R4000SC (1 MiB secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 1u << 20, 100},
-        {"r4000pc", "R4000PC (no secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 0, 100},
-        {"r4600pc", "R4600PC (no secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 0, 100},
-        {"r4600sc", "R4600SC (512 KiB secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 512u << 10, 133},
-        {"r5000pc", "R5000PC (no secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 0, 150},
-        {"r5000sc", "R5000SC (512 KiB secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 512u << 10, 180},
+        {"r4400sc", "R4400SC (1 MiB secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 1u << 20,
+         {150, 175, 200}, {150, 175, 200, 250}},
+        {"r4400pc", "R4400PC (no secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 0, {100}, {}},
+        {"r4000sc", "R4000SC (1 MiB secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 1u << 20, {100}, {100}},
+        {"r4000pc", "R4000PC (no secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 0, {100}, {}},
+        {"r4600pc", "R4600PC (no secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 0, {100, 133}, {}},
+        {"r4600sc", "R4600SC (512 KiB secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 512u << 10, {133},
+         {}},
+        {"r5000pc", "R5000PC (no secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 0, {150}, {}},
+        {"r5000sc", "R5000SC (512 KiB secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 512u << 10,
+         {180, 150}, {}},
     };
     return models;
 }
@@ -40,9 +45,130 @@ const CpuModel* find_cpu_model(const std::string& id) {
     return nullptr;
 }
 
+const std::vector<Platform>& platforms() {
+    static const std::vector<Platform> list = {
+        {"indy", "Indy (IP24)", ip22::Board::Indy},
+        {"indigo2", "Indigo2 (IP22)", ip22::Board::Indigo2},
+    };
+    return list;
+}
+
+const Platform* find_platform(const std::string& id) {
+    for (const auto& p : platforms())
+        if (id == p.id) return &p;
+    return nullptr;
+}
+
+ip22::Board board_of(const Settings& s) {
+    const Platform* p = find_platform(s.machine);
+    return p ? p->board : ip22::Board::Indy;
+}
+
+std::vector<unsigned> ram_sizes(ip22::Board board, const CpuModel* cpu) {
+    (void)cpu;
+    std::vector<unsigned> sizes;
+    for (unsigned mb = 16; mb <= 384; mb += 16)
+        if (ip22::ram_size_fits(mb, board)) sizes.push_back(mb);
+    return sizes;
+}
+
+void make_consistent(Settings& s, bool cpu_changed) {
+    const ip22::Board board = board_of(s);
+    const CpuModel* cpu = find_cpu_model(s.cpu);
+    if (!cpu || !cpu->fits(board)) {
+        cpu = find_cpu_model("r4400sc");
+        s.cpu = cpu->id;
+        cpu_changed = true;
+    }
+    const auto& speeds = cpu->mhz(board);
+    if (cpu_changed && std::find(speeds.begin(), speeds.end(), s.cpu_mhz) == speeds.end()) s.cpu_mhz = speeds.front();
+    const std::vector<unsigned> sizes = ram_sizes(board, cpu);
+    if (std::find(sizes.begin(), sizes.end(), s.ram_mb) == sizes.end()) {
+        unsigned best = sizes.front();
+        for (unsigned mb : sizes)
+            if (mb <= s.ram_mb) best = mb;
+        s.ram_mb = best;
+    }
+}
+
+bool check_hardware(const Settings& s, bool any_clock, std::string& error) {
+    const Platform* platform = find_platform(s.machine);
+    const CpuModel* cpu = find_cpu_model(s.cpu);
+    if (!platform || !cpu) {
+        error = "unknown platform or processor";
+        return false;
+    }
+    const char* name = platform->board == ip22::Board::Indigo2 ? "Indigo2" : "Indy";
+    auto list = [](const auto& items, const char* unit) {
+        std::string text;
+        for (const auto& i : items) {
+            if (!text.empty()) text += ", ";
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%g%s", static_cast<double>(i), unit);
+            text += buf;
+        }
+        return text;
+    };
+    if (!cpu->fits(platform->board)) {
+        std::string fits;
+        for (const auto& m : cpu_models())
+            if (m.fits(platform->board)) fits += std::string(fits.empty() ? "" : ", ") + m.id;
+        error = std::string("the ") + name + " does not take the " + cpu->id + " module; it takes " + fits;
+        return false;
+    }
+    const auto& speeds = cpu->mhz(platform->board);
+    if (!any_clock && std::find(speeds.begin(), speeds.end(), s.cpu_mhz) == speeds.end()) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%g MHz", s.cpu_mhz);
+        error = std::string("no ") + name + " shipped with the " + cpu->id + " module at " + buf + "; it ran at " +
+                list(speeds, " MHz") + " (add --any-clock to run it at " + buf + " anyway)";
+        return false;
+    }
+    const std::vector<unsigned> sizes = ram_sizes(platform->board, cpu);
+    if (std::find(sizes.begin(), sizes.end(), s.ram_mb) == sizes.end()) {
+        error = std::string("the ") + name + " cannot hold " + std::to_string(s.ram_mb) + " MiB (" +
+                (platform->board == ip22::Board::Indigo2 ? "up to three" : "one or two") +
+                " banks of 16, 32, 64 or 128 MiB, the largest first); it takes " + list(sizes, "");
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::string> configuration_notes(const Settings& s) {
+    std::vector<std::string> notes;
+    const ip22::Board board = board_of(s);
+    const CpuModel* cpu = find_cpu_model(s.cpu);
+    char text[160];
+    if (board == ip22::Board::Indigo2) {
+        notes.push_back("Needs an Indigo2 (IP22) boot PROM, such as 070-8127-002; the Indy's will not start.");
+        notes.push_back("IRIX 5.3 and 6.5 run (disks installed on an Indy boot unchanged).");
+        notes.push_back("NetBSD and OpenBSD do not start: the 5.1 Indigo2 PROM loads only ECOFF programs and "
+                        "their boot loaders are ELF.");
+        notes.push_back("Graphics: Newport (XL) only. The EISA slots are empty.");
+    } else {
+        notes.push_back("Needs an Indy (IP24) boot PROM, such as 070-9101-011.");
+        notes.push_back("IRIX 5.3 and 6.5, NetBSD and OpenBSD run.");
+    }
+    if (cpu && cpu->core == mips::Core::R5000)
+        notes.push_back("The R5000 needs PROM 070-9101-011 (5.3 Rev B10) or later. Its MIPS IV instructions are run "
+                        "by the interpreter, not the recompiler, so programs built for MIPS IV run slower.");
+    if (cpu && cpu->core == mips::Core::R4600 && cpu->scache_bytes)
+        notes.push_back("NetBSD does not use the R4600SC's secondary cache (IRIX does).");
+    if (cpu) {
+        const auto& speeds = cpu->mhz(board);
+        if (std::find(speeds.begin(), speeds.end(), s.cpu_mhz) == speeds.end()) {
+            std::snprintf(text, sizeof text, "No %s shipped with this module at %.0f MHz.",
+                          board == ip22::Board::Indigo2 ? "Indigo2" : "Indy", s.cpu_mhz);
+            notes.push_back(text);
+        }
+    }
+    if (!s.graphics) notes.push_back("Without a graphics board the console is the first serial port.");
+    return notes;
+}
+
 ip22::IndyConfig Settings::indy_config() const {
     ip22::IndyConfig c;
-    c.board = machine == "indigo2" ? ip22::Board::Indigo2 : ip22::Board::Indy;
+    c.board = board_of(*this);
     c.ram_mb = ram_mb;
     c.cpu_hz = cpu_mhz * 1.0e6;
     if (const CpuModel* m = find_cpu_model(cpu)) {
@@ -66,7 +192,7 @@ Settings first_run_settings() {
     Settings s;
     s.ram_mb = 256;
     s.xl24 = true;
-    s.cpu_mhz = 250;
+    s.cpu_mhz = 200;  // the fastest Indy R4400SC
     s.max_speed = 1.2;
     return s;
 }
@@ -151,7 +277,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
-    else if (key == "machine") ok = (v == "indy" || v == "indigo2") && (s.machine = v, true);
+    else if (key == "machine") ok = find_platform(v) && (s.machine = v, true);
     else if (key == "cpu") ok = find_cpu_model(v) && (s.cpu = v, true);
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 1000 && (s.cpu_mhz = n, true);
     else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 384 && n == static_cast<unsigned>(n) &&
