@@ -1002,7 +1002,9 @@ bool R4000::jit_compile(Block& b) {
             touch_();
             return true;
         }
-        // log_store()
+        // log_store(), while stores are logged
+        e.ldr(x2, kCpu, offset_of(this, &log_stores_), 1);
+        const Site unlogged = e.cbz(x2, false);
         e.ldr(x2, kCpu, o_store_count);
         e.add_imm(x0, x2, 1);
         e.str(x0, kCpu, o_store_count);
@@ -1013,6 +1015,7 @@ bool R4000::jit_compile(Block& b) {
         e.mov_imm32(x0, size);
         e.str(x0, x2, log_size, 4);
         e.str(xzr, x2, log_value);
+        e.bind(unlogged);
         Reg v;
         if (fp) {
             fp_read_gpr(x0, freg, d);
@@ -1231,6 +1234,14 @@ bool R4000::jit_compile(Block& b) {
     bool synced = true;
 
     // Branches and jumps, inline (see jit_x64.cpp).
+    // A branch-likely not taken, ending the block before its delay slot
+    // (see jit_x64.cpp).
+    struct Skip {
+        Site site{};
+        u32 i = 0;
+        u64 loaded = 0, dirty = 0;
+        bool pending = false;
+    } skip;
     auto emit_branch = [&](const Op& op, u32 i) -> bool {
         const u32 w = op.inst;
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
@@ -1336,9 +1347,6 @@ bool R4000::jit_compile(Block& b) {
             const Site visit2 = e.cbz(x2, false);
             e.sub_imm(x2, x2, 1, false);
             e.str(x2, kCpu, o_cooldown, 4);
-            done.push_back(e.cbnz(x2, false));
-            e.mov_imm(x2, ~u64{0});
-            e.str(x2, kCpu, o_loop_pc);  // cooldown over: start afresh
             done.push_back(e.b());
             e.bind(visit1);
             e.bind(visit2);
@@ -1358,7 +1366,11 @@ bool R4000::jit_compile(Block& b) {
         if (conditional) {
             const Site to_done = e.b();
             e.bind(to_not_taken);
-            if (likely) {  // the delay slot is skipped: leave, as run_block() does
+            if (likely && i + 2 == cur->count) {
+                // The delay slot is skipped: on to the block's end with the
+                // time one instruction short (see the end of the block).
+                skip = {e.b(), i, loaded, dirty, true};
+            } else if (likely) {  // no delay slot in the block: leave, as run_block() does
                 pc_plus(x0, 4 * i + 8);
                 e.str(x0, kCpu, o_pc);
                 e.add_imm(x0, x0, 4);
@@ -1449,6 +1461,20 @@ bool R4000::jit_compile(Block& b) {
             e.str(x0, kCpu, o_pc);
             e.add_imm(x0, x0, 4);
             e.str(x0, kCpu, o_npc);
+        }
+        if (skip.pending) {
+            skip.pending = false;
+            const Site join = e.b();
+            e.bind(skip.site);
+            pc_plus(x0, 4 * skip.i + 8);
+            e.str(x0, kCpu, o_pc);
+            e.add_imm(x0, x0, 4);
+            e.str(x0, kCpu, o_npc);
+            e.ldr(x3, kCpu, o_weight);
+            e.sub(kTime, kTime, x3);
+            flush(skip.dirty & ~dirty);
+            restore(loaded & ~skip.loaded);
+            e.bind(join);
         }
         if (!is_branch_word(blk.ops[blk.count - 1].inst)) add_successor(4 * static_cast<s64>(blk.count));
         std::sort(successors.begin(), successors.end());

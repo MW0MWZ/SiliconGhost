@@ -482,7 +482,7 @@ TEST(cpu_idle_skip_nested_poll_loop_with_pure_device_read) {
     CHECK_EQ(fast.cpu.cp0_read(cop0::Cause), slow.cpu.cp0_read(cop0::Cause));
     CHECK_EQ(fast.cpu.gpr[t4], slow.cpu.gpr[t4]);
     CHECK(fast.cpu.idle_skipped_cycles() > 140000);
-    CHECK(dev_fast.reads < dev_slow.reads / 100);
+    CHECK(dev_fast.reads < dev_slow.reads / 50);  // found within a few spans of iterations
 }
 
 TEST(cpu_idle_skip_never_skips_impure_device_reads) {

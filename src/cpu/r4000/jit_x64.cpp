@@ -1264,7 +1264,9 @@ bool R4000::jit_compile(Block& b) {
             return true;
         }
         e.alu(Alu::Add, rcx, rax);  // the host address
-        // log_store()
+        // log_store(), while stores are logged
+        e.cmp8_imm(Mem{kCpu, offset_of(this, &log_stores_)}, 0);
+        const std::size_t unlogged = e.jcc(Cond::E);
         e.mov(rdx, m_store_count);
         e.mov(rax, rdx);
         e.alu_imm(Alu::Add, rax, 1);
@@ -1275,6 +1277,7 @@ bool R4000::jit_compile(Block& b) {
         e.mov(Mem{rdx, log_host}, rcx);
         e.mov_store_imm32(Mem{rdx, log_size}, size);
         e.mov_store_imm(Mem{rdx, log_value}, 0);
+        e.bind(unlogged);
         if (fp) fp_read_gpr(rax, freg, size == 8);
         else read(rax, rt, size == 8);
         switch (size) {
@@ -1536,6 +1539,14 @@ bool R4000::jit_compile(Block& b) {
     // the delay slot, npc_ at the next instruction after it, next_delay_),
     // and for a taken branch backwards the idle-loop bookkeeping of
     // backward_branch(): its cheap cooldown case inline, the rest by a call.
+    // A branch-likely not taken, ending the block before its delay slot:
+    // where it jumps from and the cached registers it leaves.
+    struct Skip {
+        std::size_t site = 0;
+        u32 i = 0;
+        u64 loaded = 0, dirty = 0;
+        bool pending = false;
+    } skip;
     auto emit_branch = [&](const Op& op, u32 i) -> bool {
         const u32 w = op.inst;
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
@@ -1640,8 +1651,6 @@ bool R4000::jit_compile(Block& b) {
             const std::size_t visit2 = e.jcc(Cond::E);
             e.alu_imm(Alu::Sub, rdx, 1, false);
             e.mov(m_cooldown, rdx, false);
-            done.push_back(e.jcc(Cond::Ne));
-            e.mov_store_imm(m_loop_pc, -1);  // cooldown over: start afresh
             done.push_back(e.jmp());
             e.bind(visit1);
             e.bind(visit2);
@@ -1662,7 +1671,11 @@ bool R4000::jit_compile(Block& b) {
         if (to_not_taken) {
             const std::size_t to_done = e.jmp();
             e.bind(to_not_taken);
-            if (likely) {  // the delay slot is skipped: leave, as run_block() does
+            if (likely && i + 2 == cur->count) {
+                // The delay slot is skipped: on to the block's end with the
+                // time one instruction short (see the end of the block).
+                skip = {e.jmp(), i, loaded, dirty, true};
+            } else if (likely) {  // no delay slot in the block: leave, as run_block() does
                 pc_plus(rax, 4 * i + 8);
                 e.mov(m_pc, rax);
                 e.alu_imm(Alu::Add, rax, 4);
@@ -1769,6 +1782,22 @@ bool R4000::jit_compile(Block& b) {
             e.mov(m_pc, rax);
             e.alu_imm(Alu::Add, rax, 4);
             e.mov(m_npc, rax);
+        }
+        if (skip.pending) {
+            // The skipped delay slot's way here: pc after it, the registers
+            // as the delay slot leaves them, and the entry time moved back
+            // one instruction so that the block's end counts one fewer.
+            skip.pending = false;
+            const std::size_t join = e.jmp();
+            e.bind(skip.site);
+            pc_plus(rax, 4 * skip.i + 8);
+            e.mov(m_pc, rax);
+            e.alu_imm(Alu::Add, rax, 4);
+            e.mov(m_npc, rax);
+            e.alu(Alu::Sub, kTime, m_weight);
+            flush(skip.dirty & ~dirty);
+            restore(loaded & ~skip.loaded);
+            e.bind(join);
         }
         if (!is_branch_word(blk.ops[blk.count - 1].inst)) add_successor(4 * static_cast<s64>(blk.count));
         std::sort(successors.begin(), successors.end());

@@ -514,8 +514,12 @@ private:
 
     // Loops are tracked per backward branch (nested loops each get an entry),
     // in a small direct-mapped table.
-    // Every RAM store is logged (address and size) in a ring; an iteration's
-    // stores are the entries made since its loop's previous visit.
+    // While a loop is being checked, every RAM store is logged (address and
+    // size) in a ring; an iteration's stores are the entries made since its
+    // loop's previous visit. Logging is switched on by a visit and off when
+    // a loop proves to make progress; log_epoch_ counts the times it was
+    // switched on, so a visit knows whether the log covers the whole time
+    // since the previous one.
     static constexpr unsigned kStoreLogBits = 7;
     struct StoreRec {
         const u8* host = nullptr;
@@ -528,8 +532,9 @@ private:
         u64 epoch = 0;      // change_epoch_ at the previous visit
         u64 weight_epoch = 0;
         u64 store_pos = 0;  // store_count_ at the previous visit
+        u64 log_epoch = 0;  // log_epoch_ at the previous visit
         u64 period_fp = 0;  // length of the iteration the snapshot belongs to
-        unsigned cooldown = 0;
+        unsigned cooldown = 0;  // visits to let pass without a look
         bool have_snapshot = false;
         std::array<u64, 34> regs{};  // GPRs, HI, LO
         unsigned nstores = 0;
@@ -542,10 +547,11 @@ private:
     bool snapshot_matches(const LoopEntry& e, u64 period, unsigned nstores) const;
     void take_snapshot(LoopEntry& e, u64 period, unsigned nstores);
     void backward_branch(u64 target) {
-        // Loops known to make progress are left alone for a while, cheaply.
+        // Loops just seen, or known to make progress, are left alone for a
+        // while, cheaply.
         LoopEntry& e = loops_[(cur_pc_ >> 2) & ((1u << kLoopTableBits) - 1)];
         if (e.branch_pc == cur_pc_ && e.cooldown) {
-            if (--e.cooldown == 0) e.branch_pc = ~u64{0};  // start afresh afterwards
+            --e.cooldown;
             return;
         }
         loop_visit(e, target);
@@ -560,6 +566,8 @@ private:
     float jit_split_s_ = 4097.0f;
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
+    u64 log_epoch_ = 0;
+    bool log_stores_ = false;
     // Fields translated code uses come before the large arrays, so they lie
     // within reach of a single load or store on every host.
     bool idle_ready_ = false;  // confirmed spin: skip once the branch has executed

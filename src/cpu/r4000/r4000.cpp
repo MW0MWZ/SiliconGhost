@@ -551,7 +551,11 @@ void R4000::set_cycles_per_instruction(double cpi) {
 // ---------------------------------------------------------------------------
 
 namespace {
-constexpr u64 kMaxIdleLoopInstructions = 4096;
+// A loop is looked at every kIdleSpan iterations: one visit starts watching
+// it, the next records what an iteration span did, the one after compares.
+// Loops that run only a few times are never looked at closely.
+constexpr unsigned kIdleSpan = 5;
+constexpr u64 kMaxIdleLoopInstructions = 4096 * kIdleSpan;  // in a span
 constexpr unsigned kIdleCooldown = 1024;  // visits to ignore after a loop proved not idle
 }  // namespace
 
@@ -602,16 +606,22 @@ void R4000::loop_visit(LoopEntry& e, u64 target) {
     if (!idle_skip_) return;
     const u64 period = time_fp_ - e.time_fp;
     const u64 stores = store_count_ - e.store_pos;
+    const bool logged = log_stores_ && e.log_epoch == log_epoch_;  // every store since the last visit
     const bool same = e.branch_pc == cur_pc_ && e.epoch == change_epoch_ && e.weight_epoch == weight_epoch_ &&
-                      period <= kMaxIdleLoopInstructions * weight_ && stores <= (1u << kStoreLogBits);
+                      logged && period <= kMaxIdleLoopInstructions * weight_ && stores <= (1u << kStoreLogBits);
+    if (!log_stores_) {
+        log_stores_ = true;
+        ++log_epoch_;
+    }
     e.time_fp = time_fp_;
     e.epoch = change_epoch_;
     e.weight_epoch = weight_epoch_;
     e.store_pos = store_count_;
+    e.log_epoch = log_epoch_;
+    e.cooldown = kIdleSpan - 1;
     if (!same) {
         e.branch_pc = cur_pc_;
         e.have_snapshot = false;
-        e.cooldown = 0;
         return;
     }
     const unsigned n = static_cast<unsigned>(stores);
@@ -620,7 +630,12 @@ void R4000::loop_visit(LoopEntry& e, u64 target) {
         idle_ready_ = true;
         return;
     }
-    if (e.have_snapshot) e.cooldown = kIdleCooldown;  // a loop, but one that makes progress
+    if (e.have_snapshot) {  // a loop, but one that makes progress
+        e.cooldown = kIdleCooldown;
+        e.have_snapshot = false;
+        log_stores_ = false;
+        return;
+    }
     take_snapshot(e, period, n);
 }
 
@@ -967,7 +982,7 @@ SG_FORCEINLINE bool R4000::store(u64 vaddr, T value) {
     if (SG_UNLIKELY(!lookup<Access::Store>(vaddr, host, paddr))) return false;
     if (SG_LIKELY(host != nullptr)) {
         u8* const p = host + (vaddr & 0xFFF);
-        log_store(p, sizeof(T));
+        if (log_stores_) log_store(p, sizeof(T));
         store_be<T>(p, value);
         if (SG_UNLIKELY(*store_code_)) invalidate_code_page(host);  // decoded code lives here
         return true;
