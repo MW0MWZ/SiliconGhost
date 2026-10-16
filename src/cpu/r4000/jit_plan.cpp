@@ -34,8 +34,31 @@ Uses inline_uses(u32 w) {
                 case 0x09: return {bit(rs), bit(rd)};
                 case 0x10:
                 case 0x12: return {0, bit(rd)};
+                case 0x11:
+                case 0x13: return {bit(rs), 0};
                 case 0x18:
-                case 0x19: return {bit(rs) | bit(rt), 0};
+                case 0x19:
+                case 0x1A:
+                case 0x1B:
+                case 0x1C:
+                case 0x1D:
+                case 0x1E:
+                case 0x1F: return {bit(rs) | bit(rt), 0};
+                case 0x38:
+                case 0x3A:
+                case 0x3B:
+                case 0x3C:
+                case 0x3E:
+                case 0x3F: return {bit(rt), bit(rd)};
+                case 0x14:
+                case 0x16:
+                case 0x17:
+                case 0x20:
+                case 0x22:
+                case 0x2C:
+                case 0x2D:
+                case 0x2E:
+                case 0x2F:
                 case 0x04:
                 case 0x06:
                 case 0x07:
@@ -59,6 +82,9 @@ Uses inline_uses(u32 w) {
         case 0x07:
         case 0x16:
         case 0x17: return {bit(rs), 0};
+        case 0x08:
+        case 0x18:
+        case 0x19:
         case 0x09:
         case 0x0A:
         case 0x0B:
@@ -70,10 +96,21 @@ Uses inline_uses(u32 w) {
         case 0x21:
         case 0x23:
         case 0x24:
-        case 0x25: return {bit(rs), bit(rt)};
+        case 0x25:
+        case 0x27:
+        case 0x37: return {bit(rs), bit(rt)};
+        case 0x1A:
+        case 0x1B:
+        case 0x22:
+        case 0x26: return {bit(rs) | bit(rt), bit(rt)};  // the merges read rt too
         case 0x28:
         case 0x29:
-        case 0x2B: return {bit(rs) | bit(rt), 0};
+        case 0x2A:
+        case 0x2B:
+        case 0x2C:
+        case 0x2D:
+        case 0x2E:
+        case 0x3F: return {bit(rs) | bit(rt), 0};
         default: return {};
     }
 }

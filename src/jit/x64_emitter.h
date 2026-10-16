@@ -20,7 +20,9 @@ struct Mem {
 
 enum class Alu : unsigned { Add = 0, Or = 1, And = 4, Sub = 5, Xor = 6, Cmp = 7 };
 enum class Shift : unsigned { Shl = 4, Shr = 5, Sar = 7 };
-enum class Cond : unsigned { B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, L = 0xC, Ge = 0xD, Le = 0xE, G = 0xF };
+enum class Cond : unsigned {
+    O = 0x0, No = 0x1, B = 0x2, Ae = 0x3, E = 0x4, Ne = 0x5, Be = 0x6, A = 0x7, L = 0xC, Ge = 0xD, Le = 0xE, G = 0xF
+};
 
 class Emitter {
 public:
@@ -142,6 +144,25 @@ public:
         rex(true, dst, src);
         byte(0x0F), byte(0xBF), byte(0xC0 | ((dst & 7) << 3) | (src & 7));
     }
+    void bswap64(Reg r) {
+        rex(true, 0, r);
+        byte(0x0F), byte(0xC8 + (r & 7));
+    }
+    // op qword/dword [m], imm32
+    void alu_imm(Alu op, Mem m, s32 imm, bool w = true) {
+        op_mem(w, 0x81, Reg(static_cast<unsigned>(op)), m);
+        u32v(static_cast<u32>(imm));
+    }
+    // One-operand multiply and divide of rax (rdx:rax) by r (w: 64-bit).
+    void mul(Reg r, bool w) { group3(4, r, w); }
+    void imul1(Reg r, bool w) { group3(5, r, w); }
+    void div(Reg r, bool w) { group3(6, r, w); }
+    void idiv(Reg r, bool w) { group3(7, r, w); }
+    void neg(Reg r, bool w = true) { group3(3, r, w); }
+    void cdq(bool w) {  // sign-extends eax into edx (cqo: rax into rdx)
+        if (w) byte(0x48);
+        byte(0x99);
+    }
     void bswap32(Reg r) {
         rex_opt(false, 0, r);
         byte(0x0F), byte(0xC8 + (r & 7));
@@ -210,6 +231,10 @@ private:
         byte(0x80 | ((reg & 7) << 3) | (m.base & 7));
         if ((m.base & 7) == rsp) byte(0x24);  // SIB: base only
         u32v(static_cast<u32>(m.disp));
+    }
+    void group3(unsigned ext, Reg r, bool w) {
+        rex_opt(w, 0, r);
+        byte(0xF7), byte(0xC0 | (ext << 3) | (r & 7));
     }
     // op rm, reg (register direct)
     void op_rr(bool w, unsigned opcode, Reg reg, Reg rm) {

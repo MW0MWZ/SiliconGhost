@@ -193,37 +193,154 @@ bool R4000::jit_compile(Block& b) {
         e.call(rax);
     };
 
-    // Loads and stores of RAM, inline: the soft-TLB lookup and the host
-    // access, exactly what load()/store() do on a hit with a host page. A
-    // miss, an unaligned address, MMIO or a page holding translated code goes
-    // to the handler (`slow`). Returns false for other instructions.
+    // Instructions that can raise an exception, inline when they do not: the
+    // operation itself where it cannot fault, and a jump to the handler
+    // (`slow`) where it might. Loads and stores of RAM do the soft-TLB lookup
+    // and the host access, exactly what load()/store() do on a hit with a
+    // host page; a miss, an unaligned address, MMIO or a page holding
+    // translated code goes to the handler. Returns false for instructions
+    // with no inline form.
     const Mem m_store_count{kCpu, offset_of(this, &store_count_)};
+    const Mem m_change_epoch{kCpu, offset_of(this, &change_epoch_)};
+    const Mem m_scratch{kCpu, offset_of(this, &jit_scratch_)};
     const s32 log_host = offset_of(this, &store_log_[0].host);
     const s32 log_size = offset_of(this, &store_log_[0].size);
     const s32 log_value = offset_of(this, &store_log_[0].value);
+    auto write_nz = [&](unsigned g, Reg src) {  // r0 stays zero
+        if (g) write(g, src);
+    };
+    // 64-bit operations are reserved instructions in user and supervisor
+    // mode with 32-bit addressing (ops64_enabled()).
+    auto need64 = [&](std::vector<std::size_t>& slow) {
+        if (addr64) return;
+        e.mov(rax, m_entry_mode, false);
+        e.alu_imm(Alu::Sub, rax, kSupervisor, false);
+        e.alu_imm(Alu::Cmp, rax, kUser - kSupervisor, false);
+        slow.push_back(e.jcc(Cond::Be));
+    };
+    auto emit_alu = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
+        const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w), rd = f_rd(w), sa = f_sa(w);
+        const s32 simm = static_cast<s16>(w & 0xFFFF);
+        if (opc == 0x08 || opc == 0x18 || opc == 0x19) {  // ADDI, DADDI, DADDIU
+            const bool w64 = opc != 0x08;
+            if (w64) need64(slow);
+            ensure(rs);
+            read(rax, rs, w64);
+            e.alu_imm(Alu::Add, rax, simm, w64);
+            if (opc != 0x19) slow.push_back(e.jcc(Cond::O));
+            if (!w64) e.movsxd(rax, rax);
+            write_nz(rt, rax);
+            return true;
+        }
+        if (opc != 0x00) return false;
+        const unsigned funct = w & 63;
+        switch (funct) {
+            case 0x14:  // DSLLV
+            case 0x16:  // DSRLV
+            case 0x17:  // DSRAV (x86 masks 64-bit shift counts to 6 bits, as MIPS does)
+                need64(slow);
+                ensure(rs), ensure(rt);
+                read(rcx, rs);
+                read(rax, rt);
+                e.shift_cl(funct == 0x14 ? Shift::Shl : funct == 0x16 ? Shift::Shr : Shift::Sar, rax, true);
+                write_nz(rd, rax);
+                return true;
+            case 0x38: case 0x3A: case 0x3B:  // DSLL, DSRL, DSRA
+            case 0x3C: case 0x3E: case 0x3F:  // DSLL32, DSRL32, DSRA32
+                need64(slow);
+                ensure(rt);
+                read(rax, rt);
+                e.shift_imm((funct & 3) == 0 ? Shift::Shl : (funct & 3) == 2 ? Shift::Shr : Shift::Sar, rax,
+                            static_cast<u8>(sa + (funct >= 0x3C ? 32 : 0)), true);
+                write_nz(rd, rax);
+                return true;
+            case 0x20:  // ADD
+            case 0x22:  // SUB
+            case 0x2C:  // DADD
+            case 0x2D:  // DADDU
+            case 0x2E:  // DSUB
+            case 0x2F: {  // DSUBU
+                const bool w64 = funct >= 0x2C;
+                if (w64) need64(slow);
+                ensure(rs), ensure(rt);
+                read(rax, rs, w64);
+                alu_g((funct & 2) ? Alu::Sub : Alu::Add, rax, rt, w64);
+                if (!(funct & 1)) slow.push_back(e.jcc(Cond::O));  // overflow: the handler raises it
+                if (!w64) e.movsxd(rax, rax);
+                write_nz(rd, rax);
+                return true;
+            }
+            case 0x1C:  // DMULT
+            case 0x1D:  // DMULTU
+                need64(slow);
+                ensure(rs), ensure(rt);
+                read(rax, rs);
+                read(rcx, rt);
+                if (funct == 0x1C) e.imul1(rcx, true);
+                else e.mul(rcx, true);
+                e.mov(m_lo, rax);
+                e.mov(m_hi, rdx);
+                return true;
+            case 0x1E:  // DDIV
+            case 0x1F: {  // DDIVU: a zero divisor (and DDIV's one overflow) goes to the handler
+                need64(slow);
+                ensure(rs), ensure(rt);
+                read(rcx, rt);
+                e.test(rcx, rcx);
+                slow.push_back(e.jcc(Cond::E));
+                read(rax, rs);
+                if (funct == 0x1E) {
+                    e.alu_imm(Alu::Cmp, rcx, -1);
+                    const std::size_t ok = e.jcc(Cond::Ne);
+                    e.mov_imm64(rdx, u64{1} << 63);
+                    e.alu(Alu::Cmp, rax, rdx);
+                    slow.push_back(e.jcc(Cond::E));
+                    e.bind(ok);
+                    e.cdq(true);
+                    e.idiv(rcx, true);
+                } else {
+                    e.alu(Alu::Xor, rdx, rdx, false);
+                    e.div(rcx, true);
+                }
+                e.mov(m_lo, rax);
+                e.mov(m_hi, rdx);
+                return true;
+            }
+            default: return false;
+        }
+    };
     auto emit_memory = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
         unsigned size;
-        bool is_store = false;
+        bool is_store = false, merge = false, w64 = false;
         switch (opc) {
             case 0x20:
             case 0x24: size = 1; break;  // LB, LBU
             case 0x21:
             case 0x25: size = 2; break;  // LH, LHU
             case 0x23: size = 4; break;  // LW
+            case 0x27: size = 4, w64 = true; break;  // LWU
+            case 0x37: size = 8, w64 = true; break;  // LD
             case 0x28: size = 1, is_store = true; break;  // SB
             case 0x29: size = 2, is_store = true; break;  // SH
             case 0x2B: size = 4, is_store = true; break;  // SW
+            case 0x3F: size = 8, is_store = true, w64 = true; break;  // SD
+            case 0x22: case 0x26: size = 4, merge = true; break;  // LWL, LWR
+            case 0x2A: case 0x2E: size = 4, merge = true, is_store = true; break;  // SWL, SWR
+            case 0x1A: case 0x1B: size = 8, merge = true, w64 = true; break;  // LDL, LDR
+            case 0x2C: case 0x2D: size = 8, merge = true, is_store = true, w64 = true; break;  // SDL, SDR
             default: return false;
         }
+        const bool right = opc == 0x26 || opc == 0x2E || opc == 0x1B || opc == 0x2D;
+        if (w64) need64(slow);
         // Operands are loaded before the paths split, so both agree.
         ensure(rs);
-        if (is_store) ensure(rt);
+        if (is_store || merge) ensure(rt);
         const s32 table = is_store ? kTableBytes : 0;
         read(rax, rs);
         e.alu_imm(Alu::Add, rax, static_cast<s16>(w & 0xFFFF));
         if (!addr64) e.movsxd(rax, rax);
-        if (size > 1) {
+        if (size > 1 && !merge) {
             e.test_imm(rax, size - 1);
             slow.push_back(e.jcc(Cond::Ne));
         }
@@ -237,13 +354,64 @@ bool R4000::jit_compile(Block& b) {
         e.alu(Alu::Cmp, rcx, Mem{rdx, table + static_cast<s32>(offsetof(FastEntry, tag))});
         slow.push_back(e.jcc(Cond::Ne));
         e.alu_imm(Alu::And, rax, 0xFFF, false);
+        // Merges: rcx = the shift, 8 * the byte index (counted from the other
+        // end for the right-hand forms); rax = offset of the containing unit.
+        auto merge_shift = [&] {
+            e.mov(rcx, rax);
+            e.alu_imm(Alu::And, rcx, size - 1, false);
+            if (right) e.alu_imm(Alu::Xor, rcx, size - 1, false);
+            e.shift_imm(Shift::Shl, rcx, 3, false);
+            e.alu_imm(Alu::And, rax, static_cast<s32>(0xFFF & ~(size - 1)), false);
+        };
         if (!is_store) {
             e.mov(rdx, Mem{rdx, static_cast<s32>(offsetof(FastEntry, host))});
             e.test(rdx, rdx);
             slow.push_back(e.jcc(Cond::E));
+            if (merge) merge_shift();
             e.alu(Alu::Add, rdx, rax);
             if (rt == 0) return true;  // the access still happens, for its exceptions
             const Mem p{rdx, 0};
+            if (merge) {
+                const bool d = size == 8;
+                e.mov(rax, p, d);
+                if (d) e.bswap64(rax);
+                else e.bswap32(rax);
+                if (!right) {  // (m << sh) | (rt & ((1 << sh) - 1))
+                    e.shift_cl(Shift::Shl, rax, d);
+                    e.mov_imm32(rdx, 1);
+                    e.shift_cl(Shift::Shl, rdx, true);
+                    e.alu_imm(Alu::Sub, rdx, 1);
+                    alu_g(Alu::And, rdx, rt, d);
+                    e.alu(Alu::Or, rax, rdx, d);
+                    if (!d) e.movsxd(rax, rax);
+                } else if (d) {  // (m >> sh) | (rt & ~(~0 >> sh))
+                    e.shift_cl(Shift::Shr, rax, true);
+                    e.mov_imm64(rdx, ~u64{0});
+                    e.shift_cl(Shift::Shr, rdx, true);
+                    e.not_(rdx);
+                    alu_g(Alu::And, rdx, rt);
+                    e.alu(Alu::Or, rax, rdx);
+                } else {  // LWR: the word merged; a full word sign-extends, a part keeps bits 63:32
+                    e.shift_cl(Shift::Shr, rax, false);
+                    e.mov_imm32(rdx, 0xFFFFFFFFu);
+                    e.shift_cl(Shift::Shr, rdx, false);
+                    e.alu_imm(Alu::Xor, rdx, -1, false);
+                    alu_g(Alu::And, rdx, rt, false);
+                    e.alu(Alu::Or, rax, rdx, false);
+                    e.test(rcx, rcx);
+                    const std::size_t part = e.jcc(Cond::Ne);
+                    e.movsxd(rax, rax);
+                    const std::size_t done = e.jmp();
+                    e.bind(part);
+                    read(rdx, rt);
+                    e.shift_imm(Shift::Shr, rdx, 32, true);
+                    e.shift_imm(Shift::Shl, rdx, 32, true);
+                    e.alu(Alu::Or, rax, rdx);
+                    e.bind(done);
+                }
+                write(rt, rax);
+                return true;
+            }
             switch (opc) {
                 case 0x20: e.movsx8(rax, p); break;
                 case 0x24: e.movzx8(rax, p); break;
@@ -254,10 +422,14 @@ bool R4000::jit_compile(Block& b) {
                     if (opc == 0x21) e.movsx16(rax, rax);
                     else e.movzx16(rax, rax);
                     break;
+                case 0x37:
+                    e.mov(rax, p);
+                    e.bswap64(rax);
+                    break;
                 default:
                     e.mov(rax, p, false);
                     e.bswap32(rax);
-                    e.movsxd(rax, rax);
+                    if (opc == 0x23) e.movsxd(rax, rax);  // LWU leaves it zero-extended
                     break;
             }
             write(rt, rax);
@@ -270,6 +442,34 @@ bool R4000::jit_compile(Block& b) {
         e.movzx8(rdx, Mem{rdx, 0});
         e.test(rdx, rdx);
         slow.push_back(e.jcc(Cond::Ne));  // translated code lives in this page
+        if (merge) {  // merge_store(): (m & keep) | value, in memory byte order
+            const bool d = size == 8;
+            e.mov(rdx, rax);
+            e.alu_imm(Alu::And, rdx, static_cast<s32>(0xFFF & ~(size - 1)), false);
+            e.alu(Alu::Add, rdx, rcx);
+            e.mov(m_scratch, rdx);  // the containing unit
+            e.mov(rcx, rax);
+            e.alu_imm(Alu::And, rcx, size - 1, false);
+            if (right) e.alu_imm(Alu::Xor, rcx, size - 1, false);
+            e.shift_imm(Shift::Shl, rcx, 3, false);
+            // Left forms: value rt >> sh, keep ~(~0 >> sh); right forms:
+            // value rt << sh, keep ~(~0 << sh).
+            const Shift dir = right ? Shift::Shl : Shift::Shr;
+            read(rax, rt, d);
+            e.shift_cl(dir, rax, d);
+            if (d) e.mov_imm64(rdx, ~u64{0});
+            else e.mov_imm32(rdx, 0xFFFFFFFFu);
+            e.shift_cl(dir, rdx, d);
+            e.alu_imm(Alu::Xor, rdx, -1, d);
+            e.mov(rcx, m_scratch);
+            if (d) e.bswap64(rax), e.bswap64(rdx);
+            else e.bswap32(rax), e.bswap32(rdx);
+            e.alu(Alu::And, rdx, Mem{rcx, 0}, d);
+            e.alu(Alu::Or, rax, rdx, d);
+            e.mov(Mem{rcx, 0}, rax, d);
+            e.alu_imm(Alu::Add, m_change_epoch, 1);  // touch()
+            return true;
+        }
         e.alu(Alu::Add, rcx, rax);  // the host address
         // log_store()
         e.mov(rdx, m_store_count);
@@ -282,12 +482,16 @@ bool R4000::jit_compile(Block& b) {
         e.mov(Mem{rdx, log_host}, rcx);
         e.mov_store_imm32(Mem{rdx, log_size}, size);
         e.mov_store_imm(Mem{rdx, log_value}, 0);
-        read(rax, rt, false);
+        read(rax, rt, size == 8);
         switch (size) {
             case 1: e.mov8(Mem{rcx, 0}, rax); break;
             case 2:
                 e.rol16_8(rax);
                 e.mov16(Mem{rcx, 0}, rax);
+                break;
+            case 8:
+                e.bswap64(rax);
+                e.mov(Mem{rcx, 0}, rax);
                 break;
             default:
                 e.bswap32(rax);
@@ -315,7 +519,8 @@ bool R4000::jit_compile(Block& b) {
             e.movzx8(rax, rax);
             write(dest, rax);
         };
-        const bool is_mult = opc == 0x00 && (funct == 0x18 || funct == 0x19);
+        // MTHI, MTLO, MULT(U) and DIV(U) write HI/LO rather than rd.
+        const bool is_mult = opc == 0x00 && (funct == 0x11 || funct == 0x13 || (funct >= 0x18 && funct <= 0x1B));
         const unsigned dest = opc == 0x00 ? rd : rt;
         bool done = true;
         if (dest == 0 && !is_mult) {  // writes r0: decoded as a no-op
@@ -339,6 +544,43 @@ bool R4000::jit_compile(Block& b) {
                     break;
                 case 0x10: e.mov(rax, m_hi), write(rd, rax); break;  // MFHI
                 case 0x12: e.mov(rax, m_lo), write(rd, rax); break;  // MFLO
+                case 0x11:                                           // MTHI
+                case 0x13:                                           // MTLO
+                    read(rax, rs);
+                    e.mov(funct == 0x11 ? m_hi : m_lo, rax);
+                    break;
+                case 0x1A:  // DIV
+                case 0x1B: {  // DIVU: a zero divisor (and DIV's one overflow) through the handler
+                    std::vector<std::size_t> rare;
+                    ensure(rs), ensure(rt);
+                    read(rcx, rt, false);
+                    e.test(rcx, rcx);
+                    rare.push_back(e.jcc(Cond::E));
+                    read(rax, rs, false);
+                    if (funct == 0x1A) {
+                        e.alu_imm(Alu::Cmp, rcx, -1, false);
+                        const std::size_t ok = e.jcc(Cond::Ne);
+                        e.alu_imm(Alu::Cmp, rax, static_cast<s32>(0x80000000u), false);
+                        rare.push_back(e.jcc(Cond::E));
+                        e.bind(ok);
+                        e.cdq(false);
+                        e.idiv(rcx, false);
+                    } else {
+                        e.alu(Alu::Xor, rdx, rdx, false);
+                        e.div(rcx, false);
+                    }
+                    e.movsxd(rax, rax);
+                    e.mov(m_lo, rax);
+                    e.movsxd(rdx, rdx);
+                    e.mov(m_hi, rdx);
+                    const std::size_t to_end = e.jmp();
+                    for (std::size_t site : rare) e.bind(site);
+                    flush(dirty);
+                    call_handler(op);
+                    restore(loaded);
+                    e.bind(to_end);
+                    break;
+                }
                 case 0x18:                                           // MULT
                     movsxd_g(rax, rs);
                     movsxd_g(rcx, rt);
@@ -601,7 +843,7 @@ bool R4000::jit_compile(Block& b) {
             std::vector<std::size_t> slow;
             std::size_t skip_slow = 0;
             const u32 dirty_before = dirty;
-            const bool fast = emit_memory(w, slow);
+            const bool fast = emit_alu(w, slow) || emit_memory(w, slow);
             const u32 loaded_after = loaded;
             if (fast) {
                 if (delay_slot) leave_delay_slot();

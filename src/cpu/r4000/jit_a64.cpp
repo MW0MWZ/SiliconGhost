@@ -281,7 +281,8 @@ bool R4000::jit_compile(Block& b) {
             e.sxtw(x0, x0);
             write(dest, x0);
         };
-        const bool is_mult = opc == 0x00 && (funct == 0x18 || funct == 0x19);
+        // MTHI, MTLO, MULT(U) and DIV(U) write HI/LO rather than rd.
+        const bool is_mult = opc == 0x00 && (funct == 0x11 || funct == 0x13 || (funct >= 0x18 && funct <= 0x1B));
         bool done = true;
         if ((opc == 0x00 ? rd : rt) == 0 && !is_mult) {  // writes r0: decoded as a no-op
         } else if (opc == 0x00) {

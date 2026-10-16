@@ -625,9 +625,13 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
     };
     static constexpr unsigned kRFuncts[] = {0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x12, 0x18, 0x19,
                                             0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2F,
-                                            0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B};
-    static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19};
-    static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F, 0x22, 0x26};
+                                            0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B,
+                                            0x14, 0x16, 0x17, 0x1C, 0x1D, 0x1E, 0x1F};
+    static constexpr unsigned kTrapping[] = {0x20, 0x22, 0x2C, 0x2E};  // ADD, SUB, DADD, DSUB
+    static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19, 0x08, 0x18};
+    static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F,
+                                              0x22, 0x26, 0x2A, 0x2E, 0x1A, 0x1B, 0x2C, 0x2D};
+    auto merge_op = [](unsigned op) { return op == 0x22 || op == 0x26 || op == 0x2A || op == 0x2E || (op >= 0x1A && op <= 0x1B) || op == 0x2C || op == 0x2D; };
     static constexpr unsigned kBranches[] = {0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17};
 
     // The body runs several times, so that its blocks become hot.
@@ -638,6 +642,11 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
             case 0:
             case 1:
             case 2: {
+                if (rnd(16) == 0) {  // may overflow (and end the run): mostly with a zero operand
+                    const unsigned f = kTrapping[rnd(std::size(kTrapping))];
+                    prog.push_back(R(f, reg(), rnd(4) ? 0 : reg(), dst(), 0));
+                    break;
+                }
                 const unsigned f = kRFuncts[rnd(std::size(kRFuncts))];
                 prog.push_back(R(f, reg(), reg(), dst(), rnd(32)));
                 break;
@@ -646,7 +655,7 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
             case 4: prog.push_back(I(kImmOps[rnd(std::size(kImmOps))], reg(), dst(), static_cast<s32>(rnd(65536)) - 32768)); break;
             case 5: {  // within the data area; rarely misaligned (an address error)
                 const unsigned op = kLoadStore[rnd(std::size(kLoadStore))];
-                const s32 skew = (op == 0x22 || op == 0x26) ? static_cast<s32>(rnd(4)) : rnd(150) == 0 ? 1 : 0;
+                const s32 skew = merge_op(op) ? static_cast<s32>(rnd(8)) : rnd(150) == 0 ? 1 : 0;
                 prog.push_back(I(op, s0, dst(), static_cast<s32>(rnd(128) * 8) + skew));
                 break;
             }
@@ -728,6 +737,41 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs) { check_rando
 
 TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs_across_pages) {
     check_random_programs(60, 1500, 0x1E00);
+}
+
+// A translation made in kernel mode runs again for the same memory in user
+// mode with 32-bit addressing, where its 64-bit operation is reserved.
+TEST(cpu_jit_64bit_operation_reserved_in_user_mode) {
+    for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        // The loop starts one instruction in: the first instruction on a page
+        // newly in the soft TLB is interpreted.
+        t.load({NOP, DADDU(t1, t0, t0), ADDIU(t2, t2, -1), BNE(t2, zero, -3), NOP, SYSCALL}, 0x10000);
+        t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+        t.cpu.gpr[t0] = 0x0000000100000001ull;
+        t.cpu.gpr[t2] = 20;
+        t.cpu.set_pc(0xFFFFFFFF80010000ull);
+        t.cpu.run_until(2000);
+        CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Sys));
+        CHECK_EQ(t.cpu.gpr[t1], 0x0000000200000002ull);
+        // Global, valid, dirty mapping of user VA 0x10000 -> PA 0x10000.
+        t.cpu.cp0_write(cop0::Index, 0);
+        t.cpu.cp0_write(cop0::EntryHi, 0x00010000);
+        t.cpu.cp0_write(cop0::EntryLo0, (0x10u << 6) | (3u << 3) | 7u);
+        t.cpu.cp0_write(cop0::EntryLo1, 1);
+        t.cpu.cp0_write(cop0::EPC, 0x10000);
+        t.cpu.cp0_write(cop0::Status, sr::KSU_USER | sr::EXL);
+        t.load({TLBWI, ERET}, 0x2000);
+        t.cpu.set_pc(0xFFFFFFFF80002000ull);
+        t.cpu.gpr[t1] = 0;
+        t.cpu.gpr[t2] = 5;
+        t.cpu.run_until(4000);
+        CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::RI));
+        CHECK_EQ(t.cpu.cp0_read(cop0::EPC), 0x10004ull);
+        CHECK_EQ(t.cpu.gpr[t1], 0u);
+    }
 }
 
 TEST(cpu_linked_blocks_and_jit_match_interpreter_with_timer_interrupts) {

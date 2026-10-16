@@ -472,6 +472,7 @@ private:
     static constexpr unsigned kLoopTableBits = 4;
     bool idle_skip_ = true;
     u64 change_epoch_ = 0;  // bumped by every side effect
+    u64 jit_scratch_ = 0;   // translated code's spill slot
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
     // Fields translated code uses come before the large arrays, so they lie

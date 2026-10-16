@@ -18,6 +18,33 @@ namespace sg::mips {
 
 namespace {
 
+// DIV and DIVU. A zero divisor leaves an undefined result; this matches
+// observed R4000 behaviour.
+void div32(u64 rs, u64 rt, u64& hi, u64& lo) {
+    const s32 n = static_cast<s32>(rs), d = static_cast<s32>(rt);
+    if (d == 0) {
+        lo = n >= 0 ? ~u64{0} : 1;
+        hi = sext32(static_cast<u32>(n));
+    } else if (n == INT32_MIN && d == -1) {
+        lo = sext32(0x80000000u);
+        hi = 0;
+    } else {
+        lo = sext32(static_cast<u32>(n / d));
+        hi = sext32(static_cast<u32>(n % d));
+    }
+}
+
+void divu32(u64 rs, u64 rt, u64& hi, u64& lo) {
+    const u32 n = static_cast<u32>(rs), d = static_cast<u32>(rt);
+    if (d == 0) {
+        lo = ~u64{0};
+        hi = sext32(n);
+    } else {
+        lo = sext32(n / d);
+        hi = sext32(n % d);
+    }
+}
+
 constexpr u64 kBevBase = 0xFFFFFFFFBFC00200ull;
 constexpr u64 kNormalBase = 0xFFFFFFFF80000000ull;
 
@@ -1214,31 +1241,8 @@ void R4000::execute_special(u32 inst) {
             hi = sext32(p >> 32);
             break;
         }
-        case 0x1A: {  // DIV
-            const s32 n = static_cast<s32>(r[rs]), d = static_cast<s32>(r[rt]);
-            if (d == 0) {  // result undefined; this matches observed R4000 behaviour
-                lo = n >= 0 ? ~u64{0} : 1;
-                hi = sext32(static_cast<u32>(n));
-            } else if (n == INT32_MIN && d == -1) {
-                lo = sext32(0x80000000u);
-                hi = 0;
-            } else {
-                lo = sext32(static_cast<u32>(n / d));
-                hi = sext32(static_cast<u32>(n % d));
-            }
-            break;
-        }
-        case 0x1B: {  // DIVU
-            const u32 n = static_cast<u32>(r[rs]), d = static_cast<u32>(r[rt]);
-            if (d == 0) {
-                lo = ~u64{0};
-                hi = sext32(n);
-            } else {
-                lo = sext32(n / d);
-                hi = sext32(n % d);
-            }
-            break;
-        }
+        case 0x1A: div32(r[rs], r[rt], hi, lo); break;   // DIV
+        case 0x1B: divu32(r[rs], r[rt], hi, lo); break;  // DIVU
         case 0x1C:  // DMULT
             SG_REQUIRE_64BIT();
             mul_s64(static_cast<s64>(r[rs]), static_cast<s64>(r[rt]), hi, lo);
@@ -1526,6 +1530,10 @@ struct R4000::Ops {
     }
     static void mfhi(R4000& c, const Op& o) { c.gpr[o.rd] = c.hi; }
     static void mflo(R4000& c, const Op& o) { c.gpr[o.rd] = c.lo; }
+    static void mthi(R4000& c, const Op& o) { c.hi = c.gpr[o.rs]; }
+    static void mtlo(R4000& c, const Op& o) { c.lo = c.gpr[o.rs]; }
+    static void div(R4000& c, const Op& o) { div32(c.gpr[o.rs], c.gpr[o.rt], c.hi, c.lo); }
+    static void divu(R4000& c, const Op& o) { divu32(c.gpr[o.rs], c.gpr[o.rt], c.hi, c.lo); }
     static void mult(R4000& c, const Op& o) {
         const s64 p = s64{static_cast<s32>(c.gpr[o.rs])} * s64{static_cast<s32>(c.gpr[o.rt])};
         c.lo = sext32(static_cast<u64>(p));
@@ -1589,9 +1597,13 @@ R4000::Handler R4000::decode(u32 w, bool& plain) {
                 case 0x08: return Ops::jr;
                 case 0x09: return Ops::jalr;
                 case 0x10: return pure(Ops::mfhi, f_rd(w));
+                case 0x11: return pure(Ops::mthi, 1);
                 case 0x12: return pure(Ops::mflo, f_rd(w));
+                case 0x13: return pure(Ops::mtlo, 1);
                 case 0x18: return pure(Ops::mult, 1);
                 case 0x19: return pure(Ops::multu, 1);
+                case 0x1A: return pure(Ops::div, 1);
+                case 0x1B: return pure(Ops::divu, 1);
                 case 0x21: return pure(Ops::addu, f_rd(w));
                 case 0x23: return pure(Ops::subu, f_rd(w));
                 case 0x24: return pure(Ops::and_, f_rd(w));
