@@ -46,6 +46,8 @@ ip22::IndyConfig Settings::indy_config() const {
     c.graphics = graphics;
     c.xl24 = xl24;
     c.graphics_revision = graphics_rev;
+    c.test_device = test_device;
+    c.test_run_config = test_run_config;
     c.disk_image = disk;
     c.cdrom_images = cdroms;
     c.mac = mac;

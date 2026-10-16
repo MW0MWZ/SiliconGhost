@@ -287,6 +287,20 @@ void Mc::rebase_rpss() {
     rpss_cycle_base_ = scheduler_.now();
 }
 
+void Mc::map_banks_as_post() {
+    if (regs_[kMemCfg0] || regs_[kMemCfg1]) return;
+    u32 halves[4] = {}, base = kLowWindow;
+    for (std::size_t i = 0; i < banks_.size(); ++i) {
+        const u64 size = banks_[i].subbank_size * banks_[i].subbanks;
+        halves[i] = kBankValid | (banks_[i].subbanks == 2 ? kBankSubbanks : 0) |
+                    static_cast<u32>(((size >> 22) - 1) << 8) | (base >> 22);
+        base += static_cast<u32>(size);
+    }
+    regs_[kMemCfg0] = halves[0] << 16 | halves[1];
+    regs_[kMemCfg1] = halves[2] << 16 | halves[3];
+    remap_memory();
+}
+
 void Mc::remap_memory() {
     for (const auto& [base, size] : mapped_) bus_.unmap(base, size);
     mapped_.clear();

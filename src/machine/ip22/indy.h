@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/scheduler.h"
+#include "devices/test_device.h"
 #include "cpu/r4000/r4000.h"
 #include "machine/ip22/hpc3.h"
 #include "machine/ip22/ioc2.h"
@@ -45,6 +46,10 @@ struct IndyConfig {
     // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
     // use a default when the NVRAM has none (IRIX requires one).
     std::optional<std::array<u8, 6>> mac;
+    // The bare-metal test device in GIO expansion slot 0 (see TestDevice),
+    // and the run configuration it reports.
+    bool test_device = false;
+    u32 test_run_config = 0;
 };
 
 class Indy {
@@ -60,9 +65,15 @@ public:
     void load_prom_image(const u8* data, std::size_t size);
 
     void reset();
+    // Loads a static big-endian MIPS ELF executable into memory and starts
+    // the CPU at its entry point instead of the PROM, with the memory banks
+    // set up as the PROM would leave them. Call after reset().
+    bool load_elf(const std::string& path, std::string& error);
     // Runs the CPU for up to `cycles`, dispatching device events on time.
     u64 run(u64 cycles);
     bool powered_off() const { return powered_off_; }
+    // The code a program gave the test device's exit register, or -1.
+    int exit_code() const { return exit_code_; }
     // True while software is timing the CPU against the 8254 (the PROM and
     // the kernels calibrate their delay loops at boot by latching counter 2),
     // and for half a second of guest time after its last latch. Each such
@@ -147,6 +158,8 @@ private:
     GfxSlot gfx_slot_{newport_};
     Timer serial_timer_;
     std::unique_ptr<ScsiDisk> disk_, cdrom_;
+    std::unique_ptr<TestDevice> test_device_;
+    int exit_code_ = -1;
 
     SerialOutput serial_out_;
     std::mutex serial_mutex_;

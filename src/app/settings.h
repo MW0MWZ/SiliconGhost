@@ -46,6 +46,11 @@ struct Settings {
     bool audio = true, audio_in = false;
     bool mouse_auto_capture = true;  // the window captures the mouse when the pointer moves onto the screen
     std::string log = "warn";
+    // Command line only, never saved: a bare-metal program to run instead of
+    // the PROM, and the test device it can talk to the host through.
+    std::string load_elf;
+    bool test_device = false;
+    u32 test_run_config = 0;
 
     ip22::IndyConfig indy_config() const;
 };

@@ -170,6 +170,9 @@ Main options (`siliconghost --help` lists them all):
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
+| `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `max` |
+| `--test-device` | fit the bare-metal test device in GIO expansion slot 0: console output, a host clock, an instruction count and an exit code, in the same register layout as the IRIS emulator's, so its benchmark suite runs unchanged |
+| `--test-run-config N` | the value the test device reports in its run configuration register |
 
 ### The window
 

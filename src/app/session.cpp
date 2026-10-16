@@ -47,7 +47,7 @@ bool load_file(const std::string& path, std::vector<u8>& data) {
 bool Session::power_on(std::string& error) {
     if (machine_) return true;
     const Settings& s = settings_;
-    if (s.prom.empty()) {
+    if (s.prom.empty() && s.load_elf.empty()) {
         error = "no boot PROM image chosen";
         return false;
     }
@@ -66,13 +66,14 @@ bool Session::power_on(std::string& error) {
 
     try {
         auto machine = std::make_unique<ip22::Indy>(s.indy_config());
-        if (!machine->load_prom(s.prom, error)) return false;
+        if (!s.prom.empty() && !machine->load_prom(s.prom, error)) return false;
         machine->set_network(network.get());
         if (!s.nvram.empty() && !load_file(s.nvram, machine->rtc().memory()))
             SG_LOG(Warn, "session", "%s not found, starting with empty NVRAM", s.nvram.c_str());
         machine->rtc().power_on();  // the clock follows the host's (UTC)
         machine->set_serial_output(serial_out_);
         machine->reset();
+        if (!s.load_elf.empty() && !machine->load_elf(s.load_elf, error)) return false;
         auto& cpu = machine->cpu();
         cpu.set_idle_skip(s.idle_skip);
         cpu.set_block_cache(s.block_cache);

@@ -50,6 +50,7 @@ add_library(sg_emu STATIC
   src/devices/pit8254.cpp
   src/devices/scsi_disk.cpp
   src/devices/seeq8003.cpp
+  src/devices/test_device.cpp
   src/devices/wd33c93.cpp
   src/devices/z85230.cpp
   src/machine/ip22/hal2.cpp

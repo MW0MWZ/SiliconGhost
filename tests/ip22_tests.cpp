@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 // IP22 chipset tests: MC, HPC3, IOC2/INT3 accessed at their physical addresses.
+#include <algorithm>
 #include <cmath>
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -881,4 +884,76 @@ TEST(ip22_mc_dma_tlb_miss_faults_and_resumes) {
 TEST(ip22_ram_sizes_two_banks) {
     for (unsigned mb : {16u, 32u, 48u, 64u, 80u, 96u, 128u, 144u, 160u, 192u, 256u}) CHECK(ram_size_fits(mb));
     for (unsigned mb : {0u, 8u, 112u, 176u, 208u, 224u, 240u, 272u}) CHECK(!ram_size_fits(mb));
+}
+
+// A static ELF program run without the PROM talks to the host through the
+// test device: console bytes, the instruction count, and an exit code.
+TEST(ip22_load_elf_runs_a_program_with_the_test_device) {
+    using namespace test::as;
+    const std::vector<u32> code = {
+        LUI(8, 0xBF40),       // t0 = test device (KSEG1)
+        LW(9, 0, 8),          // signature
+        ORI(10, 0, 'O'),
+        SW(10, 4, 8),         // putc
+        ORI(10, 0, 'K'),
+        SW(10, 4, 8),
+        LW(11, 0x18, 8),      // instruction count, low word (latches)
+        LW(12, 0x1C, 8),      // high word
+        ORI(10, 0, 42),
+        SW(10, 0xC, 8),       // exit(42)
+        BEQ(0, 0, -1),
+        NOP,
+    };
+    std::vector<u8> elf(0x100 + code.size() * 4, 0);
+    const u8 ident[] = {0x7F, 'E', 'L', 'F', 1, 2, 1};
+    std::copy(std::begin(ident), std::end(ident), elf.begin());
+    store_be<u16>(&elf[16], 2);           // ET_EXEC
+    store_be<u16>(&elf[18], 8);           // EM_MIPS
+    store_be<u32>(&elf[24], 0x88200000);  // entry
+    store_be<u32>(&elf[28], 52);          // program headers
+    store_be<u16>(&elf[42], 32);
+    store_be<u16>(&elf[44], 1);
+    store_be<u32>(&elf[52], 1);  // PT_LOAD
+    store_be<u32>(&elf[56], 0x100);
+    store_be<u32>(&elf[60], 0x88200000);
+    store_be<u32>(&elf[68], static_cast<u32>(code.size() * 4));
+    store_be<u32>(&elf[72], 0x00100000);  // memsz: zero filled past the code
+    for (std::size_t i = 0; i < code.size(); ++i) store_be<u32>(&elf[0x100 + i * 4], code[i]);
+    const std::string path = (std::filesystem::temp_directory_path() / "sg_load_elf_test.elf").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+    }
+
+    IndyConfig c;
+    c.test_device = true;
+    Indy m(c);
+    std::string out;
+    m.set_serial_output([&](unsigned, u8 b) { out.push_back(static_cast<char>(b)); });
+    m.reset();
+    std::string error;
+    CHECK(m.load_elf(path, error));
+    std::filesystem::remove(path);
+    u32 memcfg0 = 0;
+    CHECK(m.bus().read<u32>(kMcMemCfg0, memcfg0));
+    CHECK_EQ(memcfg0 >> 16, 0x2000u | (15u << 8) | (0x08000000u >> 22));  // 64 MiB at 0x08000000
+    m.run(100000);
+    CHECK(m.powered_off());
+    CHECK_EQ(m.exit_code(), 42);
+    CHECK(out == "OK");
+    CHECK_EQ(static_cast<u32>(m.cpu().gpr[9]), TestDevice::kSignature);
+    CHECK(static_cast<u32>(m.cpu().gpr[11]) >= 6u && m.cpu().gpr[12] == 0);
+}
+
+TEST(ip22_load_elf_rejects_other_files) {
+    const std::string path = (std::filesystem::temp_directory_path() / "sg_load_elf_bad.elf").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f << "not an executable at all, but long enough to have a header......";
+    }
+    Indy m{IndyConfig{}};
+    std::string error;
+    CHECK(!m.load_elf(path, error));
+    CHECK(!error.empty());
+    std::filesystem::remove(path);
 }

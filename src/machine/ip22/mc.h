@@ -90,6 +90,10 @@ public:
         unsigned subbanks = 0;  // 0 = slot empty
     };
     const std::vector<Bank>& banks() const { return banks_; }
+    // Programs the bank registers as the PROM's memory sizing leaves them
+    // (the fitted banks one after another from 0x08000000), for programs
+    // started without the PROM. Does nothing if they are already set.
+    void map_banks_as_post();
 
 private:
     u32 read_reg(u32 reg);

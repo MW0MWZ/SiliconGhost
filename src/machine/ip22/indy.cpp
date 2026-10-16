@@ -6,7 +6,9 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
+#include <vector>
 
 #include "core/log.h"
 #include "machine/ip22/memmap.h"
@@ -42,6 +44,8 @@ u64 checked_ram_bytes(const IndyConfig& c) {
     return u64{c.ram_mb} << 20;
 }
 
+constexpr u64 kTestDeviceSize = 0x10000;
+
 // Serial characters take a fixed, short time to send; faster than a real
 // 9600 baud line so console output is not a bottleneck.
 constexpr u64 kSccCharCycles = 2000;
@@ -67,6 +71,20 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
     if (config_.graphics) bus_.map_device(kGioGfx, kGioGfxSize, &gfx_slot_);
+    if (config_.test_device) {
+        TestDevice::Hooks hooks;
+        hooks.putc = [this](u8 c) {
+            if (serial_out_) serial_out_(1, c);
+        };
+        hooks.exit = [this](u32 code) {
+            exit_code_ = static_cast<int>(code & 0xFF);
+            powered_off_ = true;
+            cpu_.request_stop();
+        };
+        hooks.instructions = [this] { return cpu_.instructions(); };
+        test_device_ = std::make_unique<TestDevice>(std::move(hooks), config_.test_run_config);
+        bus_.map_device(kGioExp0, kTestDeviceSize, test_device_.get());
+    }
     bus_.set_error_handler([this](u64 paddr, unsigned size, bool is_write) {
         mc_.report_bus_error(paddr, size, is_write);
     });
@@ -245,6 +263,45 @@ void Indy::reset() {
     serial_timer_.cancel();  // run() starts it again while input is queued
     reset_pending_ = false;
     powered_off_ = false;
+}
+
+bool Indy::load_elf(const std::string& path, std::string& error) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<u8> elf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!f && !f.eof()) {
+        error = "cannot read " + path;
+        return false;
+    }
+    auto be16 = [&](std::size_t at) { return static_cast<u32>(elf[at] << 8 | elf[at + 1]); };
+    auto be32 = [&](std::size_t at) { return be16(at) << 16 | be16(at + 2); };
+    if (elf.size() < 52 || std::memcmp(elf.data(), "\x7F" "ELF", 4) != 0 || elf[4] != 1 || elf[5] != 2 ||
+        be16(16) != 2 || be16(18) != 8) {
+        error = path + ": not a 32-bit big-endian MIPS executable";
+        return false;
+    }
+    mc_.map_banks_as_post();
+    const u32 phoff = be32(28), phentsize = be16(42), phnum = be16(44);
+    for (u32 i = 0; i < phnum; ++i) {
+        const std::size_t ph = phoff + std::size_t{i} * phentsize;
+        if (ph + 32 > elf.size()) {
+            error = path + ": truncated program headers";
+            return false;
+        }
+        if (be32(ph) != 1) continue;  // PT_LOAD
+        const u32 offset = be32(ph + 4), vaddr = be32(ph + 8), filesz = be32(ph + 16), memsz = be32(ph + 20);
+        if (vaddr < 0x80000000u || vaddr >= 0xC0000000u || filesz > memsz || offset + u64{filesz} > elf.size()) {
+            error = path + ": a segment is not in KSEG0/KSEG1 or lies outside the file";
+            return false;
+        }
+        std::vector<u8> image(memsz, 0);
+        std::memcpy(image.data(), elf.data() + offset, filesz);
+        if (!bus_.write_block(vaddr & 0x1FFFFFFFu, image.data(), image.size())) {
+            error = path + ": a segment does not fit in memory";
+            return false;
+        }
+    }
+    cpu_.set_pc(static_cast<u64>(static_cast<s64>(static_cast<s32>(be32(24)))));
+    return true;
 }
 
 u64 Indy::run(u64 cycles) {

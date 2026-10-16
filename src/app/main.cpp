@@ -102,6 +102,10 @@ void usage(const char* argv0) {
                  "  --audio-in       let the machine record from the host's audio input\n"
                  "  --trace          disassemble every instruction to stderr (very slow)\n"
                  "  --dump-state     print the CPU registers when the emulator stops\n"
+                 "  --load-elf F     run bare-metal MIPS ELF program F instead of the PROM (no PROM needed);\n"
+                 "                   implies --headless and, unless --timing is given, max\n"
+                 "  --test-device    fit the bare-metal test device (console, host clock, exit code)\n"
+                 "  --test-run-config N  value the test device reports in its run configuration register\n"
                  "  --log LEVEL      trace|debug|info|warn|error (default warn)\n"
                  "In the window, the Machine and Media menus hold the same choices; Ctrl-C quits.\n",
                  sg::mips::R4000::jit_available()
@@ -282,7 +286,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "error: %s\n", error.c_str());
                 return 2;
             }
-        } else if (!std::strcmp(a, "--screenshot")) screenshot = next();
+        } else if (!std::strcmp(a, "--load-elf")) settings.load_elf = next();
+        else if (!std::strcmp(a, "--test-device")) settings.test_device = true;
+        else if (!std::strcmp(a, "--test-run-config"))
+            settings.test_run_config = static_cast<sg::u32>(std::strtoul(next().c_str(), nullptr, 0));
+        else if (!std::strcmp(a, "--screenshot")) screenshot = next();
         else if (!std::strcmp(a, "--max")) max_cycles = std::strtoull(next().c_str(), nullptr, 0);
         else if (!std::strcmp(a, "--trace")) trace = true;
         else if (!std::strcmp(a, "--dump-state")) dump = true;
@@ -295,6 +303,10 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 2;
         }
+    }
+    if (!settings.load_elf.empty()) {  // a bare-metal program: console only, as fast as possible
+        headless = true;
+        if (!timing_given) settings.timing = sg::Pacer::Mode::Max;
     }
     if (max_cycles != ~0ull) {
         headless = true;
@@ -341,7 +353,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "note: this build has no window or sound (SDL3 was not found when it was built); "
                              "using the serial console\n");
 #endif
-    if (settings.prom.empty()) {
+    if (settings.prom.empty() && settings.load_elf.empty()) {
         usage(argv[0]);
         return 2;
     }
@@ -381,6 +393,7 @@ int main(int argc, char** argv) {
         if (!screenshot.empty() && !session.save_screenshot(screenshot))
             std::fprintf(stderr, "screenshot: no video signal\n");
     }
+    const int exit_code = session.machine()->exit_code();
     session.power_off();
-    return 0;
+    return exit_code >= 0 ? exit_code : 0;
 }
