@@ -19,11 +19,17 @@ namespace sg::app {
 
 const std::vector<CpuModel>& cpu_models() {
     // R4000 and R4400 share the pipeline; the R4000 has 8 KiB primary caches.
+    using mips::Core;
+    using mips::R4000;
     static const std::vector<CpuModel> models = {
-        {"r4400sc", "R4400SC (1 MiB secondary cache)", 0x0450, mips::R4000::kDefaultConfig, 1u << 20},
-        {"r4400pc", "R4400PC (no secondary cache)", 0x0450, mips::R4000::kDefaultConfig, 0},
-        {"r4000sc", "R4000SC (1 MiB secondary cache)", 0x0430, 0x10C08263u, 1u << 20},
-        {"r4000pc", "R4000PC (no secondary cache)", 0x0430, 0x10C08263u, 0},
+        {"r4400sc", "R4400SC (1 MiB secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 1u << 20, 150},
+        {"r4400pc", "R4400PC (no secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 0, 100},
+        {"r4000sc", "R4000SC (1 MiB secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 1u << 20, 100},
+        {"r4000pc", "R4000PC (no secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 0, 100},
+        {"r4600pc", "R4600PC (no secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 0, 100},
+        {"r4600sc", "R4600SC (512 KiB secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 512u << 10, 133},
+        {"r5000pc", "R5000PC (no secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 0, 150},
+        {"r5000sc", "R5000SC (512 KiB secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 512u << 10, 180},
     };
     return models;
 }
@@ -39,6 +45,7 @@ ip22::IndyConfig Settings::indy_config() const {
     c.ram_mb = ram_mb;
     c.cpu_hz = cpu_mhz * 1.0e6;
     if (const CpuModel* m = find_cpu_model(cpu)) {
+        c.cpu_core = m->core;
         c.prid = m->prid;
         c.cpu_config = m->config;
         c.scache_bytes = m->scache_bytes;

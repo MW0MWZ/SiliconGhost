@@ -900,7 +900,7 @@ bool R4000::jit_compile(Block& b) {
             default:
                 break;
         }
-        if (func >= 0x30) {  // C.cond: no NaN operand, so ordered and no exception
+        if (func >= 0x30 && (fd >> 2) == 0) {  // C.cond, condition code 0: no NaN operand, so ordered
             const unsigned cond = func & 6;  // less (4), equal (2)
             fp_usable(slow);
             auto not_nan = [&](unsigned n, unsigned scratch) {
@@ -1401,7 +1401,7 @@ bool R4000::jit_compile(Block& b) {
                 likely = rt >= 2;
                 break;
             case 0x11:  // BC1F, BC1T, BC1FL, BC1TL
-                if (rs != 0x08) return false;
+                if (rs != 0x08 || (rt >> 2) != 0) return false;  // condition code 0 only
                 kind = kFpCond, not_taken = (rt & 1) ? Cond::E : Cond::Ne, likely = (rt & 2) != 0;
                 break;
             case 0x02: case 0x03: kind = kJump; break;  // J, JAL

@@ -16,14 +16,16 @@
 
 namespace sg::app {
 
-// The processor modules the emulator can present (what the PROM and IRIX
-// see in PRId and Config; the pipeline is the same).
+// The processor modules the emulator can present: the implementation, what
+// the PROM and IRIX see in PRId and Config, and the secondary cache.
 struct CpuModel {
     const char* id;     // settings file / --cpu name
     const char* label;  // for menus
+    mips::Core core;
     u32 prid;
     u32 config;
     u32 scache_bytes;
+    double mhz;  // the clock the module shipped with (the menu's default)
 };
 const std::vector<CpuModel>& cpu_models();
 const CpuModel* find_cpu_model(const std::string& id);

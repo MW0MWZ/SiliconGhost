@@ -5,8 +5,8 @@
 
 # SiliconGhost
 
-An open-source emulator for the SGI **Indy** (IP22): MIPS R4400 CPU, the
-MC/HPC3/IOC2 chipset and **Newport (REX3)** graphics. The aim is to run the
+An open-source emulator for the SGI **Indy** (IP22): MIPS R4000, R4400,
+R4600 and R5000 processor modules, the MC/HPC3/IOC2 chipset and **Newport (REX3)** graphics. The aim is to run the
 original boot PROM and IRIX unmodified, at or above the speed of the real
 machine. Linux is the primary host; it also builds and runs on macOS, and
 builds for Windows.
@@ -39,8 +39,10 @@ SiliconGhost is under active development. What works today:
 - **Networking:** the Ethernet port works (DHCP, ping, DNS, telnet, ssh,
   file transfers in both directions), through user-mode NAT on the host (no
   privileges needed) or a Linux TAP interface.
-- **CPU:** the full R4000/R4400 integer and floating-point instruction sets,
-  TLB, exceptions, 32/64-bit addressing and cache tag operations.
+- **CPU:** the full R4000/R4400 and R4600 (MIPS III) and R5000 (MIPS IV)
+  integer and floating-point instruction sets, TLB, exceptions, 32/64-bit
+  addressing and cache tag operations, with or without a secondary cache.
+  IRIX 5.3 and 6.5, NetBSD and OpenBSD boot on the R4600 and the R5000.
 - **Speed:** hot code is translated to x86-64 or AArch64 machine code, and idle loops
   are skipped exactly. On a modest host, IRIX runs at about one and a half
   times the speed of a 175 MHz Indy, and an idle IRIX uses about 2% of one
@@ -52,7 +54,7 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 
 | Component | Model | State |
 |---|---|---|
-| CPU | MIPS R4400 (R4000 family), FPU, 48-entry TLB | complete |
+| CPU | MIPS R4000, R4400, R4600 or R5000 (PC or SC module), FPU, 48-entry TLB | complete |
 | Memory controller | MC: memory configuration, GIO bus errors | working |
 | Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
 | Interrupts/timers | IOC2 / INT3, 8254 PIT | working |
@@ -155,7 +157,7 @@ Main options (`siliconghost --help` lists them all):
 | `--nvram FILE` | DS1386 NVRAM, loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
 | `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64) |
-| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc` | processor module (default R4400SC) |
+| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock (default 150) |
 | `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
 | `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 2 for the XL8, 0 for the XL24); drivers pick timings and cursor offsets by it, and see an 8-bit board only from revision 2 |

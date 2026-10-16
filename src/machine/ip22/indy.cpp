@@ -19,6 +19,7 @@ namespace {
 
 mips::R4000::Options cpu_options(const IndyConfig& c) {
     mips::R4000::Options o;
+    o.core = c.cpu_core;
     o.prid = c.prid;
     o.config = c.cpu_config;
     o.scache_bytes = c.scache_bytes;
@@ -71,6 +72,12 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
     if (config_.graphics) bus_.map_device(kGioGfx, kGioGfxSize, &gfx_slot_);
+    // An R4600 or R5000 module with a secondary cache the processor does not
+    // report: the PROM reads its size from the module's EEPROM.
+    if (config_.cpu_core != mips::Core::R4000 && config_.scache_bytes) {
+        mc_.cpu_eeprom()[Mc::kCpuEepromCacheSize] = static_cast<u16>(config_.scache_bytes >> 12);
+        if (config_.cpu_core == mips::Core::R4600) bus_.map_device(kR4600ScControl, kR4600ScControlSize, &scache_control_);
+    }
     if (config_.test_device) {
         TestDevice::Hooks hooks;
         hooks.putc = [this](u8 c) {

@@ -30,9 +30,9 @@ struct Rig {
     static constexpr u64 kRamSize = 8u << 20;
     std::vector<u8> ram = std::vector<u8>(kRamSize);
     Bus bus;
-    R4000 cpu{bus};
+    R4000 cpu;
 
-    Rig() {
+    explicit Rig(const R4000::Options& options = R4000::Options{}) : cpu(bus, options) {
         bus.map_ram(0, kRamSize, ram.data());
         cpu.cp0_write(cop0::Status, 0);  // kernel mode, BEV=0, ERL=0, interrupts off
         cpu.set_pc(kCode);
@@ -614,7 +614,7 @@ CpuState capture(Rig& t, u64 data_paddr, std::size_t data_size) {
 // A random straight-line program with forward branches, using every
 // instruction the block cache decodes ahead (and a few it does not).
 // Runs from `base` (kseg0), which may be anywhere in the first 64 KiB.
-std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
+std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode, bool mips4 = false) {
     u64 x = seed * 0x9E3779B97F4A7C15ull + 1;
     auto rnd = [&](u32 n) {
         x ^= x << 13;
@@ -652,6 +652,15 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
                 if (rnd(16) == 0) {  // may overflow (and end the run): mostly with a zero operand
                     const unsigned f = kTrapping[rnd(std::size(kTrapping))];
                     prog.push_back(R(f, reg(), rnd(4) ? 0 : reg(), dst(), 0));
+                    break;
+                }
+                if (mips4 && rnd(4) == 0) {  // MOVZ, MOVN, MOVF/MOVT (on a random condition code), PREF
+                    switch (rnd(4)) {
+                        case 0: prog.push_back(R(0x0A, reg(), reg(), dst())); break;
+                        case 1: prog.push_back(R(0x0B, reg(), reg(), dst())); break;
+                        case 2: prog.push_back((reg() << 21) | (rnd(8) << 18) | (rnd(2) << 16) | (dst() << 11) | 0x01); break;
+                        default: prog.push_back(I(0x33, reg(), rnd(32), static_cast<s32>(rnd(65536)) - 32768)); break;
+                    }
                     break;
                 }
                 const unsigned f = kRFuncts[rnd(std::size(kRFuncts))];
@@ -711,14 +720,28 @@ void use_engine(Rig& t, Engine engine) {
     t.cpu.set_jit(engine == Engine::Jit);
 }
 
-// Each engine runs `seeds` random programs from physical address `base`.
-static void check_random_programs(u32 seeds, unsigned length, u64 base) {
+R4000::Options r5000_options() {
+    R4000::Options o;
+    o.core = Core::R5000;
+    o.prid = 0x2321;
+    o.config = R4000::kR5000Config;
+    o.scache_bytes = 512u << 10;
+    return o;
+}
+
+// Each engine runs `seeds` random programs from physical address `base`;
+// on an R5000 (with the FPU usable, for MOVF/MOVT) with `mips4`.
+static void check_random_programs(u32 seeds, unsigned length, u64 base, bool mips4 = false) {
     constexpr u64 kData = 0x10000;
     for (u32 seed = 1; seed <= seeds; ++seed) {
-        const std::vector<u32> prog = random_program(seed, length, 0xFFFFFFFF80000000ull + base);
+        const std::vector<u32> prog = random_program(seed, length, 0xFFFFFFFF80000000ull + base, mips4);
         auto run = [&](Engine engine) {
-            Rig t;
+            Rig t(mips4 ? r5000_options() : R4000::Options{});
             use_engine(t, engine);
+            if (mips4) {
+                t.cpu.cp0_write(cop0::Status, sr::CU1);
+                t.cpu.fcr31 = static_cast<u32>(seed * 0x9E3779B9u) & 0xFE800000u;  // condition codes
+            }
             t.cpu.set_idle_skip(false);
             u64 x = seed;
             for (unsigned i = 1; i < 32; ++i) {
@@ -751,13 +774,17 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_programs_across_pages) 
     check_random_programs(60, 1500, 0x1E00);
 }
 
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_mips4_programs) {
+    check_random_programs(150, 600, 0x1000, true);
+}
+
 namespace {
 
 // A random program of FPU operations: arithmetic, conversions, compares and
 // branches on the condition, moves and loads/stores, on values mostly in a
 // moderate range (sometimes special: zeros, infinities, NaNs, denormals),
 // with the FPU enabled in either register mode.
-std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base) {
+std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base, bool mips4 = false) {
     u64 x = seed * 0x9E3779B97F4A7C15ull + 7;
     auto rnd = [&](u32 n) {
         x ^= x << 13;
@@ -765,10 +792,10 @@ std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base) {
         x ^= x << 17;
         return static_cast<u32>(x % n);
     };
-    auto dst = [&] {  // never s0 (the data pointer) or s1 (the loop counter)
+    auto dst = [&] {  // never s0 (the data pointer), s1 (the loop counter) or s2 (an index into the data)
         unsigned r;
         do r = rnd(32);
-        while (r == s0 || r == s1);
+        while (r == s0 || r == s1 || r == s2);
         return r;
     };
     static constexpr unsigned kFuncs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D, 0x0E, 0x0F,
@@ -781,6 +808,36 @@ std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base) {
     std::vector<u32> prog{ADDIU(s1, zero, 12)};
     while (prog.size() + 5 < length) {
         const unsigned room = length - 5 - static_cast<unsigned>(prog.size());
+        if (mips4 && rnd(4) == 0) {
+            const unsigned fmt = rnd(6) ? main_fmt : 16 + rnd(2);
+            switch (rnd(8)) {
+                case 0: case 1: {  // LWXC1, LDXC1, SWXC1, SDXC1, PREFX through the index register
+                    static constexpr unsigned kOps[] = {0x00, 0x01, 0x08, 0x09, 0x0F};
+                    prog.push_back(ADDIU(s2, zero, static_cast<s32>(rnd(256) * 8 + (rnd(100) == 0 ? 4 : 0))));
+                    prog.push_back((0x13u << 26) | (s0 << 21) | (s2 << 16) | (rnd(32) << 11) | (rnd(32) << 6) |
+                                   kOps[rnd(std::size(kOps))]);
+                    break;
+                }
+                case 2: case 3:  // MADD, MSUB, NMADD, NMSUB
+                    prog.push_back((0x13u << 26) | (rnd(32) << 21) | (rnd(32) << 16) | (rnd(32) << 11) |
+                                   (rnd(32) << 6) | (0x20 + 8 * rnd(4) + (fmt & 1)));
+                    break;
+                case 4:  // C.cond to any condition code
+                    prog.push_back(cop1(fmt, rnd(32), rnd(32), rnd(8) << 2, 0x30 + rnd(16)));
+                    break;
+                case 5: {  // MOVF/MOVT.fmt, MOVZ/MOVN.fmt, RECIP, RSQRT
+                    static constexpr unsigned kOps[] = {0x11, 0x12, 0x13, 0x15, 0x16};
+                    prog.push_back(cop1(fmt, rnd(32), rnd(32), rnd(32), kOps[rnd(std::size(kOps))]));
+                    break;
+                }
+                default:  // BC1 on any condition code
+                    if (room < 12) break;
+                    prog.push_back((0x11u << 26) | (0x08u << 21) | (rnd(8) << 18) | (rnd(4) << 16) | (1 + rnd(8)));
+                    prog.push_back(cop1(main_fmt, rnd(32), rnd(32), rnd(32), rnd(8)));
+                    break;
+            }
+            continue;
+        }
         switch (rnd(10)) {
             case 0: case 1: case 2: case 3: {
                 const unsigned fmt = rnd(6) ? main_fmt : 16 + rnd(2);
@@ -827,13 +884,13 @@ std::vector<u32> random_fp_program(u32 seed, unsigned length, u64 base) {
 
 // The x86-64 recompiler checks FPU results with FMA where the host has it,
 // else with the host's exception flags: both are run.
-static void check_random_fpu_programs() {
+static void check_random_fpu_programs(bool mips4 = false) {
     constexpr u64 kData = 0x10000, kBase = 0x1000;
     constexpr unsigned kLength = 400;
     for (u32 seed = 1; seed <= 300; ++seed) {
-        const std::vector<u32> prog = random_fp_program(seed, kLength, kBase);
+        const std::vector<u32> prog = random_fp_program(seed, kLength, kBase, mips4);
         auto run = [&](Engine engine) {
-            Rig t;
+            Rig t(mips4 ? r5000_options() : R4000::Options{});
             use_engine(t, engine);
             t.cpu.set_idle_skip(false);
             u64 x = seed;
@@ -876,6 +933,7 @@ static void check_random_fpu_programs() {
             for (unsigned i = 0; i < 32; ++i)
                 t.cpu.fpr[i] = (seed & 1) ? value(true) : (value(false) << 32) | value(false);
             t.cpu.gpr[s0] = 0xFFFFFFFF80000000ull + kData;
+            t.cpu.gpr[s2] = 0;
             for (u64 a = 0; a < 0x800; a += 8) store_be<u64>(&t.ram[kData + a], value(seed & 1));
             // Mostly round to nearest without traps; sometimes another mode, FS, or a trap enabled.
             u32 fcsr = 0;
@@ -1006,6 +1064,13 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
     check_random_fpu_programs();
     R4000::set_jit_fma(false);
     check_random_fpu_programs();
+    R4000::set_jit_fma(true);
+}
+
+TEST(cpu_block_cache_and_jit_match_interpreter_on_random_mips4_fpu_programs) {
+    check_random_fpu_programs(true);
+    R4000::set_jit_fma(false);
+    check_random_fpu_programs(true);
     R4000::set_jit_fma(true);
 }
 

@@ -38,4 +38,9 @@ constexpr u32 kHpc3Rtc = 0x1FBE0000;          // DS1386 RTC; NVRAM byte n at 0x1
 constexpr u32 kProm = 0x1FC00000;             // boot PROM (512 KiB on Indy)
 constexpr u32 kPromMaxSize = 0x00080000;
 
+// R4600SC module: secondary cache control, uncached, at 0x80000000 | the
+// physical address of the line (the module decodes the top address bit).
+constexpr u32 kR4600ScControl = 0x80000000;
+constexpr u64 kR4600ScControlSize = 0x80000000;
+
 }  // namespace sg::ip22

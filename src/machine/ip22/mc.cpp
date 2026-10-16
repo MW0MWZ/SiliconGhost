@@ -16,7 +16,10 @@ constexpr u32 kSysIdIndy = 0x03;  // MC revision C, no EISA
 
 constexpr u32 kCpuCtrl0SysInit = 1u << 9;
 constexpr u32 kErrStatAddr = 1u << 10;  // CPU: bad address; GIO: timeout uses the same bit position
-constexpr u32 kEeromSi = 1u << 4;
+constexpr u32 kEeromCs = 1u << 1;
+constexpr u32 kEeromSck = 1u << 2;
+constexpr u32 kEeromSo = 1u << 3;  // to the EEPROM
+constexpr u32 kEeromSi = 1u << 4;  // from the EEPROM
 
 // MEMCFG half-word fields
 constexpr u32 kBankValid = 1u << 13;
@@ -52,6 +55,7 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
       cycles_per_sysclk_(cpu_hz / sysclk_hz),
       dma_timer_(scheduler, [this] { finish_dma(); }) {
     bus_.add_host_region(ram, ram_size);  // however the banks get mapped, it is one memory
+    std::fill(cpu_eeprom_.words().begin(), cpu_eeprom_.words().end(), u16{0});
     // Split installed memory into decodable banks, largest first.
     u64 remaining = ram_size, offset = 0;
     for (u64 size = u64{128} << 20; size >= (u64{4} << 20) && banks_.size() < 4;) {
@@ -151,7 +155,7 @@ u32 Mc::read_reg(u32 reg) {
         case kSysId: return kSysIdIndy;
         case kDogc: return 0;
         case kRefCtr: return regs_[kCtrld];
-        case kEerom: return regs_[kEerom] & ~kEeromSi;
+        case kEerom: return (regs_[kEerom] & ~kEeromSi) | (cpu_eeprom_.data_out() ? kEeromSi : 0);
         case kCpuErrorAddr: return cpu_error_addr_;
         case kCpuErrorStat: return cpu_error_stat_;
         case kGioErrorAddr: return gio_error_addr_;
@@ -202,6 +206,10 @@ void Mc::write_reg(u32 reg, u32 value) {
             dma_cause_ = value & 0xF;
             dma_run_ = (dma_run_ & kDmaRunActive) | dma_cause_;
             if (dma_cause_ == 0 && dma_irq_cb_) dma_irq_cb_(false);
+            return;
+        case kEerom:
+            regs_[kEerom] = value & (kEeromCs | kEeromSck | kEeromSo);
+            cpu_eeprom_.set_lines(value & kEeromCs, value & kEeromSck, value & kEeromSo);
             return;
         case kDmaCtl: dma_ctl_ = value; return;
         case kDmaMemAdr: dma_mem_addr_ = value; return;

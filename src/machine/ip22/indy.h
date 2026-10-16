@@ -32,6 +32,7 @@ struct IndyConfig {
     unsigned ram_mb = 64;       // 16..256, multiple of 16
     double cpu_hz = 150.0e6;    // pipeline clock
     double sysclk_hz = 50.0e6;  // SysAD bus clock
+    mips::Core cpu_core = mips::Core::R4000;
     u32 prid = 0x00000450;      // R4400 revision 5.0
     u32 cpu_config = mips::R4000::kDefaultConfig;  // Config register at reset (cache geometry)
     u32 scache_bytes = 1u << 20;                    // secondary cache; 0 for a PC module
@@ -159,6 +160,21 @@ private:
     Timer serial_timer_;
     std::unique_ptr<ScsiDisk> disk_, cdrom_;
     std::unique_ptr<TestDevice> test_device_;
+    // An R4600SC module's secondary cache controller: the processor has no
+    // cache interface of its own, so the module answers uncached accesses at
+    // physical 0x80000000 | address (a byte store enables the cache, a
+    // halfword store disables it, a word store invalidates a line). The
+    // cache holds no data here, so they only need to complete.
+    class ScacheControl final : public Device {
+    public:
+        const char* name() const override { return "r4600sc-cache-control"; }
+        bool read(u32, unsigned, u64& value) override {
+            value = 0;
+            return true;
+        }
+        bool write(u32, unsigned, u64) override { return true; }
+    };
+    ScacheControl scache_control_;
     int exit_code_ = -1;
 
     SerialOutput serial_out_;

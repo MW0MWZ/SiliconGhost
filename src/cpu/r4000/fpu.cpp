@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
-// R4000/R4400 floating-point unit (COP1).
+// R4000/R4400, R4600 and R5000 floating-point units (COP1), with the R5000's
+// MIPS IV additions (eight condition codes, conditional moves, reciprocals,
+// indexed loads and stores, multiply-add).
 //
 // Arithmetic runs on the host FPU with the guest rounding mode installed and
 // host exception flags collected per instruction. Operands and results the
@@ -33,6 +35,7 @@ constexpr u32 kFcrRoundMask = 0x3u;
 constexpr u32 kFcrCond = 1u << 23;
 constexpr u32 kFcrFS = 1u << 24;
 constexpr u32 kFcrWriteMask = 0x0183FFFFu;
+constexpr u32 kFcrCondMips4 = 0xFE000000u;  // condition codes 1-7
 constexpr u32 kCauseMask = 0x0003F000u;
 constexpr u32 kCauseE = 1u << 17;
 constexpr u32 kCauseV = 1u << 16;
@@ -42,8 +45,6 @@ constexpr u32 kCauseU = 1u << 13;
 constexpr u32 kCauseI = 1u << 12;
 constexpr u32 kEnableU = 1u << 8;
 constexpr u32 kEnableI = 1u << 7;
-
-constexpr u32 kFir = 0x00000500u;  // FCR0: implementation 0x05, revision 0.0
 
 enum Fmt : unsigned { kFmtS = 16, kFmtD = 17, kFmtW = 20, kFmtL = 21 };
 
@@ -296,6 +297,13 @@ void R4000::fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd) {
         write(fd, read(fs));
         return;
     }
+    if (func >= 0x11 && func <= 0x13 && mips4_enabled()) {  // MOVF/MOVT, MOVZ, MOVN.fmt: copies too
+        bool move;
+        if (func == 0x11) move = ((fcr31 & fcc_bit(ft >> 2)) != 0) == ((ft & 1) != 0);
+        else move = (gpr[ft] == 0) == (func == 0x12);
+        if (move) write(fd, read(fs));
+        return;
+    }
 
     const Bits a = read(fs), b = read(ft);
     const Class ca = classify<F>(a), cb = classify<F>(b);
@@ -311,10 +319,13 @@ void R4000::fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd) {
         const bool less = !unordered && fa < fb;
         const bool equal = !unordered && fa == fb;
         const bool c = ((cond & 4) && less) || ((cond & 2) && equal) || ((cond & 1) && unordered);
-        if (fp_commit(cause)) fcr31 = c ? (fcr31 | kFcrCond) : (fcr31 & ~kFcrCond);
+        const u32 bit = mips4_enabled() ? fcc_bit(fd >> 2) : kFcrCond;
+        if (fp_commit(cause)) fcr31 = c ? (fcr31 | bit) : (fcr31 & ~bit);
         return;
     }
 
+    const bool recip = (func == 0x15 || func == 0x16) && mips4_enabled();  // RECIP, RSQRT
+    if ((func == 0x15 || func == 0x16) && !recip) return fp_unimplemented();
     const bool unary = func >= 0x04;  // everything except ADD/SUB/MUL/DIV
     auto operand_check = [&](Class c, u32& cause) -> bool {
         if (c == Class::Denormal || c == Class::QuietNaN) return false;
@@ -367,6 +378,18 @@ void R4000::fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd) {
         case 0x02: return finish(host_eval<F>(rm, flags, [](F x, F y) { return x * y; }, fa, fb), fd);
         case 0x03: return finish(host_eval<F>(rm, flags, [](F x, F y) { return x / y; }, fa, fb), fd);
         case 0x04: return finish(host_eval<F>(rm, flags, [](F x) { return std::sqrt(x); }, fa), fd);
+        case 0x15: return finish(host_eval<F>(rm, flags, [](F x) { return F(1) / x; }, fa), fd);  // RECIP
+        case 0x16: {  // RSQRT: the square root rounded, then its reciprocal
+            int f1 = 0;
+            const F root = host_eval<F>(rm, f1, [](F x) { return std::sqrt(x); }, fa);
+            if (f1 & FE_INVALID) {  // a negative operand
+                flags = f1;
+                return finish(root, fd);
+            }
+            const F r = host_eval<F>(rm, flags, [](F x) { return F(1) / x; }, root);
+            flags |= f1;
+            return finish(r, fd);
+        }
         case 0x05:  // ABS
             if (fp_commit(0)) write(fd, a & ~T::kSign);
             return;
@@ -476,7 +499,7 @@ void R4000::execute_cop1(u32 inst) {
             gpr[ft] = fpr_read64(fs);
             return;
         case 0x02:  // CFC1
-            gpr[ft] = sext32(fs == 0 ? kFir : fs == 31 ? fcr31 : 0);
+            gpr[ft] = sext32(fs == 0 ? fir_ : fs == 31 ? fcr31 : 0);
             return;
         case 0x04: fpr_write32(fs, static_cast<u32>(gpr[ft])); return;  // MTC1
         case 0x05:                                                     // DMTC1
@@ -485,12 +508,12 @@ void R4000::execute_cop1(u32 inst) {
             return;
         case 0x06:  // CTC1
             if (fs == 31) {
-                fcr31 = static_cast<u32>(gpr[ft]) & kFcrWriteMask;
+                fcr31 = static_cast<u32>(gpr[ft]) & (mips4_ ? kFcrWriteMask | kFcrCondMips4 : kFcrWriteMask);
                 fp_check_ctc1_trap();
             }
             return;
         case 0x08: {  // BC1F / BC1T / BC1FL / BC1TL
-            const bool cond = (fcr31 & kFcrCond) != 0;
+            const bool cond = (fcr31 & (mips4_enabled() ? fcc_bit(ft >> 2) : kFcrCond)) != 0;
             const bool want = (ft & 1) != 0;
             const u64 target = cur_pc_ + 4 + (sext16(inst & 0xFFFF) << 2);
             if (ft & 2) branch_likely(cond == want, target);
@@ -509,6 +532,62 @@ void R4000::execute_cop1(u32 inst) {
     }
 }
 
+// MADD, MSUB, NMADD, NMSUB (.S, .D): fd = +-(fs * ft +- fr). The R5000
+// rounds the product before the sum, as two separate operations would.
+template <typename F>
+void R4000::fp_multiply_add(unsigned func, unsigned fr, unsigned ft, unsigned fs, unsigned fd) {
+    using T = Traits<F>;
+    using Bits = typename T::Bits;
+    constexpr bool kSingle = sizeof(F) == 4;
+    auto read = [this](unsigned n) -> Bits {
+        if constexpr (kSingle) return fpr_read32(n);
+        else return fpr_read64(n);
+    };
+    auto write = [this](unsigned n, Bits v) {
+        if constexpr (kSingle) fpr_write32(n, v);
+        else fpr_write64(n, v);
+    };
+    const u32 rm = fcr31 & kFcrRoundMask;
+    const Bits a = read(fs), b = read(ft), c = read(fr);
+    u32 cause = 0;
+    for (Bits v : {a, b, c}) {
+        const Class k = classify<F>(v);
+        if (k == Class::Denormal || k == Class::QuietNaN) return fp_unimplemented();
+        if (k == Class::SignalingNaN) cause |= kCauseV;
+    }
+    if (cause & kCauseV) {  // signaling NaN operand: invalid, default result
+        if (fp_commit(cause)) write(fd, T::kDefaultNaN);
+        return;
+    }
+    // A tiny intermediate or final result is left to software, as for the
+    // separate operations.
+    auto tiny = [&](F r, int fl) { return (fl & FE_UNDERFLOW) || classify<F>(to_bits(r)) == Class::Denormal; };
+    auto must_trap = [&] { return !(fcr31 & kFcrFS) || (fcr31 & (kEnableU | kEnableI)); };
+    int flags = 0;
+    F p = host_eval<F>(rm, flags, [](F x, F y) { return x * y; }, from_bits<F>(a), from_bits<F>(b));
+    cause |= cause_from_host(flags);
+    if (tiny(p, flags)) {
+        if (must_trap()) return fp_unimplemented();
+        cause |= kCauseU | kCauseI;
+        p = from_bits<F>(flushed<F>((to_bits(p) & T::kSign) != 0, rm));
+    }
+    const bool subtract = (func & 0x08) != 0, negate = (func & 0x10) != 0;
+    F r = host_eval<F>(rm, flags, [subtract](F x, F y) { return subtract ? x - y : x + y; }, p, from_bits<F>(c));
+    cause |= cause_from_host(flags);
+    Bits rb = to_bits(r);
+    if (std::isnan(r)) {
+        rb = T::kDefaultNaN;
+    } else {
+        if (tiny(r, flags)) {
+            if (must_trap()) return fp_unimplemented();
+            cause |= kCauseU | kCauseI;
+            rb = flushed<F>((rb & T::kSign) != 0, rm);
+        }
+        if (negate) rb ^= T::kSign;
+    }
+    if (fp_commit(cause)) write(fd, rb);
+}
+
 u32 R4000::host_fp_control() {
 #if defined(SG_DIRECT_FENV) && defined(__x86_64__)
     return kHostFpBase;
@@ -520,5 +599,7 @@ u32 R4000::host_fp_control() {
 // Used by the pre-decoded COP1 handlers (r4000.cpp).
 template void R4000::fp_compute<float>(unsigned, unsigned, unsigned, unsigned);
 template void R4000::fp_compute<double>(unsigned, unsigned, unsigned, unsigned);
+template void R4000::fp_multiply_add<float>(unsigned, unsigned, unsigned, unsigned, unsigned);
+template void R4000::fp_multiply_add<double>(unsigned, unsigned, unsigned, unsigned, unsigned);
 
 }  // namespace sg::mips

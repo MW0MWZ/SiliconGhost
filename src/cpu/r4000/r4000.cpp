@@ -57,7 +57,11 @@ constexpr u32 kCauseWriteMask = 0x00000300u;  // IP1:IP0 (software interrupts)
 constexpr u32 kCauseBD = 0x80000000u;
 constexpr u32 kCauseIP7 = 1u << 15;
 constexpr u32 kConfigWriteMask = 0x3Fu;  // IB, DB, CU, K0
+constexpr u32 kConfigWriteMaskR4600 = 0x0Fu;  // CU, K0 (the line sizes are fixed)
 constexpr u32 kConfigNoScache = 1u << 17;
+constexpr u32 kConfigR5000SE = 1u << 12;     // secondary cache enable (writable)
+constexpr u32 kConfigR5000SS = 3u << 20;     // secondary cache size
+constexpr u32 kConfigWriteMaskR5000 = kConfigR5000SE | 0x7u;
 constexpr u32 kStatusCH = 1u << 18;
 
 constexpr u64 k32BitCompatBase = 0xFFFFFFFF80000000ull;
@@ -79,6 +83,11 @@ inline u64 f_zimm(u32 i) { return i & 0xFFFF; }
 
 R4000::R4000(Bus& bus, const Options& options)
     : bus_(bus), opts_(options), blocks_(1u << kBlockBits), jit_victims_(1u << kBlockBits) {
+    mips4_ = opts_.core == Core::R5000;
+    two_way_ = opts_.core != Core::R4000;
+    // FCR0: the R4000/R4400 FPU is implementation 5; the R4600's and R5000's
+    // carry the CPU's implementation and revision numbers.
+    fir_ = opts_.core == Core::R4000 ? 0x0500u : (opts_.prid & 0xFFFFu);
     bus_.set_code_write_handler([this](const u8* page) { invalidate_code_page(page); });
     bus_.set_remap_handler([this] { flush_fast_tlb(); });  // cached host pointers are stale
     set_jit(true);
@@ -174,7 +183,21 @@ void R4000::reset() {
 
     status_ = sr::BEV | sr::ERL;
     cause_ = 0;
-    config_ = opts_.scache_bytes ? (opts_.config & ~kConfigNoScache) : (opts_.config | kConfigNoScache);
+    switch (opts_.core) {
+        case Core::R4000:
+            config_ = opts_.scache_bytes ? (opts_.config & ~kConfigNoScache) : (opts_.config | kConfigNoScache);
+            break;
+        case Core::R4600:  // no secondary cache interface: an SC module's cache is the module's own
+            config_ = opts_.config | kConfigNoScache;
+            break;
+        case Core::R5000: {  // SC, and SS: 512 KiB, 1 MiB, 2 MiB or none; SE (enable) clear
+            const u32 ss = opts_.scache_bytes >= (2u << 20) ? 2 : opts_.scache_bytes >= (1u << 20) ? 1 : 0;
+            config_ = opts_.config & ~(kConfigNoScache | kConfigR5000SS | kConfigR5000SE);
+            config_ |= opts_.scache_bytes ? (ss << 20) : (kConfigNoScache | kConfigR5000SS);
+            break;
+        }
+    }
+    waiting_ = false;
     prid_ = opts_.prid;
     index_ = wired_ = compare_ = pagemask_ = count_offset_ = 0;
     watchlo_ = watchhi_ = ecc_ = cacheerr_ = taglo_ = taghi_ = lladdr_ = 0;
@@ -191,8 +214,10 @@ void R4000::reset() {
     const u32 dcache = 1u << (12 + ((config_ >> 6) & 7));
     itag_.assign(icache / 16, 0);
     dtag_.assign(dcache / 16, 0);
-    const u32 sline = 16u << ((config_ >> 22) & 3);
-    stag_.assign(opts_.scache_bytes / sline, 0);
+    ilru_.assign(two_way_ ? icache / 64 : 0, 0);
+    dlru_.assign(two_way_ ? dcache / 64 : 0, 0);
+    const u32 sline = opts_.core == Core::R5000 ? 32u : 16u << ((config_ >> 22) & 3);
+    stag_.assign(opts_.core == Core::R4600 ? 0 : opts_.scache_bytes / sline, 0);
     stag_stored_at_.assign(stag_.size(), kNeverStored);
 
     // The cycle counter is the machine's master clock and keeps running
@@ -213,6 +238,11 @@ void R4000::reset() {
 SG_FORCEINLINE void R4000::step_inline() {
     time_fp_ += weight_;
     if (SG_UNLIKELY(time_fp_ >= timer_event_fp_)) timer_fire();
+    if (SG_UNLIKELY(waiting_)) {  // in WAIT: time passes, nothing runs
+        idle_skipped_fp_ += weight_;
+        if (cause_ & status_ & sr::IM_MASK) waiting_ = false;
+        return;
+    }
 
     cur_pc_ = pc;
     in_delay_ = next_delay_;
@@ -249,11 +279,15 @@ void R4000::run_until(u64 cycle, const u64* deadline) {
     const u64* const limit = deadline ? deadline : &kNever;
     u64 n = 0;
     while (cycles() < cycle && cycles() < *limit) {
+        if (SG_UNLIKELY(waiting_)) {
+            wait_for_interrupt(std::min(cycle, *limit));
+            continue;
+        }
         if (SG_LIKELY(block_cache_)) run_block(cycle, limit);
         else step_inline();
         if (SG_UNLIKELY(idle_ready_)) {
             idle_ready_ = false;
-            skip_idle(std::min(cycle, *limit));
+            if (!waiting_) skip_idle(std::min(cycle, *limit));
         }
         if ((++n & 4095) == 0 && stop_.load(std::memory_order_relaxed)) break;
     }
@@ -283,8 +317,7 @@ bool is_branch(u32 w) {
         case 0x17: return true;
         case 0x10:
         case 0x11:
-        case 0x12:
-        case 0x13: return ((w >> 21) & 0x1F) == 0x08;  // BCz
+        case 0x12: return ((w >> 21) & 0x1F) == 0x08;  // BC0, BC1, BC2 (0x13 is COP1X on the R5000)
         default: return false;
     }
 }
@@ -605,6 +638,30 @@ void R4000::skip_idle(u64 limit_cycle) {
     time_fp_ += advance;
     for (LoopEntry& e : loops_) e.time_fp += advance;  // keep visit times consistent
     idle_skipped_fp_ += advance;
+}
+
+// WAIT (R4600, R5000): the pipeline stops until an interrupt is requested,
+// enabled or not. The pc is already past the WAIT, so an interrupt taken
+// then returns to the instruction after it.
+void R4000::execute_wait() {
+    touch();
+    if (cause_ & status_ & sr::IM_MASK) return;
+    waiting_ = true;
+    idle_ready_ = true;  // leave the block loops; run_until() does the waiting
+}
+
+// Time passes in WAIT up to `limit_cycle` or the Compare timer, whichever
+// comes first, as if idle-skipped.
+void R4000::wait_for_interrupt(u64 limit_cycle) {
+    if (!(cause_ & status_ & sr::IM_MASK)) {
+        const u64 target = std::min(limit_cycle << kCycleFracBits, timer_event_fp_);
+        if (target > time_fp_) {
+            idle_skipped_fp_ += target - time_fp_;
+            time_fp_ = target;
+        }
+        if (time_fp_ >= timer_event_fp_) timer_fire();
+    }
+    if (cause_ & status_ & sr::IM_MASK) waiting_ = false;
 }
 
 void R4000::set_int_line(unsigned line, bool asserted) {
@@ -1000,8 +1057,14 @@ void R4000::execute(u32 inst) {
         case 0x0F: r[rt] = sext32(zimm << 16); break;                                         // LUI
         case 0x10: execute_cop0(inst); break;
         case 0x11: execute_cop1(inst); break;
+        case 0x13:  // COP1X on the R5000, COP3 otherwise
+            if (mips4_) {
+                if (mips4_enabled()) execute_cop1x(inst);
+                else raise(Exc::RI);
+                return;
+            }
+            [[fallthrough]];
         case 0x12:  // COP2
-        case 0x13:  // COP3
         {
             const unsigned z = (inst >> 26) & 3;
             if (!(status_ & (sr::CU0 << z))) raise(Exc::CpU, false, false, z);
@@ -1205,6 +1268,10 @@ void R4000::execute(u32 inst) {
             break;
         }
 
+        case 0x33:  // PREF (MIPS IV): a hint, no exceptions
+            if (!mips4_enabled()) raise(Exc::RI);
+            return;
+
         // COP2 loads/stores: no COP2 on IP22
         case 0x32:
         case 0x36:
@@ -1238,6 +1305,26 @@ void R4000::execute_special(u32 inst) {
         }
         case 0x0C: raise(Exc::Sys); return;  // SYSCALL
         case 0x0D: raise(Exc::Bp); return;   // BREAK
+        case 0x01:  // MOVF, MOVT (MIPS IV): on an FPU condition code
+            if (!mips4_enabled()) {
+                raise(Exc::RI);
+                return;
+            }
+            touch();
+            if (!(status_ & sr::CU1)) {
+                raise(Exc::CpU, false, false, 1);
+                return;
+            }
+            if (((fcr31 & fcc_bit((inst >> 18) & 7)) != 0) == ((inst >> 16) & 1)) r[rd] = r[rs];
+            break;
+        case 0x0A:  // MOVZ (MIPS IV)
+        case 0x0B:  // MOVN
+            if (!mips4_enabled()) {
+                raise(Exc::RI);
+                return;
+            }
+            if ((r[rt] == 0) == ((inst & 1) == 0)) r[rd] = r[rs];
+            break;
         case 0x0F: break;                    // SYNC
         case 0x10: r[rd] = hi; break;        // MFHI
         case 0x11: hi = r[rs]; break;        // MTHI
@@ -1386,6 +1473,40 @@ void R4000::execute_special(u32 inst) {
             SG_REQUIRE_64BIT();
             r[rd] = static_cast<u64>(static_cast<s64>(r[rt]) >> (sa + 32));
             break;
+        default: raise(Exc::RI); return;
+    }
+}
+
+// COP1X (MIPS IV): the indexed FPU loads and stores here; multiply-add in fpu.cpp.
+void R4000::execute_cop1x(u32 inst) {
+    touch();  // FPU state is not part of the idle-loop comparison
+    if (!(status_ & sr::CU1)) {
+        raise(Exc::CpU, false, false, 1);
+        return;
+    }
+    const unsigned fr = (inst >> 21) & 31, ft = (inst >> 16) & 31, fs = (inst >> 11) & 31;
+    const unsigned fd = (inst >> 6) & 31, func = inst & 63;
+    const u64 va = effective_address(gpr[fr], gpr[ft]);  // base + index
+    switch (func) {
+        case 0x00: {  // LWXC1
+            u32 v;
+            if (load<u32>(va, v)) fpr_write32(fd, v);
+            return;
+        }
+        case 0x01: {  // LDXC1
+            u64 v;
+            if (load<u64>(va, v)) fpr_write64(fd, v);
+            return;
+        }
+        case 0x08: store<u32>(va, fpr_read32(fs)); return;  // SWXC1
+        case 0x09: store<u64>(va, fpr_read64(fs)); return;  // SDXC1
+        case 0x0F: return;                                  // PREFX: a hint
+        case 0x20: case 0x28: case 0x30: case 0x38:          // MADD, MSUB, NMADD, NMSUB .S
+            fp_multiply_add<float>(func, fr, ft, fs, fd);
+            return;
+        case 0x21: case 0x29: case 0x31: case 0x39:          // .D
+            fp_multiply_add<double>(func, fr, ft, fs, fd);
+            return;
         default: raise(Exc::RI); return;
     }
 }
@@ -1739,6 +1860,10 @@ void R4000::execute_cop0(u32 inst) {
                     case 0x02: tlb_write(index_ & 63); return;    // TLBWI
                     case 0x06: tlb_write(random()); return;       // TLBWR
                     case 0x08: tlb_probe(); return;               // TLBP
+                    case 0x20:                                    // WAIT (R4600, R5000)
+                        if (opts_.core == Core::R4000) break;
+                        execute_wait();
+                        return;
                     case 0x18:                                    // ERET
                         if (status_ & sr::ERL) {
                             set_pc(errorepc_);
@@ -1831,10 +1956,20 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         }
         case cop0::Cause: cause_ = (cause_ & ~kCauseWriteMask) | (v32 & kCauseWriteMask); break;
         case cop0::EPC: epc_ = v; break;
-        case cop0::Config: config_ = (config_ & ~kConfigWriteMask) | (v32 & kConfigWriteMask); break;
+        case cop0::Config: {
+            const u32 mask = opts_.core == Core::R4000   ? kConfigWriteMask
+                             : opts_.core == Core::R4600 ? kConfigWriteMaskR4600
+                                                         : kConfigWriteMaskR5000;
+            config_ = (config_ & ~mask) | (v32 & mask);
+            break;
+        }
         case cop0::LLAddr: lladdr_ = v32; break;
-        case cop0::WatchLo: watchlo_ = v32; break;
-        case cop0::WatchHi: watchhi_ = v32; break;
+        case cop0::WatchLo:  // the R4600 and R5000 have no watch registers
+            if (opts_.core == Core::R4000) watchlo_ = v32;
+            break;
+        case cop0::WatchHi:
+            if (opts_.core == Core::R4000) watchhi_ = v32;
+            break;
         case cop0::XContext: xcontext_ = (v & ~0x1FFFFFFFFull) | (xcontext_ & 0x1FFFFFFF0ull); break;
         case cop0::ECC: ecc_ = v32; break;
         case cop0::CacheErr: cacheerr_ = v32; break;
@@ -1942,6 +2077,7 @@ void R4000::execute_cache(u32 inst) {
     if (!translate<true>(vaddr, Access::Load, paddr)) return;
 
     const unsigned cache = op & 3, operation = op >> 2;
+    if (two_way_) return cache_op_2way(cache, operation, vaddr, paddr);
     if (cache >= 2 && stag_.empty()) return;  // no secondary cache: undefined, ignore
 
     // Primary caches are virtually indexed, the secondary physically.
@@ -2011,6 +2147,86 @@ void R4000::execute_cache(u32 inst) {
             if (secondary && hit) *tag = (*tag & ~0x380u) | static_cast<u32>(((vaddr >> 12) & 7) << 7);
             if (secondary) set_ch(hit);
             break;
+    }
+}
+
+// The R4600 and R5000: 2-way primary caches (the way an Index operation
+// works on is the address bit above a way's size, so the tag array is laid
+// out as way 0 then way 1), and on the R5000 a direct-mapped secondary cache
+// of 32-byte lines whose Index Store Tag takes the tag from the address.
+void R4000::cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 paddr) {
+    if (cache == 3) {
+        if (opts_.core != Core::R5000 || stag_.empty()) return;  // none: undefined, ignore
+        constexpr u32 kLine = 32, kValid = 1u << 12;              // SState 4
+        auto stag_of = [](u64 pa) { return static_cast<u32>(((pa >> 19) & 0x1FFFF) << 15); };
+        const std::size_t lines = stag_.size();
+        const std::size_t index = (paddr / kLine) % lines;
+        switch (operation) {
+            case 0: std::fill(stag_.begin(), stag_.end(), 0); break;  // Flash Invalidate
+            case 1:  // Index Load Tag
+                // As on the R4000: a line not written through Index Store Tag
+                // recently is reported as holding the probed address, as a
+                // cached access would have left it (size probes rely on it).
+                if (!stag_[index] && (stag_stored_at_[index] == kNeverStored ||
+                                      cycles() - stag_stored_at_[index] > kScacheTagWindow))
+                    taglo_ = stag_of(paddr) | kValid;
+                else
+                    taglo_ = stag_[index];
+                taghi_ = 0;
+                ecc_ = 0;
+                break;
+            case 2:  // Index Store Tag: the tag from the address, the state from TagLo (invalid reads as zero)
+                stag_[index] = (taglo_ & kValid) ? stag_of(paddr) | kValid : 0;
+                stag_stored_at_[index] = cycles();
+                break;
+            case 5: {                                                          // Page Invalidate
+                const u64 page = paddr & ~u64{0xFFF};
+                for (u64 a = page; a < page + 0x1000; a += kLine) stag_[(a / kLine) % lines] = 0;
+                break;
+            }
+            default: break;
+        }
+        return;
+    }
+    if (cache == 2) return;  // reserved
+
+    const bool icache = cache == 0;
+    const u32 line = icache ? 16u << ((config_ >> 5) & 1) : 16u << ((config_ >> 4) & 1);
+    const u32 size = 1u << (12 + ((config_ >> (icache ? 9 : 6)) & 7));
+    std::vector<u32>& tags = icache ? itag_ : dtag_;
+    std::vector<u8>& lru = icache ? ilru_ : dlru_;
+    const u32 sets = size / 2 / line;
+    const u32 set = static_cast<u32>((vaddr & (size / 2 - 1)) / line);
+    u32* const way[2] = {&tags[set], &tags[sets + set]};
+    u32* const indexed = &tags[(vaddr & (size - 1)) / line];
+    int hit_way = -1;
+    for (int w = 0; w < 2; ++w)
+        if (primary_hit(*way[w], paddr)) hit_way = w;
+    auto allocate = [&](u32 state) {  // the way holding the line, else the one to replace
+        const int w = hit_way >= 0 ? hit_way : lru[set];
+        *way[w] = primary_tag(paddr, state);
+        lru[set] = static_cast<u8>(w ^ 1);
+    };
+    switch (operation) {
+        case 0: *indexed &= ~kPStateMask; break;  // Index Invalidate / Index Writeback Invalidate
+        case 1:                                   // Index Load Tag
+            taglo_ = *indexed;
+            taghi_ = 0;
+            ecc_ = 0;
+            break;
+        case 2: *indexed = taglo_ & 0xFFFFFFC0u; break;  // Index Store Tag
+        case 3:                                          // Create Dirty Exclusive (D)
+            if (!icache) allocate(3);
+            break;
+        case 4:  // Hit Invalidate
+            if (hit_way >= 0) *way[hit_way] &= ~kPStateMask;
+            break;
+        case 5:  // Fill (I), Hit Writeback Invalidate (D)
+            if (icache) allocate(2);
+            else if (hit_way >= 0) *way[hit_way] &= ~kPStateMask;
+            break;
+        case 6: break;  // Hit Writeback: data is never held, nothing to write
+        default: break;
     }
 }
 

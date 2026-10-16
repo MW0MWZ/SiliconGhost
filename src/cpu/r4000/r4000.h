@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
-// MIPS R4000/R4400 CPU - reference interpreter.
+// MIPS R4000/R4400, R4600 and R5000 CPUs - reference interpreter.
 //
 // This interpreter is the correctness baseline for the whole project: the
 // future JIT is validated against it instruction-for-instruction. It favours
@@ -80,6 +80,7 @@ constexpr u32 CU0 = 1u << 28;
 constexpr u32 CU1 = 1u << 29;
 constexpr u32 CU2 = 1u << 30;
 constexpr u32 CU3 = 1u << 31;
+constexpr u32 XX = CU3;  // R5000: MIPS IV instructions in user mode
 }  // namespace sr
 
 enum class Exc : u32 {
@@ -103,6 +104,14 @@ enum class Exc : u32 {
     VCED = 31,
 };
 
+// The processor implementations the core can present. They share the
+// pipeline model and differ in instruction set, CP0 details and caches.
+enum class Core : u8 {
+    R4000,  // R4000 / R4400: MIPS III, direct-mapped primary caches, on-chip secondary cache control
+    R4600,  // MIPS III, 2-way 16 KiB primary caches, no secondary cache interface, WAIT
+    R5000,  // MIPS IV, 2-way 32 KiB primary caches, its own secondary cache interface, WAIT
+};
+
 struct TlbEntry {
     u64 mask = 0;  // PageMask bits 24:13
     u64 hi = 0;    // R | VPN2 | ASID
@@ -121,10 +130,18 @@ public:
     static constexpr u32 kDefaultConfig = 0x10C084A3u;
 
     struct Options {
+        Core core = Core::R4000;
         u32 prid = 0x00000450;          // R4400 rev 5.0 (150 MHz Indy)
         u32 config = kDefaultConfig;
         u32 scache_bytes = 1u << 20;    // 0 = no secondary cache (R4x00PC)
     };
+    // Config at reset for the R4600 and R5000 (Indy modules): 32-byte
+    // primary lines, parity, sub-block ordering, big-endian, SysClock =
+    // PClock/3. The R4600 has no secondary cache interface (SC is always
+    // set: an Indy R4600SC's cache is driven by the module); the R5000's SC
+    // and SS fields are derived from scache_bytes.
+    static constexpr u32 kR4600Config = 0x1002E4B3u;
+    static constexpr u32 kR5000Config = 0x1041E6F3u;
 
     explicit R4000(Bus& bus) : R4000(bus, Options{}) {}
     R4000(Bus& bus, const Options& options);
@@ -150,6 +167,7 @@ public:
         next_delay_ = false;
     }
 
+    Core core() const { return opts_.core; }
     // COP0 access with DMFC0/DMTC0 semantics (masks applied, side effects included).
     u64 cp0_read(unsigned reg) const;
     void cp0_write(unsigned reg, u64 value);
@@ -325,12 +343,24 @@ private:
     void execute_regimm(u32 inst);
     void execute_cop0(u32 inst);
     void execute_cop1(u32 inst);
+    void execute_cop1x(u32 inst);  // MIPS IV indexed FPU loads and stores, multiply-add
     void execute_cache(u32 inst);
+    void cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 paddr);
+    void execute_wait();
+    void wait_for_interrupt(u64 limit_cycle);
+    // MIPS IV instructions: on an R5000, in kernel mode or with Status.XX.
+    bool mips4_enabled() const {
+        return mips4_ && (mode_ == kKernel || mode_ == kKernelErl || (status_ & sr::XX));
+    }
+    // FPU condition code n (MIPS IV has eight; the R4000 only code 0): its FCR31 bit.
+    static u32 fcc_bit(unsigned n) { return n ? 1u << (24 + n) : 1u << 23; }
 
     // FPU (fpu.cpp)
     template <typename F>
     void fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd);
     void fp_convert_from_int(unsigned fmt, unsigned func, unsigned fs, unsigned fd);
+    template <typename F>
+    void fp_multiply_add(unsigned func, unsigned fr, unsigned ft, unsigned fs, unsigned fd);  // COP1X
     bool fp_commit(u32 cause);  // updates FCR31; false if an FPE was raised
     void fp_unimplemented();
     void fp_check_ctc1_trap();
@@ -423,6 +453,10 @@ private:
 
     Bus& bus_;
     Options opts_;
+    bool mips4_ = false;   // the R5000's MIPS IV instructions
+    bool two_way_ = false;  // 2-way set-associative primary caches (R4600, R5000)
+    u32 fir_ = 0;          // FCR0
+    bool waiting_ = false;  // stalled in WAIT until an interrupt is requested
     bool block_cache_ = true;
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
@@ -550,6 +584,7 @@ private:
     // Cache tag arrays (no data is cached; tags exist for CACHE-instruction
     // diagnostics and size probing).
     std::vector<u32> itag_, dtag_, stag_;
+    std::vector<u8> ilru_, dlru_;  // 2-way caches: the way to replace next in each set
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
 
     // Separate tables for fetch, load and store (indexed by Access), so code

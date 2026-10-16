@@ -196,6 +196,7 @@ if(SG_BUILD_TESTS)
   add_executable(sg_tests
     tests/test_main.cpp
     tests/cpu_tests.cpp
+    tests/cpu_model_tests.cpp
     tests/misc_tests.cpp
     tests/device_tests.cpp
     tests/fpu_cache_tests.cpp

@@ -80,7 +80,7 @@ constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd
 constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kSettingsFilters[] = {{"Settings", "ini;conf;cfg"}, {"All files", "*"}};
 
-constexpr std::array<double, 6> kClockPresets = {100, 133, 150, 175, 200, 250};
+constexpr std::array<double, 7> kClockPresets = {100, 133, 150, 175, 180, 200, 250};
 constexpr std::array<u64, 7> kDiskSizesMiB = {512, 1024, 2048, 4096, 8192, 16384, 32768};
 
 // An activity light: lit for a moment whenever its counter moves.
@@ -1138,7 +1138,10 @@ void Gui::draw_settings() {
             const CpuModel* current = find_cpu_model(edit_.cpu);
             if (ImGui::BeginCombo("##cpu", current ? current->label : edit_.cpu.c_str())) {
                 for (const auto& model : cpu_models())
-                    if (ImGui::Selectable(model.label, edit_.cpu == model.id)) edit_.cpu = model.id;
+                    if (ImGui::Selectable(model.label, edit_.cpu == model.id) && edit_.cpu != model.id) {
+                        edit_.cpu = model.id;
+                        edit_.cpu_mhz = model.mhz;
+                    }
                 ImGui::EndCombo();
             }
             label("Clock (MHz)");
