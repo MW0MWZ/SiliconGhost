@@ -88,7 +88,11 @@ bool R4000::jit_compile(Block& b) {
     b.jit_addr64 = addr64;
 
     // Guest register cache (as on x86-64).
-    const JitPlan plan = jit_plan(b);
+    // The region (see jit_x64.cpp).
+    std::vector<Block> members;
+    std::vector<const Block*> rb;
+    jit_region(b, members, rb);
+    const JitPlan plan = jit_plan(rb);
     Reg host_of[32] = {};
     for (unsigned g = 1; g < 32; ++g)
         if (plan.slot[g] >= 0) host_of[g] = kCacheRegs[plan.slot[g]];
@@ -108,12 +112,13 @@ bool R4000::jit_compile(Block& b) {
     std::vector<FpKey> fp_keys;
     {
         std::vector<FpKey> all;
-        for (u32 i = 0; i < b.count; ++i) {
-            if (i > 0 && is_branch_word(b.ops[i - 1].inst) && is_branch_word(b.ops[i].inst)) continue;
-            jit_fp_uses(b.ops[i].inst, [&](unsigned n, bool dbl, bool write_access) {
-                all.push_back({fp_storage(n, dbl), dbl ? 8u : 4u, 1, write_access});
-            });
-        }
+        for (const Block* rbk : rb)
+            for (u32 i = 0; i < rbk->count; ++i) {
+                if (i > 0 && is_branch_word(rbk->ops[i - 1].inst) && is_branch_word(rbk->ops[i].inst)) continue;
+                jit_fp_uses(rbk->ops[i].inst, [&](unsigned n, bool dbl, bool write_access) {
+                    all.push_back({fp_storage(n, dbl), dbl ? 8u : 4u, 1, write_access});
+                });
+            }
         for (const FpKey& a : all) {
             bool clash = false, seen = false;
             for (const FpKey& o : all)
@@ -139,7 +144,12 @@ bool R4000::jit_compile(Block& b) {
         alloc |= fp_bit(k);
         if (fp_keys[k].written) written |= fp_bit(k);
     }
-    const bool self_loop = plan.self_loop;
+    bool region_mode = rb.size() > 1;  // registers held across the region's blocks
+    {
+        std::vector<u32> next;
+        jit_successors(b, next);
+        for (u32 off : next) region_mode |= off == b.offset;
+    }
     u64 loaded = 0, dirty = 0;
     auto cached = [&](unsigned g) { return ((alloc >> g) & 1) != 0; };
     auto ensure = [&](unsigned g) {
@@ -245,7 +255,7 @@ bool R4000::jit_compile(Block& b) {
         loaded |= fp_bit(k);
         dirty |= fp_bit(k);
     };
-    if (self_loop) {
+    if (region_mode) {
         restore(alloc);
         loaded = alloc;
         dirty = written;
@@ -273,7 +283,7 @@ bool R4000::jit_compile(Block& b) {
     };
     auto call_handler = [&](const Op& op) {
         e.mov(x0, kCpu);
-        e.load_constant(x1, reinterpret_cast<u64>(&op));
+        e.load_constant(x1, reinterpret_cast<u64>(jit_op(b, op)));
         call(reinterpret_cast<const void*>(op.fn));
     };
 
@@ -1047,13 +1057,16 @@ bool R4000::jit_compile(Block& b) {
         }
     };
 
+    const Block* cur = &b;  // the block of the region being emitted
+    std::size_t cur_k = 0;
     struct Exit {
         Site site;
         u32 completed;
         u64 flush;
+        std::size_t k;  // in rb[k]
     };
     std::vector<Exit> exits;
-    auto exit_if = [&](Site s, u32 completed, u64 mask) { exits.push_back({s, completed, mask}); };
+    auto exit_if = [&](Site s, u32 completed, u64 mask) { exits.push_back({s, completed, mask, cur_k}); };
     // Leave when run_block() would after ops[i] (see jit_x64.cpp).
     auto exit_checks = [&](u32 i) {
         e.ldr(x0, kCpu, o_io, 1);
@@ -1075,7 +1088,7 @@ bool R4000::jit_compile(Block& b) {
         e.str(xzr, kCpu, o_next_delay, 1);
     };
 
-    const u32 page_offset = b.offset;
+    u32 page_offset = b.offset;  // of the block being emitted
     const u8* const page_host = b.host - page_offset;
     std::vector<s64> successors;
     auto add_successor = [&](s64 delta) {
@@ -1125,7 +1138,7 @@ bool R4000::jit_compile(Block& b) {
             pc_plus(x0, 4 * i);
             e.str(x0, kCpu, o_pc);
             set_time(i);
-            exits.push_back({e.b(), i, dirty});
+            exits.push_back({e.b(), i, dirty, cur_k});
             e.bind(usable);
             e.ldr(x0, kCpu, offset_of(this, &change_epoch_));  // touch()
             e.add_imm(x0, x0, 1);
@@ -1216,7 +1229,7 @@ bool R4000::jit_compile(Block& b) {
                 e.add_imm(x0, x0, 4);
                 e.str(x0, kCpu, o_npc);
                 set_time(i + 1);
-                exits.push_back({e.b(), i + 1, dirty});
+                exits.push_back({e.b(), i + 1, dirty, cur_k});
             } else {
                 pc_plus(x0, 4 * i + 8);
                 e.str(x0, kCpu, o_npc);
@@ -1226,180 +1239,221 @@ bool R4000::jit_compile(Block& b) {
         }
         return true;
     };
-    for (u32 i = 0; i < b.count; ++i) {
-        const Op& op = b.ops[i];
-        const u32 w = op.inst;
-        const bool delay_slot = i > 0 && is_branch_word(b.ops[i - 1].inst);
-        bool plain;
-        decode(w, plain);
+    // Each block of the region in turn (see jit_x64.cpp).
+    std::vector<std::size_t> label(rb.size(), 0);
+    std::vector<std::vector<Site>> to_label(rb.size()), to_tail(rb.size());
+    for (std::size_t k = 0; k < rb.size(); ++k) {
+        cur = rb[k], cur_k = k, page_offset = cur->offset;
+        const Block& blk = *cur;
+        label[k] = k == 0 ? body : e.size();
+        for (const Site& site : to_label[k]) e.bind(site);
+        if (k > 0) loaded = alloc, dirty = written;
+        successors.clear();
+        synced = true;
+        bool last_handler = false;
+        for (u32 i = 0; i < blk.count; ++i) {
+            const Op& op = blk.ops[i];
+            const u32 w = op.inst;
+            const bool delay_slot = i > 0 && is_branch_word(blk.ops[i - 1].inst);
+            bool plain;
+            decode(w, plain);
+            last_handler = false;
 
-        if (plain) {
-            emit_plain(op);
-            if (delay_slot) leave_delay_slot();
-            synced = delay_slot;
-        } else if (!delay_slot && emit_branch(op, i)) {
-            synced = true;
-        } else {
-            std::vector<Site> slow;
-            Site skip_slow;
-            const u64 dirty_before = dirty;
-            const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
-            const u64 loaded_after = loaded;
-            if (fast) {
+            if (plain) {
+                emit_plain(op);
                 if (delay_slot) leave_delay_slot();
-                skip_slow = e.b();
-                for (const Site& s : slow) e.bind(s);
-            }
+                synced = delay_slot;
+            } else if (!delay_slot && emit_branch(op, i)) {
+                synced = true;
+            } else {
+                std::vector<Site> slow;
+                Site skip_slow;
+                const u64 dirty_before = dirty;
+                const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
+                const u64 loaded_after = loaded;
+                if (fast) {
+                    if (delay_slot) leave_delay_slot();
+                    skip_slow = e.b();
+                    for (const Site& site : slow) e.bind(site);
+                }
 
-            flush(fast ? dirty_before : dirty);
-            set_time(i + 1);
-            pc_plus(x0, 4 * i);
-            e.str(x0, kCpu, o_cur_pc);
-            if (delay_slot) {
-                store_byte_imm(o_in_delay, 1);
-                e.str(xzr, kCpu, o_next_delay, 1);
-                e.ldr(x0, kCpu, o_npc);
-                e.str(x0, kCpu, o_pc);
-                e.add_imm(x0, x0, 4);
-                e.str(x0, kCpu, o_npc);
-            } else {
-                e.str(xzr, kCpu, o_in_delay, 1);  // next_delay_ is already clear
-                pc_plus(x0, 4 * i + 4);
-                e.str(x0, kCpu, o_pc);
-                e.add_imm(x0, x0, 4);
-                e.str(x0, kCpu, o_npc);
+                flush(fast ? dirty_before : dirty);
+                set_time(i + 1);
+                pc_plus(x0, 4 * i);
+                e.str(x0, kCpu, o_cur_pc);
+                if (delay_slot) {
+                    store_byte_imm(o_in_delay, 1);
+                    e.str(xzr, kCpu, o_next_delay, 1);
+                    e.ldr(x0, kCpu, o_npc);
+                    e.str(x0, kCpu, o_pc);
+                    e.add_imm(x0, x0, 4);
+                    e.str(x0, kCpu, o_npc);
+                } else {
+                    e.str(xzr, kCpu, o_in_delay, 1);  // next_delay_ is already clear
+                    pc_plus(x0, 4 * i + 4);
+                    e.str(x0, kCpu, o_pc);
+                    e.add_imm(x0, x0, 4);
+                    e.str(x0, kCpu, o_npc);
+                }
+                e.str(xzr, kCpu, o_io, 1);
+                call_handler(op);
+                e.str(xzr, kCpu, gpr_off(0));
+                if (i + 1 < blk.count || fast) exit_checks(i);
+                if (fast) {
+                    restore(loaded_after);
+                    e.bind(skip_slow);
+                } else {
+                    loaded = dirty = 0;
+                    last_handler = true;
+                }
+                synced = !fast || delay_slot;
             }
-            e.str(xzr, kCpu, o_io, 1);
-            call_handler(op);
-            e.str(xzr, kCpu, gpr_off(0));
-            if (i + 1 < b.count || fast) exit_checks(i);
-            if (fast) {
-                restore(loaded_after);
-                e.bind(skip_slow);
-            } else {
-                loaded = dirty = 0;
-            }
-            synced = !fast || delay_slot;
         }
-    }
-    if (!synced) {
-        pc_plus(x0, 4 * b.count);
-        e.str(x0, kCpu, o_pc);
-        e.add_imm(x0, x0, 4);
-        e.str(x0, kCpu, o_npc);
-    }
-    if (!is_branch_word(b.ops[b.count - 1].inst)) add_successor(4 * static_cast<s64>(b.count));
-    std::sort(successors.begin(), successors.end());
-    successors.erase(std::unique(successors.begin(), successors.end()), successors.end());
+        if (!synced) {
+            pc_plus(x0, 4 * blk.count);
+            e.str(x0, kCpu, o_pc);
+            e.add_imm(x0, x0, 4);
+            e.str(x0, kCpu, o_npc);
+        }
+        if (!is_branch_word(blk.ops[blk.count - 1].inst)) add_successor(4 * static_cast<s64>(blk.count));
+        std::sort(successors.begin(), successors.end());
+        successors.erase(std::unique(successors.begin(), successors.end()), successors.end());
 
-    // Block linking (see jit_x64.cpp). x0: the next pc, x2: its entry time.
-    std::vector<Site> to_finish_dirty, to_finish;
-    e.ldr(x0, kCpu, o_io, 1);
-    e.ldr(x1, kCpu, o_invalidated, 1);
-    e.orr(x0, x0, x1, false);
-    e.ldr(x1, kCpu, o_idle_ready, 1);
-    e.orr(x0, x0, x1, false);
-    e.ldr(x1, kCpu, o_next_delay, 1);
-    e.orr(x0, x0, x1, false);
-    to_finish_dirty.push_back(e.cbnz(x0, false));
-    e.ldr(x0, kCpu, o_mode, 4);
-    e.cmp(x0, kEntryMode, false);
-    to_finish_dirty.push_back(e.b(Cond::Ne));
-    e.ldr(x3, kCpu, o_weight);
-    e.mov_imm(kScratch0, b.count);
-    e.madd(x2, x3, kScratch0, kTime);  // entry time of the next block
-    e.ldr(x0, kCpu, o_pc);
-    if (self_loop) {
-        e.cmp(x0, kPc);
-        const Site other = e.b(Cond::Ne);
-        e.mov_imm(kScratch0, b.count - 1);
-        e.madd(x1, x3, kScratch0, x2);
-        e.ldr(kScratch0, kCpu, o_safe);
-        e.cmp(x1, kScratch0);
-        to_finish_dirty.push_back(e.b(Cond::Hs));
-        restore(alloc & ~loaded);
-        e.mov(kTime, x2);
-        e.b_to(body);
-        e.bind(other);
-    }
-    const u64 dirty_end = dirty;
-    flush(dirty_end);
-    // Enters the translation of the block at `block` for pc x0 if it fits.
-    // (x5 is its own scratch: `block` may be any of x1, x3.)
-    auto enter = [&](Reg block) {
-        e.ldr(x4, block, offsetof(Block, code));
-        to_finish.push_back(e.cbz(x4));
-        e.ldr(x5, block, offsetof(Block, jit_addr64), 1);
-        to_finish.push_back(addr64 ? e.cbz(x5, false) : e.cbnz(x5, false));
-        e.ldr(x5, block, offsetof(Block, count), 4);
-        e.sub_imm(x5, x5, 1, false);
-        e.ldr(kScratch0, kCpu, o_weight);
-        e.madd(x5, x5, kScratch0, x2);
-        e.ldr(kScratch0, kCpu, o_safe);
-        e.cmp(x5, kScratch0);
-        to_finish.push_back(e.b(Cond::Hs));
-        e.mov(kTime, x2);
-        e.mov(kPc, x0);
-        e.add_imm(x4, x4, static_cast<s64>(top));
-        e.br(x4);
-    };
-    for (s64 delta : successors) {
-        if (delta == 0 && self_loop) continue;
-        pc_plus(x1, delta);
-        e.cmp(x0, x1);
-        const Site next = e.b(Cond::Ne);
-        const u8* const host = page_host + static_cast<u32>(static_cast<s64>(page_offset) + delta);
-        e.load_constant(x3, reinterpret_cast<u64>(&blocks_[block_index(host)]));
-        e.load_constant(x1, reinterpret_cast<u64>(host));
-        e.ldr(kScratch0, x3, offsetof(Block, host));
+        // Block linking (see jit_x64.cpp). x0: the next pc, x2: its entry time.
+        std::vector<Site> to_finish_dirty, to_finish;
+        auto flag_checks = [&] {
+            e.ldr(x0, kCpu, o_io, 1);
+            e.ldr(x1, kCpu, o_invalidated, 1);
+            e.orr(x0, x0, x1, false);
+            e.ldr(x1, kCpu, o_idle_ready, 1);
+            e.orr(x0, x0, x1, false);
+            e.ldr(x1, kCpu, o_next_delay, 1);
+            e.orr(x0, x0, x1, false);
+            to_finish_dirty.push_back(e.cbnz(x0, false));
+            e.ldr(x0, kCpu, o_mode, 4);
+            e.cmp(x0, kEntryMode, false);
+            to_finish_dirty.push_back(e.b(Cond::Ne));
+        };
+        if (last_handler) flag_checks();
+        e.ldr(x3, kCpu, o_weight);
+        e.mov_imm(kScratch0, blk.count);
+        e.madd(x2, x3, kScratch0, kTime);  // entry time of the next block
+        e.ldr(x0, kCpu, o_pc);
+        std::vector<s64> outside;
+        for (s64 delta : successors) {
+            std::size_t to = rb.size();
+            for (std::size_t j = 0; j < rb.size(); ++j)
+                if (static_cast<s64>(rb[j]->offset) == static_cast<s64>(page_offset) + delta) to = j;
+            if (to == rb.size() || !region_mode) {
+                outside.push_back(delta);
+                continue;
+            }
+            pc_plus(x1, delta);
+            e.cmp(x0, x1);
+            const Site other = e.b(Cond::Ne);
+            e.mov_imm(kScratch0, rb[to]->count - 1);
+            e.madd(x1, x3, kScratch0, x2);
+            e.ldr(kScratch0, kCpu, o_safe);
+            e.cmp(x1, kScratch0);
+            to_finish_dirty.push_back(e.b(Cond::Hs));
+            restore(alloc & ~loaded);
+            e.mov(kTime, x2);
+            if (delta) e.add_imm(kPc, kPc, delta);
+            if (to <= k) e.b_to(label[to]);
+            else to_label[to].push_back(e.b());
+            e.bind(other);
+        }
+        if (!last_handler) {
+            flag_checks();
+            e.ldr(x0, kCpu, o_pc);
+        }
+        const u64 dirty_end = dirty;
+        flush(dirty_end);
+        // Enters the translation of the block at `block` for pc x0 if it fits.
+        // (x5 is its own scratch: `block` may be any of x1, x3.)
+        auto enter = [&](Reg block) {
+            e.ldr(x4, block, offsetof(Block, code));
+            to_finish.push_back(e.cbz(x4));
+            e.ldr(x5, block, offsetof(Block, jit_addr64), 1);
+            to_finish.push_back(addr64 ? e.cbz(x5, false) : e.cbnz(x5, false));
+            e.ldr(x5, block, offsetof(Block, count), 4);
+            e.sub_imm(x5, x5, 1, false);
+            e.ldr(kScratch0, kCpu, o_weight);
+            e.madd(x5, x5, kScratch0, x2);
+            e.ldr(kScratch0, kCpu, o_safe);
+            e.cmp(x5, kScratch0);
+            to_finish.push_back(e.b(Cond::Hs));
+            e.mov(kTime, x2);
+            e.mov(kPc, x0);
+            e.add_imm(x4, x4, static_cast<s64>(top));
+            e.br(x4);
+        };
+        for (s64 delta : outside) {
+            pc_plus(x1, delta);
+            e.cmp(x0, x1);
+            const Site next = e.b(Cond::Ne);
+            const u8* const host = page_host + static_cast<u32>(static_cast<s64>(page_offset) + delta);
+            e.load_constant(x3, reinterpret_cast<u64>(&blocks_[block_index(host)]));
+            e.load_constant(x1, reinterpret_cast<u64>(host));
+            e.ldr(kScratch0, x3, offsetof(Block, host));
+            e.cmp(x1, kScratch0);
+            to_finish.push_back(e.b(Cond::Ne));
+            enter(x3);
+            e.bind(next);
+        }
+        // Anywhere else: look up the fetch translation and the block.
+        e.tst_imm(x0, 3);
+        to_finish.push_back(e.b(Cond::Ne));
+        e.lsr(x1, x0, 12);
+        e.ubfiz(x3, x1, 5, 10);
+        e.ldr(kScratch0, kCpu, o_asid_tag);
+        e.orr(x1, x1, kScratch0);
+        e.add(x3, x3, kTlb);
+        e.sub_imm(x3, x3, kTableBytes);  // the fetch table precedes the load table
+        e.ldr(kScratch0, x3, offsetof(FastEntry, tag));
         e.cmp(x1, kScratch0);
         to_finish.push_back(e.b(Cond::Ne));
-        enter(x3);
-        e.bind(next);
-    }
-    // Anywhere else: look up the fetch translation and the block.
-    e.tst_imm(x0, 3);
-    to_finish.push_back(e.b(Cond::Ne));
-    e.lsr(x1, x0, 12);
-    e.ubfiz(x3, x1, 5, 10);
-    e.ldr(kScratch0, kCpu, o_asid_tag);
-    e.orr(x1, x1, kScratch0);
-    e.add(x3, x3, kTlb);
-    e.sub_imm(x3, x3, kTableBytes);  // the fetch table precedes the load table
-    e.ldr(kScratch0, x3, offsetof(FastEntry, tag));
-    e.cmp(x1, kScratch0);
-    to_finish.push_back(e.b(Cond::Ne));
-    e.ldr(x3, x3, offsetof(FastEntry, host));
-    to_finish.push_back(e.cbz(x3));
-    e.and_imm(x1, x0, 0xFFF);
-    e.add(x3, x3, x1);  // host address of the instruction
-    e.lsr(x1, x3, 2);
-    e.and_imm(x1, x1, (1u << kBlockBits) - 1);
-    e.mov_imm(kScratch0, sizeof(Block));
-    e.load_constant(x4, reinterpret_cast<u64>(blocks_.data()));
-    e.madd(x1, x1, kScratch0, x4);
-    e.ldr(kScratch0, x1, offsetof(Block, host));
-    e.cmp(x3, kScratch0);
-    to_finish.push_back(e.b(Cond::Ne));
-    enter(x1);
+        e.ldr(x3, x3, offsetof(FastEntry, host));
+        to_finish.push_back(e.cbz(x3));
+        e.and_imm(x1, x0, 0xFFF);
+        e.add(x3, x3, x1);  // host address of the instruction
+        e.lsr(x1, x3, 2);
+        e.and_imm(x1, x1, (1u << kBlockBits) - 1);
+        e.mov_imm(kScratch0, sizeof(Block));
+        e.load_constant(x4, reinterpret_cast<u64>(blocks_.data()));
+        e.madd(x1, x1, kScratch0, x4);
+        e.ldr(kScratch0, x1, offsetof(Block, host));
+        e.cmp(x3, kScratch0);
+        to_finish.push_back(e.b(Cond::Ne));
+        enter(x1);
 
-    // Completed the block.
-    for (const Site& s : to_finish_dirty) e.bind(s);
-    flush(dirty_end);
-    for (const Site& s : to_finish) e.bind(s);
-    set_time(b.count);
-    e.mov_imm32(x0, b.count);
-    std::vector<Site> to_epilogue{e.b()};
+        // Completed the block.
+        for (const Site& site : to_finish_dirty) e.bind(site);
+        flush(dirty_end);
+        for (const Site& site : to_finish) e.bind(site);
+        set_time(blk.count);
+        e.mov_imm32(x0, blk.count);
+        to_tail[k].push_back(e.b());
+    }
     for (const Exit& x : exits) {
         e.bind(x.site);
         flush(x.flush);
         e.mov_imm32(x0, x.completed);
+        to_tail[x.k].push_back(e.b());
+    }
+    // Tell run_block() which block (its slot, and the block that belongs
+    // there) and entry pc the count belongs to.
+    std::vector<Site> to_epilogue;
+    for (std::size_t k = 0; k < rb.size(); ++k) {
+        if (to_tail[k].empty()) continue;
+        for (const Site& site : to_tail[k]) e.bind(site);
+        e.load_constant(kScratch0, reinterpret_cast<u64>(&blocks_[block_index(rb[k]->host)]));
+        e.str(kScratch0, kCpu, offset_of(this, &jit_block_));
+        e.load_constant(kScratch0, reinterpret_cast<u64>(rb[k]->host));
+        e.str(kScratch0, kCpu, offset_of(this, &jit_block_host_));
         to_epilogue.push_back(e.b());
     }
-    for (const Site& s : to_epilogue) e.bind(s);
-    // Tell run_block() which block (and entry pc) the count belongs to.
-    e.load_constant(kScratch0, reinterpret_cast<u64>(&b));
-    e.str(kScratch0, kCpu, offset_of(this, &jit_block_));
+    for (const Site& site : to_epilogue) e.bind(site);
     e.str(kPc, kCpu, offset_of(this, &jit_entry_pc_));
     e.ldp(x23, x24, sp, 48);
     e.ldp(x21, x22, sp, 32);
@@ -1411,6 +1465,13 @@ bool R4000::jit_compile(Block& b) {
     const void* fn = jit_buf_->add(e.code().data(), e.size());
     if (!fn) return false;
     b.code = reinterpret_cast<JitFn>(const_cast<void*>(fn));
+    b.jit_region = rb.size() > 1;
+    b.region = JitRegion{};
+    for (std::size_t k = 1; k < rb.size(); ++k) {
+        b.region.offset[b.region.n] = static_cast<u16>(rb[k]->offset);
+        b.region.count[b.region.n++] = static_cast<u8>(rb[k]->count);
+    }
+    b.region.hash = jit_region_hash(page_host, b.region);
     return true;
 }
 

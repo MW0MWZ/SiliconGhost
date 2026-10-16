@@ -926,7 +926,10 @@ TEST(cpu_jit_fpu_cause_matches_interpreter) {
     // f0..f7: doubles 3, 4, 1/3, 2, 16777217, 2^-1000; f8..f13 singles 3, 4, 1/3, 2, 9
     const std::vector<u64> values = {dbits(3.0), dbits(4.0), dbits(1.0 / 3), dbits(2.0), dbits(16777217.0),
                                      dbits(std::ldexp(1.0, -1000)), dbits(2.5), dbits(0.1), fbits(3.0f),
-                                     fbits(4.0f), fbits(1.0f / 3), fbits(2.0f), fbits(9.0f), fbits(0.1f)};
+                                     fbits(4.0f), fbits(1.0f / 3), fbits(2.0f), fbits(9.0f), fbits(0.1f),
+                                     // f14..f19: products of long operands that are exact, or just not
+                                     dbits(67108865.0), dbits(4503599761588225.0), dbits(134217729.0),
+                                     fbits(2049.0f), fbits(4097.0f), fbits(4198401.0f)};
     std::vector<u32> body;
     s32 slot = 0;
     auto op = [&](u32 w) {  // the operation, then FCR31 to the next word of the data area
@@ -951,6 +954,16 @@ TEST(cpu_jit_fpu_cause_matches_interpreter) {
     op(cop1(17, 0, 0, 20, 0x0D)); // TRUNC.W.D 3: exact
     op(cop1(16, 0, 13, 20, 0x0C)); // ROUND.W.S 0.1: inexact
     op(cop1(17, 0, 7, 20, 0x0D)); // TRUNC.W.D 0.1
+    op(cop1(17, 14, 14, 20, 2));  // MUL.D (2^26 + 1)^2: exact
+    op(cop1(17, 16, 14, 20, 2));  // MUL.D (2^26 + 1)(2^27 + 1): inexact by one
+    op(cop1(17, 14, 15, 20, 3));  // DIV.D (2^26 + 1)^2 / (2^26 + 1): exact
+    op(cop1(17, 16, 15, 20, 3));  // DIV.D by 2^27 + 1: inexact
+    op(cop1(17, 0, 15, 20, 4));   // SQRT.D (2^26 + 1)^2: exact
+    op(cop1(17, 0, 16, 20, 4));   // SQRT.D 2^27 + 1: inexact
+    op(cop1(16, 18, 17, 20, 2));  // MUL.S 2049 * 4097: exact
+    op(cop1(16, 18, 18, 20, 2));  // MUL.S 4097^2: inexact
+    op(cop1(16, 17, 19, 20, 3));  // DIV.S 2049^2 / 2049: exact
+    op(cop1(16, 0, 19, 20, 4));   // SQRT.S 2049^2: exact
     op(cop1(17, 0, 5, 20, 2));    // MUL.D tiny * 3: exact far down
     op(cop1(17, 5, 5, 20, 2));    // tiny * tiny: underflow
     std::vector<u32> prog = {ADDIU(s1, zero, 20)};

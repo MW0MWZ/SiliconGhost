@@ -4,6 +4,7 @@
 // registers a translation keeps in host registers, and in which of the
 // eight cache slots; each back end maps the slots to its host registers.
 #include <algorithm>
+#include <vector>
 
 #include "cpu/r4000/r4000.h"
 
@@ -139,21 +140,22 @@ bool branch_offset(u32 w, s64& delta) {
 
 }  // namespace
 
-R4000::JitPlan R4000::jit_plan(const Block& b) {
+R4000::JitPlan R4000::jit_plan(const Block& b) { return jit_plan(std::vector<const Block*>{&b}); }
+
+R4000::JitPlan R4000::jit_plan(const std::vector<const Block*>& region) {
     JitPlan p;
     std::fill(std::begin(p.slot), std::end(p.slot), static_cast<s8>(-1));
     unsigned uses[32] = {};
-    for (u32 i = 0; i < b.count; ++i) {
-        if (i > 0 && is_branch_word(b.ops[i - 1].inst)) {
-            if (is_branch_word(b.ops[i].inst)) continue;  // a branch in a delay slot goes to its handler
+    for (const Block* blk : region) {
+        const Block& b = *blk;
+        for (u32 i = 0; i < b.count; ++i) {
+            if (i > 0 && is_branch_word(b.ops[i - 1].inst)) {
+                if (is_branch_word(b.ops[i].inst)) continue;  // a branch in a delay slot goes to its handler
+            }
+            const Uses u = inline_uses(b.ops[i].inst);
+            for (unsigned r = 1; r < 32; ++r) uses[r] += ((u.reads >> r) & 1) + ((u.writes >> r) & 1);
+            p.written |= u.writes;
         }
-        const Uses u = inline_uses(b.ops[i].inst);
-        for (unsigned r = 1; r < 32; ++r) uses[r] += ((u.reads >> r) & 1) + ((u.writes >> r) & 1);
-        p.written |= u.writes;
-        s64 delta;
-        if (branch_offset(b.ops[i].inst, delta) && !(i > 0 && is_branch_word(b.ops[i - 1].inst)) &&
-            4 * static_cast<s64>(i) + delta == 0)
-            p.self_loop = true;
     }
     // The registers used at least twice, most used first, each in its home
     // slot (number mod 8) where free.
@@ -175,6 +177,69 @@ R4000::JitPlan R4000::jit_plan(const Block& b) {
     }
     p.written &= p.alloc;
     return p;
+}
+
+void R4000::jit_successors(const Block& b, std::vector<u32>& offsets) {
+    const u32 end = b.offset + 4 * b.count;
+    auto add = [&](s64 off) {
+        if (off >= 0 && off < 0x1000) offsets.push_back(static_cast<u32>(off));
+    };
+    if (b.count >= 2 && is_branch_word(b.ops[b.count - 2].inst)) {
+        const u32 w = b.ops[b.count - 2].inst;
+        const unsigned opc = w >> 26;
+        s64 delta;
+        bool likely = false, conditional = branch_offset(w, delta);
+        if (opc == 0x11 && f_rs(w) == 0x08) {  // BC1F, BC1T, BC1FL, BC1TL
+            conditional = true;
+            delta = 4 + 4 * static_cast<s64>(static_cast<s16>(w & 0xFFFF));
+            likely = (f_rt(w) & 2) != 0;
+        } else {
+            likely = (opc >= 0x14 && opc <= 0x17) || (opc == 0x01 && (f_rt(w) & 2));
+        }
+        if (!conditional) return;  // jumps: the target depends on the pc, or a register
+        add(static_cast<s64>(b.offset) + 4 * (b.count - 2) + delta);
+        if (!likely) add(end);
+    } else if (!is_branch_word(b.ops[b.count - 1].inst)) {
+        add(end);  // straight on (the block ended at its length limit or after a CP0 operation)
+    }
+}
+
+void R4000::jit_region(const Block& b, std::vector<Block>& members, std::vector<const Block*>& region) {
+    members.clear();
+    members.reserve(kJitRegionBlocks - 1);  // no reallocation: `region` points into it
+    region.assign(1, &b);
+    const u8* const page = b.host - b.offset;
+    u32 ops = b.count;
+    std::vector<u32> next;
+    for (std::size_t k = 0; k < region.size(); ++k) {
+        next.clear();
+        jit_successors(*region[k], next);
+        for (u32 off : next) {
+            bool known = false;
+            for (const Block* r : region) known |= r->offset == off;
+            if (known || region.size() == kJitRegionBlocks) continue;
+            Block m;
+            decode_ops(m, page + off, off);
+            if (ops + m.count > kJitRegionOps) continue;
+            ops += m.count;
+            members.push_back(m);
+            region.push_back(&members.back());
+        }
+    }
+    // Translating more blocks costs time and code space and only pays when
+    // control keeps moving between them: keep them only for a loop (some
+    // block leads back to itself or to one found before it).
+    bool loop = false;
+    for (std::size_t k = 0; k < region.size() && !loop; ++k) {
+        next.clear();
+        jit_successors(*region[k], next);
+        for (u32 off : next)
+            for (std::size_t j = 0; j <= k; ++j) loop |= region[j]->offset == off;
+    }
+    if (!loop) {
+        members.clear();
+        region.resize(1);
+    }
 }
 
 void R4000::jit_fp_uses(u32 w, const std::function<void(unsigned, bool, bool)>& use) {

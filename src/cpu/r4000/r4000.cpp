@@ -115,6 +115,7 @@ void R4000::jit_flush() {
         b.runs = 0;
     }
     if (jit_buf_) jit_buf_->clear();
+    jit_ops_.clear();
     ++jit_generation_;  // kept translations are gone too
 }
 
@@ -128,7 +129,19 @@ void R4000::keep_translation(Block& b) {
     k.generation = jit_generation_;
     k.count = b.count;
     k.addr64 = b.jit_addr64;
+    k.is_region = b.jit_region;
+    k.region = b.region;
     for (u32 i = 0; i < b.count; ++i) k.words[i] = b.ops[i].inst;
+}
+
+u64 R4000::jit_region_hash(const u8* page, const JitRegion& r) {
+    u64 h = 0xCBF29CE484222325ull;
+    for (unsigned m = 0; m < r.n; ++m)
+        for (unsigned i = 0; i < r.count[m]; ++i) {
+            h ^= load_be<u32>(page + r.offset[m] + 4 * i);
+            h *= 0x100000001B3ull;
+        }
+    return h;
 }
 
 // The code refers only to the slot, its decoded operations and host
@@ -138,9 +151,13 @@ void R4000::reuse_translation(Block& b) {
         if (k.host != b.host || k.count != b.count || k.generation != jit_generation_ || !k.code) continue;
         bool same = true;
         for (u32 i = 0; i < b.count && same; ++i) same = k.words[i] == b.ops[i].inst;
+        // A region also needs its other blocks unchanged.
+        if (same && k.is_region) same = jit_region_hash(b.host - b.offset, k.region) == k.region.hash;
         if (!same) continue;
         b.code = k.code;
         b.jit_addr64 = k.addr64;
+        b.jit_region = k.is_region;
+        b.region = k.region;
         b.jit_host = b.host;
         b.runs = kJitThreshold;
         k.code = nullptr;
@@ -287,11 +304,18 @@ bool ends_block(u32 w) {
 void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
     keep_translation(b);
     b.jit_host = nullptr;
+    b.runs = 0;
+    b.code = nullptr;
+    b.jit_region = false;
+    decode_ops(b, host, page_offset);
+    if (u8* flag = bus_.code_flag(host)) *flag = 1;  // writes to this page now drop its blocks
+    if (jit_buf_) reuse_translation(b);
+}
+
+void R4000::decode_ops(Block& b, const u8* host, u32 page_offset) {
     b.host = host;
     b.offset = page_offset;
     b.count = 0;
-    b.runs = 0;
-    b.code = nullptr;
     const u32 room = (0x1000 - page_offset) / 4;  // instructions left in the page
     const u32 max = std::min<u32>(room, kMaxBlockLength);
     b.plain = 0;
@@ -311,8 +335,6 @@ void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
         }
         if (ends_block(w)) break;
     }
-    if (u8* flag = bus_.code_flag(host)) *flag = 1;  // writes to this page now drop its blocks
-    if (jit_buf_) reuse_translation(b);
 }
 
 // `page` is the host address of a 4 KiB page that was written.
@@ -401,6 +423,10 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                 // It may have gone on into other blocks, in this page or others.
                 blk = jit_block_;
                 ipc = jit_entry_pc_ + 4 * u64{i};
+                // A region's other blocks run from the code alone: decoded again
+                // (the same, as the page is unchanged) if the slot holds another.
+                if (SG_UNLIKELY(blk->host != jit_block_host_))
+                    build_block(*blk, jit_block_host_, static_cast<u32>(jit_entry_pc_ & 0xFFF));
                 t = time_fp_;
                 first = false;
                 if (SG_UNLIKELY(io_)) {

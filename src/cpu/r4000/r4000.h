@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -258,6 +259,17 @@ private:
     // of instructions completed (see jit_x64.cpp).
     using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 time_fp);
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
+    // A region's other blocks (see jit_region()): where they are, and a hash
+    // of their instructions, so that its code can be taken back.
+    static constexpr unsigned kJitRegionBlocks = 8, kJitRegionOps = 160;
+    struct JitRegion {
+        u8 n = 0;  // other blocks
+        std::array<u16, kJitRegionBlocks - 1> offset{};
+        std::array<u8, kJitRegionBlocks - 1> count{};
+        u64 hash = 0;
+    };
+    // FNV-1a of the region's other blocks' instructions in the page at `page`.
+    static u64 jit_region_hash(const u8* page, const JitRegion& r);
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 offset = 0;            // of the first instruction within its 4 KiB page
@@ -266,6 +278,8 @@ private:
         u32 runs = 0;
         JitFn code = nullptr;
         bool jit_addr64 = false;  // addressing mode the code was translated for
+        bool jit_region = false;  // the code also runs other blocks of the page (see jit_region())
+        JitRegion region;
         const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
         Op ops[kMaxBlockLength];
     };
@@ -280,6 +294,17 @@ private:
         bool self_loop = false;
     };
     static JitPlan jit_plan(const Block& b);
+    // A translation's region: the block and up to kJitRegionBlocks - 1 more
+    // of its page that it reaches through branches with a fixed target or
+    // by falling through, decoded into `members`; `region` lists them all,
+    // the block first. One plan covers them all.
+    void jit_region(const Block& b, std::vector<Block>& members, std::vector<const Block*>& region);
+    static JitPlan jit_plan(const std::vector<const Block*>& region);
+    // Successors of a decoded block within its page that a translation can
+    // reach without a lookup: the offsets of the taken target of its
+    // conditional branch and of the instruction after it (not after a
+    // branch-likely, whose untaken path leaves the translation).
+    static void jit_successors(const Block& b, std::vector<u32>& offsets);
     // The FPU registers an instruction the back ends translate inline reads
     // and writes: use(register, as a double, written).
     static void jit_fp_uses(u32 inst, const std::function<void(unsigned, bool, bool)>& use);
@@ -292,6 +317,7 @@ private:
     }
     void run_block(u64 cycle, const u64* limit);
     void build_block(Block& b, const u8* host, u32 page_offset);
+    void decode_ops(Block& b, const u8* host, u32 page_offset);  // the instructions, nothing else
     void invalidate_code_page(const u8* page);
     void flush_blocks();
     void execute(u32 inst);
@@ -413,6 +439,8 @@ private:
         u32 count = 0;
         bool addr64 = false;
         std::array<u32, kMaxBlockLength> words{};
+        bool is_region = false;
+        JitRegion region;
     };
     std::vector<std::array<JitVictim, kJitVictims>> jit_victims_;
     u32 jit_generation_ = 1;  // bumped whenever the code buffer is emptied
@@ -423,7 +451,17 @@ private:
     u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
     // Where translated code stopped: the block it was running (it may have
     // gone on into other blocks) and that block's entry pc.
+    // Operations of a region's other blocks that translated code passes to
+    // their handlers (the blocks are decoded only while translating): kept
+    // until the code buffer is emptied.
+    std::deque<Op> jit_ops_;
+    const Op* jit_op(const Block& b, const Op& op) {
+        if (&op >= b.ops && &op < b.ops + kMaxBlockLength) return &op;
+        jit_ops_.push_back(op);
+        return &jit_ops_.back();
+    }
     Block* jit_block_ = nullptr;
+    const u8* jit_block_host_ = nullptr;  // the block it should hold (it may need decoding again)
     u64 jit_entry_pc_ = 0;
     std::size_t jit_link_offset_ = 0;  // offset of the linked entry point in every translation
     static void jit_backward_branch(R4000* cpu, u64 target) { cpu->backward_branch(target); }
@@ -484,6 +522,8 @@ private:
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 jit_scratch_ = 0;   // translated code's spill slot
     u32 jit_fp_control_ = 0;  // the host FP control word translated FP operations start from
+    double jit_split_d_ = 134217729.0;  // 2^27 + 1 and 2^12 + 1: Dekker's splitting factors
+    float jit_split_s_ = 4097.0f;
     u64 weight_epoch_ = 0;  // bumped when the charge per instruction changes
     u64 store_count_ = 0;
     // Fields translated code uses come before the large arrays, so they lie
