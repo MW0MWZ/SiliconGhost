@@ -93,6 +93,10 @@ public:
     Site b(Cond c) { return emit_site(0x54000000u | static_cast<u32>(c), Fix::B19); }
     Site cbz(Reg r, bool w64 = true) { return emit_site((w64 ? 0xB4000000u : 0x34000000u) | r, Fix::B19); }
     Site cbnz(Reg r, bool w64 = true) { return emit_site((w64 ? 0xB5000000u : 0x35000000u) | r, Fix::B19); }
+    // TBNZ: to the site if bit `bit` of r is set.
+    Site cbnz_bit(Reg r, unsigned bit) {
+        return emit_site(0x37000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | r, Fix::B14);
+    }
     void b_to(std::size_t target) { bind_to(b(), target); }
     void br(Reg r) { emit(0xD61F0000u | (u32{r} << 5)); }
     void blr(Reg r) { emit(0xD63F0000u | (u32{r} << 5)); }
@@ -218,6 +222,49 @@ public:
         emit(0x9A800400u | (31u << 16) | (static_cast<u32>(invert(c)) << 12) | (31u << 5) | d);
     }
     void rev32(Reg d, Reg n) { emit(0x5AC00800u | (u32{n} << 5) | d); }  // REV Wd
+    void rev64(Reg d, Reg n) { emit(0xDAC00C00u | (u32{n} << 5) | d); }  // REV Xd
+    // Flag-setting add and subtract (V: signed overflow), any immediate.
+    void adds(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x2B000000u, d, n, m, w64); }
+    void subs(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x6B000000u, d, n, m, w64); }
+    void adds_imm(Reg d, Reg n, s64 v, bool w64 = true) {
+        if (v < 0) return add_sub_imm(true, true, d, n, static_cast<u64>(-v), w64);
+        add_sub_imm(false, true, d, n, static_cast<u64>(v), w64);
+    }
+    void sdiv(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x1AC00C00u, d, n, m, w64); }
+    void udiv(Reg d, Reg n, Reg m, bool w64 = true) { rrr(0x1AC00800u, d, n, m, w64); }
+    void msub(Reg d, Reg n, Reg m, Reg a, bool w64 = true) {  // d = a - n * m
+        emit((w64 ? 0x9B008000u : 0x1B008000u) | (u32{m} << 16) | (u32{a} << 10) | (u32{n} << 5) | d);
+    }
+    void smulh(Reg d, Reg n, Reg m) { emit(0x9B407C00u | (u32{m} << 16) | (u32{n} << 5) | d); }
+    void umulh(Reg d, Reg n, Reg m) { emit(0x9BC07C00u | (u32{m} << 16) | (u32{n} << 5) | d); }
+
+    // --- scalar floating point on v registers (dbl: D, else S) -------------
+    enum class Fop : u32 { Mul = 0x0800, Div = 0x1800, Add = 0x2800, Sub = 0x3800 };
+    void fop(Fop op, bool dbl, unsigned d, unsigned n, unsigned m) {
+        emit(0x1E200000u | (dbl ? 0x400000u : 0) | (m << 16) | static_cast<u32>(op) | (n << 5) | d);
+    }
+    void fsqrt(bool dbl, unsigned d, unsigned n) { emit(0x1E21C000u | (dbl ? 0x400000u : 0) | (n << 5) | d); }
+    void fmov(bool dbl, unsigned d, unsigned n) { emit(0x1E204000u | (dbl ? 0x400000u : 0) | (n << 5) | d); }
+    // d = a - n * m (FMSUB), d = n * m - a (FNMSUB)
+    void fmsub(bool dbl, unsigned d, unsigned n, unsigned m, unsigned a) {
+        emit(0x1F008000u | (dbl ? 0x400000u : 0) | (m << 16) | (a << 10) | (n << 5) | d);
+    }
+    void fnmsub(bool dbl, unsigned d, unsigned n, unsigned m, unsigned a) {
+        emit(0x1F208000u | (dbl ? 0x400000u : 0) | (m << 16) | (a << 10) | (n << 5) | d);
+    }
+    void fcmp(bool dbl, unsigned n, unsigned m) { emit(0x1E202000u | (dbl ? 0x400000u : 0) | (m << 16) | (n << 5)); }
+    void fcvt_to_single(unsigned d, unsigned n) { emit(0x1E624000u | (n << 5) | d); }  // FCVT Sd, Dn
+    void fcvt_to_double(unsigned d, unsigned n) { emit(0x1E22C000u | (n << 5) | d); }  // FCVT Dd, Sn
+    // To a 32-bit integer, nearest even (FCVTNS) or toward zero (FCVTZS); saturating.
+    void fcvt_to_int(bool dbl, bool truncate, Reg d, unsigned n) {
+        emit((truncate ? 0x1E380000u : 0x1E200000u) | (dbl ? 0x400000u : 0) | (n << 5) | d);
+    }
+    void scvtf(bool dbl, unsigned d, Reg n) { emit(0x1E220000u | (dbl ? 0x400000u : 0) | (u32{n} << 5) | d); }  // from Wn
+    void fmov_to_gpr(Reg d, unsigned n, bool dbl) { emit((dbl ? 0x9E660000u : 0x1E260000u) | (n << 5) | d); }
+    void fmov_from_gpr(unsigned d, Reg n, bool dbl) { emit((dbl ? 0x9E670000u : 0x1E270000u) | (u32{n} << 5) | d); }
+    // LDR/STR of an S (size 4) or D (size 8) register, any offset.
+    void fldr(unsigned t, Reg base, s64 off, unsigned size) { fmem(true, t, base, off, size); }
+    void fstr(unsigned t, Reg base, s64 off, unsigned size) { fmem(false, t, base, off, size); }
     void rev16(Reg d, Reg n) { emit(0x5AC00400u | (u32{n} << 5) | d); }  // REV16 Wd
 
     // --- memory ---------------------------------------------------------------
@@ -305,6 +352,14 @@ private:
             return emit(ls_unscaled_op(load, size, sign) | ((static_cast<u32>(off) & 0x1FF) << 12) | (u32{base} << 5) | t);
         mov_imm(kScratch1, static_cast<u64>(off));
         emit(ls_reg_op(load, size, sign) | (u32{kScratch1} << 16) | (u32{base} << 5) | t);
+    }
+
+    void fmem(bool load, unsigned t, Reg base, s64 off, unsigned size) {
+        const u32 op = (size == 8 ? 0xFD000000u : 0xBD000000u) | (load ? 0x00400000u : 0);
+        if (off >= 0 && off % size == 0 && off / size < 4096)
+            return emit(op | (static_cast<u32>(off / size) << 10) | (u32{base} << 5) | t);
+        mov_imm(kScratch1, static_cast<u64>(off));
+        emit(((op & ~0x01000000u) | 0x00206800u) | (u32{kScratch1} << 16) | (u32{base} << 5) | t);
     }
 
     struct Literal {
