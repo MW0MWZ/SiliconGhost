@@ -632,8 +632,9 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
     static constexpr unsigned kRFuncts[] = {0x00, 0x02, 0x03, 0x04, 0x06, 0x07, 0x10, 0x12, 0x18, 0x19,
                                             0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2F,
                                             0x38, 0x3A, 0x3B, 0x3C, 0x3E, 0x3F, 0x11, 0x13, 0x1A, 0x1B,
-                                            0x14, 0x16, 0x17, 0x1C, 0x1D, 0x1E, 0x1F};
-    static constexpr unsigned kTrapping[] = {0x20, 0x22, 0x2C, 0x2E};  // ADD, SUB, DADD, DSUB
+                                            0x14, 0x16, 0x17, 0x1C, 0x1D, 0x1E, 0x1F, 0x34};
+    // ADD, SUB, DADD, DSUB; TGE, TGEU, TLT, TLTU, TNE
+    static constexpr unsigned kTrapping[] = {0x20, 0x22, 0x2C, 0x2E, 0x30, 0x31, 0x32, 0x33, 0x36};
     static constexpr unsigned kImmOps[] = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x19, 0x08, 0x18};
     static constexpr unsigned kLoadStore[] = {0x20, 0x21, 0x23, 0x24, 0x25, 0x27, 0x37, 0x28, 0x29, 0x2B, 0x3F,
                                               0x22, 0x26, 0x2A, 0x2E, 0x1A, 0x1B, 0x2C, 0x2D};
@@ -679,6 +680,11 @@ std::vector<u32> random_program(u32 seed, unsigned length, u64 base = kCode) {
                 } else if (rnd(3) == 0) {
                     static constexpr unsigned kRegimm[] = {0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13};
                     prog.push_back(I(0x01, reg(), kRegimm[rnd(std::size(kRegimm))], off));  // BLTZ/BGEZ(AL)(L)
+                    if (rnd(4) == 0) {  // TEQI or another immediate trap, mostly not taken
+                        static constexpr unsigned kTraps[] = {0x0C, 0x0C, 0x0C, 0x08, 0x09, 0x0A, 0x0B, 0x0E};
+                        prog.push_back(I(0x01, reg(), kTraps[rnd(std::size(kTraps))], static_cast<s32>(rnd(64))));
+                        break;
+                    }
                 } else {
                     prog.push_back(I(kBranches[rnd(std::size(kBranches))], reg(), reg(), off));
                 }
@@ -988,6 +994,29 @@ TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
     R4000::set_jit_fma(false);
     check_random_fpu_programs();
     R4000::set_jit_fma(true);
+}
+
+// Trap instructions in translated code: not taken while the loop is hot,
+// then taken (Tr, with EPC at the trap) in every engine.
+TEST(cpu_jit_trap_instructions_trap) {
+    const u32 teq = R(0x34, t2, t3, 0);
+    const u32 tlti = I(0x01, t2, 0x0A, 3);
+    for (u32 trap : {teq, tlti}) {
+        for (Engine engine : {Engine::Interpreter, Engine::Blocks, Engine::Jit}) {
+            Rig t;
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.load({NOP, ADDIU(t2, t2, -1), trap, BNE(t2, zero, -3), NOP, SYSCALL}, 0x1000);
+            t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+            t.cpu.gpr[t2] = 30;
+            t.cpu.gpr[t3] = 2;
+            t.cpu.set_pc(0xFFFFFFFF80001000ull);
+            t.cpu.run_until(4000);
+            CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Tr));
+            CHECK_EQ(t.cpu.cp0_read(cop0::EPC), 0xFFFFFFFF80001008ull);
+            CHECK_EQ(t.cpu.gpr[t2], 2u);
+        }
+    }
 }
 
 // A translation made in kernel mode runs again for the same memory in user

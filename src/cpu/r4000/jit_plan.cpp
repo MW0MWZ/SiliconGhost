@@ -50,6 +50,12 @@ Uses inline_uses(u32 w) {
                 case 0x3C:
                 case 0x3E:
                 case 0x3F: return {bit(rt), bit(rd)};
+                case 0x30:
+                case 0x31:
+                case 0x32:
+                case 0x33:
+                case 0x34:
+                case 0x36: return {bit(rs) | bit(rt), 0};
                 case 0x14:
                 case 0x16:
                 case 0x17:
@@ -72,7 +78,7 @@ Uses inline_uses(u32 w) {
                 case 0x2B: return {bit(rs) | bit(rt), bit(rd)};
                 default: return {};
             }
-        case 0x01: return rt < 4 ? Uses{bit(rs), 0} : Uses{};
+        case 0x01: return (rt < 4 || (rt >= 0x08 && rt <= 0x0E)) ? Uses{bit(rs), 0} : Uses{};
         case 0x03: return {0, bit(31)};
         case 0x04:
         case 0x05:

@@ -316,9 +316,26 @@ bool R4000::jit_compile(Block& b) {
             write_nz(rt, x0);
             return true;
         }
+        if (opc == 0x01 && rt >= 0x08 && rt <= 0x0E && rt != 0x0D) {  // TGEI, TGEIU, TLTI, TLTIU, TEQI, TNEI
+            static constexpr Cond kTrap[] = {Cond::Ge, Cond::Hs, Cond::Lt, Cond::Lo, Cond::Eq, Cond::Eq, Cond::Ne};
+            e.cmp_imm(src_imm(rs, x1), simm);
+            slow.push_back(e.b(kTrap[rt - 0x08]));  // the trap: the handler raises it
+            return true;
+        }
         if (opc != 0x00) return false;
         const unsigned funct = w & 63;
         switch (funct) {
+            case 0x30:  // TGE
+            case 0x31:  // TGEU
+            case 0x32:  // TLT
+            case 0x33:  // TLTU
+            case 0x34:  // TEQ
+            case 0x36: {  // TNE
+                static constexpr Cond kTrap[] = {Cond::Ge, Cond::Hs, Cond::Lt, Cond::Lo, Cond::Eq, Cond::Eq, Cond::Ne};
+                e.cmp(src(rs, x0), src(rt, x1));
+                slow.push_back(e.b(kTrap[funct - 0x30]));  // the trap: the handler raises it
+                return true;
+            }
             case 0x14:  // DSLLV
             case 0x16:  // DSRLV
             case 0x17: {  // DSRAV (the count mod 64, as MIPS)

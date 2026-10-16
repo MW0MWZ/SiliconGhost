@@ -373,9 +373,30 @@ bool R4000::jit_compile(Block& b) {
             write_nz(rt, rax);
             return true;
         }
+        if (opc == 0x01 && rt >= 0x08 && rt <= 0x0E && rt != 0x0D) {  // TGEI, TGEIU, TLTI, TLTIU, TEQI, TNEI
+            static constexpr Cond kTrap[] = {Cond::Ge, Cond::Ae, Cond::L, Cond::B, Cond::E, Cond::E, Cond::Ne};
+            ensure(rs);
+            read(rcx, rs);
+            e.alu_imm(Alu::Cmp, rcx, simm);
+            slow.push_back(e.jcc(kTrap[rt - 0x08]));  // the trap: the handler raises it
+            return true;
+        }
         if (opc != 0x00) return false;
         const unsigned funct = w & 63;
         switch (funct) {
+            case 0x30:  // TGE
+            case 0x31:  // TGEU
+            case 0x32:  // TLT
+            case 0x33:  // TLTU
+            case 0x34:  // TEQ
+            case 0x36: {  // TNE
+                static constexpr Cond kTrap[] = {Cond::Ge, Cond::Ae, Cond::L, Cond::B, Cond::E, Cond::E, Cond::Ne};
+                ensure(rs), ensure(rt);
+                read(rcx, rs);
+                alu_g(Alu::Cmp, rcx, rt);
+                slow.push_back(e.jcc(kTrap[funct - 0x30]));  // the trap: the handler raises it
+                return true;
+            }
             case 0x14:  // DSLLV
             case 0x16:  // DSRLV
             case 0x17:  // DSRAV (x86 masks 64-bit shift counts to 6 bits, as MIPS does)
@@ -1370,6 +1391,44 @@ bool R4000::jit_compile(Block& b) {
         }
         return true;
     };
+    // The bookkeeping of run_block(), then the handler, for ops[i]; `mask`:
+    // the cached registers to write back first.
+    auto emit_handler = [&](u32 i, bool delay_slot, const Op& op, u64 mask) {
+        flush(mask);
+        set_time(i + 1);
+        pc_plus(rax, 4 * i);
+        e.mov(m_cur_pc, rax);
+        if (delay_slot) {
+            e.mov_store_imm8(m_in_delay, 1);
+            e.mov_store_imm8(m_next_delay, 0);
+            e.mov(rax, m_npc);
+            e.mov(m_pc, rax);
+            e.alu_imm(Alu::Add, rax, 4);
+            e.mov(m_npc, rax);
+        } else {
+            e.mov_store_imm8(m_in_delay, 0);  // next_delay_ is already clear
+            pc_plus(rax, 4 * i + 4);
+            e.mov(m_pc, rax);
+            e.alu_imm(Alu::Add, rax, 4);
+            e.mov(m_npc, rax);
+        }
+        e.mov_store_imm8(m_io, 0);
+        call_handler(op);
+        e.mov_store_imm(gpr_at(0), 0);
+        // The last op is checked by the block's end. (A branch continues
+        // into its delay slot; a branch-likely not taken does not.)
+        if (i + 1 < b.count) exit_checks(i);
+    };
+    // An inline operation's way to its handler, emitted after the block.
+    struct Cold {
+        std::vector<std::size_t> slow;
+        u32 i = 0;
+        bool delay_slot = false;
+        const Op* op = nullptr;
+        u64 dirty_before = 0, loaded_after = 0;
+        std::size_t resume = 0;
+    };
+    std::vector<Cold> colds;
     for (u32 i = 0; i < b.count; ++i) {
         const Op& op = b.ops[i];
         const u32 w = op.inst;
@@ -1384,50 +1443,22 @@ bool R4000::jit_compile(Block& b) {
         } else if (!delay_slot && emit_branch(op, i)) {
             synced = true;
         } else {
-            // Loads and stores try the inline path first.
-            std::vector<std::size_t> slow;
-            std::size_t skip_slow = 0;
-            const u64 dirty_before = dirty;
-            const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
-            const u64 loaded_after = loaded;
+            // The inline form first, if there is one; its way to the handler
+            // is placed after the block's code, out of the straight line.
+            Cold cold;
+            cold.dirty_before = dirty;
+            const bool fast = emit_alu(w, cold.slow) || emit_fpu(w, cold.slow) || emit_memory(w, cold.slow);
             if (fast) {
                 if (delay_slot) leave_delay_slot();
-                skip_slow = e.jmp();
-                for (std::size_t site : slow) e.bind(site);
+                cold.i = i, cold.delay_slot = delay_slot, cold.op = &op, cold.loaded_after = loaded;
+                cold.resume = e.size();
+                colds.push_back(std::move(cold));
+                synced = delay_slot;
+                continue;
             }
-
-            // Anything else: the bookkeeping of run_block(), then the handler.
-            flush(fast ? dirty_before : dirty);
-            set_time(i + 1);
-            pc_plus(rax, 4 * i);
-            e.mov(m_cur_pc, rax);
-            if (delay_slot) {
-                e.mov_store_imm8(m_in_delay, 1);
-                e.mov_store_imm8(m_next_delay, 0);
-                e.mov(rax, m_npc);
-                e.mov(m_pc, rax);
-                e.alu_imm(Alu::Add, rax, 4);
-                e.mov(m_npc, rax);
-            } else {
-                e.mov_store_imm8(m_in_delay, 0);  // next_delay_ is already clear
-                pc_plus(rax, 4 * i + 4);
-                e.mov(m_pc, rax);
-                e.alu_imm(Alu::Add, rax, 4);
-                e.mov(m_npc, rax);
-            }
-            e.mov_store_imm8(m_io, 0);
-            call_handler(op);
-            e.mov_store_imm(gpr_at(0), 0);
-            // The last op is checked by the block's end. (A branch continues
-            // into its delay slot; a branch-likely not taken does not.)
-            if (i + 1 < b.count || fast) exit_checks(i);
-            if (fast) {
-                restore(loaded_after);  // as the inline path leaves them
-                e.bind(skip_slow);
-            } else {
-                loaded = dirty = 0;
-            }
-            synced = !fast || delay_slot;
+            emit_handler(i, delay_slot, op, dirty);
+            loaded = dirty = 0;
+            synced = true;
         }
     }
     if (!synced) {  // plain operations or inline accesses ran last
@@ -1535,6 +1566,16 @@ bool R4000::jit_compile(Block& b) {
     to_finish.push_back(e.jcc(Cond::Ne));
     e.mov(rsi, rcx);
     enter(rsi);
+
+    // Inline operations that need their handler after all: it runs, then
+    // the checks after it, then back to where the inline form ends.
+    for (const Cold& c : colds) {
+        for (std::size_t site : c.slow) e.bind(site);
+        emit_handler(c.i, c.delay_slot, *c.op, c.dirty_before);
+        if (c.i + 1 == b.count) exit_checks(c.i);
+        restore(c.loaded_after);  // as the inline path leaves them
+        e.jmp_to(c.resume);
+    }
 
     // Completed the block.
     for (std::size_t site : to_finish_dirty) e.bind(site);
