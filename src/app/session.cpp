@@ -67,7 +67,9 @@ bool Session::power_on(std::string& error) {
     try {
         auto machine = std::make_unique<ip22::Indy>(s.indy_config());
         if (!prom.path.empty()) {
-            if (!machine->load_prom(prom.path, error)) return false;
+            std::vector<u8> image;
+            if (!read_prom(prom, image, error)) return false;
+            machine->load_prom_image(image.data(), image.size());
             SG_LOG(Info, "session", "boot PROM: %s (%s)", prom.path.c_str(), prom.version.c_str());
         }
         machine->set_network(network.get());

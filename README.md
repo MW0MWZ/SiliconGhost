@@ -16,8 +16,8 @@ builds for Windows.
 
 SiliconGhost is under active development. What works today:
 
-- **Boot PROM:** the IP24 PROM (5.3) passes its power-on tests, plays the
-  start-up chime and reaches the System Maintenance Menu, on the serial
+- **Boot PROM:** the IP24 PROMs (5.0 and 5.3) pass their power-on tests, play the
+  start-up chime and reach the System Maintenance Menu, on the serial
   console or on the Newport graphics console.
 - **IRIX 5.3:** installs from its CD onto a blank disk image (labelled with
   `fx`, as on real hardware) and boots multi-user, on the serial console or
@@ -147,9 +147,13 @@ named with `--prom-dir`. SiliconGhost recognises each dump (by its checksum,
 or else the version string inside it) and starts each machine with the
 newest one that suits it: an Indy (IP24) PROM for the Indy, 5.3 Rev B10
 (070-9101-011) or later with an R5000, 5.0 Rev B6 (070-9101-007) or later
-with an R4600, an IP22 PROM for the Indigo². If there is none, it says which
-it needs. `--prom FILE` (*Specific PROM* in the settings) chooses one by
-hand; it must suit the machine too.
+with an R4600, an IP22 PROM for the Indigo². An Indy without a graphics
+board needs a 5.3 PROM: earlier ones set up the graphics board without first
+checking that one is fitted, and stop with a bus error. If there is none
+that fits, it says which it needs. Dumps read with each pair of
+bytes swapped are recognised and put right as they are loaded. `--prom FILE`
+(*Specific PROM* in the settings) chooses one by hand; it must suit the
+machine too.
 
 Started with no arguments, SiliconGhost opens its window with the machine
 powered off: choose the NVRAM, disk and CD-ROM images and the rest in

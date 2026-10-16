@@ -14,7 +14,10 @@ namespace sg::app {
 namespace {
 
 // Known dumps. Part numbers and what each release added follow the PROM
-// list on the Higher Intellect Vintage Wiki; CRCs are of the images.
+// list on the Higher Intellect Vintage Wiki; CRCs are of the images in the
+// right byte order. Indy PROMs before 5.3 write to the graphics board without
+// first checking that one is fitted, so they stop with a GIO bus timeout on a
+// machine without one.
 struct KnownProm {
     u32 crc;
     u32 size;
@@ -22,23 +25,24 @@ struct KnownProm {
     const char* part;
     const char* version;
     int rank;
-    bool r4600, r5000, byte_swapped;
+    bool r4600, r5000, headless;
 };
 constexpr KnownProm kKnown[] = {
-    {0xBB2F32ABu, 262144, "ip12", "", "4.0.1 Rev C", 1, false, false, false},
-    {0xEA4329EFu, 262144, "ip12", "070-8088-002", "4.0.1 Rev D", 2, false, false, true},
-    {0xBFE2AA8Bu, 524288, "ip20", "070-8116-004", "4.0.5D Rev A", 1, false, false, false},
-    {0x695355EFu, 524288, "ip20", "070-8116-005", "4.0.5G Rev B", 2, false, false, false},
-    {0xAE5ECD08u, 524288, "ip22", "070-1367-002", "5.1 Rev B", 1, false, false, false},
+    {0xBB2F32ABu, 262144, "ip12", "", "4.0.1 Rev C", 1, false, false, true},
+    {0xD35F105Cu, 262144, "ip12", "070-8088-002", "4.0.1 Rev D", 2, false, false, true},
+    {0xBFE2AA8Bu, 524288, "ip20", "070-8116-004", "4.0.5D Rev A", 1, false, false, true},
+    {0x695355EFu, 524288, "ip20", "070-8116-005", "4.0.5G Rev B", 2, false, false, true},
+    {0xAE5ECD08u, 524288, "ip22", "070-1367-002", "5.1 Rev B", 1, false, false, true},
+    {0x54460C16u, 524288, "ip22", "070-1367-012", "5.3 Rev E", 2, false, false, true},
     {0xF5E41008u, 524288, "ip24", "070-9101-005", "5.1.2 Rev B4", 1, false, false, false},
     {0x70D8D1B1u, 524288, "ip24", "070-9101-007", "5.0 Rev B6", 2, true, false, false},
-    {0xEE0B55C4u, 524288, "ip24", "070-9101-008", "5.3 Rev B7", 3, true, false, false},
-    {0x5E7F7E3Au, 524288, "ip24", "070-9101-011", "5.3 Rev B10", 4, true, true, false},
-    {0x9CED01BEu, 524288, "ip26", "070-1371-003", "6.0.1 Rev A", 1, false, false, false},
-    {0x58DD1DC2u, 524288, "ip26", "070-1371-004", "6.0.1 Rev A", 2, false, false, false},
-    {0x72749952u, 524288, "ip26", "070-1371-007", "6.0.1 Rev B", 3, false, false, false},
-    {0x78F06ACFu, 524288, "ip28", "070-1477-001", "6.2 Rev A", 1, false, false, false},
-    {0xE55BBB60u, 524288, "ip28", "070-1477-002", "6.2 Rev A", 2, false, false, false},
+    {0xEE0B55C4u, 524288, "ip24", "070-9101-008", "5.3 Rev B7", 3, true, false, true},
+    {0x5E7F7E3Au, 524288, "ip24", "070-9101-011", "5.3 Rev B10", 4, true, true, true},
+    {0x9CED01BEu, 524288, "ip26", "070-1371-003", "6.0.1 Rev A", 1, false, false, true},
+    {0x58DD1DC2u, 524288, "ip26", "070-1371-004", "6.0.1 Rev A", 2, false, false, true},
+    {0x72749952u, 524288, "ip26", "070-1371-007", "6.0.1 Rev B", 3, false, false, true},
+    {0x78F06ACFu, 524288, "ip28", "070-1477-001", "6.2 Rev A", 1, false, false, true},
+    {0xE55BBB60u, 524288, "ip28", "070-1477-002", "6.2 Rev A", 2, false, false, true},
 };
 
 u32 crc32(const std::vector<u8>& data) {
@@ -79,6 +83,20 @@ int rank_of(const std::string& version) {
     return major * 10 + minor;
 }
 
+// Some dumps were read with each pair of bytes swapped.
+std::vector<u8> swap_pairs(const std::vector<u8>& data) {
+    std::vector<u8> out(data);
+    for (std::size_t i = 0; i + 1 < out.size(); i += 2) std::swap(out[i], out[i + 1]);
+    return out;
+}
+
+bool read_file(const std::string& path, std::vector<u8>& data) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return true;
+}
+
 const char* system_name(const std::string& system) {
     if (system == "ip24") return "Indy (IP24)";
     if (system == "ip22") return "Indigo2 (IP22)";
@@ -94,26 +112,41 @@ const char* system_name(const std::string& system) {
 PromImage identify_prom(const std::string& path) {
     PromImage p;
     p.path = path;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return p;
-    std::vector<u8> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (data.empty() || data.size() > (1u << 20)) return p;
-    const u32 crc = crc32(data);
-    for (const KnownProm& k : kKnown) {
-        if (k.crc != crc || k.size != data.size()) continue;
-        p.system = k.system, p.part = k.part, p.version = k.version;
-        p.rank = 100 + k.rank;  // a known dump ranks above an unknown one of its release
-        p.r4600 = k.r4600, p.r5000 = k.r5000, p.byte_swapped = k.byte_swapped;
-        return p;
+    std::vector<u8> data;
+    if (!read_file(path, data) || data.empty() || data.size() > (1u << 20)) return p;
+    for (const bool swapped : {false, true}) {
+        const std::vector<u8> image = swapped ? swap_pairs(data) : data;
+        const u32 crc = crc32(image);
+        for (const KnownProm& k : kKnown) {
+            if (k.crc != crc || k.size != image.size()) continue;
+            p.system = k.system, p.part = k.part, p.version = k.version;
+            p.rank = 100 + k.rank;  // a known dump ranks above an unknown one of its release
+            p.r4600 = k.r4600, p.r5000 = k.r5000, p.headless = k.headless;
+            p.byte_swapped = swapped;
+            return p;
+        }
     }
     // Not a dump we know: go by the version string inside it.
-    bool r5000 = false;
-    if (version_string(data, p.version, p.system, r5000)) {
+    for (const bool swapped : {false, true}) {
+        bool r5000 = false;
+        if (!version_string(swapped ? swap_pairs(data) : data, p.version, p.system, r5000)) continue;
         p.rank = rank_of(p.version);
         p.r5000 = r5000;
         p.r4600 = r5000 || p.rank >= 50;  // R4600 support arrived with 5.0 Rev B6
+        p.headless = p.system != "ip24" || p.rank >= 53;
+        p.byte_swapped = swapped;
+        break;
     }
     return p;
+}
+
+bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error) {
+    if (!read_file(p.path, data)) {
+        error = "cannot open the boot PROM " + p.path;
+        return false;
+    }
+    if (p.byte_swapped) data = swap_pairs(data);
+    return true;
 }
 
 std::vector<PromImage> scan_proms(const std::string& folder) {
@@ -140,10 +173,6 @@ bool prom_fits(const PromImage& p, const Settings& s, std::string& why) {
         why = name + " is the " + system_name(p.system) + " PROM; the " + system_name(needed) + " needs its own";
         return false;
     }
-    if (p.byte_swapped) {
-        why = name + " was dumped with its bytes swapped";
-        return false;
-    }
     const CpuModel* cpu = find_cpu_model(s.cpu);
     if (cpu && cpu->core == mips::Core::R5000 && !p.r5000) {
         why = name + " (" + p.version + ") predates the R5000: it needs 5.3 Rev B10 (070-9101-011) or later";
@@ -151,6 +180,11 @@ bool prom_fits(const PromImage& p, const Settings& s, std::string& why) {
     }
     if (cpu && cpu->core == mips::Core::R4600 && !p.r4600) {
         why = name + " (" + p.version + ") predates the R4600: it needs 5.0 Rev B6 (070-9101-007) or later";
+        return false;
+    }
+    if (!s.graphics && !p.headless) {
+        why = name + " (" + p.version + ") cannot start without a graphics board: fit one, or use a 5.3 " +
+              "PROM such as 5.3 Rev B10 (070-9101-011)";
         return false;
     }
     return true;

@@ -236,6 +236,11 @@ TEST(proms_are_identified_and_chosen_for_the_machine) {
     CHECK(error.find("predates the R5000") != std::string::npos);
     s.cpu = "r4600sc";
     CHECK(app::select_prom(s, p, error));
+    // ... which needs a graphics board.
+    s.graphics = false;
+    CHECK(!app::select_prom(s, p, error));
+    CHECK(error.find("without a graphics board") != std::string::npos);
+    s.graphics = true;
     // A specific file must suit the machine.
     s.prom = (dir / "c.bin").string();
     CHECK(!app::select_prom(s, p, error));
@@ -246,6 +251,22 @@ TEST(proms_are_identified_and_chosen_for_the_machine) {
     s.machine = "indigo2", s.cpu = "r4400sc";
     CHECK(!app::select_prom(s, p, error));
     CHECK(error.find("no Indigo2 (IP22) boot PROM") != std::string::npos);
+    // A dump read with its bytes swapped is recognised and put right.
+    {
+        std::string data(4096, '\0');
+        const std::string version = "SGI Version 5.1 Rev B IP22 Sep 16, 1993";
+        data.replace(1000, version.size(), version);
+        data[0] = 0x0B, data[1] = 0xF0;
+        for (std::size_t i = 0; i < data.size(); i += 2) std::swap(data[i], data[i + 1]);
+        std::ofstream(dir / "swapped.bin", std::ios::binary) << data;
+    }
+    CHECK(app::select_prom(s, p, error));
+    CHECK(p.byte_swapped);
+    CHECK_STR(p.version, std::string("5.1 Rev B"));
+    std::vector<u8> contents;
+    CHECK(app::read_prom(p, contents, error));
+    CHECK_EQ(contents[0], 0x0Bu);
+    CHECK_EQ(contents[1], 0xF0u);
     fs::remove_all(dir);
 }
 

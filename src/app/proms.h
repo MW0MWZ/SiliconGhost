@@ -19,11 +19,14 @@ struct PromImage {
     std::string version;  // the version string inside it, e.g. "5.3 Rev B10"
     int rank = 0;         // newer releases rank higher
     bool r4600 = false, r5000 = false;  // Indy: the processors beyond the R4000/R4400 it supports
-    bool byte_swapped = false;          // dumped with its bytes swapped (can't be used as is)
+    bool headless = true;               // starts without a graphics board
+    bool byte_swapped = false;          // dumped with each pair of bytes swapped; read_prom() puts them right
 };
 
 // Identifies one image file; `system` is empty for anything else.
 PromImage identify_prom(const std::string& path);
+// The image's contents in the order the machine sees them.
+bool read_prom(const PromImage& p, std::vector<u8>& data, std::string& error);
 // Every file in `folder` that is a PROM image.
 std::vector<PromImage> scan_proms(const std::string& folder);
 // Whether `p` can start the configured machine; if not, why not.

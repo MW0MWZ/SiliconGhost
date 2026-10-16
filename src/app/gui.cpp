@@ -231,7 +231,7 @@ private:
 };
 
 const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
-    const std::string key = s.prom_dir + '\n' + s.prom + '\n' + s.machine + '\n' + s.cpu;
+    const std::string key = s.prom_dir + '\n' + s.prom + '\n' + s.machine + '\n' + s.cpu + (s.graphics ? "\ng" : "");
     if (key == prom_choice_.key) return prom_choice_;
     prom_choice_.key = key;
     PromImage p;
