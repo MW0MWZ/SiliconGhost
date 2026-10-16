@@ -98,7 +98,7 @@ R4000::~R4000() = default;
 
 void R4000::set_jit(bool enabled) {
     if (enabled && !jit_buf_) {
-        constexpr std::size_t kJitBufferSize = 32u << 20;
+        constexpr std::size_t kJitBufferSize = 128u << 20;
         jit_buf_ = std::make_unique<jit::ExecBuffer>(kJitBufferSize);
         if (!jit_buf_->ok() || !jit_compile_supported()) {
             jit_buf_.reset();
@@ -223,6 +223,7 @@ void R4000::reset() {
     // The cycle counter is the machine's master clock and keeps running
     // through a reset (Count's value after reset is undefined anyway).
     loops_.fill(LoopEntry{});
+    snaps_.fill(LoopSnapshot{});
     idle_ready_ = false;
     in_delay_ = false;
     update_mode();
@@ -337,6 +338,8 @@ bool ends_block(u32 w) {
 void R4000::build_block(Block& b, const u8* host, u32 page_offset) {
     keep_translation(b);
     b.jit_host = nullptr;
+    b.jr_n = 0;
+    b.hot = false;
     b.runs = 0;
     b.code = nullptr;
     b.jit_region = false;
@@ -526,6 +529,12 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         if (i == blk->count) {  // ran off the end of the block
             time_fp_ = t;
             if (!synced) set_pc(ipc);
+            // A jump through a register within the page, while interpreted:
+            // remember where to, for the translation.
+            if (!blk->code && blk->count >= 2 && (pc >> 12) == vpage) {
+                const u32 w = blk->ops[blk->count - 2].inst;
+                if ((w >> 26) == 0 && ((w & 63) == 0x08 || (w & 63) == 0x09)) note_jr(*blk, static_cast<u32>(pc & 0xFFF));
+            }
         }
 
         // Link to the block at the new pc if nothing it relies on changed.
@@ -573,36 +582,42 @@ u64 read_host(const u8* p, unsigned size) {
 // The previous iteration's registers, stores (locations and the values they
 // were left holding) and length, compared with the iteration just finished.
 bool R4000::snapshot_matches(const LoopEntry& e, u64 period, unsigned nstores) const {
-    if (!e.have_snapshot || period != e.period_fp || nstores != e.nstores || e.regs[32] != hi || e.regs[33] != lo ||
-        !std::equal(gpr.begin(), gpr.end(), e.regs.begin()))
+    const LoopSnapshot& s = snaps_[e.snap];
+    if (!e.have_snapshot || s.owner != &e || period != e.period_fp || nstores != s.nstores || s.regs[32] != hi ||
+        s.regs[33] != lo || !std::equal(gpr.begin(), gpr.end(), s.regs.begin()))
         return false;
     constexpr u64 mask = (1u << kStoreLogBits) - 1;
     for (unsigned i = 0; i < nstores; ++i) {
         const StoreRec& now = store_log_[(store_count_ - nstores + i) & mask];
-        const StoreRec& then = e.stores[i];
+        const StoreRec& then = s.stores[i];
         if (now.host != then.host || now.size != then.size || read_host(now.host, now.size) != then.value) return false;
     }
     return true;
 }
 
 void R4000::take_snapshot(LoopEntry& e, u64 period, unsigned nstores) {
-    std::copy(gpr.begin(), gpr.end(), e.regs.begin());
-    e.regs[32] = hi;
-    e.regs[33] = lo;
+    if (!e.have_snapshot || snaps_[e.snap].owner != &e) {
+        e.snap = static_cast<u8>(next_snap_);
+        next_snap_ = (next_snap_ + 1) % kLoopSnapshots;
+    }
+    LoopSnapshot& s = snaps_[e.snap];
+    s.owner = &e;
+    std::copy(gpr.begin(), gpr.end(), s.regs.begin());
+    s.regs[32] = hi;
+    s.regs[33] = lo;
     constexpr u64 mask = (1u << kStoreLogBits) - 1;
     for (unsigned i = 0; i < nstores; ++i) {
         StoreRec r = store_log_[(store_count_ - nstores + i) & mask];
         r.value = read_host(r.host, r.size);
-        e.stores[i] = r;
+        s.stores[i] = r;
     }
-    e.nstores = nstores;
+    s.nstores = nstores;
     e.period_fp = period;
     e.have_snapshot = true;
 }
 
 // Called when a branch to an earlier address is taken; see set_idle_skip().
 void R4000::loop_visit(LoopEntry& e, u64 target) {
-    (void)target;
     if (!idle_skip_) return;
     const u64 period = time_fp_ - e.time_fp;
     const u64 stores = store_count_ - e.store_pos;
@@ -634,9 +649,27 @@ void R4000::loop_visit(LoopEntry& e, u64 target) {
         e.cooldown = kIdleCooldown;
         e.have_snapshot = false;
         log_stores_ = false;
+        promote_loop(target);
         return;
     }
     take_snapshot(e, period, n);
+}
+
+// A loop that keeps running: its head's translation is made again, as a
+// large region (see jit_region()).
+void R4000::promote_loop(u64 target) {
+    if (!jit_buf_) return;
+    const FastEntry& fe = fast_[mode_][static_cast<unsigned>(Access::Fetch)][(target >> 12) & (kFastEntries - 1)];
+    if (fe.tag != ((target >> 12) | asid_tag_) || !fe.host || (target & 3)) return;
+    const u8* const host = fe.host + (target & 0xFFF);
+    Block& b = blocks_[block_index(host)];
+    if (b.host != host || b.hot) return;
+    b.hot = true;
+    if (b.code) {
+        b.code = nullptr;
+        b.jit_host = nullptr;
+        b.runs = kJitThreshold - 1;
+    }
 }
 
 // Fast-forwards whole iterations of a confirmed spin loop, stopping strictly

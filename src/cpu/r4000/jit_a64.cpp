@@ -1326,6 +1326,9 @@ bool R4000::jit_compile(Block& b) {
                 pc_plus(x0, 4 * i + 8);
                 write(rd, x0);
             }
+            std::vector<u32> seen;  // where it went while interpreted
+            jr_targets(*cur, seen);
+            for (u32 off : seen) add_successor(static_cast<s64>(off) - static_cast<s64>(page_offset));
         }
         e.str(x1, kCpu, o_npc);
         store_byte_imm(o_next_delay, 1);
@@ -1561,6 +1564,24 @@ bool R4000::jit_compile(Block& b) {
             to_finish.push_back(e.b(Cond::Ne));
             enter(x3);
             e.bind(next);
+        }
+        // A jump through a register to a place in the page with no link:
+        // learn it (see jit_jr_miss()).
+        const bool ends_jr = blk.count >= 2 && (blk.ops[blk.count - 2].inst >> 26) == 0 &&
+                             ((blk.ops[blk.count - 2].inst & 63) == 0x08 || (blk.ops[blk.count - 2].inst & 63) == 0x09);
+        if (ends_jr) {
+            e.eor(x1, x0, kPc);
+            e.lsr(x1, x1, 12);
+            const Site other_page = e.cbnz(x1);
+            e.mov(x0, kCpu);
+            e.load_constant(x1, reinterpret_cast<u64>(&blocks_[block_index(blk.host)]));
+            e.load_constant(x2, reinterpret_cast<u64>(&blocks_[block_index(b.host)]));
+            call(reinterpret_cast<const void*>(&R4000::jit_jr_miss));
+            e.ldr(x3, kCpu, o_weight);
+            e.mov_imm(kScratch0, blk.count);
+            e.madd(x2, x3, kScratch0, kTime);
+            e.ldr(x0, kCpu, o_pc);
+            e.bind(other_page);
         }
         // Anywhere else: look up the fetch translation and the block.
         e.tst_imm(x0, 3);

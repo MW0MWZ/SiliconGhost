@@ -1630,6 +1630,9 @@ bool R4000::jit_compile(Block& b) {
                 pc_plus(rax, 4 * i + 8);
                 write(rd, rax);
             }
+            std::vector<u32> seen;  // where it went while interpreted
+            jr_targets(*cur, seen);
+            for (u32 off : seen) add_successor(static_cast<s64>(off) - static_cast<s64>(page_offset));
         }
         e.mov(m_npc, rcx);
         e.mov_store_imm8(m_next_delay, 1);
@@ -1888,6 +1891,25 @@ bool R4000::jit_compile(Block& b) {
             to_finish.push_back(e.jcc(Cond::Ne));
             enter(rsi);
             e.bind(next);
+        }
+        // A jump through a register to a place in the page with no link:
+        // learn it (see jit_jr_miss()).
+        const bool ends_jr = blk.count >= 2 && (blk.ops[blk.count - 2].inst >> 26) == 0 &&
+                             ((blk.ops[blk.count - 2].inst & 63) == 0x08 || (blk.ops[blk.count - 2].inst & 63) == 0x09);
+        if (ends_jr) {
+            e.mov(rcx, rax);
+            e.alu(Alu::Xor, rcx, kPc);
+            e.shift_imm(Shift::Shr, rcx, 12, true);
+            const std::size_t other_page = e.jcc(Cond::Ne);
+            e.mov(kArg0, kCpu);
+            e.mov_imm64(kArg1, reinterpret_cast<u64>(&blocks_[block_index(blk.host)]));
+            e.mov_imm64(kArg2, reinterpret_cast<u64>(&blocks_[block_index(b.host)]));
+            e.mov_imm64(rax, reinterpret_cast<u64>(&R4000::jit_jr_miss));
+            e.call(rax);
+            e.imul_imm(rdx, m_weight, static_cast<s32>(blk.count));
+            e.alu(Alu::Add, rdx, kTime);
+            e.mov(rax, m_pc);
+            e.bind(other_page);
         }
         // Anywhere else (another page, or a jump through a register): look up
         // the fetch translation and the block as run_block() would.

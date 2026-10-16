@@ -185,7 +185,13 @@ R4000::JitPlan R4000::jit_plan(const std::vector<const Block*>& region) {
     return p;
 }
 
-void R4000::jit_successors(const Block& b, std::vector<u32>& offsets) {
+void R4000::jr_targets(const Block& b, std::vector<u32>& offsets) const {
+    const Block& slot = blocks_[block_index(b.host)];
+    if (slot.host != b.host) return;
+    for (unsigned i = 0; i < slot.jr_n; ++i) offsets.push_back(slot.jr_to[i]);
+}
+
+void R4000::jit_successors(const Block& b, std::vector<u32>& offsets) const {
     const u32 end = b.offset + 4 * b.count;
     auto add = [&](s64 off) {
         if (off >= 0 && off < 0x1000) offsets.push_back(static_cast<u32>(off));
@@ -202,7 +208,8 @@ void R4000::jit_successors(const Block& b, std::vector<u32>& offsets) {
         } else {
             likely = (opc >= 0x14 && opc <= 0x17) || (opc == 0x01 && (f_rt(w) & 2));
         }
-        if (!conditional) return;  // jumps: the target depends on the pc, or a register
+        if ((w >> 26) == 0 && ((w & 63) == 0x08 || (w & 63) == 0x09)) return jr_targets(b, offsets);  // JR, JALR
+        if (!conditional) return;  // jumps: the target depends on the pc
         add(static_cast<s64>(b.offset) + 4 * (b.count - 2) + delta);
         if (!likely) add(end);
     } else if (!is_branch_word(b.ops[b.count - 1].inst)) {
@@ -216,6 +223,8 @@ void R4000::jit_region(const Block& b, std::vector<Block>& members, std::vector<
     region.assign(1, &b);
     const u8* const page = b.host - b.offset;
     u32 ops = b.count;
+    const unsigned max_blocks = b.hot ? kJitRegionBlocks : kJitSmallRegionBlocks;
+    const u32 max_ops = b.hot ? kJitRegionOps : kJitSmallRegionOps;
     std::vector<u32> next;
     for (std::size_t k = 0; k < region.size(); ++k) {
         next.clear();
@@ -223,10 +232,14 @@ void R4000::jit_region(const Block& b, std::vector<Block>& members, std::vector<
         for (u32 off : next) {
             bool known = false;
             for (const Block* r : region) known |= r->offset == off;
-            if (known || region.size() == kJitRegionBlocks) continue;
+            if (known || region.size() == max_blocks) continue;
+            // Outside a busy loop, a block with a translation of its own is
+            // linked to, not copied.
+            const Block& slot = blocks_[block_index(page + off)];
+            if (!b.hot && slot.host == page + off && slot.code) continue;
             Block m;
             decode_ops(m, page + off, off);
-            if (ops + m.count > kJitRegionOps) continue;
+            if (ops + m.count > max_ops) continue;
             ops += m.count;
             members.push_back(m);
             region.push_back(&members.back());

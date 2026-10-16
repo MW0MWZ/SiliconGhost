@@ -279,7 +279,10 @@ private:
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
     // A region's other blocks (see jit_region()): where they are, and a hash
     // of their instructions, so that its code can be taken back.
-    static constexpr unsigned kJitRegionBlocks = 8, kJitRegionOps = 160;
+    static constexpr unsigned kJitRegionBlocks = 32, kJitRegionOps = 512;
+    // Most code runs too few times to repay translating much of it together:
+    // a region is kept small unless it is a busy loop's (Block::hot).
+    static constexpr unsigned kJitSmallRegionBlocks = 8, kJitSmallRegionOps = 160;
     struct JitRegion {
         u8 n = 0;  // other blocks
         std::array<u16, kJitRegionBlocks - 1> offset{};
@@ -297,8 +300,13 @@ private:
         JitFn code = nullptr;
         bool jit_addr64 = false;  // addressing mode the code was translated for
         bool jit_region = false;  // the code also runs other blocks of the page (see jit_region())
+        bool hot = false;         // the head of a loop that keeps running: translated as a large region
         JitRegion region;
         const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
+        // Where its jump through a register (JR, JALR) went within the page,
+        // seen while it was interpreted: likely successors for a translation.
+        u8 jr_n = 0;
+        std::array<u16, 8> jr_to{};
         Op ops[kMaxBlockLength];
     };
     static bool is_branch_word(u32 w);
@@ -322,7 +330,10 @@ private:
     // reach without a lookup: the offsets of the taken target of its
     // conditional branch and of the instruction after it (not after a
     // branch-likely, whose untaken path leaves the translation).
-    static void jit_successors(const Block& b, std::vector<u32>& offsets);
+    void jit_successors(const Block& b, std::vector<u32>& offsets) const;
+    // The page offsets recorded for `b`'s jump through a register (b may be
+    // a copy decoded for a region: the recording is in its slot).
+    void jr_targets(const Block& b, std::vector<u32>& offsets) const;
     // The FPU registers an instruction the back ends translate inline reads
     // and writes: use(register, as a double, written).
     static void jit_fp_uses(u32 inst, const std::function<void(unsigned, bool, bool)>& use);
@@ -338,6 +349,13 @@ private:
     void decode_ops(Block& b, const u8* host, u32 page_offset);  // the instructions, nothing else
     void invalidate_code_page(const u8* page);
     void flush_blocks();
+    static bool note_jr(Block& b, u32 offset) {  // true if it is new
+        for (unsigned i = 0; i < b.jr_n; ++i)
+            if (b.jr_to[i] == offset) return false;
+        if (b.jr_n == b.jr_to.size()) return false;
+        b.jr_to[b.jr_n++] = static_cast<u16>(offset);
+        return true;
+    }
     void execute(u32 inst);
     void execute_special(u32 inst);
     void execute_regimm(u32 inst);
@@ -499,6 +517,16 @@ private:
     u64 jit_entry_pc_ = 0;
     std::size_t jit_link_offset_ = 0;  // offset of the linked entry point in every translation
     static void jit_backward_branch(R4000* cpu, u64 target) { cpu->backward_branch(target); }
+    // Translated code jumped through a register (in `jr`, the slot of the
+    // block doing it) to a place in its page it had no link for: learn it,
+    // and have the translation (in `head`'s slot) made again to include it.
+    static void jit_jr_miss(R4000* cpu, Block* jr, Block* head) {
+        if (note_jr(*jr, static_cast<u32>(cpu->pc & 0xFFF)) && head->code && head->jit_host == head->host) {
+            head->code = nullptr;
+            head->jit_host = nullptr;
+            head->runs = kJitThreshold - 1;
+        }
+    }
     u8* store_code_ = nullptr;        // code flag of the last store lookup's page
     std::atomic<bool> stop_{false};
 
@@ -535,11 +563,18 @@ private:
         u64 log_epoch = 0;  // log_epoch_ at the previous visit
         u64 period_fp = 0;  // length of the iteration the snapshot belongs to
         unsigned cooldown = 0;  // visits to let pass without a look
-        bool have_snapshot = false;
+        bool have_snapshot = false;  // in snaps_[snap], while that is still its own
+        u8 snap = 0;
+    };
+    // What a loop's iteration span left behind, for the next to compare;
+    // few loops are being compared at a time, so a few are kept.
+    struct LoopSnapshot {
+        const LoopEntry* owner = nullptr;
         std::array<u64, 34> regs{};  // GPRs, HI, LO
         unsigned nstores = 0;
         std::array<StoreRec, 1u << kStoreLogBits> stores{};
     };
+    static constexpr unsigned kLoopSnapshots = 8;
     void log_store(const u8* host, unsigned size) {
         store_log_[store_count_ & ((1u << kStoreLogBits) - 1)] = {host, size, 0};
         ++store_count_;
@@ -557,7 +592,8 @@ private:
         loop_visit(e, target);
     }
     void loop_visit(LoopEntry& e, u64 target);
-    static constexpr unsigned kLoopTableBits = 4;
+    void promote_loop(u64 target);
+    static constexpr unsigned kLoopTableBits = 8;
     bool idle_skip_ = true;
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 jit_scratch_ = 0;   // translated code's spill slot
@@ -576,6 +612,8 @@ private:
     u64 asid_tag_ = 0;     // EntryHi's ASID, placed as in FastEntry::tag
     std::array<StoreRec, 1u << kStoreLogBits> store_log_{};
     std::array<LoopEntry, 1u << kLoopTableBits> loops_{};
+    std::array<LoopSnapshot, kLoopSnapshots> snaps_{};
+    unsigned next_snap_ = 0;
     u64 idle_period_fp_ = 0;
     u64 idle_skipped_fp_ = 0;
 
