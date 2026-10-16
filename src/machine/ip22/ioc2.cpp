@@ -60,7 +60,7 @@ void Ioc2::reset() {
     pit_.set_clock(1, 0);
     pport_.fill(0);
     panel_ = kPanelReset;
-    dmasel_ = reset_ = write_ = 0;
+    dmasel_ = reset_ = write_ = gc_select_ = gen_ctrl_ = 0;
     local0_mask_ = local1_mask_ = map_mask0_ = map_mask1_ = map_pol_ = 0;
     err_stat_ = 0;
     timer_int_.fill(false);
@@ -129,8 +129,8 @@ u8 Ioc2::read(unsigned index) {
         case kSccAData: return scc_.read_data(0);
         case kKbdData: return kbc_.read_data();
         case kKbdCmd: return kbc_.read_status();
-        case kGcSel:
-        case kGenCtrl:
+        case kGcSel: return gc_select_;
+        case kGenCtrl: return gen_ctrl_;  // nothing drives the pins set as inputs
         case kRead: return 0x50;  // twisted-pair link (bit 7 low), Ethernet +12 V and SCSI +5 V present
         case kPanel: return panel_;
         case kSysId: return kSysIdIndy;
@@ -194,8 +194,8 @@ void Ioc2::write(unsigned index, u8 value) {
         case kSccAData: scc_.write_data(0, value); return;
         case kKbdData: kbc_.write_data(value); return;
         case kKbdCmd: kbc_.write_command(value); return;
-        case kGcSel:
-        case kGenCtrl: return;
+        case kGcSel: gc_select_ = value; return;
+        case kGenCtrl: gen_ctrl_ = value; return;
         case kPanel:
             SG_LOG(Debug, "ioc", "panel write %02x (was %02x, local1 mask %02x)", value, panel_, local1_mask_);
             // Writing 1 to an interrupt bit acknowledges it; 0 leaves it.

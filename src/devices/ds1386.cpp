@@ -144,7 +144,7 @@ void Ds1386::write(unsigned index, u8 value) {
             frozen_ = false;
             commit();
         }
-        mem_[index] = value;
+        mem_[index] = static_cast<u8>((value & 0xFC) | (mem_[index] & 0x03));  // TDF and WAF are read-only
         return;
     }
     if (index < kNumClockRegs) {

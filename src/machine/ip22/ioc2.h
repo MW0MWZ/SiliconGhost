@@ -68,6 +68,7 @@ private:
     // IOC registers
     std::array<u8, 10> pport_{};
     u8 panel_ = 0, dmasel_ = 0, reset_ = 0, write_ = 0;
+    u8 gc_select_ = 0, gen_ctrl_ = 0;  // general control pins: directions and levels
 
     // INT3
     u8 local0_raw_ = 0, local1_raw_ = 0, map_raw_ = 0;
