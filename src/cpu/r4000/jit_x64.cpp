@@ -231,6 +231,32 @@ bool R4000::jit_compile(Block& b) {
         loaded |= u64{1} << g;
         dirty |= u64{1} << g;
     };
+    auto sext32_to = [&](unsigned g) {  // sext32(eax) to guest register g (not r0)
+        if (!cached(g)) {
+            e.movsxd(rax, rax);
+            return e.mov(gpr_at(g), rax);
+        }
+        e.movsxd(host_of[g], rax);
+        loaded |= u64{1} << g;
+        dirty |= u64{1} << g;
+    };
+    // A 64-bit shift of guest register a into d, in d's cache register where
+    // it has one; by cl when `by_cl`.
+    auto shift64 = [&](Shift op, unsigned d, unsigned a, bool by_cl, u8 n) {
+        Reg h = rax;
+        if (cached(d)) {
+            h = host_of[d];
+            if (a != d) read(h, a);
+            else ensure(d);
+        } else {
+            read(rax, a);
+        }
+        if (by_cl) e.shift_cl(op, h, true);
+        else e.shift_imm(op, h, n, true);
+        if (h == rax) return e.mov(gpr_at(d), rax);
+        loaded |= u64{1} << d;
+        dirty |= u64{1} << d;
+    };
     auto fp_store_key = [&](std::size_t k) {
         const Mem m{kCpu, fpr_base + fp_keys[k].off};
         if (fp_keys[k].width == 8) e.movq_store(m, kFpCacheRegs[k]);
@@ -369,8 +395,9 @@ bool R4000::jit_compile(Block& b) {
             read(rax, rs, w64);
             e.alu_imm(Alu::Add, rax, simm, w64);
             if (opc != 0x19) slow.push_back(e.jcc(Cond::O));
-            if (!w64) e.movsxd(rax, rax);
-            write_nz(rt, rax);
+            if (!rt) return true;
+            if (w64) write(rt, rax);
+            else sext32_to(rt);
             return true;
         }
         if (opc == 0x01 && rt >= 0x08 && rt <= 0x0E && rt != 0x0D) {  // TGEI, TGEIU, TLTI, TLTIU, TEQI, TNEI
@@ -403,18 +430,15 @@ bool R4000::jit_compile(Block& b) {
                 need64(slow);
                 ensure(rs), ensure(rt);
                 read(rcx, rs);
-                read(rax, rt);
-                e.shift_cl(funct == 0x14 ? Shift::Shl : funct == 0x16 ? Shift::Shr : Shift::Sar, rax, true);
-                write_nz(rd, rax);
+                if (rd) shift64(funct == 0x14 ? Shift::Shl : funct == 0x16 ? Shift::Shr : Shift::Sar, rd, rt, true, 0);
                 return true;
             case 0x38: case 0x3A: case 0x3B:  // DSLL, DSRL, DSRA
             case 0x3C: case 0x3E: case 0x3F:  // DSLL32, DSRL32, DSRA32
                 need64(slow);
                 ensure(rt);
-                read(rax, rt);
-                e.shift_imm((funct & 3) == 0 ? Shift::Shl : (funct & 3) == 2 ? Shift::Shr : Shift::Sar, rax,
-                            static_cast<u8>(sa + (funct >= 0x3C ? 32 : 0)), true);
-                write_nz(rd, rax);
+                if (rd)
+                    shift64((funct & 3) == 0 ? Shift::Shl : (funct & 3) == 2 ? Shift::Shr : Shift::Sar, rd, rt, false,
+                            static_cast<u8>(sa + (funct >= 0x3C ? 32 : 0)));
                 return true;
             case 0x20:  // ADD
             case 0x22:  // SUB
@@ -428,8 +452,9 @@ bool R4000::jit_compile(Block& b) {
                 read(rax, rs, w64);
                 alu_g((funct & 2) ? Alu::Sub : Alu::Add, rax, rt, w64);
                 if (!(funct & 1)) slow.push_back(e.jcc(Cond::O));  // overflow: the handler raises it
-                if (!w64) e.movsxd(rax, rax);
-                write_nz(rd, rax);
+                if (!rd) return true;
+                if (w64) write(rd, rax);
+                else sext32_to(rd);
                 return true;
             }
             case 0x1C:  // DMULT
@@ -976,8 +1001,11 @@ bool R4000::jit_compile(Block& b) {
                 default:
                     e.mov(rax, p, false);
                     e.bswap32(rax);
-                    if (opc == 0x23) e.movsxd(rax, rax);  // LWU leaves it zero-extended
-                    break;
+                    if (opc == 0x23) {
+                        sext32_to(rt);
+                        return true;
+                    }
+                    break;  // LWU leaves it zero-extended
             }
             write(rt, rax);
             return true;
@@ -1059,9 +1087,37 @@ bool R4000::jit_compile(Block& b) {
         const s32 simm = static_cast<s16>(w & 0xFFFF);
         const s32 zimm = static_cast<s32>(w & 0xFFFF);
         const unsigned opc = w >> 26, funct = w & 63;
-        auto alu32_store = [&](unsigned dest) {  // rax <- sext32(eax), stored to dest
-            e.movsxd(rax, rax);
-            write(dest, rax);
+        auto alu32_store = [&](unsigned dest) { sext32_to(dest); };
+        // A 64-bit operation of a and b into dest, straight in dest's cache
+        // register where it has one (b is a register, or an immediate when
+        // b_reg is false).
+        auto alu64 = [&](Alu aop, unsigned d, unsigned a, unsigned b_g, bool b_reg, s32 imm, bool commutes) {
+            if (!cached(d)) {
+                read(rax, a);
+                if (b_reg) alu_g(aop, rax, b_g);
+                else e.alu_imm(aop, rax, imm);
+                return write(d, rax), rax;
+            }
+            const Reg h = host_of[d];
+            if (b_reg && commutes && b_g == d && a != d) std::swap(a, b_g);
+            if (a != d) {
+                if (b_reg && b_g == d) {  // d = a op d, not commutative
+                    read(rax, a);
+                    alu_g(aop, rax, b_g);
+                    e.mov(h, rax);
+                } else {
+                    read(h, a);
+                    if (b_reg) alu_g(aop, h, b_g);
+                    else e.alu_imm(aop, h, imm);
+                }
+            } else {
+                ensure(d);
+                if (b_reg) alu_g(aop, h, b_g);
+                else e.alu_imm(aop, h, imm);
+            }
+            loaded |= u64{1} << d;
+            dirty |= u64{1} << d;
+            return h;
         };
         auto set_flag = [&](Cond c, unsigned dest) {
             e.setcc(c, rax);
@@ -1158,12 +1214,19 @@ bool R4000::jit_compile(Block& b) {
                 case 0x24:  // AND
                 case 0x25:  // OR
                 case 0x26:  // XOR
-                case 0x27:  // NOR
-                    read(rax, rs);
-                    alu_g(funct == 0x24 ? Alu::And : funct == 0x26 ? Alu::Xor : Alu::Or, rax, rt);
-                    if (funct == 0x27) e.not_(rax);
-                    write(rd, rax);
+                case 0x27: {  // NOR
+                    const Reg r = alu64(funct == 0x24 ? Alu::And : funct == 0x26 ? Alu::Xor : Alu::Or, rd, rs, rt,
+                                        true, 0, true);
+                    if (funct == 0x27) {
+                        if (r == rax) {  // written already: complement in memory
+                            e.not_(rax);
+                            write(rd, rax);
+                        } else {
+                            e.not_(r);
+                        }
+                    }
                     break;
+                }
                 case 0x2A:  // SLT
                 case 0x2B:  // SLTU
                     ensure(rt);
@@ -1191,9 +1254,7 @@ bool R4000::jit_compile(Block& b) {
                 case 0x0C:  // ANDI
                 case 0x0D:  // ORI
                 case 0x0E:  // XORI
-                    read(rax, rs);
-                    e.alu_imm(opc == 0x0C ? Alu::And : opc == 0x0D ? Alu::Or : Alu::Xor, rax, zimm);
-                    write(rt, rax);
+                    alu64(opc == 0x0C ? Alu::And : opc == 0x0D ? Alu::Or : Alu::Xor, rt, rs, 0, false, zimm, false);
                     break;
                 case 0x0F: write_imm(rt, static_cast<s32>(static_cast<u32>(zimm) << 16)); break;  // LUI
                 default: done = false; break;

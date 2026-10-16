@@ -904,9 +904,12 @@ bool R4000::jit_compile(Block& b) {
         const s32 simm = static_cast<s16>(w & 0xFFFF);
         const u32 zimm = w & 0xFFFF;
         const unsigned opc = w >> 26, funct = w & 63;
-        auto sext_store = [&](unsigned dest) {  // x0 <- sext32(w0), stored to dest
-            e.sxtw(x0, x0);
-            write(dest, x0);
+        // Results go straight to the destination's cache register where it has one.
+        const unsigned dest_g = opc == 0x00 ? rd : rt;
+        const Reg d0 = (dest_g && cached(dest_g)) ? host_of[dest_g] : x0;
+        auto sext_store = [&](unsigned dest) {  // d0 <- sext32(w(d0)), stored to dest
+            e.sxtw(d0, d0);
+            write(dest, d0);
         };
         // MTHI, MTLO, MULT(U) and DIV(U) write HI/LO rather than rd.
         const bool is_mult = opc == 0x00 && (funct == 0x11 || funct == 0x13 || (funct >= 0x18 && funct <= 0x1B));
@@ -918,9 +921,9 @@ bool R4000::jit_compile(Block& b) {
                 case 0x02:  // SRL
                 case 0x03: {  // SRA
                     const Reg t = src(rt, x0);
-                    if (funct == 0x00) e.lsl(x0, t, sa, false);
-                    else if (funct == 0x02) e.lsr(x0, t, sa, false);
-                    else e.asr(x0, t, sa, false);
+                    if (funct == 0x00) e.lsl(d0, t, sa, false);
+                    else if (funct == 0x02) e.lsr(d0, t, sa, false);
+                    else e.asr(d0, t, sa, false);
                     sext_store(rd);
                     break;
                 }
@@ -928,9 +931,9 @@ bool R4000::jit_compile(Block& b) {
                 case 0x06:  // SRLV
                 case 0x07: {  // SRAV (32-bit register shifts take the count mod 32, as MIPS)
                     const Reg s = src(rs, x1), t = src(rt, x0);
-                    if (funct == 0x04) e.lslv(x0, t, s, false);
-                    else if (funct == 0x06) e.lsrv(x0, t, s, false);
-                    else e.asrv(x0, t, s, false);
+                    if (funct == 0x04) e.lslv(d0, t, s, false);
+                    else if (funct == 0x06) e.lsrv(d0, t, s, false);
+                    else e.asrv(d0, t, s, false);
                     sext_store(rd);
                     break;
                 }
@@ -977,8 +980,8 @@ bool R4000::jit_compile(Block& b) {
                 case 0x21:  // ADDU
                 case 0x23: {  // SUBU
                     const Reg s = src(rs, x0), t = src(rt, x1);
-                    if (funct == 0x21) e.add(x0, s, t, false);
-                    else e.sub(x0, s, t, false);
+                    if (funct == 0x21) e.add(d0, s, t, false);
+                    else e.sub(d0, s, t, false);
                     sext_store(rd);
                     break;
                 }
@@ -987,19 +990,19 @@ bool R4000::jit_compile(Block& b) {
                 case 0x26:  // XOR
                 case 0x27: {  // NOR
                     const Reg s = src(rs, x0), t = src(rt, x1);
-                    if (funct == 0x24) e.and_(x0, s, t);
-                    else if (funct == 0x26) e.eor(x0, s, t);
-                    else e.orr(x0, s, t);
-                    if (funct == 0x27) e.mvn(x0, x0);
-                    write(rd, x0);
+                    if (funct == 0x24) e.and_(d0, s, t);
+                    else if (funct == 0x26) e.eor(d0, s, t);
+                    else e.orr(d0, s, t);
+                    if (funct == 0x27) e.mvn(d0, d0);
+                    write(rd, d0);
                     break;
                 }
                 case 0x2A:  // SLT
                 case 0x2B: {  // SLTU
                     const Reg s = src(rs, x0), t = src(rt, x1);
                     e.cmp(s, t);
-                    e.cset(x0, funct == 0x2A ? Cond::Lt : Cond::Lo);
-                    write(rd, x0);
+                    e.cset(d0, funct == 0x2A ? Cond::Lt : Cond::Lo);
+                    write(rd, d0);
                     break;
                 }
                 default: done = false; break;
@@ -1007,30 +1010,30 @@ bool R4000::jit_compile(Block& b) {
         } else {
             switch (opc) {
                 case 0x09:  // ADDIU
-                    e.add_imm(x0, src_imm(rs, x0), simm, false);
+                    e.add_imm(d0, src_imm(rs, x0), simm, false);
                     sext_store(rt);
                     break;
                 case 0x0A:  // SLTI
                 case 0x0B:  // SLTIU (the immediate is sign-extended, then compared unsigned)
                     e.cmp_imm(src_imm(rs, x1), simm);
-                    e.cset(x0, opc == 0x0A ? Cond::Lt : Cond::Lo);
-                    write(rt, x0);
+                    e.cset(d0, opc == 0x0A ? Cond::Lt : Cond::Lo);
+                    write(rt, d0);
                     break;
                 case 0x0C:  // ANDI
                 case 0x0D:  // ORI
                 case 0x0E: {  // XORI
                     const Reg s = src(rs, x0);
                     if (zimm == 0) {
-                        if (opc == 0x0C) e.mov(x0, xzr);
-                        else e.mov(x0, s);
+                        if (opc == 0x0C) e.mov(d0, xzr);
+                        else e.mov(d0, s);
                     } else if (opc == 0x0C) {
-                        e.and_imm(x0, s, zimm);
+                        e.and_imm(d0, s, zimm);
                     } else if (opc == 0x0D) {
-                        e.orr_imm(x0, s, zimm);
+                        e.orr_imm(d0, s, zimm);
                     } else {
-                        e.eor_imm(x0, s, zimm);
+                        e.eor_imm(d0, s, zimm);
                     }
-                    write(rt, x0);
+                    write(rt, d0);
                     break;
                 }
                 case 0x0F: write_imm(rt, static_cast<s32>(zimm << 16)); break;  // LUI
