@@ -367,6 +367,24 @@ TEST(newport_blend_source_alpha_over_frame_buffer_and_colorback) {
     CHECK_EQ(read24(t, 12, 10), 0xFFFFFFu);
 }
 
+// Below 24 bits an RGB colour is rounded to the nearest stored value, after
+// blending on 8-bit channels; COLORBACK is 8-8-8 in RGB mode.
+TEST(newport_rgb_rounding_blend_and_colorback) {
+    Rig t(Newport::Options{true, 0xA});
+    constexpr u32 kRgb12 = (kRgb24 & ~(3u << 3)) | (2u << 3);
+    point24(t, 10, 10, 0x080808, kRgb12);  // half a step rounds up
+    CHECK_EQ(read24(t, 10, 10), 0x111111u);
+    point24(t, 11, 10, 0x070707, kRgb12);  // less rounds down
+    CHECK_EQ(read24(t, 11, 10), 0u);
+    t.w(0x204, 0xFFu << 11);  // COLORALPHA 1.0
+    point24(t, 12, 10, 0x7F7F7F, kRgb12 | kBlend | factors(kSa, kMsa));  // 0x7F blended, then rounded
+    CHECK_EQ(read24(t, 12, 10), 0x888888u);
+    t.w(0x018, 0x0000FF);  // COLORBACK red
+    t.w(0x014, 0);         // ZPATTERN: background everywhere
+    point24(t, 13, 10, 0xFFFFFF, kRgb12, (1u << 12) | (1u << 16));  // ENZPATTERN ZPOPAQUE
+    CHECK_EQ(read24(t, 13, 10), 0x00F00Fu);
+}
+
 // A slope written as minus zero leaves the iterator where it is.
 TEST(newport_minus_zero_slope_keeps_alpha) {
     Rig t(Newport::Options{true, 0xA});
@@ -390,21 +408,28 @@ TEST(newport_antialiased_line_coverage) {
         t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
         t.w(kWrMask, 0xFFFFFF);
         t.w(kColorI, 0xFFFFFF);
-        t.w(0x130, 0x76543210);  // AWEIGHT: entry i = i
-        t.w(0x134, 0xFEDCBA98);
+        t.w(0x130, 0xFEDCBA98);  // AWEIGHT: entry i = i
+        t.w(0x134, 0x76543210);
         t.w(0x100, fixed(x1));
         t.w(0x104, fixed(y1));
         t.w(0x108, fixed(x2));
         t.w(0x10C, fixed(y2));
         t.w(kDrawMode0 | kGo, 2u | (4u << 2) | (1u << 5) | (1u << 8));  // DRAW A_LINE DOSETUP STOPX
     };
-    line(10, 20, 20, 20);  // on the pixel row: full coverage there, none above
+    line(10, 20.5, 20, 20.5);  // through the row's centres: all there, none above
     CHECK_EQ(read24(t, 15, 20), 0xFFFFFFu);
     CHECK_EQ(read24(t, 15, 21), 0u);
-    line(10, 40.5, 20, 40.5);  // between two rows: half each (entry 8 -> alpha 0x88)
+    line(10, 41, 20, 41);  // between two rows: S takes entry 7 (0x77 blends to 0x76), T entry 8
     CHECK_EQ(t.r(0x100) >> 11, 20u);  // XSTART rests at the end point
-    CHECK_EQ(read24(t, 15, 40), 0x888888u);
+    CHECK_EQ(read24(t, 15, 40), 0x767676u);
     CHECK_EQ(read24(t, 15, 41), 0x888888u);
+    line(30, 61, 30, 51);  // y major, falling: the same pair across the columns
+    CHECK_EQ(read24(t, 29, 55), 0x767676u);
+    CHECK_EQ(read24(t, 30, 55), 0x888888u);
+    line(40.5, 71, 40.5, 61);
+    CHECK_EQ(read24(t, 40, 65), 0xFFFFFFu);
+    CHECK_EQ(read24(t, 39, 65), 0u);
+    CHECK_EQ(read24(t, 41, 65), 0u);
 }
 
 // LENGTH32 lines draw 32 pixels a GO, each GO carrying on from the next
@@ -562,4 +587,34 @@ TEST(newport_xyoffset_and_ystride) {
     t.w(kXYEndI, (20u << 16) | 15u);
     t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 23));  // block, YSTRIDE
     for (int y = 10; y <= 16; ++y) CHECK_EQ(pixel8(t, 20, y), (y % 2 == 0 && y <= 15) ? 0x33u : 0u);
+}
+
+// A colour index with a fraction of a half or more rounds up.
+TEST(newport_ci_rounding) {
+    Rig t;
+    t.w(kDrawMode1, (3u << 28) | (1u << 3) | 1u | 0x7000u);
+    t.w(kWrMask, 0xFF);
+    t.w(0x200, (5u << 11) | (8u << 7));  // COLORRED index 5.5
+    t.w(kXYStartI, (3u << 16) | 3u);
+    t.w(kXYEndI, (3u << 16) | 3u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 5));
+    CHECK_EQ(pixel8(t, 3, 3), 6u);
+}
+
+// A double-buffered logic op takes its destination from the DBLSRC buffer.
+TEST(newport_logic_op_destination_from_dblsrc) {
+    Rig t(Newport::Options{true, 0xA});
+    auto point = [&](u32 dm1, u32 mask, u32 ci) {
+        t.w(kDrawMode1, dm1);
+        t.w(kWrMask, mask);
+        t.w(kColorI, ci);
+        t.w(kXYStartI, (4u << 16) | 4u);
+        t.w(kXYEndI, (4u << 16) | 4u);
+        t.w(kDrawMode0 | kGo, 2u | (1u << 5));
+    };
+    constexpr u32 k8 = (1u << 3) | 1u | 0x7000u;  // 8bpp, RGB/CI planes, compare always
+    point((3u << 28) | k8, 0xFFFF, 0x00);        // both buffers 0
+    point((3u << 28) | k8, 0xFF00, 0x0F);        // buffer 1 0x0F
+    point((6u << 28) | k8 | (1u << 5), 0xFF, 0xF0);  // XOR into buffer 0 against buffer 1
+    CHECK_EQ(pixel8(t, 4, 4), 0xFFu);
 }

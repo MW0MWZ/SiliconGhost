@@ -78,12 +78,15 @@ private:
     static int int_part(u32 v) { return static_cast<s16>(v >> 11); }
     void set_color_index(u32 v);
     u32 ci_index() const;  // the colour index COLORRED holds
+    u32 ci_colour(int x, int y) const;  // that index rounded or dithered by its fraction
 
     u32 source_color(int x, int y);
     u32 host_color(u32* alpha = nullptr);
     u32 blend(u32 src, int px, int py) const;
     u32 default_color(u32 colour) const;
     u32 shaded_color(int x, int y) const;
+    u32 reduce_rgb(u32 c, int x, int y) const;  // 8-8-8 to the stored depth
+    u32 background_colour(int x, int y) const;  // COLORBACK for opaque patterns
     void iterate_shade();
     void reload_shade();
     void plot_source(int x, int y, u32 colour);
@@ -164,6 +167,7 @@ private:
     u32 colorred_ = 0, coloralpha_ = 0, colorgrn_ = 0, colorblue_ = 0;
     s32 curr_red_ = 0, curr_alpha_ = 0, curr_grn_ = 0, curr_blue_ = 0;
     u32 src_alpha_ = 0xFF;  // alpha of the pixel being drawn, for blending
+    bool src_wide_ = false;  // and its colour is 8-8-8, to be blended then reduced
     u32 slopered_ = 0, slopealpha_ = 0, slopegrn_ = 0, slopeblue_ = 0;
     u32 wrmask_ = 0, colori_ = 0, colorx_ = 0;
     u64 hostrw_ = 0;
