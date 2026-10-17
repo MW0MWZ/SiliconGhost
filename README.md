@@ -428,10 +428,8 @@ so guest clocks always agree with each other.
   sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
 - **max**: as fast as possible, with guest time running ahead of the wall
-  clock; for unattended runs (the window offers only realtime and cycle,
-  realtime being just as fast for the CPU). While a key is held in the
-  window, guest time keeps to the wall clock, so the guest's key repeat runs
-  at its normal rate.
+  clock. While a key is held in the window, guest time keeps to the wall
+  clock, so the guest's key repeat runs at its normal rate.
 
 ## How it works
 
