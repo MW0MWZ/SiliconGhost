@@ -162,12 +162,19 @@ clock after every 1 ms slice (`--timing`):
 
 * `realtime` (default): guest time follows the wall clock. The CPU runs as
   many instructions as the host can, and the charge per instruction adapts
-  (down to 1/`--max-speed` and up to 16 cycles), so a fast host looks like a
-  faster R4400 while a guest second remains a second. The speed-up is capped
-  (2x by default) because guest software times the CPU against its timers:
-  IRIX 5.3 times a 1024-instruction loop against the 8254 at boot and
-  divides by zero if it takes under 2 us, i.e. beyond about 2.9x a 175 MHz
-  part.
+  (down to 1/64, or 1/`--max-speed`, and up to 16 cycles), so a fast host
+  looks like a faster R4400 while a guest second remains a second. Guest
+  software times the CPU against its timers: IRIX 5.3 times a
+  1024-instruction loop against the 8254 at boot and divides by zero if it
+  takes under 2 us, i.e. beyond about 2.9x a 175 MHz part. A latch of the
+  8254's counter marks the guest timing the CPU, and for half a second
+  after it the CPU runs at `--timed-speed` (2x by default). Delays
+  calibrated then must not run short when the CPU is faster later: delay
+  loops (a block that branches to itself and only counts one register,
+  such as `bgtz t5, self; addiu t5, t5, -1`) are recognised when decoded,
+  never translated, and run by a stepper that charges each instruction at
+  least the timed speed's charge. The extra time is accounted like idle
+  skipping, so the instruction count is unchanged.
 * `cycle`: one cycle per instruction, reproducible from run to run; waits
   when ahead of the wall clock and lags when the host is too slow.
 * `max`: no waiting, one cycle per instruction (the default with `--max`).

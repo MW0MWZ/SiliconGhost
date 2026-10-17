@@ -239,7 +239,7 @@ void R4000::jit_region(const Block& b, std::vector<Block>& members, std::vector<
             if (!b.hot && slot.host == page + off && slot.code) continue;
             Block m;
             decode_ops(m, page + off, off);
-            if (ops + m.count > max_ops) continue;
+            if (ops + m.count > max_ops || m.delay.test != DelayLoop::None) continue;
             ops += m.count;
             members.push_back(m);
             region.push_back(&members.back());

@@ -185,6 +185,11 @@ public:
     // including Count/Compare, follows the cycle counter.
     void set_cycles_per_instruction(double cpi);
     double cycles_per_instruction() const { return static_cast<double>(weight_) / (1u << kCycleFracBits); }
+    // The least guest time a delay loop's instruction is charged (see
+    // DelayLoop): the charge the guest saw when it timed the CPU, so that a
+    // calibrated delay never runs short when the CPU later runs faster.
+    // Default 0: the ordinary charge.
+    void set_delay_cycles_per_instruction(double cpi);
 
     // Idle skipping: a loop is a spin when two consecutive iterations (visits
     // to the same backward branch) end with the same registers and have
@@ -233,6 +238,11 @@ public:
     u64 pc = 0;  // address of the next instruction to execute
     std::array<u64, 32> fpr{};
     u32 fcr31 = 0;
+    // FCR31 bit 18 (reserved, reads as 0): the last operation's Cause.I is
+    // still to be worked out, from fp_lazy_*. Translated code leaves it so
+    // once the sticky Inexact flag is set, when only that bit would tell.
+    static constexpr u32 kFcrLazyI = 1u << 18;
+    void resolve_fp_lazy();
 
 private:
     enum class Access { Fetch, Load, Store };
@@ -245,12 +255,12 @@ private:
     // number never uses), so a change of address space needs no flush and
     // returning to one finds its translations still there.
     struct FastEntry {
-        u64 tag = ~u64{0};  // (vaddr >> 12) | asid_tag_
+        u64 tag = ~u64{0};  // (vaddr >> 12) | asid_tag_ (ASID and generation)
         u8* host = nullptr; // host pointer to the 4 KiB page, or nullptr for MMIO
         u64 ppage = 0;      // physical page address
         u8* code = nullptr; // the page's code flag (host pages only; see Bus::code_flag)
     };
-    static constexpr unsigned kFastBits = 10;
+    static constexpr unsigned kFastBits = 12;
     static constexpr unsigned kFastEntries = 1u << kFastBits;
 
     // Execution
@@ -274,8 +284,9 @@ private:
     // reads neither the pc nor the time, so it runs without bookkeeping.
     static Handler decode(u32 inst, bool& plain);
     // Translated block: runs the block from its start, returns the number
-    // of instructions completed (see jit_x64.cpp).
-    using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 time_fp);
+    // of instructions completed (see jit_x64.cpp). `budget`: how many
+    // instructions may start (jit_budget0_).
+    using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 budget);
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
     // A region's other blocks (see jit_region()): where they are, and a hash
     // of their instructions, so that its code can be taken back.
@@ -291,6 +302,23 @@ private:
     };
     // FNV-1a of the region's other blocks' instructions in the page at `page`.
     static u64 jit_region_hash(const u8* page, const JitRegion& r);
+    // A delay loop: a block that branches back to its own start and does
+    // nothing but count one register up or down (by a constant, or by a
+    // register the loop leaves alone) until the branch's test on it fails,
+    // e.g. `bgtz t5, self; addiu t5, t5, -1`. Software calibrates such loops
+    // against a timer, so their only effect is the time they take: they are
+    // run by run_delay_loop() instead of instruction by instruction, charged
+    // at least the delay charge (set_delay_cycles_per_instruction).
+    struct DelayLoop {
+        enum Test : u8 { None, Eq, Ne, Lez, Gtz, Ltz, Gez };
+        Test test = None;
+        bool in_slot = false;  // the count is in the delay slot (after the test)
+        bool sub = false;      // SUBU/SUB: counter -= step
+        bool trap = false;     // ADDI/ADD/SUB: stop before an overflow (the instruction traps)
+        u8 counter = 0, step_reg = 0, other = 0;  // other: what Eq/Ne compare with
+        u32 imm = 0;           // step when step_reg is 0 (sign-extended immediate)
+    };
+    static DelayLoop delay_loop(const Op* ops, u32 count, u32 page_offset);
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 offset = 0;            // of the first instruction within its 4 KiB page
@@ -301,6 +329,7 @@ private:
         bool jit_addr64 = false;  // addressing mode the code was translated for
         bool jit_region = false;  // the code also runs other blocks of the page (see jit_region())
         bool hot = false;         // the head of a loop that keeps running: translated as a large region
+        DelayLoop delay;          // the block is a delay loop (never translated)
         JitRegion region;
         const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
         // Where its jump through a register (JR, JALR) went within the page,
@@ -345,6 +374,9 @@ private:
         return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
     }
     void run_block(u64 cycle, const u64* limit);
+    // Runs whole iterations of delay loop `b` (at its start), each taken back
+    // to the start and finishing before guest time `safe`; returns the new time.
+    u64 run_delay_loop(const Block& b, u64 t, u64 safe);
     void build_block(Block& b, const u8* host, u32 page_offset);
     void decode_ops(Block& b, const u8* host, u32 page_offset);  // the instructions, nothing else
     void invalidate_code_page(const u8* page);
@@ -479,6 +511,9 @@ private:
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
     std::vector<Block> blocks_;
+    // Where run_block() stopped inside a block at the end of a run.
+    const u8* resume_host_ = nullptr;
+    u32 resume_i_ = 0;
     // Translations of blocks recently replaced in each slot (the table is
     // direct-mapped, so blocks 64 KiB apart evict each other), with the
     // instructions they were made from: a block decoded into its slot again
@@ -500,7 +535,10 @@ private:
     void keep_translation(Block& b);
     void reuse_translation(Block& b);
     std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
-    u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
+    // A translated code call's start time and budget: how many instructions
+    // may start before run_block()'s safe time (translated code counts the
+    // budget down, block by block, and works out the time from it).
+    u64 jit_time0_ = 0, jit_budget0_ = 0;
     // Where translated code stopped: the block it was running (it may have
     // gone on into other blocks) and that block's entry pc.
     // Operations of a region's other blocks that translated code passes to
@@ -537,6 +575,7 @@ private:
     static constexpr unsigned kCycleFracBits = 10;
     u64 time_fp_ = 0;                          // cycle counter, kCycleFracBits fractional bits
     u64 weight_ = u64{1} << kCycleFracBits;    // charged per instruction
+    u64 delay_weight_ = 0;                     // least charged per delay-loop instruction
     u64 instret_base_ = 0, instret_time_fp_ = 0, instret_skip_fp_ = 0;  // instructions() at the last re-base
     u64 timer_event_fp_ = ~u64{0};             // Count == Compare, in time_fp_ units
 
@@ -597,6 +636,10 @@ private:
     bool idle_skip_ = true;
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 jit_scratch_ = 0;   // translated code's spill slot
+    // The operands (raw bits) and the instruction of the operation whose
+    // Cause.I is pending (see kFcrLazyI).
+    u64 fp_lazy_a_ = 0, fp_lazy_b_ = 0, fp_lazy_c_ = 0;
+    u32 fp_lazy_w_ = 0;
     u32 jit_fp_control_ = 0;  // the host FP control word translated FP operations start from
     double jit_split_d_ = 134217729.0;  // 2^27 + 1 and 2^12 + 1: Dekker's splitting factors
     float jit_split_s_ = 4097.0f;
@@ -632,14 +675,21 @@ private:
     std::vector<u32> itag_, dtag_, stag_;
     std::vector<u8> ilru_, dlru_;  // 2-way caches: the way to replace next in each set
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
+    bool stag_valid_ = false;          // R5000: some S$ tag may be valid
 
     // Separate tables for fetch, load and store (indexed by Access), so code
     // and data pages that share low address bits do not evict each other.
     FastEntry fast_[kNumModes][3][kFastEntries];
     static constexpr unsigned kAsidTagShift = 52;
+    // Tags also carry a generation (bits 60-63): a full flush moves to the
+    // next, which no entry has, and clears the tables only when the count
+    // wraps. (Generation 15 is never used, so an empty slot's all-ones tag
+    // matches nothing.)
+    static constexpr unsigned kFastGenShift = 60, kFastGens = 15;
+    u64 fast_gen_ = 0;
     void set_entryhi(u64 v) {
         entryhi_ = v;
-        asid_tag_ = (v & 0xFF) << kAsidTagShift;
+        asid_tag_ = ((v & 0xFF) << kAsidTagShift) | (fast_gen_ << kFastGenShift);
     }
 };
 

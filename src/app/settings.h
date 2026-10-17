@@ -60,7 +60,10 @@ struct Settings {
     std::string net = "user";  // user | tap:NAME | none
     std::vector<net::PortForward> forwards;
     Pacer::Mode timing = Pacer::Mode::Realtime;
-    double max_speed = 2.0;
+    // Realtime timing, as multiples of the real CPU: its speed while the
+    // guest times it (and its delay loops' from then on), and a cap on it
+    // otherwise (0: none).
+    double timed_speed = 2.0, max_speed = 0;
     bool idle_skip = true, block_cache = true, jit = true;
     bool audio = true, audio_in = false;
     bool mouse_auto_capture = true;  // the window captures the mouse when the pointer moves onto the screen

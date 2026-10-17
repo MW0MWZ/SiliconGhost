@@ -13,6 +13,7 @@
 //
 // This file must be compiled with strict floating-point semantics
 // (-frounding-math / /fp:strict); see CMakeLists.txt.
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstring>
@@ -254,8 +255,67 @@ typename Traits<F>::Bits flushed(bool negative, u32 rm) {
 
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Whether f() rounds, on the host (rounding to nearest, as the operation
+// was translated for).
+template <typename F, typename Op>
+bool host_inexact(Op op) {
+    std::feclearexcept(FE_INEXACT);
+    volatile F r = op();
+    (void)r;
+    return std::fetestexcept(FE_INEXACT) != 0;
+}
+
+template <typename F>
+F lazy_operand(u64 v) {
+    if constexpr (sizeof(F) == 8) return std::bit_cast<double>(v);
+    else return std::bit_cast<float>(static_cast<u32>(v));
+}
+
+// The operation translated code deferred: ADD, SUB, MUL, DIV, SQRT, RECIP
+// (a = 1) or a MIPS IV multiply-add (product rounded, then the sum).
+template <typename F>
+bool lazy_inexact(u32 w, u64 a_bits, u64 b_bits, u64 c_bits) {
+    volatile F a = lazy_operand<F>(a_bits), b = lazy_operand<F>(b_bits), c = lazy_operand<F>(c_bits);
+    if ((w >> 26) == 0x13) {
+        bool inexact = false;
+        volatile F p = 0;
+        inexact |= host_inexact<F>([&] {
+            p = a * b;
+            return F(p);
+        });
+        if (w & 0x08) inexact |= host_inexact<F>([&] { return F(p - c); });
+        else inexact |= host_inexact<F>([&] { return F(p + c); });
+        return inexact;
+    }
+    switch (w & 63) {
+        case 0x00: return host_inexact<F>([&] { return F(a + b); });
+        case 0x01: return host_inexact<F>([&] { return F(a - b); });
+        case 0x02: return host_inexact<F>([&] { return F(a * b); });
+        case 0x04: return host_inexact<F>([&] { return F(std::sqrt(a)); });
+        default: return host_inexact<F>([&] { return F(a / b); });  // DIV, RECIP
+    }
+}
+
+}  // namespace
+
+void R4000::resolve_fp_lazy() {
+    if (!(fcr31 & kFcrLazyI)) return;
+    fcr31 &= ~kFcrLazyI;
+    const u32 w = fp_lazy_w_;
+    const bool dbl = (w >> 26) == 0x13 ? (w & 1) != 0 : ((w >> 21) & 31) == 0x11;
+    std::fenv_t saved;
+    std::feholdexcept(&saved);
+    std::fesetround(FE_TONEAREST);
+    const bool inexact = dbl ? lazy_inexact<double>(w, fp_lazy_a_, fp_lazy_b_, fp_lazy_c_)
+                             : lazy_inexact<float>(w, fp_lazy_a_, fp_lazy_b_, fp_lazy_c_);
+    std::fesetenv(&saved);
+    if (inexact) fcr31 |= kCauseI;
+}
+
 bool R4000::fp_commit(u32 cause) {
-    fcr31 = (fcr31 & ~kCauseMask) | cause;
+    fcr31 = (fcr31 & ~(kCauseMask | kFcrLazyI)) | cause;
     const u32 ieee = (cause >> 12) & 0x1F;
     const u32 enables = (fcr31 >> 7) & 0x1F;
     if ((cause & kCauseE) || (ieee & enables)) {
@@ -267,7 +327,7 @@ bool R4000::fp_commit(u32 cause) {
 }
 
 void R4000::fp_unimplemented() {
-    fcr31 = (fcr31 & ~kCauseMask) | kCauseE;
+    fcr31 = (fcr31 & ~(kCauseMask | kFcrLazyI)) | kCauseE;
     raise(Exc::FPE);
 }
 
@@ -499,6 +559,7 @@ void R4000::execute_cop1(u32 inst) {
             gpr[ft] = fpr_read64(fs);
             return;
         case 0x02:  // CFC1
+            if (fs == 31) resolve_fp_lazy();
             gpr[ft] = sext32(fs == 0 ? fir_ : fs == 31 ? fcr31 : 0);
             return;
         case 0x04: fpr_write32(fs, static_cast<u32>(gpr[ft])); return;  // MTC1

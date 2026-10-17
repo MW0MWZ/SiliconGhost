@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "core/host_memory.h"
 #include "core/scheduler.h"
 #include "devices/test_device.h"
 #include "cpu/r4000/r4000.h"
@@ -164,7 +165,7 @@ private:
     IndyConfig config_;
     Scheduler scheduler_;
     Bus bus_;
-    std::unique_ptr<u8[]> ram_;
+    HostMemory ram_;
     std::unique_ptr<u8[]> prom_;
     mips::R4000 cpu_;
     Ioc2 ioc_;

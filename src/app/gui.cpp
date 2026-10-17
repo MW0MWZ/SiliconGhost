@@ -1355,23 +1355,38 @@ void Gui::draw_settings() {
             label("Timing");
             ImGui::SetNextItemWidth(-1);
             int timing = edit_.timing == Pacer::Mode::Realtime ? 0 : edit_.timing == Pacer::Mode::Cycle ? 1 : 2;
-            ImGui::Combo("##timing", &timing,
-                         "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
-                         "Maximum: no waiting, guest time runs ahead\0");
-            edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
+            if (ImGui::Combo("##timing", &timing,
+                             "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
+                             "Maximum: CPU never held back, guest clocks follow the host's\0"))
+                edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
             if (timing == 0) {
-                label("Speed limit");
+                label("Timed speed");
                 ImGui::SetNextItemWidth(200 * scale_);
-                float limit = static_cast<float>(edit_.max_speed);
-                ImGui::SliderFloat("##maxspeed", &limit, 1.0f, 4.0f, "%.1fx the real CPU");
-                edit_.max_speed = limit;
-                ImGui::SameLine();
-                const double fastest = edit_.cpu_mhz * edit_.max_speed;
-                const bool too_fast = fastest > 350;
-                ImGui::TextColored(too_fast ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
-                                   too_fast ? "%.0f MHz: too fast for IRIX 5.3" : "up to %.0f MHz", fastest);
+                float timed = static_cast<float>(edit_.timed_speed);
+                ImGui::SliderFloat("##timedspeed", &timed, 1.0f, 4.0f, "%.1fx the real CPU");
+                edit_.timed_speed = timed;
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("IRIX 5.3 times the CPU at boot and fails beyond about 350 MHz (clock x limit)");
+                    ImGui::SetTooltip("The CPU's speed while the system times it at boot. Its delays keep that\n"
+                                      "length; everything else runs as fast as the host allows.");
+                ImGui::SameLine();
+                const double timed_mhz = edit_.cpu_mhz * edit_.timed_speed;
+                const bool too_fast = timed_mhz > 350;
+                ImGui::TextColored(too_fast ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
+                                   too_fast ? "%.0f MHz: too fast for IRIX 5.3" : "%.0f MHz", timed_mhz);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("IRIX 5.3 times the CPU at boot and fails beyond about 350 MHz (clock x speed)");
+                label("Speed limit");
+                bool cap = edit_.max_speed > 0;
+                if (ImGui::Checkbox("##cap", &cap)) edit_.max_speed = cap ? std::max(4.0, edit_.timed_speed) : 0;
+                ImGui::SameLine();
+                if (cap) {
+                    ImGui::SetNextItemWidth(200 * scale_);
+                    float limit = static_cast<float>(edit_.max_speed);
+                    ImGui::SliderFloat("##maxspeed", &limit, 1.0f, 16.0f, "%.1fx the real CPU");
+                    edit_.max_speed = limit;
+                } else {
+                    ImGui::TextDisabled("none: as fast as the host allows");
+                }
             }
             ImGui::Spacing();
             ImGui::Checkbox("Skip idle loops", &edit_.idle_skip);

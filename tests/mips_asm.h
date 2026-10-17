@@ -38,6 +38,10 @@ constexpr u32 BEQ(unsigned rs, unsigned rt, s32 off) { return I(0x04, rs, rt, of
 constexpr u32 BNE(unsigned rs, unsigned rt, s32 off) { return I(0x05, rs, rt, off); }
 constexpr u32 BEQL(unsigned rs, unsigned rt, s32 off) { return I(0x14, rs, rt, off); }
 constexpr u32 ADDIU(unsigned rt, unsigned rs, s32 imm) { return I(0x09, rs, rt, imm); }
+constexpr u32 ADDI(unsigned rt, unsigned rs, s32 imm) { return I(0x08, rs, rt, imm); }
+constexpr u32 SUBU(unsigned rd, unsigned rs, unsigned rt) { return R(0x23, rs, rt, rd); }
+constexpr u32 BGTZ(unsigned rs, s32 off) { return I(0x07, rs, 0, off); }
+constexpr u32 BGEZL(unsigned rs, s32 off) { return I(0x01, rs, 0x03, off); }
 constexpr u32 ANDI(unsigned rt, unsigned rs, u32 imm) { return I(0x0C, rs, rt, static_cast<s32>(imm)); }
 constexpr u32 ORI(unsigned rt, unsigned rs, u32 imm) { return I(0x0D, rs, rt, static_cast<s32>(imm)); }
 constexpr u32 LUI(unsigned rt, u32 imm) { return I(0x0F, 0, rt, static_cast<s32>(imm)); }

@@ -186,15 +186,16 @@ Main options (`siliconghost --help` lists them all):
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
-| `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
-| `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 2) |
+| `--timing realtime\|cycle\|max\|free` | how guest time relates to host time (see below) |
+| `--timed-speed X` | in realtime mode, the CPU's speed (X times real) while the system times it at boot; delay loops keep that speed (default 2) |
+| `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 0: as fast as the host allows) |
 | `--no-audio` | do not play the machine's audio |
 | `--audio-in` | let the machine record from the host's audio input (off by default) |
 | `--net user\|tap:NAME\|none` | Ethernet through user-mode NAT (default), a TAP interface, or none |
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
-| `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `max` |
+| `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `free` |
 | `--test-device` | fit the bare-metal test device in GIO expansion slot 0: console output, a host clock, an instruction count and an exit code, for bare-metal test and benchmark programs |
 | `--test-run-config N` | the value the test device reports in its run configuration register |
 
@@ -414,18 +415,25 @@ The CPU's cycle counter is the master clock for every timer in the machine,
 so guest clocks always agree with each other.
 
 - **realtime** (default): guest time follows the wall clock. A fast host
-  makes the CPU look faster, while a guest second stays a second. The
-  speed-up is capped by `--max-speed`, because IRIX 5.3 times the CPU
-  against its timers at boot and fails on a CPU much faster than real: keep
-  the clock times the limit at about 350 MHz or less (175 MHz x 2 boots,
-  200 MHz x 1.8 does not). IRIX 6.5 boots at 250 MHz x 1.8.
-  While the PROM or a kernel times the CPU at boot, the CPU runs at the
-  cap, so delays calibrated then never run short later. If the host falls
-  behind (a busy start, a stall), guest time catches up afterwards; only a
-  gap of more than 10 seconds, such as the host sleeping, is skipped.
+  makes the CPU look faster, while a guest second stays a second.
+  While the PROM or a kernel times the CPU at boot, the CPU runs at
+  `--timed-speed`, because IRIX 5.3 fails on a CPU it measures as much
+  faster than real: keep the clock times the timed speed at about 350 MHz
+  or less (175 MHz x 2 boots, 200 MHz x 1.8 does not). IRIX 6.5 boots at
+  250 MHz x 1.8. Delay loops (a register counted down, nothing else) keep
+  that speed afterwards, so delays calibrated at boot never run short;
+  everything else runs as fast as the host allows, or up to `--max-speed`.
+  If the host falls behind (a busy start, a stall), guest time catches up
+  afterwards; only a gap of more than 10 seconds, such as the host
+  sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
-- **max**: as fast as possible, with guest time running ahead of the wall
-  clock.
+- **max**: guest time follows the wall clock as in realtime, but the CPU is
+  never held back: no timed speed at boot, no slower delay loops and no
+  cap. A guest that times the CPU sees the host's full speed, so IRIX 5.3
+  may not boot this way.
+- **free**: no waiting and one cycle per instruction, with guest time
+  running ahead of the wall clock; for runs of a set length and
+  benchmarks.
 
 ## How it works
 

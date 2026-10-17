@@ -219,6 +219,7 @@ void R4000::reset() {
     const u32 sline = opts_.core == Core::R5000 ? 32u : 16u << ((config_ >> 22) & 3);
     stag_.assign(opts_.core == Core::R4600 ? 0 : opts_.scache_bytes / sline, 0);
     stag_stored_at_.assign(stag_.size(), kNeverStored);
+    stag_valid_ = false;
 
     // The cycle counter is the machine's master clock and keeps running
     // through a reset (Count's value after reset is undefined anyway).
@@ -292,6 +293,7 @@ void R4000::run_until(u64 cycle, const u64* deadline) {
         }
         if ((++n & 4095) == 0 && stop_.load(std::memory_order_relaxed)) break;
     }
+    resolve_fp_lazy();  // FCR31 as it stands, for anyone looking from outside
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +373,104 @@ void R4000::decode_ops(Block& b, const u8* host, u32 page_offset) {
         }
         if (ends_block(w)) break;
     }
+    b.delay = delay_loop(b.ops, b.count, page_offset);
+}
+
+R4000::DelayLoop R4000::delay_loop(const Op* ops, u32 n, u32 page_offset) {
+    DelayLoop d;
+    if (n < 2 || n > 4) return d;
+    const u32 br = ops[n - 2].inst;
+    const unsigned opc = br >> 26, rs = f_rs(br), rt = f_rt(br);
+    if (static_cast<s64>(page_offset) + 4 * (n - 1) + 4 * static_cast<s16>(br & 0xFFFF) != page_offset) return d;
+    // One instruction counts; any others are NOPs.
+    int count = -1;
+    for (u32 i = 0; i < n; ++i) {
+        if (i == n - 2 || ops[i].inst == 0) continue;
+        if (count >= 0) return d;
+        count = static_cast<int>(i);
+    }
+    if (count < 0) return d;
+    const u32 w = ops[count].inst;
+    switch (w >> 26) {
+        case 0x08: case 0x09:  // ADDI, ADDIU
+            if (f_rs(w) != f_rt(w)) return d;
+            d.counter = static_cast<u8>(f_rt(w));
+            d.imm = static_cast<u32>(static_cast<s32>(static_cast<s16>(w & 0xFFFF)));
+            d.trap = (w >> 26) == 0x08;
+            if (d.imm == 0) return d;
+            break;
+        case 0x00:
+            switch (w & 63) {
+                case 0x20: case 0x21: case 0x22: case 0x23:  // ADD, ADDU, SUB, SUBU
+                    if (f_rd(w) != f_rs(w) || f_rt(w) == f_rd(w) || f_rt(w) == 0 || (w >> 6 & 31)) return d;
+                    d.counter = static_cast<u8>(f_rd(w));
+                    d.step_reg = static_cast<u8>(f_rt(w));
+                    d.sub = (w & 63) >= 0x22;
+                    d.trap = !(w & 1);
+                    break;
+                default: return d;
+            }
+            break;
+        default: return d;
+    }
+    if (d.counter == 0) return d;
+    DelayLoop::Test test = DelayLoop::None;
+    switch (opc) {
+        case 0x04: case 0x14:  // BEQ(L), BNE(L): the counter against a register
+        case 0x05: case 0x15:
+            if (rs == rt || (rs != d.counter && rt != d.counter)) return d;
+            d.other = static_cast<u8>(rs == d.counter ? rt : rs);
+            test = (opc & 1) ? DelayLoop::Ne : DelayLoop::Eq;
+            break;
+        case 0x06: case 0x16: case 0x07: case 0x17:  // BLEZ(L), BGTZ(L)
+            if (rt != 0 || rs != d.counter) return d;
+            test = (opc & 1) ? DelayLoop::Gtz : DelayLoop::Lez;
+            break;
+        case 0x01:  // BLTZ(L), BGEZ(L)
+            if (rs != d.counter || (rt & ~3u)) return d;
+            test = (rt & 1) ? DelayLoop::Gez : DelayLoop::Ltz;
+            break;
+        default: return d;
+    }
+    d.in_slot = static_cast<u32>(count) == n - 1;
+    d.test = test;
+    return d;
+}
+
+u64 R4000::run_delay_loop(const Block& b, u64 t, u64 safe) {
+    const DelayLoop& d = b.delay;
+    const u64 w = std::max(weight_, delay_weight_);
+    const u64 per = w * b.count;
+    if (t + per >= safe) return t;
+    const u64 max = (safe - t - 1) / per;
+    u64 c = gpr[d.counter];
+    const u32 step = d.step_reg ? static_cast<u32>(gpr[d.step_reg]) : d.imm;
+    const u64 other = gpr[d.other];
+    u64 k = 0;
+    for (; k < max; ++k) {
+        const u32 a = static_cast<u32>(c);
+        const u32 r = d.sub ? a - step : a + step;
+        if (d.trap && ((d.sub ? (a ^ step) : ~(a ^ step)) & (a ^ r) & 0x80000000u)) break;  // overflow
+        const u64 next = sext32(r);
+        const s64 v = static_cast<s64>(d.in_slot ? c : next);
+        bool taken = false;
+        switch (d.test) {
+            case DelayLoop::Eq: taken = static_cast<u64>(v) == other; break;
+            case DelayLoop::Ne: taken = static_cast<u64>(v) != other; break;
+            case DelayLoop::Lez: taken = v <= 0; break;
+            case DelayLoop::Gtz: taken = v > 0; break;
+            case DelayLoop::Ltz: taken = v < 0; break;
+            case DelayLoop::Gez: taken = v >= 0; break;
+            case DelayLoop::None: break;
+        }
+        if (!taken) break;
+        c = next;
+    }
+    gpr[d.counter] = c;
+    // Time beyond the ordinary charge is not instructions (see instructions()).
+    const u64 n = k * b.count;
+    idle_skipped_fp_ += n * (w - weight_);
+    return t + n * w;
 }
 
 // `page` is the host address of a 4 KiB page that was written.
@@ -425,10 +525,26 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     for (unsigned linked = 0; linked < kMaxLinkedBlocks; ++linked) {
         const u32 offset = static_cast<u32>(pc & 0xFFF);
         const u8* const host = page + offset;
-        Block* blk = &blocks_[block_index(host)];
-        if (blk->host != host) build_block(*blk, host, offset);
+        // A run that stopped inside a block carries on in it: a block made
+        // from where it stopped would only duplicate the end of that one.
+        u32 start = 0;
+        Block* blk = nullptr;
+        if (resume_host_) {
+            Block& r = blocks_[block_index(resume_host_)];
+            if (linked == 0 && r.host == resume_host_ && resume_i_ < r.count && r.host + 4 * resume_i_ == host)
+                blk = &r, start = resume_i_;
+            resume_host_ = nullptr;
+        }
+        if (!blk) {
+            blk = &blocks_[block_index(host)];
+            if (blk->host != host) build_block(*blk, host, offset);
+        }
         block_invalidated_ = false;
-        if (jit_buf_ && !blk->code && ++blk->runs == kJitThreshold) {
+        if (SG_UNLIKELY(blk->delay.test != DelayLoop::None) && !start && !(check_irq && interrupt_pending())) {
+            check_irq = false;
+            time_fp_ = run_delay_loop(*blk, time_fp_, safe);
+        }
+        if (jit_buf_ && !start && !blk->code && blk->delay.test == DelayLoop::None && ++blk->runs == kJitThreshold) {
             if (!jit_compile(*blk)) {
                 jit_flush();  // the code buffer is full: start afresh
                 jit_compile(*blk);
@@ -445,17 +561,18 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         u64 ipc = pc;  // address of ops[i]
         u64 t = time_fp_;
         bool synced = true;
-        u32 i = 0;
+        u32 i = start;
         bool leave = false;
         // Translated code runs the block when no time check falls inside it
         // and no interrupt is pending; it stops early where the loop below
         // would break, or after an access that may need the checks redone,
         // and may carry on directly into other translated blocks.
-        if (blk->code && blk->jit_addr64 == addr64_ && t + (blk->count - 1) * weight_ < safe) {
+        if (!start && blk->code && blk->jit_addr64 == addr64_ && t + (blk->count - 1) * weight_ < safe) {
             if (check_irq && !interrupt_pending()) check_irq = false;
             if (!check_irq) {
-                jit_safe_ = safe;
-                i = blk->code(this, ipc, t);
+                jit_time0_ = t;
+                jit_budget0_ = (safe - t + weight_ - 1) / weight_;  // instructions starting before `safe`
+                i = blk->code(this, ipc, jit_budget0_);
                 // It may have gone on into other blocks, in this page or others.
                 blk = jit_block_;
                 ipc = jit_entry_pc_ + 4 * u64{i};
@@ -477,6 +594,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                 time_fp_ = t;
                 if (!first && !(cycles() < cycle && cycles() < *limit)) {
                     if (!synced) set_pc(ipc);
+                    if (i > 0) resume_host_ = blk->host, resume_i_ = i;
                     return;
                 }
                 time_fp_ = t += weight_;
@@ -542,6 +660,10 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             fe.host != page)
             return;
     }
+}
+
+void R4000::set_delay_cycles_per_instruction(double cpi) {
+    delay_weight_ = cpi > 0 ? static_cast<u64>(cpi * (1u << kCycleFracBits) + 0.5) : 0;
 }
 
 void R4000::set_cycles_per_instruction(double cpi) {
@@ -799,6 +921,9 @@ bool R4000::ops64_enabled() const {
 }
 
 void R4000::flush_fast_tlb() {
+    fast_gen_ = (fast_gen_ + 1) % kFastGens;
+    asid_tag_ = (asid_tag_ & ~(u64{0xF} << kFastGenShift)) | (fast_gen_ << kFastGenShift);
+    if (fast_gen_ != 0) return;
     for (auto& mode : fast_)
         for (auto& table : mode)
             for (auto& e : table) e = FastEntry{};
@@ -2210,7 +2335,10 @@ void R4000::cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 pad
         const std::size_t lines = stag_.size();
         const std::size_t index = (paddr / kLine) % lines;
         switch (operation) {
-            case 0: std::fill(stag_.begin(), stag_.end(), 0); break;  // Flash Invalidate
+            case 0:  // Flash Invalidate
+                if (stag_valid_) std::fill(stag_.begin(), stag_.end(), 0);
+                stag_valid_ = false;
+                break;
             case 1:  // Index Load Tag
                 // As on the R4000: a line not written through Index Store Tag
                 // recently is reported as holding the probed address, as a
@@ -2225,11 +2353,13 @@ void R4000::cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 pad
                 break;
             case 2:  // Index Store Tag: the tag from the address, the state from TagLo (invalid reads as zero)
                 stag_[index] = (taglo_ & kValid) ? stag_of(paddr) | kValid : 0;
+                stag_valid_ |= stag_[index] != 0;
                 stag_stored_at_[index] = cycles();
                 break;
-            case 5: {                                                          // Page Invalidate
-                const u64 page = paddr & ~u64{0xFFF};
-                for (u64 a = page; a < page + 0x1000; a += kLine) stag_[(a / kLine) % lines] = 0;
+            case 5: {  // Page Invalidate: the page's lines, one run of tags (lines is a multiple of a page's)
+                if (!stag_valid_) break;
+                const std::size_t first = ((paddr & ~u64{0xFFF}) / kLine) % lines;
+                std::fill_n(stag_.begin() + static_cast<std::ptrdiff_t>(first), 0x1000 / kLine, 0u);
                 break;
             }
             default: break;

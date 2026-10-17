@@ -87,7 +87,9 @@ bool Session::power_on(std::string& error) {
         cpu.set_block_cache(s.block_cache);
         cpu.set_jit(s.jit);
         pacer_ = std::make_unique<Pacer>(s.timing, machine->cycles_per_second());
+        pacer_->set_timed_speed(s.timed_speed);
         pacer_->set_max_speed(s.max_speed);
+        cpu.set_delay_cycles_per_instruction(pacer_->delay_cycles_per_instruction());
         pacer_->update(cpu.cycles(), cpu.instructions());
         nvram_saved_ = machine->nvram_changes();
         network_ = std::move(network);

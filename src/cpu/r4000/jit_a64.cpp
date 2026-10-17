@@ -27,7 +27,7 @@ using Site = Emitter::Site;
 
 // Callee-saved registers live across the whole function.
 constexpr Reg kCpu = x19;        // R4000*
-constexpr Reg kTime = x20;       // time_fp_ at entry
+constexpr Reg kTime = x20;       // the instructions that may still start (see jit_x64.cpp)
 constexpr Reg kPc = x21;         // pc at entry (blocks are shared by aliases)
 constexpr Reg kTlb = x22;        // this mode's soft-TLB load table (fetch before it, store after it)
 constexpr Reg kEntryMode = x23;  // mode_ at entry
@@ -62,9 +62,10 @@ bool R4000::jit_compile(Block& b) {
     const s64 o_next_delay = offset_of(this, &next_delay_), o_io = offset_of(this, &io_);
     const s64 o_invalidated = offset_of(this, &block_invalidated_), o_idle_ready = offset_of(this, &idle_ready_);
     const s64 o_hi = offset_of(this, &hi), o_lo = offset_of(this, &lo), o_mode = offset_of(this, &mode_);
-    const s64 o_safe = offset_of(this, &jit_safe_), o_weight = offset_of(this, &weight_);
+    const s64 o_time0 = offset_of(this, &jit_time0_), o_budget0 = offset_of(this, &jit_budget0_),
+              o_weight = offset_of(this, &weight_);
     const s64 o_asid_tag = offset_of(this, &asid_tag_);
-    static_assert(sizeof(FastEntry) == 32 && kFastEntries == 1024);
+    static_assert(sizeof(FastEntry) == 32);
     constexpr s64 kTableBytes = kFastEntries * sizeof(FastEntry);
 
     // Prologue: frame record, then the callee-saved registers used.
@@ -262,10 +263,13 @@ bool R4000::jit_compile(Block& b) {
     }
     const std::size_t body = e.size();
 
-    auto set_time = [&](unsigned n) {  // time_fp_ = entry time + n instructions
-        e.ldr(x0, kCpu, o_weight);
-        e.mov_imm(kScratch0, n);
-        e.madd(x0, x0, kScratch0, kTime);
+    auto set_time = [&](unsigned n) {  // time_fp_ = the block's start time + n instructions
+        e.ldr(x0, kCpu, o_budget0);
+        e.sub(x0, x0, kTime);  // instructions run before the block
+        if (n) e.add_imm(x0, x0, n);
+        e.ldr(kScratch0, kCpu, o_weight);
+        e.ldr(kScratch1, kCpu, o_time0);
+        e.madd(x0, x0, kScratch0, kScratch1);
         e.str(x0, kCpu, o_time);
     };
     auto pc_plus = [&](Reg dst, s64 bytes) {
@@ -440,7 +444,7 @@ bool R4000::jit_compile(Block& b) {
     // COP1, inline for the common case (see jit_x64.cpp); results are checked
     // arithmetically, with fused multiply-adds for the rounding errors.
     const s64 o_status = offset_of(this, &status_), o_fcr31 = offset_of(this, &fcr31);
-    constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;
+    constexpr u32 kCauseMask = 0x0003F000u | kFcrLazyI, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;  // (see jit_x64.cpp)
     auto fp_usable = [&](std::vector<Site>& slow) {
         e.ldr(x0, kCpu, o_status, 4);
         e.and_imm(x0, x0, sr::CU1 | sr::FR, false);
@@ -878,7 +882,7 @@ bool R4000::jit_compile(Block& b) {
         if (((is_store || merge) && !fp) || indexed) ensure(rt);
         read(x0, rs);
         if (indexed) e.add(x0, x0, src(rt, x1));
-        else e.add_imm(x0, x0, static_cast<s16>(w & 0xFFFF));
+        else if (w & 0xFFFF) e.add_imm(x0, x0, static_cast<s16>(w & 0xFFFF));
         if (!addr64) e.sxtw(x0, x0);
         if (size > 1 && !merge) {
             e.tst_imm(x0, size - 1);
@@ -1215,12 +1219,14 @@ bool R4000::jit_compile(Block& b) {
         e.cmp(x0, x1);
         exit_if(e.b(Cond::Ne), i + 1, 0);
     };
-    auto leave_delay_slot = [&] {
+    // (A branch emitted inline leaves next_delay_ clear; one run by its
+    // handler sets it.)
+    auto leave_delay_slot = [&](bool by_handler) {
         e.ldr(x0, kCpu, o_npc);
         e.str(x0, kCpu, o_pc);
         e.add_imm(x0, x0, 4);
         e.str(x0, kCpu, o_npc);
-        e.str(xzr, kCpu, o_next_delay, 1);
+        if (by_handler) e.str(xzr, kCpu, o_next_delay, 1);
     };
 
     u32 page_offset = b.offset;  // of the block being emitted
@@ -1242,6 +1248,21 @@ bool R4000::jit_compile(Block& b) {
         u64 loaded = 0, dirty = 0;
         bool pending = false;
     } skip;
+    // A conditional branch in a region whose delay slot is in its block
+    // (see jit_x64.cpp).
+    struct Direct {
+        bool active = false;
+        Site not_taken{};
+        s64 taken = 0;
+        bool likely = false;
+        u32 i = 0;
+        u64 loaded = 0, dirty = 0;
+    } direct;
+    auto member = [&](s64 delta) {
+        for (std::size_t j = 0; j < rb.size(); ++j)
+            if (static_cast<s64>(rb[j]->offset) == static_cast<s64>(page_offset) + delta) return j;
+        return rb.size();
+    };
     auto emit_branch = [&](const Op& op, u32 i) -> bool {
         const u32 w = op.inst;
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
@@ -1290,8 +1311,12 @@ bool R4000::jit_compile(Block& b) {
             e.add_imm(x0, x0, 1);
             e.str(x0, kCpu, offset_of(this, &change_epoch_));
         }
-        pc_plus(x0, 4 * i + 4);
-        e.str(x0, kCpu, o_pc);
+        // With its delay slot in the block, only npc_ is needed (see jit_x64.cpp).
+        const bool slot_here = i + 2 == cur->count;
+        if (!slot_here) {
+            pc_plus(x0, 4 * i + 4);
+            e.str(x0, kCpu, o_pc);
+        }
         Site to_not_taken;
         bool conditional = false;
         if (kind == kFpCond) {
@@ -1331,7 +1356,7 @@ bool R4000::jit_compile(Block& b) {
             for (u32 off : seen) add_successor(static_cast<s64>(off) - static_cast<s64>(page_offset));
         }
         e.str(x1, kCpu, o_npc);
-        store_byte_imm(o_next_delay, 1);
+        if (!slot_here) store_byte_imm(o_next_delay, 1);
         const bool maybe_backward = ((kind == kCompare || kind == kSign || kind == kFpCond) && simm < 0) || opc == 0x02;
         if (maybe_backward) {
             const unsigned idx = ((page_offset + 4 * i) >> 2) & ((1u << kLoopTableBits) - 1);
@@ -1354,6 +1379,11 @@ bool R4000::jit_compile(Block& b) {
             e.bind(visit1);
             e.bind(visit2);
             e.str(x0, kCpu, o_cur_pc);
+            if (slot_here) {  // as run_block() would leave them, should this be an idle loop
+                e.add_imm(x0, x0, 4);
+                e.str(x0, kCpu, o_pc);
+                store_byte_imm(o_next_delay, 1);
+            }
             e.mov(x24, x1);  // the target, kept over the time update
             set_time(i + 1);
             flush(dirty);  // the loop bookkeeping compares registers
@@ -1362,14 +1392,20 @@ bool R4000::jit_compile(Block& b) {
             call(reinterpret_cast<const void*>(&R4000::jit_backward_branch));
             e.ldr(x0, kCpu, o_idle_ready, 1);
             exit_if(e.cbnz(x0, false), i + 1, 0);
+            if (slot_here) e.str(xzr, kCpu, o_next_delay, 1);
             restore(loaded);
             for (const Site& s : done) e.bind(s);
         }
 
+        if (conditional && slot_here && region_mode &&
+            (member(delta) < rb.size() || member(4 * static_cast<s64>(cur->count)) < rb.size())) {
+            direct = {true, to_not_taken, delta, likely, i, loaded, dirty};
+            return true;
+        }
         if (conditional) {
             const Site to_done = e.b();
             e.bind(to_not_taken);
-            if (likely && i + 2 == cur->count) {
+            if (likely && slot_here) {
                 // The delay slot is skipped: on to the block's end with the
                 // time one instruction short (see the end of the block).
                 skip = {e.b(), i, loaded, dirty, true};
@@ -1383,7 +1419,7 @@ bool R4000::jit_compile(Block& b) {
             } else {
                 pc_plus(x0, 4 * i + 8);
                 e.str(x0, kCpu, o_npc);
-                store_byte_imm(o_next_delay, 1);
+                if (!slot_here) store_byte_imm(o_next_delay, 1);
             }
             e.bind(to_done);
         }
@@ -1401,63 +1437,132 @@ bool R4000::jit_compile(Block& b) {
         successors.clear();
         synced = true;
         bool last_handler = false;
-        for (u32 i = 0; i < blk.count; ++i) {
+        std::vector<Site> to_common, to_finish_direct;
+        bool branch_by_handler = false;  // the last branch ran its handler
+        // A non-branch op (see jit_x64.cpp); returns whether its handler ran inline.
+        auto emit_op = [&](u32 i, bool delay_slot, bool leave) {
             const Op& op = blk.ops[i];
             const u32 w = op.inst;
-            const bool delay_slot = i > 0 && is_branch_word(blk.ops[i - 1].inst);
             bool plain;
             decode(w, plain);
-            last_handler = false;
-
             if (plain) {
                 emit_plain(op);
-                if (delay_slot) leave_delay_slot();
+                if (delay_slot && leave) leave_delay_slot(branch_by_handler);
                 synced = delay_slot;
-            } else if (!delay_slot && emit_branch(op, i)) {
-                synced = true;
-            } else {
-                std::vector<Site> slow;
-                Site skip_slow;
-                const u64 dirty_before = dirty;
-                const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
-                const u64 loaded_after = loaded;
-                if (fast) {
-                    if (delay_slot) leave_delay_slot();
-                    skip_slow = e.b();
-                    for (const Site& site : slow) e.bind(site);
-                }
-
-                flush(fast ? dirty_before : dirty);
-                set_time(i + 1);
-                pc_plus(x0, 4 * i);
-                e.str(x0, kCpu, o_cur_pc);
-                if (delay_slot) {
-                    store_byte_imm(o_in_delay, 1);
-                    e.str(xzr, kCpu, o_next_delay, 1);
-                    e.ldr(x0, kCpu, o_npc);
-                    e.str(x0, kCpu, o_pc);
-                    e.add_imm(x0, x0, 4);
-                    e.str(x0, kCpu, o_npc);
-                } else {
-                    e.str(xzr, kCpu, o_in_delay, 1);  // next_delay_ is already clear
-                    pc_plus(x0, 4 * i + 4);
-                    e.str(x0, kCpu, o_pc);
-                    e.add_imm(x0, x0, 4);
-                    e.str(x0, kCpu, o_npc);
-                }
-                e.str(xzr, kCpu, o_io, 1);
-                call_handler(op);
-                e.str(xzr, kCpu, gpr_off(0));
-                if (i + 1 < blk.count || fast) exit_checks(i);
-                if (fast) {
-                    restore(loaded_after);
-                    e.bind(skip_slow);
-                } else {
-                    loaded = dirty = 0;
-                    last_handler = true;
-                }
-                synced = !fast || delay_slot;
+                return false;
             }
+            std::vector<Site> slow;
+            Site skip_slow;
+            const u64 dirty_before = dirty;
+            const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
+            const u64 loaded_after = loaded;
+            if (fast) {
+                if (delay_slot && leave) leave_delay_slot(branch_by_handler);
+                skip_slow = e.b();
+                for (const Site& site : slow) e.bind(site);
+            }
+
+            flush(fast ? dirty_before : dirty);
+            set_time(i + 1);
+            pc_plus(x0, 4 * i);
+            e.str(x0, kCpu, o_cur_pc);
+            if (delay_slot) {
+                store_byte_imm(o_in_delay, 1);
+                e.str(xzr, kCpu, o_next_delay, 1);
+                e.ldr(x0, kCpu, o_npc);
+                e.str(x0, kCpu, o_pc);
+                e.add_imm(x0, x0, 4);
+                e.str(x0, kCpu, o_npc);
+            } else {
+                e.str(xzr, kCpu, o_in_delay, 1);  // next_delay_ is already clear
+                pc_plus(x0, 4 * i + 4);
+                e.str(x0, kCpu, o_pc);
+                e.add_imm(x0, x0, 4);
+                e.str(x0, kCpu, o_npc);
+            }
+            e.str(xzr, kCpu, o_io, 1);
+            call_handler(op);
+            e.str(xzr, kCpu, gpr_off(0));
+            if (i + 1 < blk.count || fast) exit_checks(i);
+            synced = !fast || delay_slot;
+            if (fast) {
+                restore(loaded_after);
+                e.bind(skip_slow);
+                return false;
+            }
+            loaded = dirty = 0;
+            return true;
+        };
+        auto link_direct = [&](s64 delta, u32 executed, bool handler_ran) {
+            if (handler_ran) {
+                if (executed != blk.count) e.add_imm(kTime, kTime, blk.count - executed);
+                to_common.push_back(e.b());
+                return;
+            }
+            auto store_pc = [&] {
+                pc_plus(x0, delta);
+                e.str(x0, kCpu, o_pc);
+                e.add_imm(x0, x0, 4);
+                e.str(x0, kCpu, o_npc);
+                flush(dirty);
+                if (executed != blk.count) e.add_imm(kTime, kTime, blk.count - executed);
+            };
+            const std::size_t to = member(delta);
+            if (to == rb.size()) {
+                store_pc();
+                to_common.push_back(e.b());
+                return;
+            }
+            e.sub_imm(x2, kTime, executed);  // the next block's budget
+            e.cmp_imm(x2, rb[to]->count);
+            const Site short_budget = e.b(Cond::Lt);
+            restore(alloc & ~loaded);
+            e.mov(kTime, x2);
+            if (delta) e.add_imm(kPc, kPc, delta);
+            if (to <= k) e.b_to(label[to]);
+            else to_label[to].push_back(e.b());
+            e.bind(short_budget);
+            store_pc();
+            to_finish_direct.push_back(e.b());
+        };
+        for (u32 i = 0; i < blk.count; ++i) {
+            const Op& op = blk.ops[i];
+            const bool delay_slot = i > 0 && is_branch_word(blk.ops[i - 1].inst);
+            last_handler = false;
+            if (direct.active) {
+                direct.active = false;
+                const u64 fall = 4 * static_cast<u64>(blk.count);
+                last_handler = emit_op(i, true, false);
+                link_direct(direct.taken, blk.count, last_handler);
+                e.bind(direct.not_taken);
+                loaded = direct.loaded, dirty = direct.dirty;
+                if (direct.likely) {
+                    link_direct(static_cast<s64>(fall), blk.count - 1, false);
+                } else {
+                    bool plain;
+                    decode(op.inst, plain);
+                    if (!plain) {  // its handler goes on to npc_
+                        pc_plus(x0, static_cast<s64>(fall));
+                        e.str(x0, kCpu, o_npc);
+                    }
+                    last_handler = emit_op(i, true, false);
+                    link_direct(static_cast<s64>(fall), blk.count, last_handler);
+                }
+                for (const Site& site : to_common) e.bind(site);
+                loaded = dirty = 0;
+                last_handler = true;
+                synced = true;
+                break;
+            }
+            if (!delay_slot && is_branch_word(op.inst) && emit_branch(op, i)) {
+                synced = true;
+                branch_by_handler = false;
+                continue;
+            }
+            // A branch run by its handler sets next_delay_, which its delay
+            // slot then clears; one emitted inline leaves it clear.
+            if (!delay_slot) branch_by_handler = is_branch_word(op.inst);
+            last_handler = emit_op(i, delay_slot, true);
         }
         if (!synced) {
             pc_plus(x0, 4 * blk.count);
@@ -1473,8 +1578,7 @@ bool R4000::jit_compile(Block& b) {
             e.str(x0, kCpu, o_pc);
             e.add_imm(x0, x0, 4);
             e.str(x0, kCpu, o_npc);
-            e.ldr(x3, kCpu, o_weight);
-            e.sub(kTime, kTime, x3);
+            e.add_imm(kTime, kTime, 1);
             flush(skip.dirty & ~dirty);
             restore(loaded & ~skip.loaded);
             e.bind(join);
@@ -1499,9 +1603,7 @@ bool R4000::jit_compile(Block& b) {
             to_finish_dirty.push_back(e.b(Cond::Ne));
         };
         if (last_handler) flag_checks();
-        e.ldr(x3, kCpu, o_weight);
-        e.mov_imm(kScratch0, blk.count);
-        e.madd(x2, x3, kScratch0, kTime);  // entry time of the next block
+        e.sub_imm(x2, kTime, blk.count);  // the next block's budget
         e.ldr(x0, kCpu, o_pc);
         std::vector<s64> outside;
         for (s64 delta : successors) {
@@ -1515,11 +1617,8 @@ bool R4000::jit_compile(Block& b) {
             pc_plus(x1, delta);
             e.cmp(x0, x1);
             const Site other = e.b(Cond::Ne);
-            e.mov_imm(kScratch0, rb[to]->count - 1);
-            e.madd(x1, x3, kScratch0, x2);
-            e.ldr(kScratch0, kCpu, o_safe);
-            e.cmp(x1, kScratch0);
-            to_finish_dirty.push_back(e.b(Cond::Hs));
+            e.cmp_imm(x2, rb[to]->count);
+            to_finish_dirty.push_back(e.b(Cond::Lt));
             restore(alloc & ~loaded);
             e.mov(kTime, x2);
             if (delta) e.add_imm(kPc, kPc, delta);
@@ -1541,12 +1640,8 @@ bool R4000::jit_compile(Block& b) {
             e.ldr(x5, block, offsetof(Block, jit_addr64), 1);
             to_finish.push_back(addr64 ? e.cbz(x5, false) : e.cbnz(x5, false));
             e.ldr(x5, block, offsetof(Block, count), 4);
-            e.sub_imm(x5, x5, 1, false);
-            e.ldr(kScratch0, kCpu, o_weight);
-            e.madd(x5, x5, kScratch0, x2);
-            e.ldr(kScratch0, kCpu, o_safe);
-            e.cmp(x5, kScratch0);
-            to_finish.push_back(e.b(Cond::Hs));
+            e.cmp(x2, x5);
+            to_finish.push_back(e.b(Cond::Lt));
             e.mov(kTime, x2);
             e.mov(kPc, x0);
             e.add_imm(x4, x4, static_cast<s64>(top));
@@ -1577,9 +1672,7 @@ bool R4000::jit_compile(Block& b) {
             e.load_constant(x1, reinterpret_cast<u64>(&blocks_[block_index(blk.host)]));
             e.load_constant(x2, reinterpret_cast<u64>(&blocks_[block_index(b.host)]));
             call(reinterpret_cast<const void*>(&R4000::jit_jr_miss));
-            e.ldr(x3, kCpu, o_weight);
-            e.mov_imm(kScratch0, blk.count);
-            e.madd(x2, x3, kScratch0, kTime);
+            e.sub_imm(x2, kTime, blk.count);
             e.ldr(x0, kCpu, o_pc);
             e.bind(other_page);
         }
@@ -1613,6 +1706,7 @@ bool R4000::jit_compile(Block& b) {
         for (const Site& site : to_finish_dirty) e.bind(site);
         flush(dirty_end);
         for (const Site& site : to_finish) e.bind(site);
+        for (const Site& site : to_finish_direct) e.bind(site);
         set_time(blk.count);
         e.mov_imm32(x0, blk.count);
         to_tail[k].push_back(e.b());
