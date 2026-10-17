@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
+#include <optional>
 #include <vector>
 
 #include "jit/exec_buffer.h"
@@ -557,7 +559,10 @@ bool R4000::jit_compile(Block& b) {
     const Mem m_status{kCpu, offset_of(this, &status_)};
     const Mem m_fcr31{kCpu, offset_of(this, &fcr31)};
     const Mem m_fp_control{kCpu, offset_of(this, &jit_fp_control_)};
-    constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;
+    // (A new Cause also drops a pending Cause.I: kFcrLazyI.)
+    constexpr u32 kCauseMask = 0x0003F000u | kFcrLazyI, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;
+    const Mem m_lazy_a{kCpu, offset_of(this, &fp_lazy_a_)}, m_lazy_b{kCpu, offset_of(this, &fp_lazy_b_)},
+        m_lazy_c{kCpu, offset_of(this, &fp_lazy_c_)}, m_lazy_w{kCpu, offset_of(this, &fp_lazy_w_)};
     auto fp_usable = [&](std::vector<std::size_t>& slow) {
         e.mov(rax, m_status, false);
         e.alu_imm(Alu::And, rax, static_cast<s32>(sr::CU1 | sr::FR), false);
@@ -766,6 +771,25 @@ bool R4000::jit_compile(Block& b) {
             e.sse(S::Mul, dbl, 7, 6), e.sse(S::Add, dbl, 1, 7);                   // + xl * yh
             e.sse(S::Mul, dbl, 6, 2), e.sse(S::Add, dbl, 1, 6);                   // + xl * yl
         };
+        // Once the sticky Inexact flag is set, Cause.I is all an exact
+        // check would add: it is left to be worked out from the operands if
+        // anything reads it (kFcrLazyI). `lazy` jumps to that way when the
+        // flag is set; `store_operand` keeps an operand for it.
+        auto if_flag_set = [&] {
+            e.test8_imm(m_fcr31, kFlagInexact);
+            return e.jcc(Cond::Ne);
+        };
+        auto store_operand = [&](Mem m, unsigned x) {
+            if (dbl) e.movq_store(m, x);
+            else e.movd_store(m, x);
+        };
+        auto pend_inexact = [&] {  // Cause cleared, Cause.I pending
+            e.mov_store_imm32(m_lazy_w, w);
+            e.mov(rdx, m_fcr31, false);
+            e.alu_imm(Alu::And, rdx, static_cast<s32>(~kCauseMask), false);
+            e.alu_imm(Alu::Or, rdx, static_cast<s32>(kFcrLazyI), false);
+            e.mov(m_fcr31, rdx, false);
+        };
         if (madd) {  // MADD, MSUB, NMADD, NMSUB: p = fs * ft rounded, then p +- fr rounded
             if (!(jit_fma_ || kDekker)) return false;
             const bool subtract = (func & 0x08) != 0, negate = (func & 0x10) != 0;
@@ -775,6 +799,9 @@ bool R4000::jit_compile(Block& b) {
             const unsigned a = fp_operand(fs, dbl, 4, slow), m = fp_operand(ft, dbl, 3, slow);
             e.movapd(0, a);
             e.sse(Emitter::Sse::Mul, dbl, 0, m);
+            e.movq_from_xmm(rax, 0, dbl);
+            result_check({a, m}, min_result);  // the product: neither tiny nor overflowing
+            const std::size_t lazy_product = if_flag_set();
             if (jit_fma_) {
                 e.movapd(1, 0);
                 e.fmsub231(dbl, 1, a, m);  // a * m - p
@@ -782,24 +809,33 @@ bool R4000::jit_compile(Block& b) {
                 split_ok(a), split_ok(m);
                 two_product(a, m, 0);
             }
-            e.movq_from_xmm(rax, 0, dbl);
-            result_check({a, m}, min_result);  // the product: neither tiny nor overflowing
             nonzero(1);
             e.mov(m_scratch, rcx);  // the product was inexact
-            e.movapd(4, 0);         // p
+            const std::size_t product_done = e.jmp();
+            e.bind(lazy_product);
+            store_operand(m_lazy_a, a);
+            store_operand(m_lazy_b, m);
+            e.bind(product_done);
+            e.movapd(4, 0);  // p
             const unsigned c = fp_operand(fr_reg, dbl, 2, slow);
             e.movapd(0, 4);
             e.sse(subtract ? Emitter::Sse::Sub : Emitter::Sse::Add, dbl, 0, c);
+            e.movq_from_xmm(rax, 0, dbl);
+            result_check({0}, 1);  // a zero sum is exact
+            const std::size_t lazy_sum = if_flag_set();
             e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, 4);  // TwoSum / TwoDiff with p in xmm4
             e.movapd(2, c), e.sse(subtract ? Emitter::Sse::Add : Emitter::Sse::Sub, dbl, 2, 1);
             e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
             e.movapd(1, 4), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
             e.sse(subtract ? Emitter::Sse::Sub : Emitter::Sse::Add, dbl, 1, 2);
-            e.movq_from_xmm(rax, 0, dbl);
-            result_check({0}, 1);  // a zero sum is exact
             nonzero(1);
             e.alu(Alu::Or, rcx, m_scratch);
             commit_inexact_rcx();
+            const std::size_t sum_done = e.jmp();
+            e.bind(lazy_sum);
+            store_operand(m_lazy_c, c);
+            pend_inexact();
+            e.bind(sum_done);
             if (negate) {
                 e.movq_from_xmm(rax, 0, dbl);
                 if (dbl) e.mov_imm64(rcx, u64{1} << 63);
@@ -849,6 +885,10 @@ bool R4000::jit_compile(Block& b) {
                 a = fp_operand(fs, dbl, 4, slow);
             }
             if (recip) func = 0x03;  // RECIP: 1 / fs, as DIV
+            // The exact error of the result into xmm1 (zero if exact), and the
+            // operands to keep for a pending Cause.I.
+            std::function<void()> residual;
+            std::optional<unsigned> lazy_b;
             if (func == 0x04) {  // SQRT: a zero or a positive number not too small
                 e.test(rax, rax);
                 if (!dbl) e.test_imm(rax, 0x80000000u);
@@ -866,16 +906,18 @@ bool R4000::jit_compile(Block& b) {
                 e.bind(zero);
                 e.movapd(0, a);
                 e.sse(Emitter::Sse::Sqrt, dbl, 0, 0);
-                if (jit_fma_) {
-                    e.movapd(1, a);
-                    e.fnmadd231(dbl, 1, 0, 0);  // a - r * r
-                } else {  // (a - p) - (r * r - p), p = r * r rounded
-                    e.movapd(8, 0), e.sse(Emitter::Sse::Mul, dbl, 8, 0);
-                    two_product(0, 0, 8);
-                    e.movapd(2, a), e.sse(Emitter::Sse::Sub, dbl, 2, 8);
-                    e.sse(Emitter::Sse::Sub, dbl, 2, 1);
-                    e.movapd(1, 2);
-                }
+                residual = [&, a] {
+                    if (jit_fma_) {
+                        e.movapd(1, a);
+                        e.fnmadd231(dbl, 1, 0, 0);  // a - r * r
+                    } else {  // (a - p) - (r * r - p), p = r * r rounded
+                        e.movapd(8, 0), e.sse(Emitter::Sse::Mul, dbl, 8, 0);
+                        two_product(0, 0, 8);
+                        e.movapd(2, a), e.sse(Emitter::Sse::Sub, dbl, 2, 8);
+                        e.sse(Emitter::Sse::Sub, dbl, 2, 1);
+                        e.movapd(1, 2);
+                    }
+                };
             } else {
                 const unsigned c = fp_operand(recip ? fs : ft, dbl, 3, slow);
                 if (func == 0x03) {  // DIV: a nonzero divisor, a dividend zero or not too small
@@ -895,44 +937,55 @@ bool R4000::jit_compile(Block& b) {
                                                         Emitter::Sse::Div};
                 e.movapd(0, a);
                 e.sse(kOps[func], dbl, 0, c);
-                if (func == 0x00) {  // TwoSum: (a - (s - (s - a))) + (b - (s - a))
-                    e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, a);
-                    e.movapd(2, c), e.sse(Emitter::Sse::Sub, dbl, 2, 1);
-                    e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
-                    e.movapd(1, a), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
-                    e.sse(Emitter::Sse::Add, dbl, 1, 2);
-                } else if (func == 0x01) {  // (a - (s - (s - a))) - (b + (s - a))
-                    e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, a);
-                    e.movapd(2, c), e.sse(Emitter::Sse::Add, dbl, 2, 1);
-                    e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
-                    e.movapd(1, a), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
-                    e.sse(Emitter::Sse::Sub, dbl, 1, 2);
-                } else if (func == 0x02) {
-                    if (jit_fma_) {
-                        e.movapd(1, 0);
-                        e.fmsub231(dbl, 1, a, c);  // a * b - p
-                    } else {
-                        split_ok(a), split_ok(c);
-                        two_product(a, c, 0);
+                residual = [&, a, c] {
+                    if (func == 0x00) {  // TwoSum: (a - (s - (s - a))) + (b - (s - a))
+                        e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, a);
+                        e.movapd(2, c), e.sse(Emitter::Sse::Sub, dbl, 2, 1);
+                        e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
+                        e.movapd(1, a), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
+                        e.sse(Emitter::Sse::Add, dbl, 1, 2);
+                    } else if (func == 0x01) {  // (a - (s - (s - a))) - (b + (s - a))
+                        e.movapd(1, 0), e.sse(Emitter::Sse::Sub, dbl, 1, a);
+                        e.movapd(2, c), e.sse(Emitter::Sse::Add, dbl, 2, 1);
+                        e.movapd(3, 0), e.sse(Emitter::Sse::Sub, dbl, 3, 1);
+                        e.movapd(1, a), e.sse(Emitter::Sse::Sub, dbl, 1, 3);
+                        e.sse(Emitter::Sse::Sub, dbl, 1, 2);
+                    } else if (func == 0x02) {
+                        if (jit_fma_) {
+                            e.movapd(1, 0);
+                            e.fmsub231(dbl, 1, a, c);  // a * b - p
+                        } else {
+                            split_ok(a), split_ok(c);
+                            two_product(a, c, 0);
+                        }
+                    } else if (jit_fma_) {
+                        e.movapd(1, a);
+                        e.fnmadd231(dbl, 1, 0, c);  // a - q * b
+                    } else {  // (a - p) - (q * b - p), p = q * b rounded
+                        split_ok(0), split_ok(c);
+                        e.movapd(8, 0), e.sse(Emitter::Sse::Mul, dbl, 8, c);
+                        two_product(0, c, 8);
+                        e.movapd(2, a), e.sse(Emitter::Sse::Sub, dbl, 2, 8);
+                        e.sse(Emitter::Sse::Sub, dbl, 2, 1);
+                        e.movapd(1, 2);
                     }
-                } else if (jit_fma_) {
-                    e.movapd(1, a);
-                    e.fnmadd231(dbl, 1, 0, c);  // a - q * b
-                } else {  // (a - p) - (q * b - p), p = q * b rounded
-                    split_ok(0), split_ok(c);
-                    e.movapd(8, 0), e.sse(Emitter::Sse::Mul, dbl, 8, c);
-                    two_product(0, c, 8);
-                    e.movapd(2, a), e.sse(Emitter::Sse::Sub, dbl, 2, 8);
-                    e.sse(Emitter::Sse::Sub, dbl, 2, 1);
-                    e.movapd(1, 2);
-                }
+                };
+                lazy_b = c;
             }
             e.movq_from_xmm(rax, 0, dbl);
             if (func <= 0x01) result_check({0}, 1);  // a zero sum is exact
             else if (func == 0x02) result_check({a, fp_src(ft, dbl, 3)}, min_result);
             else if (func == 0x03) result_check({a}, min_result);
+            const std::size_t lazy = if_flag_set();
+            residual();
             nonzero(1);
             commit_inexact_rcx();
+            const std::size_t done = e.jmp();
+            e.bind(lazy);
+            store_operand(m_lazy_a, a);
+            if (lazy_b) store_operand(m_lazy_b, *lazy_b);
+            pend_inexact();
+            e.bind(done);
             fp_write_xmm(fd, dbl, 0);
             touch_();
             return true;

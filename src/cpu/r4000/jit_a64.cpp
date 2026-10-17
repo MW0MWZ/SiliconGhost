@@ -444,7 +444,7 @@ bool R4000::jit_compile(Block& b) {
     // COP1, inline for the common case (see jit_x64.cpp); results are checked
     // arithmetically, with fused multiply-adds for the rounding errors.
     const s64 o_status = offset_of(this, &status_), o_fcr31 = offset_of(this, &fcr31);
-    constexpr u32 kCauseMask = 0x0003F000u, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;
+    constexpr u32 kCauseMask = 0x0003F000u | kFcrLazyI, kCauseInexact = 0x1000u, kFlagInexact = 0x4u;  // (see jit_x64.cpp)
     auto fp_usable = [&](std::vector<Site>& slow) {
         e.ldr(x0, kCpu, o_status, 4);
         e.and_imm(x0, x0, sr::CU1 | sr::FR, false);

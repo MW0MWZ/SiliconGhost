@@ -292,6 +292,7 @@ void R4000::run_until(u64 cycle, const u64* deadline) {
         }
         if ((++n & 4095) == 0 && stop_.load(std::memory_order_relaxed)) break;
     }
+    resolve_fp_lazy();  // FCR31 as it stands, for anyone looking from outside
 }
 
 // ---------------------------------------------------------------------------

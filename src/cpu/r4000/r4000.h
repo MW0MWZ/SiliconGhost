@@ -233,6 +233,11 @@ public:
     u64 pc = 0;  // address of the next instruction to execute
     std::array<u64, 32> fpr{};
     u32 fcr31 = 0;
+    // FCR31 bit 18 (reserved, reads as 0): the last operation's Cause.I is
+    // still to be worked out, from fp_lazy_*. Translated code leaves it so
+    // once the sticky Inexact flag is set, when only that bit would tell.
+    static constexpr u32 kFcrLazyI = 1u << 18;
+    void resolve_fp_lazy();
 
 private:
     enum class Access { Fetch, Load, Store };
@@ -604,6 +609,10 @@ private:
     bool idle_skip_ = true;
     u64 change_epoch_ = 0;  // bumped by every side effect
     u64 jit_scratch_ = 0;   // translated code's spill slot
+    // The operands (raw bits) and the instruction of the operation whose
+    // Cause.I is pending (see kFcrLazyI).
+    u64 fp_lazy_a_ = 0, fp_lazy_b_ = 0, fp_lazy_c_ = 0;
+    u32 fp_lazy_w_ = 0;
     u32 jit_fp_control_ = 0;  // the host FP control word translated FP operations start from
     double jit_split_d_ = 134217729.0;  // 2^27 + 1 and 2^12 + 1: Dekker's splitting factors
     float jit_split_s_ = 4097.0f;
