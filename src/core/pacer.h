@@ -23,10 +23,14 @@
 //             mode. When the host falls behind (a busy stretch, a stall)
 //             the guest catches up by charging more per instruction; only
 //             beyond 10 s (the host was suspended) is the lost time given up.
-//   Max       No waiting and one cycle per instruction: as fast as possible,
-//             with guest time running ahead of the wall clock. Except while
-//             a key is held (set_key_held): the guest repeats a held key by
-//             its own clock, so guest time is then held to the wall clock.
+//   Max       As Realtime, with guest time following the wall clock, but
+//             the CPU is never held back: no timed speed while the guest
+//             times it, no charge on delay loops and no cap. Guests that
+//             time the CPU see it at the host's full speed (IRIX 5.3 fails
+//             to boot when that is much faster than the real CPU).
+//   Free      No waiting and one cycle per instruction: guest time runs
+//             ahead of the wall clock. For runs of a set length and
+//             benchmarks, where the wall clock does not matter.
 #pragma once
 
 #include <algorithm>
@@ -38,7 +42,7 @@ namespace sg {
 
 class Pacer {
 public:
-    enum class Mode { Cycle, Realtime, Max };
+    enum class Mode { Cycle, Realtime, Max, Free };
 
     // Host clock: monotonic nanoseconds and a sleep. Defaults to the system's.
     struct HostClock {
@@ -51,7 +55,7 @@ public:
     // Call after each slice of emulation with the CPU's counters. Waits if the
     // guest is ahead of the wall clock and returns the cycles per instruction
     // to charge from now on. `timing_cpu`: the guest is measuring the CPU's
-    // speed (Realtime mode then holds it at the cap).
+    // speed (Realtime mode then holds it at the timed speed).
     double update(u64 guest_cycles, u64 instructions, bool timing_cpu = false);
 
     Mode mode() const { return mode_; }
@@ -60,11 +64,6 @@ public:
     // the most it may be sped up otherwise (0, the default: no cap).
     void set_timed_speed(double factor) { timed_speed_ = factor; }
     void set_max_speed(double factor) { max_speed_ = factor; }
-    // A key is held down on the guest's keyboard (see Max).
-    void set_key_held(bool held) {
-        if (held && !key_held_) key_rebase_ = true;
-        key_held_ = held;
-    }
     double cycles_per_instruction() const { return cpi_; }
     // The least charge for an instruction of a delay loop (see
     // R4000::set_delay_cycles_per_instruction): in Realtime mode the charge
@@ -92,7 +91,6 @@ private:
 
     double cpi_ = 1.0;
     double timed_speed_ = 2.0, max_speed_ = 0;  // see set_timed_speed(), set_max_speed()
-    bool key_held_ = false, key_rebase_ = false;
 };
 
 }  // namespace sg

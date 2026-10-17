@@ -198,6 +198,7 @@ const char* timing_name(Pacer::Mode mode) {
     switch (mode) {
         case Pacer::Mode::Cycle: return "cycle";
         case Pacer::Mode::Max: return "max";
+        case Pacer::Mode::Free: return "free";
         default: return "realtime";
     }
 }
@@ -206,6 +207,7 @@ bool parse_timing(const std::string& text, Pacer::Mode& mode) {
     if (text == "realtime") mode = Pacer::Mode::Realtime;
     else if (text == "cycle") mode = Pacer::Mode::Cycle;
     else if (text == "max") mode = Pacer::Mode::Max;
+    else if (text == "free") mode = Pacer::Mode::Free;
     else return false;
     return true;
 }

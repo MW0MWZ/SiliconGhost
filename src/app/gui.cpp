@@ -357,7 +357,6 @@ int Gui::run() {
         }
         if (auto* m = session_.machine()) {
             const u64 slice = static_cast<u64>(m->cycles_per_second() / 1000);  // 1 ms of guest time
-            session_.pacer()->set_key_held(keys_down_.any());
             while (SDL_GetTicksNS() < next_frame_ns && !m->powered_off()) session_.run(slice);
             if (m->powered_off()) {
                 power_off();
@@ -1356,10 +1355,10 @@ void Gui::draw_settings() {
             label("Timing");
             ImGui::SetNextItemWidth(-1);
             int timing = edit_.timing == Pacer::Mode::Realtime ? 0 : edit_.timing == Pacer::Mode::Cycle ? 1 : 2;
-            ImGui::Combo("##timing", &timing,
-                         "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
-                         "Maximum: no waiting, guest time runs ahead\0");
-            edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
+            if (ImGui::Combo("##timing", &timing,
+                             "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
+                             "Maximum: CPU never held back, guest clocks follow the host's\0"))
+                edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
             if (timing == 0) {
                 label("Timed speed");
                 ImGui::SetNextItemWidth(200 * scale_);

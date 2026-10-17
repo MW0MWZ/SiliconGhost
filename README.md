@@ -186,7 +186,7 @@ Main options (`siliconghost --help` lists them all):
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
-| `--timing realtime\|cycle\|max` | how guest time relates to host time (see below) |
+| `--timing realtime\|cycle\|max\|free` | how guest time relates to host time (see below) |
 | `--timed-speed X` | in realtime mode, the CPU's speed (X times real) while the system times it at boot; delay loops keep that speed (default 2) |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 0: as fast as the host allows) |
 | `--no-audio` | do not play the machine's audio |
@@ -195,7 +195,7 @@ Main options (`siliconghost --help` lists them all):
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
-| `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `max` |
+| `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `free` |
 | `--test-device` | fit the bare-metal test device in GIO expansion slot 0: console output, a host clock, an instruction count and an exit code, in the same register layout as the IRIS emulator's, so its benchmark suite runs unchanged |
 | `--test-run-config N` | the value the test device reports in its run configuration register |
 
@@ -427,9 +427,13 @@ so guest clocks always agree with each other.
   afterwards; only a gap of more than 10 seconds, such as the host
   sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
-- **max**: as fast as possible, with guest time running ahead of the wall
-  clock. While a key is held in the window, guest time keeps to the wall
-  clock, so the guest's key repeat runs at its normal rate.
+- **max**: guest time follows the wall clock as in realtime, but the CPU is
+  never held back: no timed speed at boot, no slower delay loops and no
+  cap. A guest that times the CPU sees the host's full speed, so IRIX 5.3
+  may not boot this way.
+- **free**: no waiting and one cycle per instruction, with guest time
+  running ahead of the wall clock; for runs of a set length and
+  benchmarks.
 
 ## How it works
 
