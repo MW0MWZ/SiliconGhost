@@ -207,5 +207,14 @@ if(SG_BUILD_TESTS)
     tests/app_tests.cpp
   )
   target_link_libraries(sg_tests PRIVATE sg_app sg_warnings)
+  # Tests keep whole machines (over 1 MB each) on the stack; Windows gives
+  # the main thread 1 MB by default.
+  if(WIN32)
+    if(MSVC)
+      target_link_options(sg_tests PRIVATE /STACK:16777216)
+    else()
+      target_link_options(sg_tests PRIVATE -Wl,--stack,16777216)
+    endif()
+  endif()
   add_test(NAME sg_tests COMMAND sg_tests)
 endif()
