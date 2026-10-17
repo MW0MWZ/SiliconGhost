@@ -262,8 +262,12 @@ int Gui::run() {
     if (!options_.power_on && options_.settings_file.empty()) {
         Settings saved;
         std::string error;
-        if (std::filesystem::exists(settings_path_) && load_settings(settings_path_, saved, error))
+        if (std::filesystem::exists(settings_path_) && load_settings(settings_path_, saved, error)) {
+            // Real time now runs the CPU as fast as Maximum did, without the
+            // guest's clocks racing; the window no longer offers Maximum.
+            if (saved.timing == Pacer::Mode::Max) saved.timing = Pacer::Mode::Realtime;
             session_.set_settings(saved);
+        }
         else if (!std::filesystem::exists(settings_path_))
             session_.set_settings(first_run_settings());
     }
@@ -1355,11 +1359,11 @@ void Gui::draw_settings() {
         if (ImGui::BeginTabItem("Performance")) {
             label("Timing");
             ImGui::SetNextItemWidth(-1);
-            int timing = edit_.timing == Pacer::Mode::Realtime ? 0 : edit_.timing == Pacer::Mode::Cycle ? 1 : 2;
+            int timing = edit_.timing == Pacer::Mode::Cycle ? 1 : 0;
             ImGui::Combo("##timing", &timing,
-                         "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
-                         "Maximum: no waiting, guest time runs ahead\0");
-            edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
+                         "Real time: full speed, guest clocks follow the host's\0"
+                         "Cycle: one cycle per instruction, reproducible\0");
+            edit_.timing = timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Realtime;
             if (timing == 0) {
                 label("Timed speed");
                 ImGui::SetNextItemWidth(200 * scale_);
