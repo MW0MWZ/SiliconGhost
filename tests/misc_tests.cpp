@@ -261,3 +261,26 @@ TEST(pacer_max_mode_never_waits) {
     CHECK_EQ(p.update(100000000, 1000), 1.0);
     CHECK_EQ(host.slept, 0u);
 }
+
+// A held key repeats by the guest's clock, which therefore keeps to the wall
+// clock until the key is released.
+TEST(pacer_max_mode_keeps_to_the_wall_clock_while_a_key_is_held) {
+    FakeHost host;
+    Pacer p(Pacer::Mode::Max, 100e6, host.clock());
+    p.update(0, 0);
+    host.now += 1000000;
+    p.update(500000000, 1000);  // 5 s of guest time in 1 ms
+    CHECK_EQ(host.slept, 0u);
+    p.set_key_held(true);
+    host.now += 1000000;
+    p.update(500000000, 2000);  // the lead so far is not waited out
+    CHECK_EQ(host.slept, 0u);
+    host.now += 1000000;
+    CHECK_EQ(p.update(510000000, 3000), 1.0);  // 100 ms of guest time in 1 ms
+    CHECK(host.slept >= 98000000 && host.slept <= 100000000);
+    p.set_key_held(false);
+    const u64 slept = host.slept;
+    host.now += 1000000;
+    p.update(600000000, 4000);
+    CHECK_EQ(host.slept, slept);
+}

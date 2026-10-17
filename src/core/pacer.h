@@ -24,7 +24,9 @@
 //             the guest catches up by charging more per instruction; only
 //             beyond 10 s (the host was suspended) is the lost time given up.
 //   Max       No waiting and one cycle per instruction: as fast as possible,
-//             with guest time running ahead of the wall clock.
+//             with guest time running ahead of the wall clock. Except while
+//             a key is held (set_key_held): the guest repeats a held key by
+//             its own clock, so guest time is then held to the wall clock.
 #pragma once
 
 #include <algorithm>
@@ -58,6 +60,11 @@ public:
     // the most it may be sped up otherwise (0, the default: no cap).
     void set_timed_speed(double factor) { timed_speed_ = factor; }
     void set_max_speed(double factor) { max_speed_ = factor; }
+    // A key is held down on the guest's keyboard (see Max).
+    void set_key_held(bool held) {
+        if (held && !key_held_) key_rebase_ = true;
+        key_held_ = held;
+    }
     double cycles_per_instruction() const { return cpi_; }
     // The least charge for an instruction of a delay loop (see
     // R4000::set_delay_cycles_per_instruction): in Realtime mode the charge
@@ -85,6 +92,7 @@ private:
 
     double cpi_ = 1.0;
     double timed_speed_ = 2.0, max_speed_ = 0;  // see set_timed_speed(), set_max_speed()
+    bool key_held_ = false, key_rebase_ = false;
 };
 
 }  // namespace sg

@@ -48,7 +48,13 @@ double Pacer::update(u64 guest_cycles, u64 instructions, bool timing_cpu) {
         last_instructions_ = instructions;
         return cpi_;
     }
-    if (mode_ == Mode::Max) return cpi_ = 1.0;
+    if (mode_ == Mode::Max) {
+        if (!key_held_) return cpi_ = 1.0;
+        if (key_rebase_) {  // whatever lead the guest had is kept, not waited out
+            key_rebase_ = false;
+            rebase(now, guest_cycles);
+        }
+    }
     if (guest_cycles < epoch_cycles_) rebase(now, guest_cycles);  // clock replaced (not expected)
 
     // Host speed while busy: instructions per second of host time spent

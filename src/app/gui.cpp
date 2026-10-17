@@ -357,6 +357,7 @@ int Gui::run() {
         }
         if (auto* m = session_.machine()) {
             const u64 slice = static_cast<u64>(m->cycles_per_second() / 1000);  // 1 ms of guest time
+            session_.pacer()->set_key_held(keys_down_.any());
             while (SDL_GetTicksNS() < next_frame_ns && !m->powered_off()) session_.run(slice);
             if (m->powered_off()) {
                 power_off();
