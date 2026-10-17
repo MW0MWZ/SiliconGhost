@@ -648,6 +648,7 @@ private:
     std::vector<u32> itag_, dtag_, stag_;
     std::vector<u8> ilru_, dlru_;  // 2-way caches: the way to replace next in each set
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
+    bool stag_valid_ = false;          // R5000: some S$ tag may be valid
 
     // Separate tables for fetch, load and store (indexed by Access), so code
     // and data pages that share low address bits do not evict each other.

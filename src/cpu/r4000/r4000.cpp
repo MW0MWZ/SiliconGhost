@@ -219,6 +219,7 @@ void R4000::reset() {
     const u32 sline = opts_.core == Core::R5000 ? 32u : 16u << ((config_ >> 22) & 3);
     stag_.assign(opts_.core == Core::R4600 ? 0 : opts_.scache_bytes / sline, 0);
     stag_stored_at_.assign(stag_.size(), kNeverStored);
+    stag_valid_ = false;
 
     // The cycle counter is the machine's master clock and keeps running
     // through a reset (Count's value after reset is undefined anyway).
@@ -2228,7 +2229,10 @@ void R4000::cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 pad
         const std::size_t lines = stag_.size();
         const std::size_t index = (paddr / kLine) % lines;
         switch (operation) {
-            case 0: std::fill(stag_.begin(), stag_.end(), 0); break;  // Flash Invalidate
+            case 0:  // Flash Invalidate
+                if (stag_valid_) std::fill(stag_.begin(), stag_.end(), 0);
+                stag_valid_ = false;
+                break;
             case 1:  // Index Load Tag
                 // As on the R4000: a line not written through Index Store Tag
                 // recently is reported as holding the probed address, as a
@@ -2243,11 +2247,13 @@ void R4000::cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 pad
                 break;
             case 2:  // Index Store Tag: the tag from the address, the state from TagLo (invalid reads as zero)
                 stag_[index] = (taglo_ & kValid) ? stag_of(paddr) | kValid : 0;
+                stag_valid_ |= stag_[index] != 0;
                 stag_stored_at_[index] = cycles();
                 break;
-            case 5: {                                                          // Page Invalidate
-                const u64 page = paddr & ~u64{0xFFF};
-                for (u64 a = page; a < page + 0x1000; a += kLine) stag_[(a / kLine) % lines] = 0;
+            case 5: {  // Page Invalidate: the page's lines, one run of tags (lines is a multiple of a page's)
+                if (!stag_valid_) break;
+                const std::size_t first = ((paddr & ~u64{0xFFF}) / kLine) % lines;
+                std::fill_n(stag_.begin() + static_cast<std::ptrdiff_t>(first), 0x1000 / kLine, 0u);
                 break;
             }
             default: break;
