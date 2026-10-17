@@ -245,12 +245,12 @@ private:
     // number never uses), so a change of address space needs no flush and
     // returning to one finds its translations still there.
     struct FastEntry {
-        u64 tag = ~u64{0};  // (vaddr >> 12) | asid_tag_
+        u64 tag = ~u64{0};  // (vaddr >> 12) | asid_tag_ (ASID and generation)
         u8* host = nullptr; // host pointer to the 4 KiB page, or nullptr for MMIO
         u64 ppage = 0;      // physical page address
         u8* code = nullptr; // the page's code flag (host pages only; see Bus::code_flag)
     };
-    static constexpr unsigned kFastBits = 10;
+    static constexpr unsigned kFastBits = 12;
     static constexpr unsigned kFastEntries = 1u << kFastBits;
 
     // Execution
@@ -644,9 +644,15 @@ private:
     // and data pages that share low address bits do not evict each other.
     FastEntry fast_[kNumModes][3][kFastEntries];
     static constexpr unsigned kAsidTagShift = 52;
+    // Tags also carry a generation (bits 60-63): a full flush moves to the
+    // next, which no entry has, and clears the tables only when the count
+    // wraps. (Generation 15 is never used, so an empty slot's all-ones tag
+    // matches nothing.)
+    static constexpr unsigned kFastGenShift = 60, kFastGens = 15;
+    u64 fast_gen_ = 0;
     void set_entryhi(u64 v) {
         entryhi_ = v;
-        asid_tag_ = (v & 0xFF) << kAsidTagShift;
+        asid_tag_ = ((v & 0xFF) << kAsidTagShift) | (fast_gen_ << kFastGenShift);
     }
 };
 

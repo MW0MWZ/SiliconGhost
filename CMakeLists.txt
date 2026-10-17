@@ -33,6 +33,7 @@ else()
 endif()
 
 add_library(sg_emu STATIC
+  src/core/host_memory.cpp
   src/core/log.cpp
   src/core/pacer.cpp
   src/core/scheduler.cpp

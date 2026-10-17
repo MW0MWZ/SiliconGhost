@@ -124,7 +124,7 @@ bool R4000::jit_compile(Block& b) {
     e.mov(kTime, kArg2);
     e.mov(rax, m_mode, false);
     e.mov(m_entry_mode, rax, false);
-    static_assert(sizeof(FastEntry) == 32 && kFastEntries == 1024);
+    static_assert(sizeof(FastEntry) == 32);
     constexpr s32 kTableBytes = kFastEntries * sizeof(FastEntry);
     e.imul_imm(kTlb, rax, 3 * kTableBytes);
     e.alu(Alu::Add, kTlb, kCpu);

@@ -65,7 +65,7 @@ bool R4000::jit_compile(Block& b) {
     const s64 o_time0 = offset_of(this, &jit_time0_), o_budget0 = offset_of(this, &jit_budget0_),
               o_weight = offset_of(this, &weight_);
     const s64 o_asid_tag = offset_of(this, &asid_tag_);
-    static_assert(sizeof(FastEntry) == 32 && kFastEntries == 1024);
+    static_assert(sizeof(FastEntry) == 32);
     constexpr s64 kTableBytes = kFastEntries * sizeof(FastEntry);
 
     // Prologue: frame record, then the callee-saved registers used.

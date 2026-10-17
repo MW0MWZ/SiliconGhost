@@ -813,6 +813,9 @@ bool R4000::ops64_enabled() const {
 }
 
 void R4000::flush_fast_tlb() {
+    fast_gen_ = (fast_gen_ + 1) % kFastGens;
+    asid_tag_ = (asid_tag_ & ~(u64{0xF} << kFastGenShift)) | (fast_gen_ << kFastGenShift);
+    if (fast_gen_ != 0) return;
     for (auto& mode : fast_)
         for (auto& table : mode)
             for (auto& e : table) e = FastEntry{};

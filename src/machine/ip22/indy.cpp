@@ -62,7 +62,7 @@ constexpr u64 kSccCharCycles = 2000;
 
 Indy::Indy(const IndyConfig& config)
     : config_(config),
-      ram_(std::make_unique<u8[]>(checked_ram_bytes(config))),
+      ram_(checked_ram_bytes(config)),
       prom_(std::make_unique<u8[]>(kPromMaxSize)),
       cpu_(bus_, cpu_options(config)),
       ioc_(scheduler_, config.cpu_hz, kSccCharCycles, config.board == Board::Indigo2),
@@ -71,7 +71,6 @@ Indy::Indy(const IndyConfig& config)
           config.board == Board::Indigo2),
       newport_(scheduler_, config.cpu_hz, Newport::Options{config.xl24, 0xA, config.graphics_revision}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
-    std::memset(ram_.get(), 0, checked_ram_bytes(config));
     std::memset(prom_.get(), 0xFF, kPromMaxSize);
     scheduler_.set_clock([this] { return cpu_.cycles(); });
 
