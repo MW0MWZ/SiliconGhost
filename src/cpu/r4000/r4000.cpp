@@ -373,6 +373,104 @@ void R4000::decode_ops(Block& b, const u8* host, u32 page_offset) {
         }
         if (ends_block(w)) break;
     }
+    b.delay = delay_loop(b.ops, b.count, page_offset);
+}
+
+R4000::DelayLoop R4000::delay_loop(const Op* ops, u32 n, u32 page_offset) {
+    DelayLoop d;
+    if (n < 2 || n > 4) return d;
+    const u32 br = ops[n - 2].inst;
+    const unsigned opc = br >> 26, rs = f_rs(br), rt = f_rt(br);
+    if (static_cast<s64>(page_offset) + 4 * (n - 1) + 4 * static_cast<s16>(br & 0xFFFF) != page_offset) return d;
+    // One instruction counts; any others are NOPs.
+    int count = -1;
+    for (u32 i = 0; i < n; ++i) {
+        if (i == n - 2 || ops[i].inst == 0) continue;
+        if (count >= 0) return d;
+        count = static_cast<int>(i);
+    }
+    if (count < 0) return d;
+    const u32 w = ops[count].inst;
+    switch (w >> 26) {
+        case 0x08: case 0x09:  // ADDI, ADDIU
+            if (f_rs(w) != f_rt(w)) return d;
+            d.counter = static_cast<u8>(f_rt(w));
+            d.imm = static_cast<u32>(static_cast<s32>(static_cast<s16>(w & 0xFFFF)));
+            d.trap = (w >> 26) == 0x08;
+            if (d.imm == 0) return d;
+            break;
+        case 0x00:
+            switch (w & 63) {
+                case 0x20: case 0x21: case 0x22: case 0x23:  // ADD, ADDU, SUB, SUBU
+                    if (f_rd(w) != f_rs(w) || f_rt(w) == f_rd(w) || f_rt(w) == 0 || (w >> 6 & 31)) return d;
+                    d.counter = static_cast<u8>(f_rd(w));
+                    d.step_reg = static_cast<u8>(f_rt(w));
+                    d.sub = (w & 63) >= 0x22;
+                    d.trap = !(w & 1);
+                    break;
+                default: return d;
+            }
+            break;
+        default: return d;
+    }
+    if (d.counter == 0) return d;
+    DelayLoop::Test test = DelayLoop::None;
+    switch (opc) {
+        case 0x04: case 0x14:  // BEQ(L), BNE(L): the counter against a register
+        case 0x05: case 0x15:
+            if (rs == rt || (rs != d.counter && rt != d.counter)) return d;
+            d.other = static_cast<u8>(rs == d.counter ? rt : rs);
+            test = (opc & 1) ? DelayLoop::Ne : DelayLoop::Eq;
+            break;
+        case 0x06: case 0x16: case 0x07: case 0x17:  // BLEZ(L), BGTZ(L)
+            if (rt != 0 || rs != d.counter) return d;
+            test = (opc & 1) ? DelayLoop::Gtz : DelayLoop::Lez;
+            break;
+        case 0x01:  // BLTZ(L), BGEZ(L)
+            if (rs != d.counter || (rt & ~3u)) return d;
+            test = (rt & 1) ? DelayLoop::Gez : DelayLoop::Ltz;
+            break;
+        default: return d;
+    }
+    d.in_slot = static_cast<u32>(count) == n - 1;
+    d.test = test;
+    return d;
+}
+
+u64 R4000::run_delay_loop(const Block& b, u64 t, u64 safe) {
+    const DelayLoop& d = b.delay;
+    const u64 w = std::max(weight_, delay_weight_);
+    const u64 per = w * b.count;
+    if (t + per >= safe) return t;
+    const u64 max = (safe - t - 1) / per;
+    u64 c = gpr[d.counter];
+    const u32 step = d.step_reg ? static_cast<u32>(gpr[d.step_reg]) : d.imm;
+    const u64 other = gpr[d.other];
+    u64 k = 0;
+    for (; k < max; ++k) {
+        const u32 a = static_cast<u32>(c);
+        const u32 r = d.sub ? a - step : a + step;
+        if (d.trap && ((d.sub ? (a ^ step) : ~(a ^ step)) & (a ^ r) & 0x80000000u)) break;  // overflow
+        const u64 next = sext32(r);
+        const s64 v = static_cast<s64>(d.in_slot ? c : next);
+        bool taken = false;
+        switch (d.test) {
+            case DelayLoop::Eq: taken = static_cast<u64>(v) == other; break;
+            case DelayLoop::Ne: taken = static_cast<u64>(v) != other; break;
+            case DelayLoop::Lez: taken = v <= 0; break;
+            case DelayLoop::Gtz: taken = v > 0; break;
+            case DelayLoop::Ltz: taken = v < 0; break;
+            case DelayLoop::Gez: taken = v >= 0; break;
+            case DelayLoop::None: break;
+        }
+        if (!taken) break;
+        c = next;
+    }
+    gpr[d.counter] = c;
+    // Time beyond the ordinary charge is not instructions (see instructions()).
+    const u64 n = k * b.count;
+    idle_skipped_fp_ += n * (w - weight_);
+    return t + n * w;
 }
 
 // `page` is the host address of a 4 KiB page that was written.
@@ -442,7 +540,11 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             if (blk->host != host) build_block(*blk, host, offset);
         }
         block_invalidated_ = false;
-        if (jit_buf_ && !start && !blk->code && ++blk->runs == kJitThreshold) {
+        if (SG_UNLIKELY(blk->delay.test != DelayLoop::None) && !start && !(check_irq && interrupt_pending())) {
+            check_irq = false;
+            time_fp_ = run_delay_loop(*blk, time_fp_, safe);
+        }
+        if (jit_buf_ && !start && !blk->code && blk->delay.test == DelayLoop::None && ++blk->runs == kJitThreshold) {
             if (!jit_compile(*blk)) {
                 jit_flush();  // the code buffer is full: start afresh
                 jit_compile(*blk);
@@ -558,6 +660,10 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             fe.host != page)
             return;
     }
+}
+
+void R4000::set_delay_cycles_per_instruction(double cpi) {
+    delay_weight_ = cpi > 0 ? static_cast<u64>(cpi * (1u << kCycleFracBits) + 0.5) : 0;
 }
 
 void R4000::set_cycles_per_instruction(double cpi) {

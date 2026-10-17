@@ -185,6 +185,11 @@ public:
     // including Count/Compare, follows the cycle counter.
     void set_cycles_per_instruction(double cpi);
     double cycles_per_instruction() const { return static_cast<double>(weight_) / (1u << kCycleFracBits); }
+    // The least guest time a delay loop's instruction is charged (see
+    // DelayLoop): the charge the guest saw when it timed the CPU, so that a
+    // calibrated delay never runs short when the CPU later runs faster.
+    // Default 0: the ordinary charge.
+    void set_delay_cycles_per_instruction(double cpi);
 
     // Idle skipping: a loop is a spin when two consecutive iterations (visits
     // to the same backward branch) end with the same registers and have
@@ -297,6 +302,23 @@ private:
     };
     // FNV-1a of the region's other blocks' instructions in the page at `page`.
     static u64 jit_region_hash(const u8* page, const JitRegion& r);
+    // A delay loop: a block that branches back to its own start and does
+    // nothing but count one register up or down (by a constant, or by a
+    // register the loop leaves alone) until the branch's test on it fails,
+    // e.g. `bgtz t5, self; addiu t5, t5, -1`. Software calibrates such loops
+    // against a timer, so their only effect is the time they take: they are
+    // run by run_delay_loop() instead of instruction by instruction, charged
+    // at least the delay charge (set_delay_cycles_per_instruction).
+    struct DelayLoop {
+        enum Test : u8 { None, Eq, Ne, Lez, Gtz, Ltz, Gez };
+        Test test = None;
+        bool in_slot = false;  // the count is in the delay slot (after the test)
+        bool sub = false;      // SUBU/SUB: counter -= step
+        bool trap = false;     // ADDI/ADD/SUB: stop before an overflow (the instruction traps)
+        u8 counter = 0, step_reg = 0, other = 0;  // other: what Eq/Ne compare with
+        u32 imm = 0;           // step when step_reg is 0 (sign-extended immediate)
+    };
+    static DelayLoop delay_loop(const Op* ops, u32 count, u32 page_offset);
     struct Block {
         const u8* host = nullptr;  // first instruction (canonical: aliases share host memory)
         u32 offset = 0;            // of the first instruction within its 4 KiB page
@@ -307,6 +329,7 @@ private:
         bool jit_addr64 = false;  // addressing mode the code was translated for
         bool jit_region = false;  // the code also runs other blocks of the page (see jit_region())
         bool hot = false;         // the head of a loop that keeps running: translated as a large region
+        DelayLoop delay;          // the block is a delay loop (never translated)
         JitRegion region;
         const u8* jit_host = nullptr;  // the block the code was translated from (kept when `host` is dropped)
         // Where its jump through a register (JR, JALR) went within the page,
@@ -351,6 +374,9 @@ private:
         return static_cast<unsigned>(reinterpret_cast<uintptr_t>(host) >> 2) & ((1u << kBlockBits) - 1);
     }
     void run_block(u64 cycle, const u64* limit);
+    // Runs whole iterations of delay loop `b` (at its start), each taken back
+    // to the start and finishing before guest time `safe`; returns the new time.
+    u64 run_delay_loop(const Block& b, u64 t, u64 safe);
     void build_block(Block& b, const u8* host, u32 page_offset);
     void decode_ops(Block& b, const u8* host, u32 page_offset);  // the instructions, nothing else
     void invalidate_code_page(const u8* page);
@@ -549,6 +575,7 @@ private:
     static constexpr unsigned kCycleFracBits = 10;
     u64 time_fp_ = 0;                          // cycle counter, kCycleFracBits fractional bits
     u64 weight_ = u64{1} << kCycleFracBits;    // charged per instruction
+    u64 delay_weight_ = 0;                     // least charged per delay-loop instruction
     u64 instret_base_ = 0, instret_time_fp_ = 0, instret_skip_fp_ = 0;  // instructions() at the last re-base
     u64 timer_event_fp_ = ~u64{0};             // Count == Compare, in time_fp_ units
 

@@ -1458,6 +1458,68 @@ TEST(cpu_jit_delay_slot_after_a_branch_run_by_its_handler) {
     CHECK_EQ(reference.cause >> 31, 0u);
 }
 
+// Delay loops (a register counted to a limit, nothing else) are run without
+// executing each instruction: the result, the time, a trap on overflow and
+// an interrupt arriving part way must all be as if they were.
+TEST(cpu_delay_loops_run_exactly_as_instructions) {
+    struct Case {
+        std::vector<u32> loop;
+        u64 v0, v1, t5;
+        bool irq;
+    };
+    const std::vector<Case> cases = {
+        {{BGTZ(t5, -1), ADDIU(t5, t5, -1)}, 0, 0, 5000, false},                 // count in the delay slot
+        {{ADDI(v0, v0, -1), BNE(v0, zero, -2), NOP}, 3000, 0, 0, false},        // count, then test
+        {{BGEZL(v1, -1), SUBU(v1, v1, v0)}, 3, 9998, 0, false},                 // by a register, branch-likely
+        {{ADDI(v0, v0, 1), BNE(v0, v1, -2), NOP}, 0x7FFFF000, 0, 0, false},     // overflows: traps
+        {{BGTZ(t5, -1), ADDIU(t5, t5, -1)}, 0, 0, 200000, true},                // the timer interrupts it
+        {{NOP, ADDIU(v0, v0, 2), BNE(v0, v1, -3), NOP}, 0, 40000, 0, false},    // counts up to a register
+    };
+    for (const Case& c : cases) {
+        auto run = [&](Engine engine) {
+            Rig t;
+            use_engine(t, engine);
+            t.cpu.set_idle_skip(false);
+            t.cpu.gpr[v0] = c.v0, t.cpu.gpr[v1] = c.v1, t.cpu.gpr[t5] = c.t5;
+            std::vector<u32> prog = {ADDIU(t0, zero, 1)};  // 1000
+            prog.insert(prog.end(), c.loop.begin(), c.loop.end());
+            prog.insert(prog.end(), {ADDIU(t1, zero, 2), BEQ(zero, zero, -1), NOP});
+            for (std::size_t i = 0; i < prog.size(); ++i) store_be<u32>(&t.ram[0x1000 + 4 * i], prog[i]);
+            t.load({ADDIU(t2, zero, 3), BEQ(zero, zero, -1), NOP}, 0x180);
+            if (c.irq) {
+                t.cpu.cp0_write(cop0::Compare, 50000);  // Count == Compare at cycle 100000
+                t.cpu.cp0_write(cop0::Status, sr::IE | (1u << 15));
+            }
+            t.cpu.run_until(600000);
+            return capture(t, 0, 0);
+        };
+        const CpuState reference = run(Engine::Interpreter);
+        CHECK(run(Engine::Blocks) == reference);
+        CHECK(run(Engine::Jit) == reference);
+    }
+}
+
+// Charged at least the delay charge, a calibrated delay keeps its length
+// while other instructions are charged less.
+TEST(cpu_delay_loops_keep_the_delay_charge) {
+    for (Engine engine : {Engine::Blocks, Engine::Jit}) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.cpu.set_cycles_per_instruction(0.25);
+        t.cpu.set_delay_cycles_per_instruction(0.5);
+        t.cpu.gpr[t5] = 100000;
+        t.load({BGTZ(t5, -1), ADDIU(t5, t5, -1), ADDIU(t1, zero, 2), BEQ(zero, zero, -1), NOP});
+        // 200002 instructions: 50001 cycles at the ordinary charge, 100001 at the delay charge.
+        t.cpu.run_until(90000);
+        CHECK(t.cpu.gpr[t5] > 9000 && t.cpu.gpr[t5] < 11000);  // 90000 cycles: 90000 iterations
+        const u64 ran = 2 * (100000 - t.cpu.gpr[t5]);  // still counted as instructions run
+        CHECK(t.cpu.instructions() + 2 >= ran && t.cpu.instructions() <= ran + 2);
+        t.cpu.run_until(100100);
+        CHECK_EQ(t.cpu.gpr[t1], 2u);
+    }
+}
+
 // Pages whose fetch translations share a soft-TLB slot: translated code
 // jumping from one to the other must not take the slot's translation for
 // its own.

@@ -98,11 +98,14 @@ void usage(const char* argv0) {
                  "  --screenshot F   on exit, save the display as a binary PPM image\n"
                  "  --max N          stop after N cycles (default: run until Ctrl-C); implies --headless\n"
                  "  --timing MODE    realtime: guest clocks follow the host clock and the CPU runs as\n"
-                 "                             fast as the host allows, up to --max-speed (default)\n"
+                 "                             fast as the host allows (default)\n"
                  "                   cycle:    one cycle per instruction, reproducible; waits when ahead\n"
                  "                   max:      no waiting; guest time runs ahead (default with --max)\n"
+                 "  --timed-speed X  realtime: the CPU runs X times as fast as the real one while the\n"
+                 "                   system times it, and its delays keep that length (default 2;\n"
+                 "                   IRIX 5.3 boots with clock x X up to about 350 MHz)\n"
                  "  --max-speed X    realtime: run the CPU at most X times as fast as the real one\n"
-                 "                   (default 2; IRIX 5.3 boots with clock x X up to about 350 MHz)\n"
+                 "                   (default 0: as fast as the host allows)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "%s"
@@ -265,7 +268,8 @@ int main(int argc, char** argv) {
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},  {"--machine", "machine"},
                        {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"},
-                       {"--graphics-rev", "graphics_rev"}, {"--timing", "timing"}, {"--max-speed", "max_speed"},
+                       {"--graphics-rev", "graphics_rev"}, {"--timing", "timing"},
+                       {"--timed-speed", "timed_speed"}, {"--max-speed", "max_speed"},
                        {"--log", "log"}};
         static const struct {
             const char* flag;

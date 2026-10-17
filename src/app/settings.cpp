@@ -188,7 +188,7 @@ Settings first_run_settings() {
     s.ram_mb = 256;
     s.xl24 = true;
     s.cpu_mhz = 200;  // the fastest Indy R4400SC
-    s.max_speed = 1.2;
+    s.timed_speed = 1.2;
     return s;
 }
 
@@ -300,7 +300,8 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
         net::PortForward f;
         ok = parse_forward(v, f) && (s.forwards.push_back(f), true);
     } else if (key == "timing") ok = parse_timing(v, s.timing);
-    else if (key == "max_speed") ok = parse_number(v, n) && n > 0 && (s.max_speed = n, true);
+    else if (key == "timed_speed") ok = parse_number(v, n) && n > 0 && (s.timed_speed = n, true);
+    else if (key == "max_speed") ok = parse_number(v, n) && n >= 0 && (s.max_speed = n, true);
     else if (key == "idle_skip") ok = parse_bool(v, s.idle_skip);
     else if (key == "block_cache") ok = parse_bool(v, s.block_cache);
     else if (key == "jit") ok = parse_bool(v, s.jit);
@@ -354,17 +355,25 @@ bool load_settings(const std::string& path, Settings& s, std::string& error) {
     Settings loaded;
     std::string line;
     unsigned number = 0;
+    bool timed_speed = false;
     while (std::getline(f, line)) {
         ++number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         const auto eq = line.find('=');
+        if (line.compare(0, eq, "timed_speed") == 0) timed_speed = true;
         std::string why;
         if (eq == std::string::npos || !set_option(loaded, line.substr(0, eq), line.substr(eq + 1), why)) {
             // An unknown or bad line is skipped, so a file from another
             // version still loads.
             SG_LOG(Warn, "settings", "%s:%u: %s", path.c_str(), number, why.empty() ? "not key=value" : why.c_str());
         }
+    }
+    // Older files have only max_speed, which then capped the CPU at all
+    // times: it is the speed the guest times.
+    if (!timed_speed) {
+        loaded.timed_speed = loaded.max_speed > 0 ? loaded.max_speed : Settings{}.timed_speed;
+        loaded.max_speed = 0;
     }
     s = std::move(loaded);
     return true;
@@ -381,7 +390,8 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
           << "\ngraphics_rev=" << (s.graphics_rev >= 0 ? std::to_string(s.graphics_rev) : "")
           << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
-        f << "timing=" << timing_name(s.timing) << "\nmax_speed=" << s.max_speed << "\nidle_skip=" << (s.idle_skip ? 1 : 0)
+        f << "timing=" << timing_name(s.timing) << "\ntimed_speed=" << s.timed_speed << "\nmax_speed=" << s.max_speed
+          << "\nidle_skip=" << (s.idle_skip ? 1 : 0)
           << "\nblock_cache=" << (s.block_cache ? 1 : 0) << "\njit=" << (s.jit ? 1 : 0) << "\naudio=" << (s.audio ? 1 : 0)
           << "\naudio_in=" << (s.audio_in ? 1 : 0) << "\nlog=" << s.log
           << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0) << "\n";

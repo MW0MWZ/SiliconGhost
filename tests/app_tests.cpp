@@ -142,6 +142,30 @@ TEST(settings_round_trip_and_validation) {
     std::filesystem::remove(path);
 }
 
+// Files from before the timed speed have only max_speed, which capped the CPU
+// at all times: it becomes the speed the guest times, with no cap after.
+TEST(settings_older_max_speed_becomes_the_timed_speed) {
+    const std::string path = temp_path("sg_settings_speed.ini");
+    std::string error;
+    {
+        std::ofstream f(path);
+        f << "timing=realtime\nmax_speed=1.2\n";
+    }
+    app::Settings loaded;
+    CHECK(app::load_settings(path, loaded, error));
+    CHECK_EQ(loaded.timed_speed, 1.2);
+    CHECK_EQ(loaded.max_speed, 0.0);
+    app::Settings s;
+    CHECK(app::set_option(s, "timed_speed", "1.5", error));
+    CHECK(app::set_option(s, "max_speed", "3", error));
+    CHECK(!app::set_option(s, "timed_speed", "0", error));
+    CHECK(app::save_settings(path, s, error));
+    CHECK(app::load_settings(path, loaded, error));
+    CHECK_EQ(loaded.timed_speed, 1.5);
+    CHECK_EQ(loaded.max_speed, 3.0);
+    std::filesystem::remove(path);
+}
+
 TEST(settings_platform_limits_processor_clock_and_memory) {
     using ip22::Board;
     // Only the modules each platform shipped with, at the clocks it shipped them.

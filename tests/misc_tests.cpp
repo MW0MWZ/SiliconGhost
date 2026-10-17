@@ -208,13 +208,13 @@ TEST(pacer_realtime_catches_up_after_a_long_stall) {
     CHECK(guest > wall - 0.01 && guest < wall + 0.01);
 }
 
-// While the guest times the CPU, it runs at the cap even on a host too slow
-// to keep up, so it is never faster afterwards than when it was measured.
-TEST(pacer_realtime_holds_the_cap_while_the_guest_times_the_cpu) {
+// While the guest times the CPU, it runs at the timed speed even on a host
+// too slow to keep up, so its delay loops are calibrated at that speed.
+TEST(pacer_realtime_runs_at_the_timed_speed_while_the_guest_times_the_cpu) {
     FakeHost host;
     const double hz = 175e6, host_ips = 100e6;  // slower than the real CPU
     Pacer p(Pacer::Mode::Realtime, hz, host.clock());
-    p.set_max_speed(1.5);
+    p.set_timed_speed(1.5);
     double cpi = p.update(0, 0);
     u64 cycles = 0, instructions = 0;
     for (int slice = 0; slice < 3000; ++slice) {
@@ -225,9 +225,32 @@ TEST(pacer_realtime_holds_the_cap_while_the_guest_times_the_cpu) {
         const bool timing = slice >= 1000 && slice < 1100;
         cpi = p.update(cycles, instructions, timing);
         if (slice >= 1000 && slice < 1099) CHECK(std::abs(cpi - 1 / 1.5) < 1e-9);
-        if (slice >= 1100) CHECK(cpi >= 1 / 1.5);
     }
     CHECK(cpi > 1.7);  // adapting again: the host covers 0.57 of real speed
+    CHECK(std::abs(p.delay_cycles_per_instruction() - 1 / 1.5) < 1e-9);
+}
+
+// Outside the guest's timing the CPU runs as fast as the host allows, while
+// guest time still follows the wall clock.
+TEST(pacer_realtime_runs_uncapped_after_the_guest_times_the_cpu) {
+    FakeHost host;
+    const double hz = 175e6, host_ips = 1000e6;  // could run the guest CPU 5.7x as fast
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    double cpi = p.update(0, 0);
+    u64 cycles = 0, instructions = 0;
+    for (int slice = 0; slice < 3000; ++slice) {  // 1 ms slices of host time, fully busy
+        const u64 n = static_cast<u64>(host_ips / 1000);
+        instructions += n;
+        cycles += static_cast<u64>(static_cast<double>(n) * cpi);
+        host.now += 1000000;
+        const bool timing = slice >= 1000 && slice < 1100;
+        cpi = p.update(cycles, instructions, timing);
+        if (slice >= 1000 && slice < 1099) CHECK_EQ(cpi, 0.5);  // the default timed speed, 2x
+    }
+    CHECK(cpi > 0.17 && cpi < 0.18);
+    CHECK_EQ(p.delay_cycles_per_instruction(), 0.5);
+    const double wall = static_cast<double>(host.now - 1000000000) * 1e-9, guest = static_cast<double>(cycles) / hz;
+    CHECK(guest > wall - 0.01 && guest < wall + 0.01);
 }
 
 TEST(pacer_max_mode_never_waits) {
