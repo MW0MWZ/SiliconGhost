@@ -274,8 +274,9 @@ private:
     // reads neither the pc nor the time, so it runs without bookkeeping.
     static Handler decode(u32 inst, bool& plain);
     // Translated block: runs the block from its start, returns the number
-    // of instructions completed (see jit_x64.cpp).
-    using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 time_fp);
+    // of instructions completed (see jit_x64.cpp). `budget`: how many
+    // instructions may start (jit_budget0_).
+    using JitFn = u32 (*)(R4000* cpu, u64 pc, u64 budget);
     static constexpr u32 kJitThreshold = 8;  // runs before a block is translated
     // A region's other blocks (see jit_region()): where they are, and a hash
     // of their instructions, so that its code can be taken back.
@@ -479,6 +480,9 @@ private:
     bool block_invalidated_ = false;  // the running block's memory was written
     bool io_ = false;                 // a device was accessed (interrupts or events may have changed)
     std::vector<Block> blocks_;
+    // Where run_block() stopped inside a block at the end of a run.
+    const u8* resume_host_ = nullptr;
+    u32 resume_i_ = 0;
     // Translations of blocks recently replaced in each slot (the table is
     // direct-mapped, so blocks 64 KiB apart evict each other), with the
     // instructions they were made from: a block decoded into its slot again
@@ -500,7 +504,10 @@ private:
     void keep_translation(Block& b);
     void reuse_translation(Block& b);
     std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
-    u64 jit_safe_ = 0;  // run_block()'s safe time, for translated code
+    // A translated code call's start time and budget: how many instructions
+    // may start before run_block()'s safe time (translated code counts the
+    // budget down, block by block, and works out the time from it).
+    u64 jit_time0_ = 0, jit_budget0_ = 0;
     // Where translated code stopped: the block it was running (it may have
     // gone on into other blocks) and that block's entry pc.
     // Operations of a region's other blocks that translated code passes to

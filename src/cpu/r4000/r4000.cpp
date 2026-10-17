@@ -425,10 +425,22 @@ void R4000::run_block(u64 cycle, const u64* limit) {
     for (unsigned linked = 0; linked < kMaxLinkedBlocks; ++linked) {
         const u32 offset = static_cast<u32>(pc & 0xFFF);
         const u8* const host = page + offset;
-        Block* blk = &blocks_[block_index(host)];
-        if (blk->host != host) build_block(*blk, host, offset);
+        // A run that stopped inside a block carries on in it: a block made
+        // from where it stopped would only duplicate the end of that one.
+        u32 start = 0;
+        Block* blk = nullptr;
+        if (resume_host_) {
+            Block& r = blocks_[block_index(resume_host_)];
+            if (linked == 0 && r.host == resume_host_ && resume_i_ < r.count && r.host + 4 * resume_i_ == host)
+                blk = &r, start = resume_i_;
+            resume_host_ = nullptr;
+        }
+        if (!blk) {
+            blk = &blocks_[block_index(host)];
+            if (blk->host != host) build_block(*blk, host, offset);
+        }
         block_invalidated_ = false;
-        if (jit_buf_ && !blk->code && ++blk->runs == kJitThreshold) {
+        if (jit_buf_ && !start && !blk->code && ++blk->runs == kJitThreshold) {
             if (!jit_compile(*blk)) {
                 jit_flush();  // the code buffer is full: start afresh
                 jit_compile(*blk);
@@ -445,17 +457,18 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         u64 ipc = pc;  // address of ops[i]
         u64 t = time_fp_;
         bool synced = true;
-        u32 i = 0;
+        u32 i = start;
         bool leave = false;
         // Translated code runs the block when no time check falls inside it
         // and no interrupt is pending; it stops early where the loop below
         // would break, or after an access that may need the checks redone,
         // and may carry on directly into other translated blocks.
-        if (blk->code && blk->jit_addr64 == addr64_ && t + (blk->count - 1) * weight_ < safe) {
+        if (!start && blk->code && blk->jit_addr64 == addr64_ && t + (blk->count - 1) * weight_ < safe) {
             if (check_irq && !interrupt_pending()) check_irq = false;
             if (!check_irq) {
-                jit_safe_ = safe;
-                i = blk->code(this, ipc, t);
+                jit_time0_ = t;
+                jit_budget0_ = (safe - t + weight_ - 1) / weight_;  // instructions starting before `safe`
+                i = blk->code(this, ipc, jit_budget0_);
                 // It may have gone on into other blocks, in this page or others.
                 blk = jit_block_;
                 ipc = jit_entry_pc_ + 4 * u64{i};
@@ -477,6 +490,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                 time_fp_ = t;
                 if (!first && !(cycles() < cycle && cycles() < *limit)) {
                     if (!synced) set_pc(ipc);
+                    if (i > 0) resume_host_ = blk->host, resume_i_ = i;
                     return;
                 }
                 time_fp_ = t += weight_;

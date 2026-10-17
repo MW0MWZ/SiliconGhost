@@ -1429,6 +1429,35 @@ TEST(cpu_jit_keeps_registers_across_soft_tlb_refills_and_handler_calls) {
     CHECK_EQ(reference.gpr[t2], 300u * (7 + 5) + 300u * 301u / 2);
 }
 
+// A branch the translation leaves to its handler (BGEZAL) sets the
+// delay-slot state that an inline delay slot after it must clear.
+TEST(cpu_jit_delay_slot_after_a_branch_run_by_its_handler) {
+    auto run = [](Engine engine) {
+        Rig t;
+        use_engine(t, engine);
+        t.cpu.set_idle_skip(false);
+        t.cpu.gpr[t4] = 100000;
+        t.cpu.gpr[t5] = 200;
+        t.load({
+            ADDIU(t0, t0, 1),           // 1000: loop
+            I(0x01, zero, 0x11, 3),     // 1004: bgezal zero, 1014
+            ADDIU(t1, t1, 2),           // 1008: delay slot
+            BNE(t0, t4, -4), NOP,       // 100c: -> 1000
+            R(0x34, t0, t5, 0),         // 1014: the subroutine: teq t0, t5 (traps on pass 200)
+            JR(ra), NOP,                // back to 100c
+        });
+        t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+        t.cpu.run_until(20000);
+        return capture(t, 0, 0);
+    };
+    const CpuState reference = run(Engine::Interpreter);
+    CHECK(run(Engine::Blocks) == reference);
+    CHECK(run(Engine::Jit) == reference);
+    CHECK_EQ(reference.gpr[t0], 200u);
+    CHECK_EQ(reference.epc, 0xFFFFFFFF80001014ull);  // not in a delay slot
+    CHECK_EQ(reference.cause >> 31, 0u);
+}
+
 // Pages whose fetch translations share a soft-TLB slot: translated code
 // jumping from one to the other must not take the slot's translation for
 // its own.

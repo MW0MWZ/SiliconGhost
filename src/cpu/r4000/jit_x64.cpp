@@ -37,7 +37,7 @@ using namespace sg::jit::x64;
 // Registers live across the whole function (callee-saved). The mode at
 // entry is kept at [rsp].
 constexpr Reg kCpu = rbx;   // R4000*
-constexpr Reg kTime = r12;  // time_fp_ at entry
+constexpr Reg kTime = r12;  // the instructions that may still start, from the current block's first
 constexpr Reg kPc = r14;    // pc at entry (blocks are shared by aliases)
 constexpr Reg kTlb = rbp;   // this mode's soft-TLB load table (fetch before it, store after it)
 // Host registers that hold guest registers; rax, rcx and rdx are scratch.
@@ -107,7 +107,7 @@ bool R4000::jit_compile(Block& b) {
     const Mem m_idle_ready{kCpu, offset_of(this, &idle_ready_)};
     const Mem m_hi{kCpu, offset_of(this, &hi)};
     const Mem m_mode{kCpu, offset_of(this, &mode_)};
-    const Mem m_safe{kCpu, offset_of(this, &jit_safe_)};
+    const Mem m_time0{kCpu, offset_of(this, &jit_time0_)}, m_budget0{kCpu, offset_of(this, &jit_budget0_)};
     const Mem m_lo{kCpu, offset_of(this, &lo)};
     const Mem m_weight{kCpu, offset_of(this, &weight_)};
     const Mem m_asid_tag{kCpu, offset_of(this, &asid_tag_)};
@@ -359,14 +359,17 @@ bool R4000::jit_compile(Block& b) {
     }
     const std::size_t body = e.size();
 
-    auto set_time = [&](unsigned n) {  // time_fp_ = entry time + n instructions
-        e.imul_imm(rax, m_weight, static_cast<s32>(n));
-        e.alu(Alu::Add, rax, kTime);
+    auto set_time = [&](unsigned n) {  // time_fp_ = the block's start time + n instructions
+        e.mov(rax, m_budget0);
+        e.alu(Alu::Sub, rax, kTime);  // instructions run before the block
+        if (n) e.alu_imm(Alu::Add, rax, static_cast<s32>(n));
+        e.imul(rax, m_weight);
+        e.alu(Alu::Add, rax, m_time0);
         e.mov(m_time, rax);
     };
     auto pc_plus = [&](Reg dst, s64 bytes) {  // dst = entry pc + bytes
         e.mov(dst, kPc);
-        e.alu_imm(Alu::Add, dst, static_cast<s32>(bytes));
+        if (bytes) e.alu_imm(Alu::Add, dst, static_cast<s32>(bytes));
     };
     auto call_handler = [&](const Op& op) {
         e.mov(kArg0, kCpu);
@@ -1120,7 +1123,7 @@ bool R4000::jit_compile(Block& b) {
         const s32 table = is_store ? kTableBytes : 0;
         read(rax, rs);
         if (indexed) alu_g(Alu::Add, rax, rt);
-        else e.alu_imm(Alu::Add, rax, static_cast<s16>(w & 0xFFFF));
+        else if (w & 0xFFFF) e.alu_imm(Alu::Add, rax, static_cast<s16>(w & 0xFFFF));
         if (!addr64) e.movsxd(rax, rax);
         if (size > 1 && !merge) {
             e.test_imm(rax, size - 1);
@@ -1513,12 +1516,14 @@ bool R4000::jit_compile(Block& b) {
         exit_if(Cond::Ne, i + 1, 0);
     };
     // The delay slot ran without bookkeeping: move on to the branch's choice.
-    auto leave_delay_slot = [&] {
+    // (A branch emitted inline leaves next_delay_ clear; one run by its
+    // handler sets it.)
+    auto leave_delay_slot = [&](bool by_handler) {
         e.mov(rax, m_npc);
         e.mov(m_pc, rax);
         e.alu_imm(Alu::Add, rax, 4);
         e.mov(m_npc, rax);
-        e.mov_store_imm8(m_next_delay, 0);
+        if (by_handler) e.mov_store_imm8(m_next_delay, 0);
     };
 
     // Guest RAM need not be page-aligned in host memory: page positions come
@@ -1547,6 +1552,25 @@ bool R4000::jit_compile(Block& b) {
         u64 loaded = 0, dirty = 0;
         bool pending = false;
     } skip;
+    // A conditional branch in a region whose delay slot is in its block:
+    // the delay slot is emitted on each path, and each goes straight on to
+    // its successor (see the op loop). Set by emit_branch() on the taken
+    // path, which it leaves open; `not_taken` jumps to the other.
+    struct Direct {
+        bool active = false;
+        std::size_t not_taken = 0;
+        s64 taken = 0;  // the target's pc delta
+        bool likely = false;
+        u32 i = 0;      // the branch
+        u64 loaded = 0, dirty = 0;
+    } direct;
+    // The region block a pc delta from the current block's entry leads to,
+    // or rb.size().
+    auto member = [&](s64 delta) {
+        for (std::size_t j = 0; j < rb.size(); ++j)
+            if (static_cast<s64>(rb[j]->offset) == static_cast<s64>(page_offset) + delta) return j;
+        return rb.size();
+    };
     auto emit_branch = [&](const Op& op, u32 i) -> bool {
         const u32 w = op.inst;
         const unsigned opc = w >> 26, rs = f_rs(w), rt = f_rt(w);
@@ -1593,8 +1617,15 @@ bool R4000::jit_compile(Block& b) {
             e.bind(usable);
             e.alu_imm(Alu::Add, Mem{kCpu, offset_of(this, &change_epoch_)}, 1);  // touch()
         }
-        pc_plus(rax, 4 * i + 4);
-        e.mov(m_pc, rax);
+        // With its delay slot in the block, the branch leaves pc and
+        // next_delay_ alone: nothing reads them before the delay slot is
+        // done, except the loop bookkeeping below, which sets them itself.
+        // Only npc_ (where the delay slot goes on to) is needed.
+        const bool slot_here = i + 2 == cur->count;
+        if (!slot_here) {
+            pc_plus(rax, 4 * i + 4);
+            e.mov(m_pc, rax);
+        }
         std::size_t to_not_taken = 0;
         if (kind == kFpCond) {
             const auto [m, mask] = fcc_byte(rt >> 2);  // the condition: FCR31 bit 23, or 25-31
@@ -1635,7 +1666,7 @@ bool R4000::jit_compile(Block& b) {
             for (u32 off : seen) add_successor(static_cast<s64>(off) - static_cast<s64>(page_offset));
         }
         e.mov(m_npc, rcx);
-        e.mov_store_imm8(m_next_delay, 1);
+        if (!slot_here) e.mov_store_imm8(m_next_delay, 1);
         const bool maybe_backward = ((kind == kCompare || kind == kSign || kind == kFpCond) && simm < 0) || opc == 0x02;
         if (maybe_backward) {
             const unsigned idx = ((page_offset + 4 * i) >> 2) & ((1u << kLoopTableBits) - 1);
@@ -1658,6 +1689,11 @@ bool R4000::jit_compile(Block& b) {
             e.bind(visit1);
             e.bind(visit2);
             e.mov(m_cur_pc, rax);
+            if (slot_here) {  // as run_block() would leave them, should this be an idle loop
+                e.alu_imm(Alu::Add, rax, 4);
+                e.mov(m_pc, rax);
+                e.mov_store_imm8(m_next_delay, 1);
+            }
             set_time(i + 1);
             flush(dirty);  // the loop bookkeeping compares registers
             e.mov(kArg1, rcx);  // the target (before rcx may become the first argument)
@@ -1667,14 +1703,20 @@ bool R4000::jit_compile(Block& b) {
             e.movzx8(rax, m_idle_ready);
             e.test(rax, rax);
             exit_if(Cond::Ne, i + 1, 0);
+            if (slot_here) e.mov_store_imm8(m_next_delay, 0);
             restore(loaded);
             for (std::size_t site : done) e.bind(site);
         }
 
+        if (to_not_taken && slot_here && region_mode &&
+            (member(delta) < rb.size() || member(4 * static_cast<s64>(cur->count)) < rb.size())) {
+            direct = {true, to_not_taken, delta, likely, i, loaded, dirty};
+            return true;
+        }
         if (to_not_taken) {
             const std::size_t to_done = e.jmp();
             e.bind(to_not_taken);
-            if (likely && i + 2 == cur->count) {
+            if (likely && slot_here) {
                 // The delay slot is skipped: on to the block's end with the
                 // time one instruction short (see the end of the block).
                 skip = {e.jmp(), i, loaded, dirty, true};
@@ -1688,7 +1730,7 @@ bool R4000::jit_compile(Block& b) {
             } else {
                 pc_plus(rax, 4 * i + 8);
                 e.mov(m_npc, rax);
-                e.mov_store_imm8(m_next_delay, 1);
+                if (!slot_here) e.mov_store_imm8(m_next_delay, 1);
             }
             e.bind(to_done);
         }
@@ -1746,39 +1788,118 @@ bool R4000::jit_compile(Block& b) {
         successors.clear();
         synced = true;
         bool last_handler = false;  // the last op ran its handler in the straight line
-        for (u32 i = 0; i < blk.count; ++i) {
+        // Ways to the block's end with every register written back and pc
+        // and npc_ in memory, and ways to finish (as to_finish below).
+        std::vector<std::size_t> to_common, to_finish_direct;
+        bool branch_by_handler = false;  // the last branch ran its handler
+        // A non-branch op: plain, inline (with its way to the handler out of
+        // line) or by its handler. `leave`: move on to the branch's choice
+        // after a delay slot. Returns whether its handler ran inline.
+        auto emit_op = [&](u32 i, bool delay_slot, bool leave) {
             const Op& op = blk.ops[i];
             const u32 w = op.inst;
-            const bool delay_slot = i > 0 && is_branch_word(blk.ops[i - 1].inst);
             bool plain;
             decode(w, plain);
-            last_handler = false;
-
             if (plain) {
                 emit_plain(op);
-                if (delay_slot) leave_delay_slot();
+                if (delay_slot && leave) leave_delay_slot(branch_by_handler);
                 synced = delay_slot;
-            } else if (!delay_slot && emit_branch(op, i)) {
-                synced = true;
-            } else {
-                // The inline form first, if there is one; its way to the handler
-                // is placed after the region's code, out of the straight line.
-                Cold cold;
-                cold.dirty_before = dirty;
-                const bool fast = emit_alu(w, cold.slow) || emit_fpu(w, cold.slow) || emit_memory(w, cold.slow);
-                if (fast) {
-                    if (delay_slot) leave_delay_slot();
-                    cold.i = i, cold.delay_slot = delay_slot, cold.op = &op, cold.loaded_after = loaded, cold.k = k;
-                    cold.resume = e.size();
-                    colds.push_back(std::move(cold));
-                    synced = delay_slot;
-                    continue;
-                }
-                emit_handler(i, delay_slot, op, dirty);
-                loaded = dirty = 0;
-                synced = true;
-                last_handler = true;
+                return false;
             }
+            // The inline form first, if there is one; its way to the handler
+            // is placed after the region's code, out of the straight line.
+            Cold cold;
+            cold.dirty_before = dirty;
+            const bool fast = emit_alu(w, cold.slow) || emit_fpu(w, cold.slow) || emit_memory(w, cold.slow);
+            if (fast) {
+                if (delay_slot && leave) leave_delay_slot(branch_by_handler);
+                cold.i = i, cold.delay_slot = delay_slot, cold.op = &op, cold.loaded_after = loaded, cold.k = k;
+                cold.resume = e.size();
+                colds.push_back(std::move(cold));
+                synced = delay_slot;
+                return false;
+            }
+            emit_handler(i, delay_slot, op, dirty);
+            loaded = dirty = 0;
+            synced = true;
+            return true;
+        };
+        // After a direct path's delay slot: on to the block `delta` leads to,
+        // `executed` instructions of this one having run. A handler that
+        // ran (and may have raised an exception) leaves the choice to the
+        // block's end.
+        auto link_direct = [&](s64 delta, u32 executed, bool handler_ran) {
+            if (handler_ran) {
+                if (executed != blk.count) e.alu_imm(Alu::Add, kTime, static_cast<s32>(blk.count - executed));
+                to_common.push_back(e.jmp());
+                return;
+            }
+            auto store_pc = [&] {
+                pc_plus(rax, delta);
+                e.mov(m_pc, rax);
+                e.alu_imm(Alu::Add, rax, 4);
+                e.mov(m_npc, rax);
+                flush(dirty);
+                if (executed != blk.count) e.alu_imm(Alu::Add, kTime, static_cast<s32>(blk.count - executed));
+            };
+            const std::size_t to = member(delta);
+            if (to == rb.size()) {
+                store_pc();
+                to_common.push_back(e.jmp());
+                return;
+            }
+            e.mov(rdx, kTime);
+            e.alu_imm(Alu::Sub, rdx, static_cast<s32>(executed));  // the next block's budget
+            e.alu_imm(Alu::Cmp, rdx, static_cast<s32>(rb[to]->count));
+            const std::size_t short_budget = e.jcc(Cond::L);
+            restore(alloc & ~loaded);
+            e.mov(kTime, rdx);
+            if (delta) e.alu_imm(Alu::Add, kPc, static_cast<s32>(delta));
+            if (to <= k) e.jmp_to(label[to]);
+            else to_label[to].push_back(e.jmp());
+            e.bind(short_budget);
+            store_pc();
+            to_finish_direct.push_back(e.jmp());
+        };
+        for (u32 i = 0; i < blk.count; ++i) {
+            const Op& op = blk.ops[i];
+            const bool delay_slot = i > 0 && is_branch_word(blk.ops[i - 1].inst);
+            last_handler = false;
+            if (direct.active) {
+                // The delay slot on each path, then straight on.
+                direct.active = false;
+                const u64 fall = 4 * static_cast<u64>(blk.count);
+                last_handler = emit_op(i, true, false);
+                link_direct(direct.taken, blk.count, last_handler);
+                e.bind(direct.not_taken);
+                loaded = direct.loaded, dirty = direct.dirty;
+                if (direct.likely) {
+                    link_direct(static_cast<s64>(fall), blk.count - 1, false);
+                } else {
+                    bool plain;
+                    decode(op.inst, plain);
+                    if (!plain) {  // its handler goes on to npc_
+                        pc_plus(rax, static_cast<s64>(fall));
+                        e.mov(m_npc, rax);
+                    }
+                    last_handler = emit_op(i, true, false);
+                    link_direct(static_cast<s64>(fall), blk.count, last_handler);
+                }
+                for (std::size_t site : to_common) e.bind(site);
+                loaded = dirty = 0;
+                last_handler = true;  // the flags may need a look
+                synced = true;
+                break;
+            }
+            if (!delay_slot && is_branch_word(op.inst) && emit_branch(op, i)) {
+                synced = true;
+                branch_by_handler = false;
+                continue;
+            }
+            // A branch run by its handler sets next_delay_, which its delay
+            // slot then clears; one emitted inline leaves it clear.
+            if (!delay_slot) branch_by_handler = is_branch_word(op.inst);
+            last_handler = emit_op(i, delay_slot, true);
         }
         if (!synced) {  // plain operations or inline accesses ran last
             pc_plus(rax, 4 * blk.count);
@@ -1797,7 +1918,7 @@ bool R4000::jit_compile(Block& b) {
             e.mov(m_pc, rax);
             e.alu_imm(Alu::Add, rax, 4);
             e.mov(m_npc, rax);
-            e.alu(Alu::Sub, kTime, m_weight);
+            e.alu_imm(Alu::Add, kTime, 1);
             flush(skip.dirty & ~dirty);
             restore(loaded & ~skip.loaded);
             e.bind(join);
@@ -1808,10 +1929,10 @@ bool R4000::jit_compile(Block& b) {
 
         // Block linking: run the next block's code straight away when
         // run_block() would run it next with nothing checked in between. The
-        // pass must fit below the safe time (run_block() stores it in
-        // jit_safe_), no access may have happened that needs the checks, and
-        // the mode must be unchanged. Within the region the registers stay
-        // as they are and only the time needs checking, unless a handler
+        // block must fit in the budget (kTime: what run_block() allowed,
+        // less what ran), no access may have happened that needs the checks,
+        // and the mode must be unchanged. Within the region the registers
+        // stay as they are and only the budget needs checking, unless a handler
         // ran last (an inline operation's handler checks after itself).
         // Elsewhere in the page the translation is known to be the same;
         // beyond, the fetch soft-TLB must map the pc as run_block() would
@@ -1828,8 +1949,8 @@ bool R4000::jit_compile(Block& b) {
             to_finish_dirty.push_back(e.jcc(Cond::Ne));
         };
         if (last_handler) flag_checks();
-        e.imul_imm(rdx, m_weight, static_cast<s32>(blk.count));
-        e.alu(Alu::Add, rdx, kTime);  // entry time of the next block
+        e.mov(rdx, kTime);
+        e.alu_imm(Alu::Sub, rdx, static_cast<s32>(blk.count));  // the next block's budget
         e.mov(rax, m_pc);
         std::vector<s64> outside;  // successors not in the region
         for (s64 delta : successors) {
@@ -1844,10 +1965,8 @@ bool R4000::jit_compile(Block& b) {
             pc_plus(rcx, delta);
             e.alu(Alu::Cmp, rax, rcx);
             const std::size_t other = e.jcc(Cond::Ne);
-            e.imul_imm(rcx, m_weight, static_cast<s32>(rb[to]->count - 1));
-            e.alu(Alu::Add, rcx, rdx);
-            e.alu(Alu::Cmp, rcx, m_safe);
-            to_finish_dirty.push_back(e.jcc(Cond::Ae));
+            e.alu_imm(Alu::Cmp, rdx, static_cast<s32>(rb[to]->count));
+            to_finish_dirty.push_back(e.jcc(Cond::L));
             restore(alloc & ~loaded);
             e.mov(kTime, rdx);
             if (delta) e.alu_imm(Alu::Add, kPc, static_cast<s32>(delta));
@@ -1870,11 +1989,8 @@ bool R4000::jit_compile(Block& b) {
             e.cmp8_imm(Mem{block, static_cast<s32>(offsetof(Block, jit_addr64))}, addr64 ? 1 : 0);
             to_finish.push_back(e.jcc(Cond::Ne));
             e.mov(rcx, Mem{block, static_cast<s32>(offsetof(Block, count))}, false);
-            e.alu_imm(Alu::Sub, rcx, 1, false);
-            e.imul(rcx, m_weight);
-            e.alu(Alu::Add, rcx, rdx);
-            e.alu(Alu::Cmp, rcx, m_safe);
-            to_finish.push_back(e.jcc(Cond::Ae));
+            e.alu(Alu::Cmp, rdx, rcx);
+            to_finish.push_back(e.jcc(Cond::L));
             e.mov(kTime, rdx);
             e.mov(kPc, rax);
             e.alu_imm(Alu::Add, rdi, static_cast<s32>(top));
@@ -1906,8 +2022,8 @@ bool R4000::jit_compile(Block& b) {
             e.mov_imm64(kArg2, reinterpret_cast<u64>(&blocks_[block_index(b.host)]));
             e.mov_imm64(rax, reinterpret_cast<u64>(&R4000::jit_jr_miss));
             e.call(rax);
-            e.imul_imm(rdx, m_weight, static_cast<s32>(blk.count));
-            e.alu(Alu::Add, rdx, kTime);
+            e.mov(rdx, kTime);
+            e.alu_imm(Alu::Sub, rdx, static_cast<s32>(blk.count));
             e.mov(rax, m_pc);
             e.bind(other_page);
         }
@@ -1945,6 +2061,7 @@ bool R4000::jit_compile(Block& b) {
         for (std::size_t site : to_finish_dirty) e.bind(site);
         flush(dirty_end);
         for (std::size_t site : to_finish) e.bind(site);
+        for (std::size_t site : to_finish_direct) e.bind(site);
         set_time(blk.count);
         e.mov_imm32(rax, blk.count);
         to_tail[k].push_back(e.jmp());
