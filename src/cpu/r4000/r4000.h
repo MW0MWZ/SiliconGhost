@@ -268,8 +268,11 @@ private:
 
     // Decoded blocks. Each instruction is decoded once, into a handler and
     // its register fields; uncommon instructions use a handler that runs
-    // execute() on the raw word.
-    static constexpr unsigned kBlockBits = 14;
+    // execute() on the raw word. A slot per instruction word of 256 KiB of
+    // code (a slot is ~700 bytes): starting processes runs the kernel, libc,
+    // the shell and more in quick succession, and a smaller table kept
+    // decoding and translating the same code again.
+    static constexpr unsigned kBlockBits = 16;
     static constexpr unsigned kMaxBlockLength = 32;
     static constexpr unsigned kMaxLinkedBlocks = 1024;  // per run_block() call
     struct Op;
@@ -456,6 +459,7 @@ private:
     bool lookup(u64 vaddr, u8*& host, u64& paddr);
     void flush_fast_tlb();
     void flush_fast_tlb_entry(const TlbEntry& e);
+    void narrow_addressing(u32 cleared);
     void update_mode();
     bool ops64_enabled() const;
     // Load/store address: a full 64-bit sum with 64-bit addressing, otherwise
@@ -687,6 +691,10 @@ private:
     // matches nothing.)
     static constexpr unsigned kFastGenShift = 60, kFastGens = 15;
     u64 fast_gen_ = 0;
+    // Bit per mode: its tables hold a translation that needs 64-bit
+    // addressing (between 2 GiB and the 32-bit compatibility space), which
+    // must go if that mode's addressing is narrowed (see narrow_addressing).
+    u8 wide_cached_ = 0;
     void set_entryhi(u64 v) {
         entryhi_ = v;
         asid_tag_ = ((v & 0xFF) << kAsidTagShift) | (fast_gen_ << kFastGenShift);

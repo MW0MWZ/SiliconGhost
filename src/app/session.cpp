@@ -86,11 +86,17 @@ bool Session::power_on(std::string& error) {
         cpu.set_idle_skip(s.idle_skip);
         cpu.set_block_cache(s.block_cache);
         cpu.set_jit(s.jit);
-        pacer_ = std::make_unique<Pacer>(s.timing, machine->cycles_per_second());
+        base_timing_ = s.timing;
+        pacer_ = std::make_unique<Pacer>(turbo_ && (s.timing == Pacer::Mode::Realtime || s.timing == Pacer::Mode::Cycle)
+                                             ? Pacer::Mode::Max
+                                             : s.timing,
+                                         machine->cycles_per_second());
         pacer_->set_timed_speed(s.timed_speed);
         pacer_->set_max_speed(s.max_speed);
         cpu.set_delay_cycles_per_instruction(pacer_->delay_cycles_per_instruction());
-        pacer_->update(cpu.cycles(), cpu.instructions());
+        machine->set_fast_io(pacer_->mode() == Pacer::Mode::Max);
+        machine->set_quick_scsi_scan(pacer_->mode() == Pacer::Mode::Max ? s.quick_scsi_scan_max : s.quick_scsi_scan);
+        pacer_->update(cpu.cycles(), cpu.instructions(), false, cpu.idle_skipped_cycles());
         nvram_saved_ = machine->nvram_changes();
         network_ = std::move(network);
         machine_ = std::move(machine);
@@ -114,6 +120,19 @@ void Session::power_off() {
     pacer_.reset();
 }
 
+Pacer::Mode Session::timing() const {
+    return turbo_ && turbo_available() ? Pacer::Mode::Max : base_timing();
+}
+
+void Session::set_turbo(bool on) {
+    turbo_ = on;
+    if (!machine_) return;
+    pacer_->set_mode(timing());
+    machine_->cpu().set_delay_cycles_per_instruction(pacer_->delay_cycles_per_instruction());
+    machine_->set_fast_io(timing() == Pacer::Mode::Max);
+    machine_->set_quick_scsi_scan(timing() == Pacer::Mode::Max ? settings_.quick_scsi_scan_max : settings_.quick_scsi_scan);
+}
+
 void Session::set_serial_output(ip22::Indy::SerialOutput out) {
     serial_out_ = std::move(out);
     if (machine_) machine_->set_serial_output(serial_out_);
@@ -123,7 +142,8 @@ void Session::run(u64 cycles) {
     if (!machine_) return;
     machine_->run(cycles);
     auto& cpu = machine_->cpu();
-    cpu.set_cycles_per_instruction(pacer_->update(cpu.cycles(), cpu.instructions(), machine_->timing_cpu()));
+    cpu.set_cycles_per_instruction(
+        pacer_->update(cpu.cycles(), cpu.instructions(), machine_->timing_cpu(), cpu.idle_skipped_cycles()));
 }
 
 void Session::periodic() {

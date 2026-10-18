@@ -50,8 +50,6 @@ constexpr u8 kPhaseCommandComplete = 0x60;
 constexpr u8 kMsgCommandComplete = 0x00;
 constexpr u8 kMsgMessageReject = 0x07;
 
-// Approximate bus throughput for completion timing: 5 MB/s.
-constexpr double kBytesPerMs = 5000.0;
 // From the end of the command phase to STATUS: a target takes a while to
 // act on a command, and drivers count on not seeing the status interrupt
 // at once (OpenBSD's frees the request it is still looking at).
@@ -219,7 +217,7 @@ void Wd33c93::sat_data() {
         }
         if (buffer_pos_ < buffer_.size()) {
             regs_[kCommandPhase] = kPhaseTransferCount;
-            finish_in(static_cast<u8>(kStatusUnexpectedPhase | bus_phase_), 0.05 + moved / kBytesPerMs);
+            finish_in(static_cast<u8>(kStatusUnexpectedPhase | bus_phase_), 0.05 + moved / bytes_per_ms_);
             return;
         }
         end_data();
@@ -232,7 +230,7 @@ void Wd33c93::sat_complete(u32 moved) {
     regs_[kTargetLun] = target_status_;
     regs_[kCommandPhase] = kPhaseCommandComplete;
     release_bus();
-    finish_in(kStatusSelectTransferDone, kCommandMs + moved / kBytesPerMs);
+    finish_in(kStatusSelectTransferDone, kCommandMs + moved / bytes_per_ms_);
 }
 
 // TRANSFER INFO in a data phase, by DMA (waiting for the host's channel if
@@ -244,7 +242,7 @@ void Wd33c93::transfer_data() {
         return;
     }
     if (buffer_pos_ == buffer_.size()) end_data();
-    finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.05 + moved / kBytesPerMs);
+    finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.05 + moved / bytes_per_ms_);
 }
 
 // Data is due but the host's DMA moved none: the chip keeps requesting.
@@ -387,7 +385,8 @@ void Wd33c93::negate_ack() {
 
 // Nothing answers: selection times out after the programmed period, value x
 // 80 / input clock (MHz) milliseconds, the clock given by the Own ID
-// register's frequency select (20 MHz on the Indy); 0 never times out.
+// register's frequency select (20 MHz on the Indy); 0 never times out. At
+// most a millisecond with quick selection timeouts.
 void Wd33c93::selection_timeout() {
     SG_LOG(Debug, "wd33c93", "select target %u: no device", regs_[kDestinationId] & 7);
     regs_[kCommandPhase] = 0;
@@ -396,7 +395,8 @@ void Wd33c93::selection_timeout() {
         return;
     }
     static constexpr double kClockMhz[4] = {10.0, 15.0, 20.0, 20.0};
-    finish_in(kStatusSelectionTimeout, regs_[kTimeout] * 80.0 / kClockMhz[regs_[kOwnId] >> 6]);
+    const double ms = regs_[kTimeout] * 80.0 / kClockMhz[regs_[kOwnId] >> 6];
+    finish_in(kStatusSelectionTimeout, quick_selection_timeout_ ? std::min(ms, 1.0) : ms);
 }
 
 void Wd33c93::bus_reset() {

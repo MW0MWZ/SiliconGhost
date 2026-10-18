@@ -209,7 +209,7 @@ TEST(pacer_realtime_catches_up_after_a_long_stall) {
 }
 
 // While the guest times the CPU, it runs at the timed speed even on a host
-// too slow to keep up, so its delay loops are calibrated at that speed.
+// too slow to keep up.
 TEST(pacer_realtime_runs_at_the_timed_speed_while_the_guest_times_the_cpu) {
     FakeHost host;
     const double hz = 175e6, host_ips = 100e6;  // slower than the real CPU
@@ -227,7 +227,21 @@ TEST(pacer_realtime_runs_at_the_timed_speed_while_the_guest_times_the_cpu) {
         if (slice >= 1000 && slice < 1099) CHECK(std::abs(cpi - 1 / 1.5) < 1e-9);
     }
     CHECK(cpi > 1.7);  // adapting again: the host covers 0.57 of real speed
-    CHECK(std::abs(p.delay_cycles_per_instruction() - 1 / 1.5) < 1e-9);
+    CHECK_EQ(p.delay_cycles_per_instruction(), 1.0);  // delay loops: the real CPU's speed
+}
+
+// Delay loops run at the real CPU's speed, so that the guest times enough of
+// one for its timer's resolution, or at the timed speed if that is slower.
+TEST(pacer_charges_delay_loops_at_least_the_real_cpu_speed) {
+    FakeHost host;
+    Pacer fast(Pacer::Mode::Realtime, 150e6, host.clock());
+    fast.set_timed_speed(4);
+    CHECK_EQ(fast.delay_cycles_per_instruction(), 1.0);
+    Pacer slow(Pacer::Mode::Max, 150e6, host.clock());
+    slow.set_timed_speed(0.5);
+    CHECK_EQ(slow.delay_cycles_per_instruction(), 2.0);
+    CHECK_EQ(Pacer(Pacer::Mode::Free, 150e6, host.clock()).delay_cycles_per_instruction(), 0.0);
+    CHECK_EQ(Pacer(Pacer::Mode::Cycle, 150e6, host.clock()).delay_cycles_per_instruction(), 0.0);
 }
 
 // Outside the guest's timing the CPU runs as fast as the host allows, while
@@ -248,9 +262,73 @@ TEST(pacer_realtime_runs_uncapped_after_the_guest_times_the_cpu) {
         if (slice >= 1000 && slice < 1099) CHECK_EQ(cpi, 0.5);  // the default timed speed, 2x
     }
     CHECK(cpi > 0.17 && cpi < 0.18);
-    CHECK_EQ(p.delay_cycles_per_instruction(), 0.5);
+    CHECK_EQ(p.delay_cycles_per_instruction(), 1.0);
     const double wall = static_cast<double>(host.now - 1000000000) * 1e-9, guest = static_cast<double>(cycles) / hz;
     CHECK(guest > wall - 0.01 && guest < wall + 0.01);
+}
+
+// An idle guest runs few instructions for the host time its devices take,
+// and wakes for short bursts of slow code (interrupts, code just woken up);
+// neither says how fast the host runs the CPU when it is busy.
+TEST(pacer_realtime_shows_a_steady_cpu_speed_while_the_guest_is_idle) {
+    FakeHost host;
+    const double hz = 175e6, host_ips = 1000e6;
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    double cpi = p.update(0, 0);
+    u64 cycles = 0, instructions = 0, idle = 0;
+    for (int slice = 0; slice < 63000; ++slice) {  // 3 s busy, then a minute idle
+        const bool idling = slice >= 3000;
+        // Once a second, 20000 instructions at a tenth of the speed (an idle
+        // IRIX desktop runs about 22000 a second).
+        const bool burst = idling && slice % 1000 == 0;
+        const u64 n = !idling ? static_cast<u64>(host_ips / 1000) : burst ? 20000 : 200;
+        instructions += n;
+        const u64 ran = static_cast<u64>(static_cast<double>(n) * cpi);
+        const u64 skipped = idling && !burst ? static_cast<u64>(hz / 1000) - ran : 0;  // the rest of 1 ms skipped
+        cycles += ran + skipped;
+        idle += skipped;
+        host.now += !idling ? 1000000 : burst ? 200000 : 20000;
+        cpi = p.update(cycles, instructions, false, idle);
+    }
+    CHECK(p.cpu_speed() > 5.6 && p.cpu_speed() < 5.8);
+}
+
+// A real change of work (code the host runs at a fifth of the speed) is
+// followed, both in pacing and in the speed shown, and the guest falls no
+// more than a little behind.
+TEST(pacer_realtime_follows_a_change_of_work) {
+    FakeHost host;
+    const double hz = 175e6;
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    double cpi = p.update(0, 0);
+    u64 cycles = 0, instructions = 0;
+    double most_behind = 0;
+    for (int slice = 0; slice < 8000; ++slice) {
+        const double host_ips = slice < 2000 ? 1000e6 : 200e6;
+        const u64 n = static_cast<u64>(host_ips / 1000);
+        instructions += n;
+        cycles += static_cast<u64>(static_cast<double>(n) * cpi);
+        host.now += 1000000;
+        cpi = p.update(cycles, instructions);
+        most_behind = std::max(most_behind, p.lag());
+    }
+    CHECK(cpi > 0.85 && cpi < 0.9);
+    CHECK(p.cpu_speed() > 1.1 && p.cpu_speed() < 1.2);  // 200 MIPS on a 175 MHz CPU
+    CHECK(most_behind < 0.5);
+    CHECK(p.lag() < 0.01);
+}
+
+// Lag: how far guest time is behind the wall clock.
+TEST(pacer_reports_how_far_the_guest_is_behind) {
+    FakeHost host;
+    Pacer p(Pacer::Mode::Realtime, 100e6, host.clock());
+    p.update(0, 0);
+    host.now += 3000000000ull;
+    p.update(100000000, 1000000);  // 1 s of guest time in 3 s
+    CHECK(std::abs(p.lag() - 2.0) < 1e-6);
+    host.now += 1000000;
+    p.update(310000000, 2000000);  // caught up and ahead
+    CHECK_EQ(p.lag(), 0.0);
 }
 
 TEST(pacer_free_mode_never_waits) {
@@ -262,9 +340,40 @@ TEST(pacer_free_mode_never_waits) {
     CHECK_EQ(host.slept, 0u);
 }
 
-// Max: guest time follows the wall clock like Realtime, but the CPU is never
-// held at the timed speed, nor its delay loops charged at it.
-TEST(pacer_max_mode_follows_the_wall_clock_with_the_cpu_never_held_back) {
+// Max: as Realtime, with guest time following the wall clock and the timed
+// speed while the guest times the CPU, but never capped.
+// Turbo: Realtime with a cap switched to Max while running lifts the cap,
+// and switching back restores it; guest time carries on following the wall
+// clock across both switches.
+TEST(pacer_switches_mode_while_running) {
+    FakeHost host;
+    const double hz = 175e6, host_ips = 1000e6;  // could run 5.7x as fast
+    Pacer p(Pacer::Mode::Realtime, hz, host.clock());
+    p.set_max_speed(2);
+    double cpi = p.update(0, 0);
+    u64 cycles = 0, instructions = 0;
+    auto run = [&](int slices) {
+        for (int slice = 0; slice < slices; ++slice) {
+            const u64 n = static_cast<u64>(host_ips / 1000);
+            instructions += n;
+            cycles += static_cast<u64>(static_cast<double>(n) * cpi);
+            host.now += 1000000;
+            cpi = p.update(cycles, instructions);
+        }
+    };
+    run(1000);
+    CHECK_EQ(cpi, 0.5);  // capped at twice the real speed
+    p.set_mode(Pacer::Mode::Max);
+    run(1000);
+    CHECK(cpi > 0.17 && cpi < 0.18);  // uncapped
+    p.set_mode(Pacer::Mode::Realtime);
+    run(1000);
+    CHECK_EQ(cpi, 0.5);
+    const double wall = static_cast<double>(host.now - 1000000000) * 1e-9, guest = static_cast<double>(cycles) / hz;
+    CHECK(guest > wall - 0.05 && guest < wall + 0.05);
+}
+
+TEST(pacer_max_mode_follows_the_wall_clock_and_is_never_capped) {
     FakeHost host;
     const double hz = 175e6, host_ips = 1000e6;
     Pacer p(Pacer::Mode::Max, hz, host.clock());
@@ -277,9 +386,10 @@ TEST(pacer_max_mode_follows_the_wall_clock_with_the_cpu_never_held_back) {
         cycles += static_cast<u64>(static_cast<double>(n) * cpi);
         host.now += 1000000;
         cpi = p.update(cycles, instructions, slice >= 1000 && slice < 1100);
+        if (slice >= 1000 && slice < 1099) CHECK_EQ(cpi, 0.5);  // the default timed speed, 2x
     }
     CHECK(cpi > 0.17 && cpi < 0.18);
-    CHECK_EQ(p.delay_cycles_per_instruction(), 0.0);
+    CHECK_EQ(p.delay_cycles_per_instruction(), 1.0);
     const double wall = static_cast<double>(host.now - 1000000000) * 1e-9, guest = static_cast<double>(cycles) / hz;
     CHECK(guest > wall - 0.01 && guest < wall + 0.01);
     host.now += 1000000;  // a guest that idles ahead of the wall clock waits

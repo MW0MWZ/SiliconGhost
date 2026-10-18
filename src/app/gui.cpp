@@ -204,7 +204,7 @@ private:
     Light disk_light_, cd_light_, net_light_;
     ip22::Indy::Activity last_activity_{};
     u64 last_instructions_ = 0, meter_time_ns_ = 0, next_status_ns_ = 0;
-    double cpu_load_ = 0, gfx_mpix_ = 0, speed_ = 0, mips_ = 0;
+    double cpu_load_ = 0, gfx_mpix_ = 0, mips_ = 0;
     std::string status_text_, status_shown_;
     u64 status_until_ns_ = 0;
 
@@ -768,7 +768,6 @@ void Gui::update_meters(u64 now) {
     const double idle = static_cast<double>(a.idle_cycles - last_activity_.idle_cycles);
     cpu_load_ = cycles > 0 ? std::clamp(1.0 - idle / cycles, 0.0, 1.0) : 0.0;
     gfx_mpix_ = static_cast<double>(a.pixels - last_activity_.pixels) / dt / 1e6;
-    speed_ = cycles / m->cycles_per_second() / dt;
     mips_ = static_cast<double>(instructions - last_instructions_) / dt / 1e6;
     meter_time_ns_ = now;
     last_activity_ = a;
@@ -786,8 +785,9 @@ void Gui::frame() {
             next_status_ns_ = now + 100000000ull;
             auto* m = session_.machine();
             char sig[96];
-            std::snprintf(sig, sizeof sig, "%d%d%d %d %3.0f %5.1f %3.0f", disk_light_.lit(now), cd_light_.lit(now),
-                          net_light_.lit(now), m->disc_in_drive(), cpu_load_ * 100, gfx_mpix_, speed_ * 100);
+            std::snprintf(sig, sizeof sig, "%d%d%d %d %3.0f %5.1f %4.1f %.0f %d", disk_light_.lit(now), cd_light_.lit(now),
+                          net_light_.lit(now), m->disc_in_drive(), cpu_load_ * 100, gfx_mpix_,
+                          session_.pacer()->cpu_speed(), std::floor(session_.pacer()->lag()), session_.turbo());
             if (status_shown_ != sig) {
                 status_shown_ = sig;
                 pending_frames_ = std::max(pending_frames_, 1);
@@ -1030,9 +1030,47 @@ void Gui::draw_status_bar() {
         ImGui::Text("GFX %5.1f Mpix/s", gfx_mpix_);
         ImGui::SetItemTooltip("Pixels drawn by the Newport's REX3 per second");
         ImGui::SameLine(0, 14 * scale_);
-        ImGui::Text("Speed %3.0f%%", speed_ * 100);
-        ImGui::SetItemTooltip("Guest time against real time; %.0f million instructions a second", mips_);
+        const Pacer* pacer = session_.pacer();
+        const double cpu_speed = pacer ? pacer->cpu_speed() : 0;
+        if (cpu_speed > 0) ImGui::Text("Speed %4.1fx", cpu_speed);
+        else ImGui::Text("Speed  -  ");
+        ImGui::SetItemTooltip("How many times as fast as a real %.0f MHz CPU it runs when busy, by the host's\n"
+                              "measured speed. Now: %.0f million instructions a second.",
+                              m->cycles_per_second() / 1e6, mips_);
         ImGui::SameLine(0, 14 * scale_);
+        // Turbo: Maximum timing until pressed again (or the configured
+        // timing is already Maximum or Free: shown lit, not pressable).
+        {
+            const bool available = session_.turbo_available();
+            const bool on = available ? session_.turbo() : session_.base_timing() != Pacer::Mode::Cycle;
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * scale_, 0));
+            if (on) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(200, 60, 40, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(225, 80, 55, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(170, 45, 30, 255));
+            }
+            ImGui::BeginDisabled(!available);
+            if (ImGui::SmallButton("Turbo")) {
+                session_.set_turbo(!session_.turbo());
+                status(session_.turbo() ? "Turbo on: maximum speed, fast disk and network"
+                                        : "Turbo off: back to the set timing");
+                pending_frames_ = std::max(pending_frames_, 2);
+            }
+            ImGui::EndDisabled();
+            if (on) ImGui::PopStyleColor(3);
+            ImGui::PopStyleVar();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", available ? "Run flat out (Maximum timing: no speed limit, fast disk and network)\n"
+                                              "until pressed again; guest clocks still follow the host's"
+                                            : "Timing is set to Maximum or Free in Settings: already flat out");
+            ImGui::SameLine(0, 14 * scale_);
+        }
+        // Guest time behind the wall clock: the host cannot keep up.
+        if (const double lag = pacer ? pacer->lag() : 0; lag >= 1.0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Behind %.0f s", lag);
+            ImGui::SetItemTooltip("The host cannot run the machine fast enough to keep its clocks to real time");
+            ImGui::SameLine(0, 14 * scale_);
+        }
     }
     if (!status_text_.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s", status_text_.c_str());
@@ -1357,9 +1395,9 @@ void Gui::draw_settings() {
             int timing = edit_.timing == Pacer::Mode::Realtime ? 0 : edit_.timing == Pacer::Mode::Cycle ? 1 : 2;
             if (ImGui::Combo("##timing", &timing,
                              "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
-                             "Maximum: CPU never held back, guest clocks follow the host's\0"))
+                             "Maximum: no speed limit, fast disk and network, guest clocks follow the host's\0"))
                 edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
-            if (timing == 0) {
+            if (timing != 1) {
                 label("Timed speed");
                 ImGui::SetNextItemWidth(200 * scale_);
                 float timed = static_cast<float>(edit_.timed_speed);
@@ -1375,19 +1413,31 @@ void Gui::draw_settings() {
                                    too_fast ? "%.0f MHz: too fast for IRIX 5.3" : "%.0f MHz", timed_mhz);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("IRIX 5.3 times the CPU at boot and fails beyond about 350 MHz (clock x speed)");
-                label("Speed limit");
-                bool cap = edit_.max_speed > 0;
-                if (ImGui::Checkbox("##cap", &cap)) edit_.max_speed = cap ? std::max(4.0, edit_.timed_speed) : 0;
-                ImGui::SameLine();
-                if (cap) {
-                    ImGui::SetNextItemWidth(200 * scale_);
-                    float limit = static_cast<float>(edit_.max_speed);
-                    ImGui::SliderFloat("##maxspeed", &limit, 1.0f, 16.0f, "%.1fx the real CPU");
-                    edit_.max_speed = limit;
-                } else {
-                    ImGui::TextDisabled("none: as fast as the host allows");
+                if (timing == 0) {
+                    label("Speed limit");
+                    bool cap = edit_.max_speed > 0;
+                    if (ImGui::Checkbox("##cap", &cap)) edit_.max_speed = cap ? std::max(4.0, edit_.timed_speed) : 0;
+                    ImGui::SameLine();
+                    if (cap) {
+                        ImGui::SetNextItemWidth(200 * scale_);
+                        float limit = static_cast<float>(edit_.max_speed);
+                        ImGui::SliderFloat("##maxspeed", &limit, 1.0f, 16.0f, "%.1fx the real CPU");
+                        edit_.max_speed = limit;
+                    } else {
+                        ImGui::TextDisabled("none: as fast as the host allows");
+                    }
                 }
             }
+            ImGui::Spacing();
+            label("Quick SCSI scan");
+            static const char* const kQuickScsiTip =
+                "Absent SCSI devices answer within a millisecond instead of after the controller's\n"
+                "programmed timeout, which takes the PROM's bus scan about two seconds";
+            ImGui::Checkbox("Real time and cycle##quickscsi", &edit_.quick_scsi_scan);
+            ImGui::SetItemTooltip("%s", kQuickScsiTip);
+            ImGui::SameLine();
+            ImGui::Checkbox("Maximum and turbo##quickscsimax", &edit_.quick_scsi_scan_max);
+            ImGui::SetItemTooltip("%s", kQuickScsiTip);
             ImGui::Spacing();
             ImGui::Checkbox("Skip idle loops", &edit_.idle_skip);
             if (mips::R4000::jit_available())

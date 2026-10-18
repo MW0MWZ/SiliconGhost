@@ -100,15 +100,19 @@ void usage(const char* argv0) {
                  "  --timing MODE    realtime: guest clocks follow the host clock and the CPU runs as\n"
                  "                             fast as the host allows (default)\n"
                  "                   cycle:    one cycle per instruction, reproducible; waits when ahead\n"
-                 "                   max:      as realtime, but the CPU is never held back (no timed\n"
-                 "                             speed, delay loops or cap)\n"
+                 "                   max:      as realtime without --max-speed, and disk and Ethernet as\n"
+                 "                             fast as the host allows\n"
                  "                   free:     no waiting; guest time runs ahead (default with --max)\n"
-                 "  --timed-speed X  realtime: the CPU runs X times as fast as the real one while the\n"
-                 "                   system times it, and its delays keep that length (default 2;\n"
+                 "  --timed-speed X  realtime, max: the CPU runs X times as fast as the real one while the\n"
+                 "                   system times it (default 2; delay loops run at the real speed,\n"
+                 "                   or this one if slower;\n"
                  "                   IRIX 5.3 boots with clock x X up to about 350 MHz)\n"
                  "  --max-speed X    realtime: run the CPU at most X times as fast as the real one\n"
                  "                   (default 0: as fast as the host allows)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
+                 "  --quick-scsi-scan     realtime, cycle: absent SCSI targets answer within 1 ms instead of\n"
+                 "                        the controller's programmed timeout (always so with max timing)\n"
+                 "  --no-quick-scsi-scan  full selection timeouts in every timing mode\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "%s"
                  "  --no-audio       do not play the machine's audio output\n"
@@ -279,6 +283,7 @@ int main(int argc, char** argv) {
             const char* value;
         } kSwitches[] = {{"--no-graphics", "graphics", "0"}, {"--no-idle-skip", "idle_skip", "0"},
                          {"--no-block-cache", "block_cache", "0"}, {"--no-jit", "jit", "0"},
+                         {"--quick-scsi-scan", "quick_scsi_scan", "1"}, {"--no-quick-scsi-scan", "quick_scsi_scan_all", "0"},
                          {"--no-audio", "audio", "0"},        {"--audio-in", "audio_in", "1"}};
         std::string key, value, error;
         for (const auto& v : kValued)

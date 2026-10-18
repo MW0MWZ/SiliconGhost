@@ -315,6 +315,30 @@ TEST(wd33c93_reset_and_selection_timeout) {
     CHECK(!irq);
 }
 
+// Quick selection timeouts: an absent target's selection times out within a
+// millisecond, whatever the period programmed.
+TEST(wd33c93_quick_selection_timeout) {
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    wd.set_quick_selection_timeout(true);
+    bool irq = false;
+    wd.set_irq_callback([&](bool a) { irq = a; });
+    wd.write_address(0x00);
+    wd.write_data(0x80 | 0x08 | 7);  // 20 MHz input clock
+    wd.write_address(0x02);
+    wd.write_data(0x20);  // 128 ms
+    wd.write_address(0x15);
+    wd.write_data(3);
+    wd.write_address(0x18);
+    wd.write_data(0x07);  // SELECT without ATN
+    clk.advance_to(150000 / 2);
+    CHECK(!irq);
+    clk.advance_to(150000 * 2);
+    CHECK(irq);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x42);  // selection timeout
+}
+
 namespace {
 std::string make_image(unsigned blocks) {
     static unsigned serial = 0;  // a name per image, so a test can have several
@@ -502,6 +526,38 @@ TEST(wd33c93_select_and_transfer_dma) {
     CHECK_EQ(wd.read_data(), 0x00);  // target status GOOD
     wd.write_address(0x17);
     CHECK_EQ(wd.read_data(), 0x16);  // select-and-transfer complete
+}
+
+// Fast transfers: a 32 KB read completes in well under the 6.5 ms that
+// 5 MB/s would take, while the command still takes its usual time.
+TEST(wd33c93_fast_transfers_take_next_to_no_time) {
+    for (const bool fast : {false, true}) {
+        const TempImage image(128);
+        ScsiDisk disk(ScsiDisk::Kind::Disk, image.path);
+        Clock clk;
+        Wd33c93 wd(clk.sched, 150000.0);
+        wd.set_fast_transfers(fast);
+        bool irq = false;
+        u32 moved = 0;
+        wd.set_irq_callback([&](bool a) { irq = a; });
+        wd.set_dma([&](const u8*, u32 n) { moved += n; return n; }, [&](u8*, u32) { return 0u; });
+        wd.attach(1, &disk);
+        wd_write(wd, 0x01, 0x80);  // control: DMA mode
+        wd_write(wd, 0x15, 1);
+        const u8 cdb[10] = {0x28, 0, 0, 0, 0, 0, 0, 0, 64, 0};  // READ(10): 64 blocks
+        for (unsigned i = 0; i < 10; ++i) wd_write(wd, static_cast<u8>(0x03 + i), cdb[i]);
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, 0x80);
+        wd_write(wd, 0x14, 0x00);  // transfer count 32768
+        wd_write(wd, 0x18, 0x09);  // SELECT-AND-TRANSFER
+        clk.advance_to(15000);     // 0.1 ms: not even the command is done
+        CHECK(!irq);
+        clk.advance_to(75000);  // 0.5 ms
+        CHECK_EQ(irq, fast);
+        clk.advance_to(1500000);  // 10 ms
+        CHECK(irq);
+        CHECK_EQ(moved, 32768u);
+    }
 }
 
 TEST(wd33c93_transfer_count_exhausted_pauses_and_resumes) {

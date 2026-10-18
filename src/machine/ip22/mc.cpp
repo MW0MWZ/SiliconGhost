@@ -438,7 +438,8 @@ void Mc::start_dma() {
     dma_run_ = kDmaRunActive;
     const u64 lines = dma_size_ >> 16, width = dma_size_ & 0xFFFF, zoom = (dma_stride_ >> 16) & 0x3FF;
     const u64 words = std::max<u64>(1, lines * zoom * width / 8);
-    dma_timer_.schedule_in(static_cast<u64>(static_cast<double>(words) * cycles_per_sysclk_) + 1);
+    const double clocks = fast_dma_ ? static_cast<double>(words) / 32 : static_cast<double>(words);
+    dma_timer_.schedule_in(static_cast<u64>(clocks * cycles_per_sysclk_) + 1);
 }
 
 // The data sheet's algorithm: LINE COUNT lines, each sent ZOOM times (the

@@ -136,7 +136,16 @@ public:
     // The host side of the Ethernet port (null: unplugged); it must outlive
     // the machine or be detached first.
     void set_network(net::NetBackend* backend) { hpc3_.set_network(backend); }
+    // Disk, Ethernet and the memory controller's DMA as fast as the host allows
+    // (see Hpc3::set_fast_io, Mc::set_fast_dma).
+    void set_fast_io(bool fast) {
+        hpc3_.set_fast_io(fast);
+        mc_.set_fast_dma(fast);
+    }
     Ioc2& ioc() { return ioc_; }
+    // Absent SCSI targets answer within a millisecond (see
+    // Wd33c93::set_quick_selection_timeout).
+    void set_quick_scsi_scan(bool quick) { hpc3_.set_quick_scsi_scan(quick); }
     Mc& mc() { return mc_; }
     Newport* newport() { return config_.graphics ? &newport_ : nullptr; }
 

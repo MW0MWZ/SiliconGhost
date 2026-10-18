@@ -143,6 +143,18 @@ void Hpc3::set_network(net::NetBackend* backend) {
     enet_poll_timer_->cancel();
 }
 
+void Hpc3::set_fast_io(bool fast) {
+    fast_io_ = fast;
+    scsi0_.set_fast_transfers(fast);
+    scsi1_.set_fast_transfers(fast);
+}
+
+// The next receive descriptor has been handed to the HPC.
+bool Hpc3::enet_rx_ready() const {
+    u32 cnt = 0;
+    return enet_rx_.active && bus_.read<u32>(enet_rx_.ndbp + 4, cnt) && (cnt & kEnetDescOwn);
+}
+
 void Hpc3::poll_network() {
     if (net_ && !enet_poll_timer_->active() && net_->pending()) enet_poll_timer_->schedule_in(1);
 }
@@ -164,13 +176,20 @@ void Hpc3::enet_interrupt() {
 
 // Frames from the host arrive no faster than a 10 Mbit/s wire carries them
 // (with the preamble, FCS and gap between frames). When the host has none,
-// the poll stops until poll_network() sees more.
+// the poll stops until poll_network() sees more. With fast I/O a frame waits
+// (looked at again every 50 us) while the driver has no buffer ready, which
+// includes the channel stopped at the end of its ring until restarted.
 void Hpc3::enet_poll() {
+    if (!net_) return;
+    if (fast_io_ && !enet_held_ && !enet_rx_ready()) {
+        enet_poll_timer_->schedule_in(std::max<u64>(1, static_cast<u64>(cpu_hz_ * 50e-6)));
+        return;
+    }
     std::vector<u8> frame;
-    if (net_ && net_->receive(frame)) {
+    if (net_->receive(frame)) {
         enet_receive(frame.data(), frame.size());
         const std::size_t wire = std::max(frame.size(), kEnetMinFrame) + 24;
-        enet_poll_timer_->schedule_in(std::max<u64>(1, static_cast<u64>(wire * 8 / 10e6 * cpu_hz_)));
+        enet_poll_timer_->schedule_in(std::max<u64>(1, static_cast<u64>(wire * 8 / enet_bits_per_second() * cpu_hz_)));
     }
 }
 
@@ -257,7 +276,8 @@ void Hpc3::enet_transmit() {
     irq |= seeq_.transmitted(end_of_packet ? Seeq8003::kTxDone : Seeq8003::kTxUnderflow);
     if (irq) enet_interrupt();
     // Preamble, FCS and the gap between frames: 24 bytes more on the wire.
-    if (enet_tx_.active) enet_tx_timer_->schedule_in(static_cast<u64>((frame.size() + 24) * 8 / 10e6 * cpu_hz_));
+    if (enet_tx_.active)
+        enet_tx_timer_->schedule_in(static_cast<u64>((frame.size() + 24) * 8 / enet_bits_per_second() * cpu_hz_));
 }
 
 u32 Hpc3::enet_read(u32 offset) {

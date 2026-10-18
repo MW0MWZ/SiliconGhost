@@ -305,6 +305,9 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "timed_speed") ok = parse_number(v, n) && n > 0 && (s.timed_speed = n, true);
     else if (key == "max_speed") ok = parse_number(v, n) && n >= 0 && (s.max_speed = n, true);
     else if (key == "idle_skip") ok = parse_bool(v, s.idle_skip);
+    else if (key == "quick_scsi_scan") ok = parse_bool(v, s.quick_scsi_scan);
+    else if (key == "quick_scsi_scan_max") ok = parse_bool(v, s.quick_scsi_scan_max);
+    else if (key == "quick_scsi_scan_all") ok = parse_bool(v, s.quick_scsi_scan) && parse_bool(v, s.quick_scsi_scan_max);
     else if (key == "block_cache") ok = parse_bool(v, s.block_cache);
     else if (key == "jit") ok = parse_bool(v, s.jit);
     else if (key == "audio") ok = parse_bool(v, s.audio);
@@ -393,7 +396,8 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
           << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\ntimed_speed=" << s.timed_speed << "\nmax_speed=" << s.max_speed
-          << "\nidle_skip=" << (s.idle_skip ? 1 : 0)
+          << "\nidle_skip=" << (s.idle_skip ? 1 : 0) << "\nquick_scsi_scan=" << (s.quick_scsi_scan ? 1 : 0)
+          << "\nquick_scsi_scan_max=" << (s.quick_scsi_scan_max ? 1 : 0)
           << "\nblock_cache=" << (s.block_cache ? 1 : 0) << "\njit=" << (s.jit ? 1 : 0) << "\naudio=" << (s.audio ? 1 : 0)
           << "\naudio_in=" << (s.audio_in ? 1 : 0) << "\nlog=" << s.log
           << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0) << "\n";

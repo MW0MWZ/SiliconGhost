@@ -190,6 +190,36 @@ TEST(cpu_64bit_addressing_does_not_wrap) {
     CHECK_EQ(t.cpu.pc, kRefillVector + 0x80);  // xkuseg 0x80002010: XTLB refill
 }
 
+// The soft TLB keeps translations across changes of addressing mode, but one
+// only 64-bit addressing reaches must not outlive it. (Loads and stores
+// cannot reach one in 32-bit addressing, which wraps their addresses; an
+// instruction fetch from a 64-bit pc can.)
+TEST(cpu_narrowed_addressing_drops_64bit_translations) {
+    Rig t;
+    t.cpu.cp0_write(cop0::Status, sr::KX);
+    t.cpu.cp0_write(cop0::Index, 0);
+    t.cpu.cp0_write(cop0::PageMask, 0);
+    t.cpu.cp0_write(cop0::EntryHi, 0x0000000100000000ull);  // xkuseg, above 4 GiB
+    t.cpu.cp0_write(cop0::EntryLo0, (0x200u << 6) | (3u << 3) | 7u);
+    t.cpu.cp0_write(cop0::EntryLo1, 1);
+    t.load({TLBWI});
+    t.load({ADDIU(t1, t1, 1)}, 0x200000);
+    t.steps(1);
+    t.cpu.pc = 0x0000000100000000ull;
+    t.steps(1);
+    CHECK_EQ(t.cpu.gpr[t1], 1ull);
+    t.cpu.cp0_write(cop0::Status, 0);  // 32-bit addressing: the address is out of reach
+    t.cpu.pc = 0x0000000100000000ull;
+    t.steps(1);
+    CHECK_EQ(t.cpu.pc, kGeneralVector);
+    CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::AdEL));
+    CHECK_EQ(t.cpu.gpr[t1], 1ull);
+    t.cpu.cp0_write(cop0::Status, sr::KX);  // and widened again
+    t.cpu.pc = 0x0000000100000000ull;
+    t.steps(1);
+    CHECK_EQ(t.cpu.gpr[t1], 2ull);
+}
+
 TEST(cpu_kseg0_kseg1_alias) {
     Rig t;
     t.cpu.gpr[t0] = 0xFFFFFFFF80002000ull;
@@ -1742,7 +1772,7 @@ TEST(cpu_fpu_code_matches_interpreter_in_every_engine) {
     CHECK(acc == 199.0 * 200 / 2 + 199.0 * 200 * 399 / 6);
 }
 
-// Two hot loops 64 KiB apart share a block slot and keep evicting each
+// Two hot loops 256 KiB apart share a block slot and keep evicting each
 // other: each takes its translation back instead of being translated again,
 // unless its instructions have changed in the meantime.
 TEST(cpu_jit_takes_back_translations_of_evicted_blocks) {
@@ -1750,17 +1780,17 @@ TEST(cpu_jit_takes_back_translations_of_evicted_blocks) {
     Rig t;
     use_engine(t, Engine::Jit);
     t.cpu.set_idle_skip(false);
-    // main loop at 0x1000 calls loop A at 0x2000 and loop B at 0x12000 in turn
+    // main loop at 0x1000 calls loop A at 0x2000 and loop B at 0x42000 in turn
     t.load({
         ADDIU(s0, zero, 40),
         JAL(0x80002000), NOP,  // loop: A
-        JAL(0x80012000), NOP,  // B
+        JAL(0x80042000), NOP,  // B
         ADDIU(s0, s0, -1),
         BNE(s0, zero, -6), NOP,
         BEQ(zero, zero, -1), NOP,
     });
     t.load({ADDIU(t0, zero, 20), ADDIU(t1, t1, 1), ADDIU(t0, t0, -1), BNE(t0, zero, -3), NOP, JR(ra), NOP}, 0x2000);
-    t.load({ADDIU(t0, zero, 20), ADDIU(t2, t2, 1), ADDIU(t0, t0, -1), BNE(t0, zero, -3), NOP, JR(ra), NOP}, 0x12000);
+    t.load({ADDIU(t0, zero, 20), ADDIU(t2, t2, 1), ADDIU(t0, t0, -1), BNE(t0, zero, -3), NOP, JR(ra), NOP}, 0x42000);
     t.cpu.run_until(60000);
     CHECK_EQ(t.cpu.gpr[s0], 0u);
     CHECK_EQ(t.cpu.gpr[t1], 800u);

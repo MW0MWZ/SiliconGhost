@@ -187,13 +187,15 @@ Main options (`siliconghost --help` lists them all):
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
 | `--timing realtime\|cycle\|max\|free` | how guest time relates to host time (see below) |
-| `--timed-speed X` | in realtime mode, the CPU's speed (X times real) while the system times it at boot; delay loops keep that speed (default 2) |
+| `--timed-speed X` | in realtime mode, the CPU's speed (X times real) while the system times it at boot (default 2); delay loops run at the real CPU's speed, or this one if slower |
 | `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 0: as fast as the host allows) |
 | `--no-audio` | do not play the machine's audio |
 | `--audio-in` | let the machine record from the host's audio input (off by default) |
 | `--net user\|tap:NAME\|none` | Ethernet through user-mode NAT (default), a TAP interface, or none |
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
+| `--quick-scsi-scan` | with realtime or cycle timing, absent SCSI devices answer within 1 ms instead of after the controller's programmed timeout (as with max timing) |
+| `--no-quick-scsi-scan` | the full selection timeout with every timing, max included |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
 | `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `free` |
 | `--test-device` | fit the bare-metal test device in GIO expansion slot 0: console output, a host clock, an instruction count and an exit code, for bare-metal test and benchmark programs |
@@ -239,7 +241,14 @@ why it could not open a window.
   terminal SiliconGhost was started from.
 - **Status bar:** power, disk, CD-ROM and network activity, the CPU's load
   (the time it is not idle), the pixels the Newport draws per second, and
-  the emulation speed against real time.
+  the CPU's speed as a multiple of the real one when busy, measured over
+  its recent busy running so that it holds steady while the system idles.
+  Guest clocks keep to real time however fast the CPU runs; only if the
+  host cannot keep up and they fall a second or more behind does a
+  "Behind" warning appear. The **Turbo** button switches a machine running
+  with real-time or cycle timing to max timing (below) for a heavy job,
+  and back when pressed again; with max or free timing set it is lit and
+  cannot be pressed.
 - **Mouse:** click in the window to capture the pointer; Ctrl+Alt+G
   (Ctrl+Option+G on a Mac), or switching to another window, releases it.
   All three buttons work. Where the system draws its pointer with the
@@ -420,17 +429,25 @@ so guest clocks always agree with each other.
   `--timed-speed`, because IRIX 5.3 fails on a CPU it measures as much
   faster than real: keep the clock times the timed speed at about 350 MHz
   or less (175 MHz x 2 boots, 200 MHz x 1.8 does not). IRIX 6.5 boots at
-  250 MHz x 1.8. Delay loops (a register counted down, nothing else) keep
-  that speed afterwards, so delays calibrated at boot never run short;
-  everything else runs as fast as the host allows, or up to `--max-speed`.
+  250 MHz x 1.8. Delay loops (a register counted down, nothing else) run
+  at the real CPU's speed, or the timed speed if that is slower: systems
+  calibrate their delays by timing one against a timer, and at the real
+  speed enough of it is timed for the timer's resolution, so delays come
+  out their real length and never short. Everything else runs as fast as
+  the host allows, or up to `--max-speed`.
   If the host falls behind (a busy start, a stall), guest time catches up
   afterwards; only a gap of more than 10 seconds, such as the host
   sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
-- **max**: guest time follows the wall clock as in realtime, but the CPU is
-  never held back: no timed speed at boot, no slower delay loops and no
-  cap. A guest that times the CPU sees the host's full speed, so IRIX 5.3
-  may not boot this way.
+- **max**: as realtime, with the CPU as fast as the host allows (the timed
+  speed at boot and the speed of delay loops stay, keeping the guest's
+  delays right, but `--max-speed` is ignored), and with disk and Ethernet
+  not held to their real rates: SCSI data moves as fast as the host reads it (each
+  command still takes its usual fraction of a millisecond, and by default
+  selecting an absent device gives up within a millisecond, which takes
+  seconds off the PROM's bus scan), Ethernet carries frames at 1 Gbit/s, holding each until
+  the system has a buffer for it instead of dropping it, and the memory
+  controller's DMA (with which the PROM clears memory) runs 32 times as fast.
 - **free**: no waiting and one cycle per instruction, with guest time
   running ahead of the wall clock; for runs of a set length and
   benchmarks.
@@ -477,8 +494,8 @@ with performance layers on top that must give exactly the same results:
 
 - Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
-- Indigo² graphics other than Newport (GR2 XZ/Extreme, IMPACT), EISA cards
-- Other SGI machines from the same PROM set (Indigo IP20, Indigo² R8000 and R10000)
+- Indigo² graphics other than Newport (GR2 XZ/Extreme, IMPACT)
+- Indigo² R8000 and R10000 (IP26, IP28)
 
 ## Legal
 

@@ -683,6 +683,39 @@ TEST(ip22_ethernet_receives_into_owned_descriptors_only) {
     CHECK_EQ(t.r32(kDesc + 4), c0);
 }
 
+// With fast I/O a frame waits for a buffer instead of being lost, and frames
+// follow each other far faster than on a 10 Mbit/s wire.
+TEST(ip22_ethernet_fast_io_holds_frames_until_a_buffer_is_ready) {
+    EnetRig t;
+    t.m.set_fast_io(true);
+    constexpr u32 kDesc = 0x08300000, kBuf0 = 0x08301000, kBuf1 = 0x08302000, kSize = 1586;
+    t.w32(kDesc + 0, kBuf0);
+    t.w32(kDesc + 4, kEnd | kOwn | kXie | kSize);  // a single buffer
+    t.w32(kDesc + 8, kDesc);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+    const std::array<u8, 6> us = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+    const std::vector<u8> first = test_frame(us, 1500), second = test_frame(us, 1400);
+    t.net.inject(first);
+    t.net.inject(second);
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 1000));  // 1 ms: 10 Mbit/s would carry one frame
+    CHECK_EQ(t.r32(kDesc + 4) & 0x3FFF, kSize - (2 + 1500 + 1));
+    CHECK(!(t.r32(kEnetRxCtrl) & 0x200));  // stopped at the end of the ring
+    t.w32(kDesc + 0, kBuf1);  // the driver hands over a new buffer and restarts
+    t.w32(kDesc + 4, kEnd | kOwn | kXie | kSize);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 5000));  // 200 us
+    CHECK_EQ(t.r32(kDesc + 4) & 0x3FFF, kSize - (2 + 1400 + 1));
+    bool same = true;
+    for (std::size_t i = 0; i < second.size(); ++i) {
+        u8 b = 0;
+        t.m.bus().read<u8>(static_cast<u32>(kBuf1 + 2 + i), b);
+        same &= b == second[i];
+    }
+    CHECK(same);
+}
+
 // Typed-ahead input is fed one byte at a time as the guest takes it; the
 // feeder only runs while something is queued, and starts again for input
 // that arrives later.
@@ -879,6 +912,28 @@ TEST(ip22_mc_dma_tlb_miss_faults_and_resumes) {
     CHECK_EQ(t.r32(kPage), 0xA5A5A5A5u);
     CHECK_EQ(t.r32(kPage + 4), 0xA5A5A5A5u);
     CHECK_EQ(t.r32(kPage + 8), 0u);
+}
+
+// With fast I/O the DMA engine fills memory 32 times as fast: 2 MiB, a
+// quarter of a million 64-bit words, take that many bus clocks otherwise.
+TEST(ip22_mc_dma_fast_io_fills_memory_faster) {
+    for (const bool fast : {false, true}) {
+        IndyRig t;
+        t.m.set_fast_io(fast);
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);  // 64 MiB at 0x08000000
+        constexpr u32 kMc = 0x1FA00000, kBuf = 0x08200000;
+        t.w32(kMc + 0x200C, kBuf);                     // MEMADRD: defaults
+        t.w32(kMc + 0x2014, (64u << 16) | 0x8000u);    // 64 lines of 32 KiB
+        t.w32(kMc + 0x201C, 1u << 16);
+        t.w32(kMc + 0x2034, (1u << 4) | (1u << 3) | (1u << 1));  // increment, fill memory
+        t.w32(kMc + 0x202C, 0xA5A5A5A5u);              // the fill value; starts
+        const double words = 2.0 * 1024 * 1024 / 8, clocks = words * t.m.cycles_per_second() / IndyConfig{}.sysclk_hz;
+        t.m.run(static_cast<u64>(clocks / 32 * 1.1));
+        CHECK_EQ((t.r32(kMc + 0x204C) & 0x40) == 0, fast);  // still running at the real rate
+        t.m.run(static_cast<u64>(clocks));
+        CHECK_EQ(t.r32(kMc + 0x204C) & 0x40, 0u);
+        CHECK_EQ(t.r32(kBuf + 2 * 1024 * 1024 - 4), 0xA5A5A5A5u);
+    }
 }
 
 // Only sizes two banks of 16, 32, 64 or 128 MiB can make are accepted.

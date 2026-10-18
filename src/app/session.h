@@ -39,6 +39,14 @@ public:
     bool on() const { return machine_ != nullptr; }
     ip22::Indy* machine() { return machine_.get(); }
     Pacer* pacer() { return pacer_.get(); }
+    // Turbo: Max timing (CPU uncapped, fast disk and network) while on, the
+    // configured timing when off. Kept across power cycles; not a setting.
+    // Offered when the configured timing (as the machine was powered on
+    // with) is Realtime or Cycle.
+    Pacer::Mode base_timing() const { return machine_ ? base_timing_ : settings_.timing; }
+    bool turbo_available() const { return base_timing() == Pacer::Mode::Realtime || base_timing() == Pacer::Mode::Cycle; }
+    bool turbo() const { return turbo_; }
+    void set_turbo(bool on);
 
     // Serial bytes from the machine (set before or after power-on).
     void set_serial_output(ip22::Indy::SerialOutput out);
@@ -59,12 +67,16 @@ public:
 
 private:
     void save_nvram();
+    // The timing in effect: the configured one, or Max with turbo on.
+    Pacer::Mode timing() const;
 
     Settings settings_;
     std::unique_ptr<net::NetBackend> network_;
     std::unique_ptr<ip22::Indy> machine_;
     std::unique_ptr<Pacer> pacer_;
     u64 nvram_saved_ = 0;
+    bool turbo_ = false;
+    Pacer::Mode base_timing_ = Pacer::Mode::Realtime;
     ip22::Indy::SerialOutput serial_out_;
     std::function<void(ip22::Indy&)> on_hook_, off_hook_;
 };

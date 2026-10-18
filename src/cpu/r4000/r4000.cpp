@@ -927,6 +927,27 @@ void R4000::flush_fast_tlb() {
     for (auto& mode : fast_)
         for (auto& table : mode)
             for (auto& e : table) e = FastEntry{};
+    wide_cached_ = 0;
+}
+
+// Status's KX, SX or UX was cleared: 32-bit addressing for that mode. Its
+// soft-TLB entries stay right, as any address 32-bit addressing reaches
+// translates the same in 64-bit addressing, except those of 64-bit addresses
+// beyond it. Setting a bit needs nothing at all, which matters: IRIX runs
+// its kernel with UX clear and sets it on every return to a user process.
+void R4000::narrow_addressing(u32 cleared) {
+    auto drop = [&](unsigned mode) {
+        if (!(wide_cached_ & (1u << mode))) return;
+        wide_cached_ &= static_cast<u8>(~(1u << mode));
+        for (auto& table : fast_[mode])
+            for (auto& e : table) e = FastEntry{};
+    };
+    if (cleared & sr::UX) drop(kUser);
+    if (cleared & sr::SX) drop(kSupervisor);
+    if (cleared & sr::KX) {
+        drop(kKernel);
+        drop(kKernelErl);
+    }
 }
 
 // Drops the soft-TLB slots a TLB entry's pages can occupy (in every mode).
@@ -1040,6 +1061,7 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     const bool is_store = acc == Access::Store;
     host = is_store ? bus_.host_write_ptr(ppage) : bus_.host_read_ptr(ppage);
     FastEntry& e = fast_[mode_][static_cast<unsigned>(acc)][(vaddr >> 12) & (kFastEntries - 1)];
+    if (vaddr >= 0x80000000ull && vaddr < k32BitCompatBase) wide_cached_ |= 1u << mode_;
     e.tag = (vaddr >> 12) | asid_tag_;
     e.host = host;
     e.ppage = ppage;
@@ -2122,7 +2144,7 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         case cop0::Status: {
             const u32 old = status_;
             status_ = (status_ & ~kStatusWriteMask) | (v32 & kStatusWriteMask);
-            if ((old ^ status_) & (sr::KX | sr::SX | sr::UX)) flush_fast_tlb();
+            if (const u32 cleared = old & ~status_ & (sr::KX | sr::SX | sr::UX)) narrow_addressing(cleared);
             if ((old ^ status_) & sr::RE) SG_LOG(Warn, "cpu", "reverse-endian user mode not supported");
             update_mode();
             break;

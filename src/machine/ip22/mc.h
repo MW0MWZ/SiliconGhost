@@ -83,6 +83,9 @@ public:
     void set_irq_callback(std::function<void(bool)> cb) { irq_cb_ = std::move(cb); }
     // DMA-done interrupt (INT3 LOCAL0 bit 4).
     void set_dma_irq_callback(std::function<void(bool)> cb) { dma_irq_cb_ = std::move(cb); }
+    // The virtual DMA engine moves 32 times as much per clock as the real
+    // one's 64 bits (the PROM clears all of memory with it at power-on).
+    void set_fast_dma(bool fast) { fast_dma_ = fast; }
     // CPUCTRL0.SIN: software requested a full system reset.
     void set_reset_callback(std::function<void()> cb) { reset_cb_ = std::move(cb); }
 
@@ -155,6 +158,7 @@ private:
     u32 dma_run_ = 0, dma_ctl_ = 0, dma_cause_ = 0;
     std::array<u32, 4> dma_tlb_hi_{}, dma_tlb_lo_{};
     Timer dma_timer_;
+    bool fast_dma_ = false;
     std::function<void()> reset_cb_;
 };
 

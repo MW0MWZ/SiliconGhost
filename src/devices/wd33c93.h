@@ -36,6 +36,15 @@ public:
     // `cycles_per_ms`: CPU cycles per millisecond, for command timing.
     Wd33c93(Scheduler& scheduler, double cycles_per_ms);
 
+    // Data phases take next to no time, as on a much faster bus; commands
+    // still take their usual time to act on (drivers count on that).
+    void set_fast_transfers(bool fast) { bytes_per_ms_ = fast ? kFastBytesPerMs : kBytesPerMs; }
+    // A selection nobody answers times out within a millisecond, however
+    // long the period programmed: software only learns that nobody is there,
+    // and scanning the bus for absent targets (three tries each) takes the
+    // PROM seconds at the full period.
+    void set_quick_selection_timeout(bool quick) { quick_selection_timeout_ = quick; }
+
     void reset();
     // The master reset line was held and is now released: the chip comes out
     // of reset and interrupts with the reset status, as after a RESET command.
@@ -98,8 +107,14 @@ private:
     void pio_in_taken();
     void negate_ack();
 
+    // Approximate bus throughput for completion timing: 5 MB/s (or 1 GB/s
+    // with fast transfers).
+    static constexpr double kBytesPerMs = 5000.0, kFastBytesPerMs = 1e6;
+
     Scheduler& scheduler_;
     double cycles_per_ms_;
+    double bytes_per_ms_ = kBytesPerMs;
+    bool quick_selection_timeout_ = false;
     std::array<u8, 32> regs_{};
     u8 address_ = 0;
     u8 aux_status_ = 0;

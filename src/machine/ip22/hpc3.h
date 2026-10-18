@@ -51,6 +51,16 @@ public:
     Seeq8003& seeq() { return seeq_; }
     // Ethernet frames go to and come from `backend` (null: no cable).
     void set_network(net::NetBackend* backend);
+    // SCSI and Ethernet as fast as the host allows instead of at their real
+    // rates (Ethernet then takes in a frame only when the driver has a
+    // buffer ready for it, rather than losing it, unless the channel is
+    // held in reset).
+    void set_fast_io(bool fast);
+    // See Wd33c93::set_quick_selection_timeout.
+    void set_quick_scsi_scan(bool quick) {
+        scsi0_.set_quick_selection_timeout(quick);
+        scsi1_.set_quick_selection_timeout(quick);
+    }
     // Frames sent and received on the Ethernet port (for activity lights).
     u64 enet_tx_frames() const { return enet_tx_frames_; }
     u64 enet_rx_frames() const { return enet_rx_frames_; }
@@ -143,6 +153,9 @@ private:
     Seeq8003 seeq_;
     EnetDma enet_rx_, enet_tx_;
     bool enet_irq_ = false, enet_loopback_ = false;
+    bool enet_rx_ready() const;
+    double enet_bits_per_second() const { return fast_io_ ? 1e9 : 10e6; }
+    bool fast_io_ = false;
     bool enet_held_ = true;  // channel reset bit: set at power-on, holds the channel and the Seeq in reset
     u32 enet_dconfig_ = 0, enet_pconfig_ = 0;
     net::NetBackend* net_ = nullptr;
