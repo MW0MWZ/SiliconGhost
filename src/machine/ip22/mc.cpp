@@ -15,7 +15,13 @@ namespace {
 constexpr u32 kSysIdRevC = 0x03;     // MC revision C
 constexpr u32 kSysIdEisa = 1u << 4;  // EISA bus present
 
+constexpr u32 kCpuCtrl0Dog = 1u << 8;       // watchdog enabled
 constexpr u32 kCpuCtrl0SysInit = 1u << 9;
+constexpr u32 kCpuCtrl0PromWrEn = 1u << 15;  // no interrupt on PROM writes
+constexpr u32 kCpuCtrl0WarmRestart = 1u << 16;  // WR_ST: the CPU's reset sequence
+constexpr u32 kCpuCtrl0WarmReset = 1u << 19;    // WRST: a warm reset of the CPU
+constexpr u32 kGioErrStatProm = 1u << 11;
+constexpr u32 kDogBits = 20;
 constexpr u32 kErrStatAddr = 1u << 10;  // CPU: bad address; GIO: timeout uses the same bit position
 constexpr u32 kEeromCs = 1u << 1;
 constexpr u32 kEeromSck = 1u << 2;
@@ -55,7 +61,16 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
       eisa_(eisa),
       ram_(ram),
       cycles_per_sysclk_(cpu_hz / sysclk_hz),
-      dma_timer_(scheduler, [this] { finish_dma(); }) {
+      dma_timer_(scheduler, [this] { finish_dma(); }),
+      dog_timer_(scheduler, [this] {
+          if (!(regs_[kCpuCtrl0] & kCpuCtrl0Dog)) return;
+          if (dog_count() >> kDogBits) {
+              SG_LOG(Info, "mc", "watchdog timer ran out");
+              if (reset_cb_) reset_cb_();
+          } else {
+              schedule_dog();
+          }
+      }) {
     bus_.add_host_region(ram, ram_size);  // however the banks get mapped, it is one memory
     std::fill(cpu_eeprom_.words().begin(), cpu_eeprom_.words().end(), u16{0});
     // Split installed memory into decodable banks, largest first.
@@ -105,8 +120,49 @@ void Mc::reset() {
     dma_tlb_hi_.fill(0);
     dma_tlb_lo_.fill(0);
     if (dma_irq_cb_) dma_irq_cb_(false);
+    refresh_base_ = scheduler_.now();
+    dog_cleared_at_ = 0;
+    dog_timer_.cancel();
     remap_memory();
     update_irq();
+}
+
+u64 Mc::sysclks_since(u64 cycle) const {
+    return static_cast<u64>(static_cast<double>(scheduler_.now() - cycle) / cycles_per_sysclk_);
+}
+
+// The refresh counter counts CTRLD down to zero at the system clock, then
+// does a refresh burst and loads CTRLD again.
+u64 Mc::refresh_bursts() const { return sysclks_since(refresh_base_) / (u64{regs_.at(kCtrld)} + 1); }
+
+// The watchdog counts refresh bursts (20 bits; the count can run past them
+// until the timer acts on it).
+u32 Mc::dog_count() const { return static_cast<u32>(static_cast<s64>(refresh_bursts()) - dog_cleared_at_); }
+
+void Mc::clear_dog() {
+    dog_cleared_at_ = static_cast<s64>(refresh_bursts());
+    schedule_dog();
+}
+
+// With the watchdog on, the machine resets when the count rolls over.
+void Mc::schedule_dog() {
+    if (!(regs_[kCpuCtrl0] & kCpuCtrl0Dog)) {
+        dog_timer_.cancel();
+        return;
+    }
+    const u64 left = (u64{1} << kDogBits) - std::min<u64>(dog_count(), u64{1} << kDogBits);
+    const double sysclks = static_cast<double>(left) * (regs_[kCtrld] + 1);
+    dog_timer_.schedule_in(static_cast<u64>(sysclks * cycles_per_sysclk_) + 1);
+}
+
+void Mc::prom_written(u32 paddr) {
+    if (regs_[kCpuCtrl0] & kCpuCtrl0PromWrEn) return;
+    if (!gio_error_stat_) {
+        gio_error_addr_ = paddr;
+        gio_error_stat_ = kGioErrStatProm;
+    }
+    irq_ = true;
+    if (irq_cb_) irq_cb_(true);
 }
 
 bool Mc::read(u32 offset, unsigned size, u64& value) {
@@ -115,10 +171,9 @@ bool Mc::read(u32 offset, unsigned size, u64& value) {
         return true;
     }
     const u32 word = offset & ~3u;
-    if (!(word & 4)) {
-        SG_LOG(Debug, "mc", "read of little-endian register address +%05x", word);
-        value = 0;
-        return true;
+    if (!register_word(word)) {  // the other endianness's address: a memory bus error (ADDR)
+        SG_LOG(Debug, "mc", "read of the wrong-endian register address +%05x", word);
+        return false;
     }
     const u32 v = read_reg(word);
     const unsigned shift = (4 - size - (offset & 3)) * 8;
@@ -132,9 +187,9 @@ bool Mc::write(u32 offset, unsigned size, u64 value) {
         return true;
     }
     const u32 word = offset & ~3u;
-    if (!(word & 4)) {
-        SG_LOG(Debug, "mc", "write to little-endian register address +%05x", word);
-        return true;
+    if (!register_word(word)) {
+        SG_LOG(Debug, "mc", "write to the wrong-endian register address +%05x", word);
+        return false;
     }
     if (size != 4) {  // sub-word write: merge into the register
         const unsigned shift = (4 - size - (offset & 3)) * 8;
@@ -155,8 +210,11 @@ u32 Mc::read_reg(u32 reg) {
     }
     switch (reg) {
         case kSysId: return kSysIdRevC | (eisa_ ? kSysIdEisa : 0);
-        case kDogc: return 0;
-        case kRefCtr: return regs_[kCtrld];
+        case kDogc: return dog_count() & ((1u << kDogBits) - 1);
+        case kRefCtr: {
+            const u64 period = u64{regs_[kCtrld]} + 1;
+            return static_cast<u32>(regs_[kCtrld] - sysclks_since(refresh_base_) % period) & 0xFFFF;
+        }
         case kEerom: return (regs_[kEerom] & ~kEeromSi) | (cpu_eeprom_.data_out() ? kEeromSi : 0);
         case kCpuErrorAddr: return cpu_error_addr_;
         case kCpuErrorStat: return cpu_error_stat_;
@@ -192,17 +250,30 @@ u32 Mc::read_reg(u32 reg) {
 }
 
 void Mc::write_reg(u32 reg, u32 value) {
+    // Writing any MC register clears the watchdog (DOGR is the one meant for it).
+    if (regs_[kCpuCtrl0] & kCpuCtrl0Dog) clear_dog();
+    else dog_cleared_at_ = static_cast<s64>(refresh_bursts());
     if (reg >= kUserSemaphores && reg < kUserSemaphores + 0x10000 && (reg & 0xFFF) == 4) {
         user_semaphores_[(reg - kUserSemaphores) >> 12] = value & 1;
         return;
     }
     switch (reg) {
         case kCpuCtrl0:
-            regs_[reg] = value & ~kCpuCtrl0SysInit;
+            regs_[reg] = value & ~(kCpuCtrl0SysInit | kCpuCtrl0WarmRestart | kCpuCtrl0WarmReset);
+            schedule_dog();
             if (value & kCpuCtrl0SysInit) {
                 SG_LOG(Info, "mc", "system reset requested");
                 if (reset_cb_) reset_cb_();
+            } else if (value & (kCpuCtrl0WarmRestart | kCpuCtrl0WarmReset)) {
+                SG_LOG(Info, "mc", "processor %s requested", (value & kCpuCtrl0WarmReset) ? "warm reset" : "restart");
+                if (cpu_reset_cb_) cpu_reset_cb_((value & kCpuCtrl0WarmReset) != 0);
             }
+            return;
+        case kCtrld:  // the counter takes the new value when it next reloads; near enough, now
+            regs_[reg] = value & 0xFFFF;
+            refresh_base_ = scheduler_.now();
+            dog_cleared_at_ = static_cast<s64>(refresh_bursts());
+            schedule_dog();
             return;
         case kDmaCause:
             dma_cause_ = value & 0xF;
@@ -252,7 +323,7 @@ void Mc::write_reg(u32 reg, u32 value) {
         case kDmaRun:
         case kCpuErrorAddr:
         case kGioErrorAddr: return;  // read-only
-        case kDogc: return;           // any write clears the watchdog (never modelled to fire)
+        case kDogc: return;  // DOGR: clears the watchdog, as any write does (above)
         case kRpssDivider:
             rebase_rpss();
             regs_[reg] = value & 0xFFFF;

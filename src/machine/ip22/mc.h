@@ -86,8 +86,14 @@ public:
     // The virtual DMA engine moves 32 times as much per clock as the real
     // one's 64 bits (the PROM clears all of memory with it at power-on).
     void set_fast_dma(bool fast) { fast_dma_ = fast; }
-    // CPUCTRL0.SIN: software requested a full system reset.
+    // CPUCTRL0.SIN (or the watchdog running out): a full system reset.
     void set_reset_callback(std::function<void()> cb) { reset_cb_ = std::move(cb); }
+    // CPUCTRL0.WR_ST and WRST: the processor alone is reset, from its reset
+    // sequence (warm = false) or with a warm (soft) reset.
+    void set_cpu_reset_callback(std::function<void(bool warm)> cb) { cpu_reset_cb_ = std::move(cb); }
+    // The CPU wrote to the boot PROM: a bus error interrupt (GIO_ERROR_STAT
+    // PROM) unless CPUCTRL0.PROM_WR_EN is set. The write itself goes nowhere.
+    void prom_written(u32 paddr);
 
     struct Bank {
         u64 offset = 0;         // into ram_
@@ -106,6 +112,9 @@ public:
     void map_banks_as_post();
 
 private:
+    // Registers answer at the odd word (big-endian) or, with CPUCTRL0.LITTLE,
+    // the even word.
+    bool register_word(u32 word) const { return ((word & 4) != 0) != ((regs_.at(kCpuCtrl0) & (1u << 18)) != 0); }
     u32 read_reg(u32 reg);
     void write_reg(u32 reg, u32 value);
     void remap_memory();
@@ -118,6 +127,12 @@ private:
     // the cause bit (TLB miss, page fault, clean page written).
     u32 dma_translate(u32 vaddr, bool to_memory, u32& fault);
     void dma_load_defaults();
+    // Refresh counter and watchdog (see read_reg kRefCtr / kDogc).
+    u64 sysclks_since(u64 cycle) const;
+    u64 refresh_bursts() const;
+    u32 dog_count() const;
+    void clear_dog();
+    void schedule_dog();
 
     // A bank that is configured valid but has no SIMMs fitted: the MC still
     // decodes it, so accesses complete (reads see an undriven bus, here zero)
@@ -160,6 +175,10 @@ private:
     Timer dma_timer_;
     bool fast_dma_ = false;
     std::function<void()> reset_cb_;
+    std::function<void(bool)> cpu_reset_cb_;
+    u64 refresh_base_ = 0;    // when the refresh counter last loaded CTRLD
+    s64 dog_cleared_at_ = 0;  // refresh_bursts() when the watchdog was last cleared
+    Timer dog_timer_;
 };
 
 }  // namespace sg::ip22

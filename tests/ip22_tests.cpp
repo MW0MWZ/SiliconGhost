@@ -11,6 +11,7 @@
 
 #include "core/endian.h"
 #include "cpu/r4000/r4000.h"
+#include "devices/scsi_disk.h"
 #include "machine/ip22/indy.h"
 #include "mips_asm.h"
 #include "net/net_backend.h"
@@ -132,6 +133,99 @@ TEST(ip22_mc_bus_errors) {
     CHECK_EQ(t.r32(0x1FA000FC), 0x4F0u);  // TIME
 }
 
+// The big-endian CPU must use the odd word: the even one is a memory bus
+// error (CPU_ERROR_STAT ADDR), synchronous for reads, by interrupt for writes.
+TEST(ip22_mc_wrong_endian_register_word) {
+    IndyRig t;
+    u32 v;
+    CHECK(!t.m.bus().read<u32>(0x1FA00000, v));
+    CHECK(t.r32(kMcCpuErrorStat) & 0x400);
+    CHECK_EQ(t.r32(kMcCpuErrorAddr), 0x1FA00000u);
+    t.w32(kMcCpuErrorStat, 0);
+    t.w32(0x1FA00040, 5);  // CTRLD's even word: not written
+    CHECK(t.ip(6));
+    CHECK_EQ(t.r32(0x1FA00044), 0x0C30u);
+    t.w32(kMcCpuErrorStat, 0);
+}
+
+// REF_CTR counts CTRLD down at the 50 MHz system clock; DOGC counts the
+// refresh bursts and clears on any MC register write.
+TEST(ip22_mc_refresh_counter_and_watchdog_count) {
+    IndyRig t;  // 150 MHz CPU: 3 cycles a system clock
+    t.w32(0x1FA00044, 999);  // a burst every 1000 system clocks (20 us)
+    t.m.run(150000);         // 1 ms: 50 bursts
+    const u32 ref = t.r32(0x1FA0004C);
+    CHECK(ref <= 999);
+    const u32 dog = t.r32(0x1FA00014);
+    CHECK(dog >= 49 && dog <= 51);
+    t.w32(0x1FA0002C, 0x0104);  // any register write (here RPSS_DIVIDER) clears it
+    CHECK_EQ(t.r32(0x1FA00014), 0u);
+    t.m.run(3000);  // 20 us
+    CHECK(t.r32(0x1FA00014) <= 1u);
+}
+
+// With CPUCTRL0.DOG set, the watchdog rolling over (2^20 bursts) resets the
+// machine as power cycling does.
+TEST(ip22_mc_watchdog_resets_the_machine) {
+    IndyRig t;
+    t.w32(0x1FA00044, 0);  // a burst every system clock: 2^20 in 21 ms
+    t.w32(0x1FA00004, 0x00100012 | 0x100);  // DOG
+    t.m.run(1500000);  // 10 ms: not yet
+    CHECK_EQ(t.r32(0x1FA00044), 0u);
+    t.m.run(3000000);  // past 21 ms: reset (CTRLD back to its reset value)
+    CHECK_EQ(t.r32(0x1FA00044), 0x0C30u);
+    CHECK_EQ(t.r32(0x1FA00004) & 0x100, 0u);
+}
+
+// A write to the boot PROM interrupts (GIO_ERROR_STAT PROM) unless
+// CPUCTRL0.PROM_WR_EN is set; the PROM itself is unchanged.
+TEST(ip22_mc_prom_write_bus_error) {
+    IndyRig t;
+    const u32 before = t.r32(0x1FC00000);
+    t.w32(0x1FC00000, 0x12345678);
+    CHECK_EQ(t.r32(0x1FC00000), before);
+    CHECK(t.ip(6));
+    CHECK_EQ(t.r32(0x1FA000FC), 0x800u);
+    CHECK_EQ(t.r32(0x1FA000F4), 0x1FC00000u);
+    t.w32(0x1FA000FC, 0);
+    CHECK(!t.ip(6));
+    t.w32(0x1FA00004, 0x00100012 | 0x8000);  // PROM_WR_EN
+    t.w32(0x1FC00000, 0);
+    CHECK(!t.ip(6));
+}
+
+// CPUCTRL0.WRST: a warm reset of the processor only (Status SR set,
+// ErrorEPC the restart PC); WR_ST: its full reset sequence. The MC keeps
+// its registers either way.
+TEST(ip22_mc_processor_resets) {
+    IndyRig t;
+    t.w32(0x1FA00044, 0x1234);
+    t.m.run(1000);
+    t.w32(0x1FA00004, 0x00100012 | (1u << 19));
+    t.m.run(1000);
+    CHECK(t.m.cpu().cp0_read(mips::cop0::Status) & (1u << 20));  // SR: a soft reset
+    CHECK_EQ(t.m.cpu().cp0_read(mips::cop0::ErrorEPC) & 0xFFFFFFFFu, 0xBFC00000u);  // the PROM's loop
+    CHECK_EQ(t.r32(0x1FA00044), 0x1234u);
+    CHECK_EQ(t.r32(0x1FA00004) & (1u << 19), 0u);
+    t.w32(0x1FA00004, 0x00100012 | (1u << 16));
+    t.m.run(1000);
+    CHECK_EQ(t.m.cpu().cp0_read(mips::cop0::Status) & (1u << 20), 0u);  // a full reset clears SR
+    CHECK_EQ(t.r32(0x1FA00044), 0x1234u);
+}
+
+// The IOC decodes 64 registers, repeated through its PBUS window; reset
+// register bit 1 low (as at power-on) holds the keyboard controller in reset.
+TEST(ip22_ioc_register_repeat_and_keyboard_reset) {
+    IndyRig t;
+    t.m.reset();
+    CHECK_EQ(t.r8(0x1FBD9858 + 3), t.r8(0x1FBD9958 + 3));  // SYSID at +0x100
+    CHECK_EQ(t.r8(0x1FBD9844 + 3), 0u);  // keyboard status: held, nothing answers
+    t.w8(0x1FBD9870 + 3, 0x13);         // released, as the PROM does first
+    CHECK(t.r8(0x1FBD9844 + 3) != 0u);
+    t.w8(0x1FBD9970 + 3, 0x11);  // through the repeat: held again
+    CHECK_EQ(t.r8(0x1FBD9844 + 3), 0u);
+}
+
 TEST(ip22_rpss_counts_100ns) {
     IndyRig t;
     t.w32(kMcRpssDivider, 0x0104);  // +1 every 5 system clocks at 50 MHz
@@ -223,6 +317,11 @@ TEST(ip22_serial_console_output) {
         t.w8(data_b, static_cast<u8>(c));
         while (!(t.r8(ctrl_b) & 0x04)) t.m.run(500);
     }
+    for (int i = 0; i < 1000; ++i) {  // until RR1 All Sent
+        t.w8(ctrl_b, 1);
+        if (t.r8(ctrl_b) & 0x01) break;
+        t.m.run(500);
+    }
     CHECK(t.serial == "ok");
 }
 
@@ -233,6 +332,10 @@ TEST(ip22_nvram_and_rtc) {
     CHECK_EQ(t.r32(kNvram + 4 * 250) & 0xFF, 0x08u);  // word access: data in the low byte
     const u8 month = t.r8(0x1FBE0000 + 4 * 9 + 3) & 0x1F;
     CHECK(month >= 0x01 && month <= 0x12);
+    // The 8 KiB repeats through the 32K-word window.
+    CHECK_EQ(t.r32(0x1FBE0000 + 0x18000 + 4 * (0x40 + 250)) & 0xFF, 0x08u);
+    t.w8(0x1FBE0000 + 0x10000 + 4 * (0x40 + 251) + 3, 0x5A);
+    CHECK_EQ(t.m.rtc().memory()[0x40 + 251], 0x5A);
 }
 
 TEST(ip22_nvram_default_ethernet_address) {
@@ -245,6 +348,60 @@ TEST(ip22_nvram_default_ethernet_address) {
     t.m.rtc().memory()[0x40 + 255] = 0x77;  // an address already in NVRAM is kept
     t.m.reset();
     CHECK_EQ(nv[5], 0x77);
+}
+
+namespace {
+
+// The PROM's environment checksum, worked independently of the machine's
+// own: the 256 bytes as 16-bit words, each XORed in (less the checksum byte
+// itself) and rotated, from 0xA5.
+u8 env_checksum(const u8* env) {
+    u8 sum = 0xA5;
+    for (unsigned i = 0; i < 256; i += 2) {
+        sum ^= env[i + 1];
+        if (i) sum ^= env[i];
+        sum = static_cast<u8>(sum << 1 | sum >> 7);
+    }
+    return sum;
+}
+
+// A valid environment as the PROM leaves it: layout revision 8, console "g".
+void set_up_env(u8* env) {
+    std::fill_n(env, 250, u8{0});
+    env[1] = 8;
+    env[2] = 'g';
+    env[0] = env_checksum(env);
+}
+
+}  // namespace
+
+TEST(ip22_nvram_console_setting) {
+    for (const Board board : {Board::Indy, Board::Indigo2}) {
+        IndyConfig c;
+        c.board = board;
+        c.console = 'd';
+        c.mac = std::array<u8, 6>{0x08, 0x00, 0x69, 0x11, 0x22, 0x33};
+        Indy m{c};
+        std::vector<u8> image = m.nvram_image();
+        u8* env = board == Board::Indigo2 ? image.data() : image.data() + 0x40;
+        set_up_env(env);
+        m.load_nvram_image(image);
+        m.reset();
+        image = m.nvram_image();
+        env = board == Board::Indigo2 ? image.data() : image.data() + 0x40;
+        CHECK_EQ(env[2], 'd');
+        CHECK_EQ(env[3], 0);
+        CHECK_EQ(env[253], 0x11);  // the address is set too,
+        CHECK_EQ(env[0], env_checksum(env));  // and the checksum still holds
+    }
+    // A blank environment is left for the PROM to set up with its defaults.
+    IndyConfig c;
+    c.console = 'd';
+    Indy m{c};
+    m.reset();
+    const u8* env = &m.rtc().memory()[0x40];
+    CHECK_EQ(env[2], 0);
+    CHECK(env[0] != env_checksum(env));
 }
 
 TEST(ip22_second_scsi_port_unconnected) {
@@ -312,11 +469,24 @@ void hal2_write(IndyRig& t, u32 reg, u32 value) {
 }
 u32 hal2_read(IndyRig& t, u32 reg) {
     t.w32(kHal2 + 0x30, reg | 0x80);
-    const u32 lo = t.r32(kHal2 + 0x40);
+    const u32 lo = t.r32(kHal2 + 0x40) & 0xFFFF;  // a 16-bit device: both halves of the word
     t.w32(kHal2 + 0x30, reg | 0x81);
-    return lo | (t.r32(kHal2 + 0x40) << 16);
+    return lo | ((t.r32(kHal2 + 0x40) & 0xFFFF) << 16);
 }
 }  // namespace
+
+// PBUS device registers fill the word: an 8-bit register's byte in every
+// lane (the IOC's SYSID), a 16-bit one's halfword in both halves (HAL2).
+TEST(ip22_pbus_registers_are_replicated) {
+    IndyRig t;
+    CHECK_EQ(t.r32(0x1FBD9858), 0x26262626u);
+    CHECK_EQ(t.r8(0x1FBD9858), 0x26);
+    CHECK_EQ(t.r8(0x1FBD9858 + 1), 0x26);
+    CHECK_EQ(t.r8(0x1FBD9858 + 3), 0x26);
+    t.w32(kHal2 + 0x10, 0x18);
+    const u32 rev = t.r32(kHal2 + 0x20);  // HAL2 revision
+    CHECK_EQ(rev >> 16, rev & 0xFFFF);
+}
 
 TEST(ip22_hal2_indirect_registers_read_back) {
     IndyRig t;
@@ -626,8 +796,8 @@ TEST(ip22_ethernet_transmits_a_frame_across_descriptors) {
     t.m.run(200000);
     CHECK_EQ(t.net.sent.size(), 1u);
     if (!t.net.sent.empty()) CHECK(t.net.sent[0] == frame);
-    CHECK(t.r32(kDesc + 4) & kTxDone);
-    CHECK(t.r32(kDesc + 20) & kTxDone);
+    CHECK_EQ(t.r32(kDesc + 4), kTxDone);  // TXD in the packet's first descriptor, its count cleared
+    CHECK_EQ(t.r32(kDesc + 20), kEnd | kEop | 60);  // the others untouched
     CHECK_EQ(t.r32(kEnetTxCtrl), 0x08u);  // sent, no longer active
     CHECK(t.enet_irq());
     t.w32(kEnetReset, 2);  // clear the interrupt
@@ -681,6 +851,108 @@ TEST(ip22_ethernet_receives_into_owned_descriptors_only) {
     t.m.run(static_cast<u64>(t.m.cycles_per_second() / 100));
     CHECK_EQ(t.r32(kBuf0 + 4), before);
     CHECK_EQ(t.r32(kDesc + 4), c0);
+}
+
+// One buffer per received packet: a packet larger than its buffer fills it,
+// sets RBO (cleared by reading the control register) and stops the channel.
+TEST(ip22_ethernet_receive_buffer_overflow) {
+    EnetRig t;
+    constexpr u32 kDesc = 0x08300000, kBuf0 = 0x08301000, kBuf1 = 0x08302000;
+    t.w32(kDesc + 0, kBuf0);
+    t.w32(kDesc + 4, kOwn | kXie | kEop | 64);  // too small for the frame
+    t.w32(kDesc + 8, kDesc + 16);
+    t.w32(kDesc + 16, kBuf1);
+    t.w32(kDesc + 20, kEnd | kOwn | kXie | kEop | 1586);
+    t.w32(kDesc + 24, kDesc);
+    t.w32(kEnetRxNdbp, kDesc);
+    t.w32(kEnetRxCtrl, 0x200);
+    const std::array<u8, 6> us = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+    const std::vector<u8> big = test_frame(us, 200);
+    t.net.inject(big);
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 100));
+    CHECK(t.enet_irq());
+    const u32 ctrl = t.r32(kEnetRxCtrl);
+    CHECK(ctrl & 0x800);     // RBO
+    CHECK(!(ctrl & 0x200));  // stopped
+    CHECK(!(t.r32(kEnetRxCtrl) & 0x800));  // read: cleared
+    CHECK_EQ(t.r32(kDesc + 4) & 0x3FFF, 0u);  // the buffer filled
+    u8 b = 0;
+    t.m.bus().read<u8>(kBuf0 + 2, b);
+    CHECK_EQ(b, big[0]);
+    CHECK_EQ(t.r32(kDesc + 20) & 0x3FFF, 1586u);  // the next buffer untouched
+}
+
+// With the channel's endian bit set, byte n of each doubleword travels in
+// its low-order bits: in the big-endian memory, the frame's bytes sit at
+// their addresses XOR 7, both ways.
+TEST(ip22_ethernet_little_endian_transfers) {
+    EnetRig t;
+    constexpr u32 kDesc = 0x08200000, kBuf = 0x08201000, kRxDesc = 0x08300000, kRxBuf = 0x08301000;
+    const std::vector<u8> frame = test_frame({0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, 64);
+    for (std::size_t i = 0; i < frame.size(); ++i) t.m.bus().write<u8>(static_cast<u32>(kBuf + i) ^ 7, frame[i]);
+    t.w32(kDesc + 0, kBuf);
+    t.w32(kDesc + 4, kEnd | kEop | 64);
+    t.w32(kDesc + 8, 0);
+    t.w32(kEnetTxNdbp, kDesc);
+    t.w32(kEnetTxCtrl, 0x300);  // active, little-endian
+    t.m.run(200000);
+    CHECK_EQ(t.net.sent.size(), 1u);
+    if (!t.net.sent.empty()) CHECK(t.net.sent[0] == frame);
+
+    t.w32(kRxDesc + 0, kRxBuf);
+    t.w32(kRxDesc + 4, kEnd | kOwn | 1586);
+    t.w32(kRxDesc + 8, 0);
+    t.w32(kEnetRxNdbp, kRxDesc);
+    t.w32(kEnetRxCtrl, 0x300);
+    const std::vector<u8> mine = test_frame({0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01}, 100);
+    t.net.inject(mine);
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 100));
+    bool same = true;
+    for (std::size_t i = 0; i < mine.size(); ++i) {
+        u8 b = 0;
+        t.m.bus().read<u8>(static_cast<u32>(kRxBuf + 2 + i) ^ 7, b);
+        same &= b == mine[i];
+    }
+    CHECK(same);
+    u8 status = 0;
+    t.m.bus().read<u8>((kRxBuf + 2 + 100) ^ 7, status);
+    CHECK_EQ(status, 0x30u);
+}
+
+// A host that answers the moment a frame is handed to it (the NAT replying
+// to a ping to its own address) is heard only after the request has left
+// the wire and a turnaround: IRIX loses replies that land sooner.
+TEST(ip22_ethernet_replies_wait_for_the_wire_and_a_turnaround) {
+    class AnsweringBackend final : public net::NetBackend {
+    public:
+        void send(const u8*, std::size_t) override { deliver(reply.data(), reply.size()); }
+        std::vector<u8> reply;
+    };
+    for (const bool fast : {false, true}) {
+        EnetRig t;
+        AnsweringBackend net;
+        net.reply = test_frame({0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01}, 98);
+        t.m.set_network(&net);
+        t.m.set_fast_io(fast);
+        constexpr u32 kRx = 0x08300000, kTx = 0x08310000, kBuf = 0x08301000, kTxBuf = 0x08311000, kSize = 1586;
+        t.w32(kRx + 0, kBuf);
+        t.w32(kRx + 4, kEnd | kOwn | kXie | kSize);
+        t.w32(kRx + 8, kRx);
+        t.w32(kEnetRxNdbp, kRx);
+        t.w32(kEnetRxCtrl, 0x200);
+        t.w32(kTx + 0, kTxBuf);
+        t.w32(kTx + 4, kEnd | kEop | 98);
+        t.w32(kTx + 8, 0);
+        t.w32(kEnetTxNdbp, kTx);
+        t.w32(kEnetTxCtrl, 0x200);
+        const double hz = t.m.cycles_per_second();
+        t.m.run(static_cast<u64>(hz * 100e-6));
+        CHECK(t.r32(kTx + 4) & kTxDone);         // sent...
+        CHECK(t.r32(kRx + 4) & kOwn);            // ...and nothing back yet
+        t.m.run(static_cast<u64>(hz * 1e-3));
+        CHECK(!(t.r32(kRx + 4) & kOwn));         // the reply, within a millisecond
+        CHECK_EQ(t.r32(kRx + 4) & 0x3FFF, kSize - (2 + 98 + 1));
+    }
 }
 
 // With fast I/O a frame waits for a buffer instead of being lost, and frames
@@ -1027,6 +1299,38 @@ struct Indigo2Rig : IndyRig {
 };
 }  // namespace
 
+// Expansion slot 0's GIO interrupts on the Indigo2: EXTIO's S0 bits and the
+// local inputs it shares with the graphics slot, its retrace latched until
+// PORT_CONFIG bit 4 is pulsed low; expansion slot 1 has no lines. On the
+// Indy each expansion slot is a mappable input.
+TEST(gio_expansion_slot_interrupts) {
+    Indigo2Rig t;
+    t.m.ioc().set_gio_slot_irq(1, 1, true);
+    CHECK_EQ(t.r32(kExtIo) & 0xF000, 0xD000u);  // S0 graphics (active low)
+    CHECK(t.r8(int2_addr(0x00)) & 0x40);        // local 0 graphics
+    t.m.ioc().set_gio_slot_irq(1, 1, false);
+    t.m.ioc().set_gio_slot_irq(1, 2, true);
+    t.m.ioc().set_gio_slot_irq(1, 2, false);  // latched
+    CHECK_EQ(t.r32(kExtIo) & 0xF000, 0xE000u);
+    CHECK(t.r8(int2_addr(0x08)) & 0x80);      // local 1 retrace
+    t.w8(int2_addr(0x1C), 0xFF & ~0x10);      // clear S0 retrace
+    t.w8(int2_addr(0x1C), 0xFF);
+    CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu);
+    CHECK(!(t.r8(int2_addr(0x08)) & 0x80));
+    t.m.ioc().set_gio_slot_irq(2, 0, true);  // expansion slot 1: nothing
+    CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu);
+    CHECK(!(t.r8(int2_addr(0x00)) & 0x01));
+    t.m.ioc().set_gfx_drain(0, true);  // drain feedback: mappable 6
+    CHECK(t.r8(int2_addr(0x10)) & 0x40);
+
+    IndyRig indy;
+    indy.m.ioc().set_gio_slot_irq(2, 0, true);
+    CHECK_EQ(indy.r8(ioc_addr(0x90)) & 0xC0, 0x80u);  // MAP status: GIO EXP1
+    indy.m.ioc().set_gio_slot_irq(2, 0, false);
+    indy.m.ioc().set_gio_slot_irq(1, 2, true);
+    CHECK_EQ(indy.r8(ioc_addr(0x90)) & 0xC0, 0x40u);  // GIO EXP0
+}
+
 TEST(indigo2_identity_registers) {
     Indigo2Rig t;
     CHECK_EQ(t.r32(kMcSysId), 0x13u);         // MC revision C, EISA present
@@ -1080,6 +1384,55 @@ TEST(indigo2_graphics_slot_interrupts_in_extio) {
     t.w8(int2_addr(0x1C), 0xFF);
     CHECK(!t.ip(3));
     CHECK_EQ(t.r32(kExtIo) & 0xFFFF, 0xFFFFu);
+}
+
+// SCSI DMA with the channel's endian bit set: as for Ethernet, the bytes
+// sit at their addresses XOR 7.
+TEST(ip22_scsi_dma_little_endian) {
+    const std::string path = (std::filesystem::temp_directory_path() / "sg_scsi_endian.img").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        for (unsigned i = 0; i < 512; ++i) f.put(static_cast<char>(i * 3 + 1));
+    }
+    {
+        ScsiDisk disk(ScsiDisk::Kind::Disk, path);
+        IndyRig t;
+        t.w32(kMcMemCfg0, (0x2000u | 0x0F00u | 0x20u) << 16);
+        Wd33c93& wd = t.m.hpc3().scsi0();
+        wd.attach(2, &disk);
+        auto reg = [&](u8 r, u8 v) {
+            wd.write_address(r);
+            wd.write_data(v);
+        };
+        constexpr u32 kRegs = 0x1FB90000, kDesc = 0x08001000, kBuf = 0x08002000;
+        t.w32(kRegs + 0x1004, 0);  // out of reset
+        wd.write_address(0x17);
+        wd.read_data();  // its reset interrupt taken
+        t.w32(kDesc, kBuf);
+        t.w32(kDesc + 4, (1u << 31) | 512);
+        t.w32(kDesc + 8, 0);
+        t.w32(kRegs + 0x0004, kDesc);
+        t.w32(kRegs + 0x1004, 0x12);  // active, little-endian, device -> memory
+        reg(0x01, 0x80);              // DMA mode
+        const u8 cdb[6] = {0x08, 0, 0, 0, 1, 0};  // READ(6) block 0
+        for (unsigned i = 0; i < 6; ++i) reg(static_cast<u8>(0x03 + i), cdb[i]);
+        reg(0x12, 0);
+        reg(0x13, 2);
+        reg(0x14, 0);
+        reg(0x15, 2);
+        reg(0x18, 0x09);  // SELECT-AND-TRANSFER
+        t.m.run(static_cast<u64>(t.m.cycles_per_second() / 100));
+        wd.write_address(0x17);
+        CHECK_EQ(wd.read_data(), 0x16);
+        bool same = true;
+        for (u32 i = 0; i < 512; ++i) {
+            u8 b = 0;
+            t.m.bus().read<u8>((kBuf + i) ^ 7, b);
+            same &= b == static_cast<u8>(i * 3 + 1);
+        }
+        CHECK(same);
+    }
+    std::filesystem::remove(path);
 }
 
 TEST(indigo2_second_scsi_controller) {

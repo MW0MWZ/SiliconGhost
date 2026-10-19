@@ -66,6 +66,9 @@ public:
     // up to the handler (on IP22 the MC raises an interrupt).
     using ErrorHandler = std::function<void(u64 paddr, unsigned size, bool is_write)>;
     void set_error_handler(ErrorHandler handler) { error_handler_ = std::move(handler); }
+    // Called for writes to ROM (host memory mapped read-only); they change nothing.
+    using RomWriteHandler = std::function<void(u64 paddr)>;
+    void set_rom_write_handler(RomWriteHandler handler) { rom_write_handler_ = std::move(handler); }
 
     // Code tracking for the CPU's decoded-block cache. Host-backed memory has
     // one flag per 4 KiB ("decoded code was taken from here"), shared by all
@@ -148,6 +151,7 @@ private:
     std::vector<Page> pages_;
     std::vector<std::unique_ptr<Region>> regions_;
     ErrorHandler error_handler_;
+    RomWriteHandler rom_write_handler_;
     CodeWriteHandler code_write_handler_;
     std::function<void()> remap_handler_;
 };

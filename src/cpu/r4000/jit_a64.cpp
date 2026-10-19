@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <vector>
 
 #include "jit/a64_emitter.h"
@@ -85,6 +86,65 @@ bool R4000::jit_compile(Block& b) {
     // Linked blocks enter here, so the prologue must be the same everywhere.
     if (jit_link_offset_ == 0) jit_link_offset_ = top;
     if (top != jit_link_offset_) return false;
+    // The block-end code the translations share, once per buffer of code
+    // (see jit_x64.cpp). The enter stub runs the translation of the block at
+    // x1 for pc x0 if it fits in the budget x2; the lookup stub finds the
+    // block first. Either goes back to x6 when it can't, with x0, x2 and x6
+    // as they were.
+    if (jit_stub_generation_ != jit_generation_) {
+        Emitter s;
+        std::vector<Emitter::Site> miss;
+        std::size_t enter_at[2], lookup_at[2];
+        for (unsigned a = 0; a < 2; ++a) {
+            enter_at[a] = s.size();
+            s.ldr(x4, x1, offsetof(Block, code));
+            miss.push_back(s.cbz(x4));
+            s.ldr(x5, x1, offsetof(Block, jit_addr64), 1);
+            miss.push_back(a ? s.cbz(x5, false) : s.cbnz(x5, false));
+            s.ldr(x5, x1, offsetof(Block, count), 4);
+            s.cmp(x2, x5);
+            miss.push_back(s.b(Cond::Lt));
+            s.mov(kTime, x2);
+            s.mov(kPc, x0);
+            s.add_imm(x4, x4, static_cast<s64>(top));
+            s.br(x4);
+        }
+        for (unsigned a = 0; a < 2; ++a) {
+            lookup_at[a] = s.size();
+            s.tst_imm(x0, 3);
+            miss.push_back(s.b(Cond::Ne));
+            s.lsr(x1, x0, 12);
+            s.ubfiz(x3, x1, 5, 10);
+            s.ldr(kScratch0, kCpu, o_asid_tag);
+            s.orr(x1, x1, kScratch0);
+            s.add(x3, x3, kTlb);
+            s.sub_imm(x3, x3, kTableBytes);  // the fetch table precedes the load table
+            s.ldr(kScratch0, x3, offsetof(FastEntry, tag));
+            s.cmp(x1, kScratch0);
+            miss.push_back(s.b(Cond::Ne));
+            s.ldr(x3, x3, offsetof(FastEntry, host));
+            miss.push_back(s.cbz(x3));
+            s.and_imm(x1, x0, 0xFFF);
+            s.add(x3, x3, x1);  // host address of the instruction
+            s.lsr(x1, x3, 2);
+            s.and_imm(x1, x1, (1u << kBlockBits) - 1);
+            s.mov_imm(kScratch0, sizeof(Block));
+            s.load_constant(x4, reinterpret_cast<u64>(blocks_.data()));
+            s.madd(x1, x1, kScratch0, x4);
+            s.ldr(kScratch0, x1, offsetof(Block, host));
+            s.cmp(x3, kScratch0);
+            miss.push_back(s.b(Cond::Ne));
+            s.b_to(enter_at[a]);
+        }
+        for (const Emitter::Site& site : miss) s.bind(site);
+        s.br(x6);
+        s.finish_literals();
+        const u8* at = static_cast<const u8*>(jit_buf_->add(s.code().data(), s.size()));
+        if (!at) return false;
+        for (unsigned a = 0; a < 2; ++a) jit_enter_stub_[a] = at + enter_at[a], jit_lookup_stub_[a] = at + lookup_at[a];
+        jit_stub_generation_ = jit_generation_;
+    }
+    const u8* const base = jit_buf_->next();  // where this translation will go
     const bool addr64 = addr64_;
     b.jit_addr64 = addr64;
 
@@ -451,14 +511,62 @@ bool R4000::jit_compile(Block& b) {
         e.cmp_imm(x0, sr::CU1 | (fr ? sr::FR : 0), false);
         slow.push_back(e.b(Cond::Ne));
     };
-    auto fp_nearest = [&](std::vector<Site>& slow) {  // RM nearest, inexact trap off
+    auto fp_trap_off = [&](std::vector<Site>& slow) {  // the inexact trap off (any rounding)
         e.ldr(x0, kCpu, o_fcr31, 4);
-        e.tst_imm(x0, 0x83, false);
+        slow.push_back(e.cbnz_bit(x0, 7));
+    };
+    // Another way through an operation, placed with its way to the handler
+    // (see jit_x64.cpp): from `from`, `body`, then on at `join`.
+    using AltBody = std::function<void(std::vector<Site>& slow)>;
+    struct AltPath {
+        std::vector<Site> from;
+        AltBody body;
+        std::size_t join = 0;
+    };
+    std::vector<AltPath> alt_paths;  // of the operation being emitted
+    // Rounding other than to nearest (as on x86-64, by the host's flags):
+    // FPCR.RMode set from a MIPS rounding mode (RM 0-3: nearest, toward
+    // zero, up, down; RMode 0, 3, 1, 2), FCR31.RM's or a fixed one, the
+    // flags cleared, the operations, then FPCR back to nearest. Any flag but
+    // inexact goes to the handler; the flags stay in x3. x0-x3 are clobbered.
+    constexpr int kGuestRounding = -1;
+    auto fp_host_rounded = [&](int rm, auto&& op, std::vector<Site>& slow) {
+        if (rm == kGuestRounding) {
+            e.ldr(x0, kCpu, o_fcr31, 4);
+            e.and_imm(x0, x0, 3, false);
+            e.lsl(x0, x0, 1, false);
+            e.mov_imm32(x1, 0x9C);  // RMode for each RM, two bits apiece
+            e.lsrv(x1, x1, x0, false);
+            e.and_imm(x1, x1, 3, false);
+            e.lsl(x1, x1, 22, false);
+        } else {
+            static constexpr u32 kRmode[] = {0, 3, 1, 2};
+            e.mov_imm32(x1, kRmode[rm & 3] << 22);
+        }
+        e.mrs_fpcr(x2);
+        e.and_imm(x2, x2, ~(u64{3} << 22));
+        e.orr(x2, x2, x1);
+        e.msr_fpcr(x2);
+        e.msr_fpsr(xzr);
+        op();
+        e.mrs_fpsr(x3);
+        e.mrs_fpcr(x2);
+        e.and_imm(x2, x2, ~(u64{3} << 22));
+        e.msr_fpcr(x2);
+        e.tst_imm(x3, 0xF, false);  // invalid, divide by zero, overflow, underflow
         slow.push_back(e.b(Cond::Ne));
     };
-    // FPU register n (zero or normal, else slow) as a v register, its bits in x0.
-    auto fp_operand = [&](unsigned n, bool dbl, unsigned scratch, std::vector<Site>& slow) -> unsigned {
-        const unsigned v = fp_src(n, dbl, scratch);
+    // Rounding to nearest goes on in line; any other mode takes `path`,
+    // which rejoins where fp_join() is called. The body sees the machine
+    // state at the split, so it must not use the register cache.
+    auto fp_if_directed = [&](AltBody path) {
+        e.ldr(x6, kCpu, o_fcr31, 4);
+        e.tst_imm(x6, 3, false);
+        alt_paths.push_back({{e.b(Cond::Ne)}, std::move(path), 0});
+    };
+    auto fp_join = [&] { alt_paths.back().join = e.size(); };
+    // v register v holds zero or a normal number, else slow; its bits in x0.
+    auto fp_ordinary = [&](unsigned v, bool dbl, std::vector<Site>& slow) {
         e.fmov_to_gpr(x0, v, dbl);
         e.lsl(x1, x0, 1, dbl);
         const Site zero = e.cbz(x1, dbl);
@@ -467,6 +575,11 @@ bool R4000::jit_compile(Block& b) {
         e.cmp_imm(x1, dbl ? 0x7FD : 0xFD, false);
         slow.push_back(e.b(Cond::Hi));
         e.bind(zero);
+    };
+    // FPU register n (zero or normal, else slow) as a v register, its bits in x0.
+    auto fp_operand = [&](unsigned n, bool dbl, unsigned scratch, std::vector<Site>& slow) -> unsigned {
+        const unsigned v = fp_src(n, dbl, scratch);
+        fp_ordinary(v, dbl, slow);
         return v;
     };
     auto fp_commit_x1 = [&] {  // fp_commit() with x1 = 1 for an inexact result
@@ -481,6 +594,20 @@ bool R4000::jit_compile(Block& b) {
         e.ldr(x2, kCpu, o_fcr31, 4);
         e.and_imm(x2, x2, ~kCauseMask, false);
         e.str(x2, kCpu, o_fcr31, 4);
+    };
+    auto fp_commit_flags = [&] {  // fp_commit() with the inexact flag in x3 (FPSR.IXC)
+        e.lsr(x1, x3, 4, false);
+        e.and_imm(x1, x1, 1, false);
+        fp_commit_x1();
+    };
+    // A result (v register v) that is not denormal, else slow; x0, x1 clobbered.
+    auto fp_not_denormal = [&](unsigned v, bool dbl, std::vector<Site>& slow) {
+        e.fmov_to_gpr(x0, v, dbl);
+        e.lsl(x1, x0, 1, dbl);
+        const Site zero = e.cbz(x1, dbl);
+        e.lsr(x1, x1, dbl ? 53 : 24, dbl);
+        slow.push_back(e.cbz(x1, dbl));
+        e.bind(zero);
     };
     auto emit_fpu = [&](u32 w, std::vector<Site>& slow) -> bool {
         const unsigned opc = w >> 26;
@@ -521,9 +648,38 @@ bool R4000::jit_compile(Block& b) {
                 fp_write_gpr(fs, fmt == 0x05, src(ft, x2));
                 touch_();
                 return true;
+            case 0x02:  // CFC1
+                fp_usable(slow);
+                if (fs == 31) {
+                    static_assert(kFcrLazyI == 1u << 18);
+                    e.ldr(x0, kCpu, o_fcr31, 4);
+                    slow.push_back(e.cbnz_bit(x0, 18));  // Cause.I to be worked out first
+                    e.sxtw(x0, x0);
+                } else {
+                    e.mov_imm(x0, fs == 0 ? sext32(fir_) : 0);
+                }
+                write_nz(ft, x0);
+                touch_();
+                return true;
+            case 0x06:  // CTC1: FCR31 written, unless that raises an exception
+                fp_usable(slow);
+                if (fs == 31) {
+                    e.and_imm(x0, src(ft, x2), mips4_ ? kFcrWriteMask | kFcrCondMips4 : kFcrWriteMask, false);
+                    e.lsr(x1, x0, 12, false);
+                    e.and_imm(x1, x1, 0x3F, false);  // Cause
+                    e.lsr(x3, x0, 7, false);
+                    e.and_imm(x3, x3, 0x1F, false);
+                    e.orr_imm(x3, x3, 0x20, false);  // the enables, and E (always enabled)
+                    e.tst(x1, x3, false);
+                    slow.push_back(e.b(Cond::Ne));
+                    e.str(x0, kCpu, o_fcr31, 4);
+                }
+                touch_();
+                return true;
             case 0x10:
             case 0x11:
             case 0x14:
+            case 0x15:
                 break;
             default: return false;
         }
@@ -540,20 +696,31 @@ bool R4000::jit_compile(Block& b) {
             e.fcmp(true, a, c);
             e.cset(x1, Cond::Ne);
         };
-        if (fmt == 0x14) {  // CVT.S.W, CVT.D.W
+        if (fmt == 0x14 || fmt == 0x15) {  // CVT.S.W, CVT.D.W, CVT.S.L, CVT.D.L
             if (func != 0x20 && func != 0x21) return false;
-            const bool to_d = func == 0x21;
+            const bool to_d = func == 0x21, from_l = fmt == 0x15;
+            if (from_l) need64(slow);
             fp_usable(slow);
-            fp_nearest(slow);
-            fp_read_gpr(x4, fs, false);
-            e.scvtf(to_d, 0, x4);
-            if (to_d) {
+            fp_read_gpr(x4, fs, from_l);
+            if (to_d && !from_l) {  // exact
+                e.scvtf(true, 0, x4);
                 fp_commit_exact();
-            } else {
+            } else if (from_l) {  // the host's flags, any rounding
+                fp_trap_off(slow);
+                fp_host_rounded(kGuestRounding, [&] { e.scvtf(to_d, 0, x4, true); }, slow);
+                fp_commit_flags();
+            } else {  // inexact if the single differs from the integer
+                fp_trap_off(slow);
+                fp_if_directed([=, &e](std::vector<Site>& s) {
+                    fp_host_rounded(kGuestRounding, [&] { e.scvtf(false, 0, x4); }, s);
+                    fp_commit_flags();
+                });
+                e.scvtf(false, 0, x4);
                 e.fcvt_to_double(1, 0);
                 e.scvtf(true, 2, x4);
                 differ(1, 2);
                 fp_commit_x1();
+                fp_join();
             }
             fp_write_v(fd, to_d, 0);
             touch_();
@@ -593,8 +760,29 @@ bool R4000::jit_compile(Block& b) {
             const Emitter::Fop sum = subtract ? Emitter::Fop::Sub : Emitter::Fop::Add;
             need_mips4(slow);
             fp_usable(slow);
-            fp_nearest(slow);
+            fp_trap_off(slow);
             const unsigned a = fp_operand(fs, dbl, 4, slow), m = fp_operand(ft, dbl, 3, slow);
+            // Other rounding: the product and the sum under it, by the host's
+            // flags; fr from its cache register (brought in now) or memory.
+            const int kc = fp_slot(fr_reg, dbl);
+            const s64 fr_off = fpr_base + fp_storage(fr_reg, dbl);
+            fp_if_directed([=, &e](std::vector<Site>& s) {
+                unsigned vc = 2;
+                if (kc >= 0) vc = kFpCacheRegs[kc];
+                else e.fldr(2, kCpu, fr_off, dbl ? 8 : 4);
+                fp_ordinary(vc, dbl, s);
+                fp_host_rounded(
+                    kGuestRounding,
+                    [&] {
+                        e.fop(Emitter::Fop::Mul, dbl, 0, a, m);
+                        e.fmov(dbl, 1, 0);
+                        e.fop(sum, dbl, 0, 0, vc);
+                    },
+                    s);
+                fp_not_denormal(1, dbl, s);  // a tiny product: the handler
+                fp_not_denormal(0, dbl, s);
+                fp_commit_flags();
+            });
             e.fop(Emitter::Fop::Mul, dbl, 0, a, m);
             e.fnmsub(dbl, 1, a, m, 0);  // a * m - p
             e.fmov_to_gpr(x0, 0, dbl);
@@ -614,6 +802,7 @@ bool R4000::jit_compile(Block& b) {
             nonzero(1, dbl);
             e.orr(x1, x1, x5, false);
             fp_commit_x1();
+            fp_join();
             if (negate) {
                 e.fmov_to_gpr(x0, 0, dbl);
                 e.eor_imm(x0, x0, dbl ? u64{1} << 63 : u64{0x80000000u}, dbl);
@@ -645,11 +834,27 @@ bool R4000::jit_compile(Block& b) {
             e.bind(skip);
             return true;
         }
+        // Other rounding for the operations below: by the host's flags.
+        auto directed = [&](unsigned op, unsigned a, unsigned c) {
+            fp_if_directed([=, &e](std::vector<Site>& s) {
+                static constexpr Emitter::Fop kOps[] = {Emitter::Fop::Add, Emitter::Fop::Sub, Emitter::Fop::Mul,
+                                                        Emitter::Fop::Div};
+                fp_host_rounded(
+                    kGuestRounding,
+                    [&] {
+                        if (op == 0x04) e.fsqrt(dbl, 0, a);
+                        else e.fop(kOps[op], dbl, 0, a, c);
+                    },
+                    s);
+                fp_not_denormal(0, dbl, s);
+                fp_commit_flags();
+            });
+        };
         const bool recip = func == 0x15 && mips4_;
         if (func <= 0x04 || recip) {  // ADD, SUB, MUL, DIV, SQRT, RECIP (1 / fs, as DIV)
             if (recip) need_mips4(slow);
             fp_usable(slow);
-            fp_nearest(slow);
+            fp_trap_off(slow);
             unsigned a = 4;
             if (recip) {
                 e.mov_imm(x0, dbl ? 0x3FF0000000000000ull : 0x3F800000u);
@@ -660,6 +865,7 @@ bool R4000::jit_compile(Block& b) {
             }
             unsigned c = a;
             if (func == 0x04) {  // SQRT: a zero or a positive number not too small
+                directed(func, a, a);  // (x0 still holds the operand)
                 e.lsr(x1, x0, dbl ? 63 : 31, dbl);
                 const Site positive = e.cbz(x1, false);
                 e.lsl(x1, x0, 1, dbl);
@@ -675,6 +881,7 @@ bool R4000::jit_compile(Block& b) {
                 e.fmsub(dbl, 1, 0, 0, a);  // a - r * r
             } else {
                 c = fp_operand(recip ? fs : ft, dbl, 3, slow);
+                directed(func, a, c);  // (x0 still holds c)
                 if (func == 0x03) {  // DIV: a nonzero divisor, a dividend zero or not too small
                     e.lsl(x1, x0, 1, dbl);
                     slow.push_back(e.cbz(x1, dbl));
@@ -713,6 +920,7 @@ bool R4000::jit_compile(Block& b) {
             else if (func == 0x03) result_check({a}, min_result);
             nonzero(1, dbl);
             fp_commit_x1();
+            fp_join();
             fp_write_v(fd, dbl, 0);
             touch_();
             return true;
@@ -739,9 +947,14 @@ bool R4000::jit_compile(Block& b) {
             case 0x21: {  // CVT.D.S (exact)
                 if ((func == 0x20) != dbl) return false;  // CVT.S.S and CVT.D.D are unimplemented
                 fp_usable(slow);
-                if (dbl) fp_nearest(slow);
+                if (dbl) fp_trap_off(slow);
                 const unsigned v = fp_operand(fs, dbl, 4, slow);
                 if (dbl) {  // a zero, or a normal single, inexact if it differs from the double
+                    fp_if_directed([=, &e](std::vector<Site>& s) {
+                        fp_host_rounded(kGuestRounding, [&] { e.fcvt_to_single(0, v); }, s);
+                        fp_not_denormal(0, false, s);
+                        fp_commit_flags();
+                    });
                     e.fcvt_to_single(0, v);
                     e.fmov_to_gpr(x0, 0, false);
                     e.lsl(x1, x0, 1, false);
@@ -759,6 +972,7 @@ bool R4000::jit_compile(Block& b) {
                     e.fcvt_to_double(1, 0);
                     differ(1, v);
                     fp_commit_x1();
+                    fp_join();
                 } else {
                     e.fcvt_to_double(0, v);
                     fp_commit_exact();
@@ -767,21 +981,55 @@ bool R4000::jit_compile(Block& b) {
                 touch_();
                 return true;
             }
-            case 0x0C:  // ROUND.W (to nearest even)
-            case 0x0D:  // TRUNC.W
-            case 0x24: {  // CVT.W (RM, here nearest)
+            case 0x08: case 0x09: case 0x0A: case 0x0B:  // ROUND/TRUNC/CEIL/FLOOR.L
+            case 0x0C: case 0x0D: case 0x0E: case 0x0F:  // ROUND/TRUNC/CEIL/FLOOR.W
+            case 0x24:                                   // CVT.W (FCR31.RM)
+            case 0x25: {                                 // CVT.L
+                const bool to_long = func == 0x25 || func < 0x0C;
+                if (to_long) need64(slow);
                 fp_usable(slow);
-                fp_nearest(slow);
+                fp_trap_off(slow);
                 const unsigned v = fp_operand(fs, dbl, 4, slow);
-                e.fcvt_to_int(dbl, func == 0x0D, x4, v);
-                // Out of range saturates (exactly -2^31 or 2^31 - 1: the handler sorts it out).
-                e.mov_imm32(x1, 0x80000000u);
-                e.cmp(x4, x1, false);
-                slow.push_back(e.b(Cond::Eq));
-                e.mov_imm32(x1, 0x7FFFFFFFu);
-                e.cmp(x4, x1, false);
-                slow.push_back(e.b(Cond::Eq));
-                e.scvtf(true, 1, x4);  // inexact if the integer differs from the operand
+                // The direction in the function's low bits, in FCR31.RM's order.
+                if (func >= 0x24) {
+                    fp_if_directed([=, &e](std::vector<Site>&) {
+                        e.and_imm(x6, x6, 3, false);  // RM, from the split
+                        e.cmp_imm(x6, 2, false);
+                        const Site up = e.b(Cond::Eq);
+                        const Site down = e.b(Cond::Hi);
+                        e.fcvt_to_int(dbl, 1, x4, v, to_long);
+                        const Site done1 = e.b();
+                        e.bind(up);
+                        e.fcvt_to_int(dbl, 2, x4, v, to_long);
+                        const Site done2 = e.b();
+                        e.bind(down);
+                        e.fcvt_to_int(dbl, 3, x4, v, to_long);
+                        e.bind(done1);
+                        e.bind(done2);
+                    });
+                    e.fcvt_to_int(dbl, 0, x4, v, to_long);
+                    fp_join();
+                } else {
+                    e.fcvt_to_int(dbl, func & 3, x4, v, to_long);
+                }
+                // Out of range saturates (exactly the most negative or positive
+                // integer: the handler sorts it out).
+                if (to_long) {
+                    e.mov_imm(x1, u64{1} << 63);
+                    e.cmp(x4, x1);
+                    slow.push_back(e.b(Cond::Eq));
+                    e.mvn(x1, x1);
+                    e.cmp(x4, x1);
+                    slow.push_back(e.b(Cond::Eq));
+                } else {
+                    e.mov_imm32(x1, 0x80000000u);
+                    e.cmp(x4, x1, false);
+                    slow.push_back(e.b(Cond::Eq));
+                    e.mov_imm32(x1, 0x7FFFFFFFu);
+                    e.cmp(x4, x1, false);
+                    slow.push_back(e.b(Cond::Eq));
+                }
+                e.scvtf(true, 1, x4, to_long);  // inexact if the integer differs from the operand
                 if (dbl) {
                     differ(1, v);
                 } else {
@@ -789,7 +1037,28 @@ bool R4000::jit_compile(Block& b) {
                     differ(1, 2);
                 }
                 fp_commit_x1();
-                fp_write_gpr(fd, false, x4);
+                fp_write_gpr(fd, to_long, x4);
+                touch_();
+                return true;
+            }
+            case 0x16: {  // RSQRT (MIPS IV): the square root rounded, then its reciprocal, by the host's flags
+                if (!mips4_) break;
+                need_mips4(slow);
+                fp_usable(slow);
+                fp_trap_off(slow);
+                const unsigned a = fp_operand(fs, dbl, 4, slow);
+                e.mov_imm(x5, dbl ? 0x3FF0000000000000ull : 0x3F800000u);
+                e.fmov_from_gpr(1, x5, dbl);
+                fp_host_rounded(
+                    kGuestRounding,
+                    [&] {
+                        e.fsqrt(dbl, 0, a);
+                        e.fop(Emitter::Fop::Div, dbl, 0, 1, 0);
+                    },
+                    slow);
+                fp_not_denormal(0, dbl, slow);
+                fp_commit_flags();
+                fp_write_v(fd, dbl, 0);
                 touch_();
                 return true;
             }
@@ -1340,6 +1609,7 @@ bool R4000::jit_compile(Block& b) {
             pc_plus(x1, 4 * i + 4);
             e.and_imm(x1, x1, ~u64{0x0FFFFFFF});
             e.orr_imm(x1, x1, (w & 0x03FFFFFFu) << 2);
+            add_successor(static_cast<s64>((w << 2) & 0xFFF) - static_cast<s64>(page_offset));  // if in this page
             if (opc == 0x03) {
                 pc_plus(x0, 4 * i + 8);
                 write(31, x0);
@@ -1454,11 +1724,17 @@ bool R4000::jit_compile(Block& b) {
             std::vector<Site> slow;
             Site skip_slow;
             const u64 dirty_before = dirty;
+            alt_paths.clear();
             const bool fast = emit_alu(w, slow) || emit_fpu(w, slow) || emit_memory(w, slow);
             const u64 loaded_after = loaded;
             if (fast) {
                 if (delay_slot && leave) leave_delay_slot(branch_by_handler);
                 skip_slow = e.b();
+                for (const AltPath& alt : alt_paths) {
+                    for (const Site& site : alt.from) e.bind(site);
+                    alt.body(slow);
+                    e.b_to(alt.join);
+                }
                 for (const Site& site : slow) e.bind(site);
             }
 
@@ -1632,32 +1908,20 @@ bool R4000::jit_compile(Block& b) {
         }
         const u64 dirty_end = dirty;
         flush(dirty_end);
-        // Enters the translation of the block at `block` for pc x0 if it fits.
-        // (x5 is its own scratch: `block` may be any of x1, x3.)
-        auto enter = [&](Reg block) {
-            e.ldr(x4, block, offsetof(Block, code));
-            to_finish.push_back(e.cbz(x4));
-            e.ldr(x5, block, offsetof(Block, jit_addr64), 1);
-            to_finish.push_back(addr64 ? e.cbz(x5, false) : e.cbnz(x5, false));
-            e.ldr(x5, block, offsetof(Block, count), 4);
-            e.cmp(x2, x5);
-            to_finish.push_back(e.b(Cond::Lt));
-            e.mov(kTime, x2);
-            e.mov(kPc, x0);
-            e.add_imm(x4, x4, static_cast<s64>(top));
-            e.br(x4);
-        };
+        // On to the shared stubs (above), which come back to to_finish
+        // through x6 if they can't enter the next translation.
+        to_finish.push_back(e.adr(x6));
         for (s64 delta : outside) {
             pc_plus(x1, delta);
             e.cmp(x0, x1);
             const Site next = e.b(Cond::Ne);
             const u8* const host = page_host + static_cast<u32>(static_cast<s64>(page_offset) + delta);
-            e.load_constant(x3, reinterpret_cast<u64>(&blocks_[block_index(host)]));
-            e.load_constant(x1, reinterpret_cast<u64>(host));
-            e.ldr(kScratch0, x3, offsetof(Block, host));
-            e.cmp(x1, kScratch0);
+            e.load_constant(x1, reinterpret_cast<u64>(&blocks_[block_index(host)]));
+            e.load_constant(x3, reinterpret_cast<u64>(host));
+            e.ldr(kScratch0, x1, offsetof(Block, host));
+            e.cmp(x3, kScratch0);
             to_finish.push_back(e.b(Cond::Ne));
-            enter(x3);
+            e.b_abs(jit_enter_stub_[addr64], base);
             e.bind(next);
         }
         // A jump through a register to a place in the page with no link:
@@ -1674,33 +1938,11 @@ bool R4000::jit_compile(Block& b) {
             call(reinterpret_cast<const void*>(&R4000::jit_jr_miss));
             e.sub_imm(x2, kTime, blk.count);
             e.ldr(x0, kCpu, o_pc);
+            to_finish.push_back(e.adr(x6));  // the call may have changed it
             e.bind(other_page);
         }
         // Anywhere else: look up the fetch translation and the block.
-        e.tst_imm(x0, 3);
-        to_finish.push_back(e.b(Cond::Ne));
-        e.lsr(x1, x0, 12);
-        e.ubfiz(x3, x1, 5, 10);
-        e.ldr(kScratch0, kCpu, o_asid_tag);
-        e.orr(x1, x1, kScratch0);
-        e.add(x3, x3, kTlb);
-        e.sub_imm(x3, x3, kTableBytes);  // the fetch table precedes the load table
-        e.ldr(kScratch0, x3, offsetof(FastEntry, tag));
-        e.cmp(x1, kScratch0);
-        to_finish.push_back(e.b(Cond::Ne));
-        e.ldr(x3, x3, offsetof(FastEntry, host));
-        to_finish.push_back(e.cbz(x3));
-        e.and_imm(x1, x0, 0xFFF);
-        e.add(x3, x3, x1);  // host address of the instruction
-        e.lsr(x1, x3, 2);
-        e.and_imm(x1, x1, (1u << kBlockBits) - 1);
-        e.mov_imm(kScratch0, sizeof(Block));
-        e.load_constant(x4, reinterpret_cast<u64>(blocks_.data()));
-        e.madd(x1, x1, kScratch0, x4);
-        e.ldr(kScratch0, x1, offsetof(Block, host));
-        e.cmp(x3, kScratch0);
-        to_finish.push_back(e.b(Cond::Ne));
-        enter(x1);
+        e.b_abs(jit_lookup_stub_[addr64], base);
 
         // Completed the block.
         for (const Site& site : to_finish_dirty) e.bind(site);
@@ -1739,7 +1981,7 @@ bool R4000::jit_compile(Block& b) {
     e.finish_literals();
 
     const void* fn = jit_buf_->add(e.code().data(), e.size());
-    if (!fn) return false;
+    if (fn != base) return false;  // full
     b.code = reinterpret_cast<JitFn>(const_cast<void*>(fn));
     b.jit_region = rb.size() > 1;
     b.region = JitRegion{};

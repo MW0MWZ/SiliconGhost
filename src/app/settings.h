@@ -53,9 +53,12 @@ struct Settings {
     std::string cpu = "r4400sc";
     double cpu_mhz = 150.0;
     unsigned ram_mb = 64;
-    bool graphics = true;  // a Newport board fitted
-    bool xl24 = false;     // and it is the 24-bit XL24
+    bool graphics = true;  // a graphics board fitted
+    std::string graphics_board = "xl24";  // xl24, or solid-, high- or max-impact (Indigo2)
     int graphics_rev = -1;  // its board revision, 0-7; -1 for the usual one
+    // Where the PROM puts its console, written to NVRAM at power-on (see
+    // IndyConfig::console): "graphics", "serial", or empty to leave it.
+    std::string console;
     std::optional<std::array<u8, 6>> mac;
     std::string net = "user";  // user | tap:NAME | none
     std::vector<net::PortForward> forwards;
@@ -82,9 +85,8 @@ struct Settings {
 };
 
 // What the window offers on first start, with no settings file yet: the
-// best-equipped Indy (256 MiB, the 24-bit board, a 250 MHz CPU). The speed
-// limit keeps the CPU at most 1.2x as fast, 300 MHz in all: IRIX 5.3 does
-// not boot beyond about 350.
+// best-equipped Indy (256 MiB, the 24-bit board, a 200 MHz CPU), timed at
+// 1.2x the real CPU.
 Settings first_run_settings();
 
 ip22::Board board_of(const Settings& s);
@@ -105,7 +107,7 @@ std::vector<std::string> configuration_notes(const Settings& s);
 
 // Text forms shared by the command line and the settings file.
 const char* timing_name(Pacer::Mode mode);
-const char* graphics_name(const Settings& s);  // xl8, xl24 or none
+const char* graphics_name(const Settings& s);  // the board, or none
 bool parse_timing(const std::string& text, Pacer::Mode& mode);
 std::string mac_text(const std::array<u8, 6>& mac);
 bool parse_mac(const std::string& text, std::array<u8, 6>& mac);

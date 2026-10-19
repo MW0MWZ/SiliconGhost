@@ -32,6 +32,8 @@
     <string>Copyright (C) 2026 Andy Taylor. GNU General Public License, version 2 or later.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>The emulated Indy records from your audio input when recording is turned on in Settings.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>The emulated Indy's network reaches your local network (your router's name server and other machines) through user-mode networking.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

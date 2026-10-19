@@ -74,7 +74,6 @@ ExecBuffer::~ExecBuffer() {
 }
 
 const void* ExecBuffer::add(const u8* code, std::size_t size) {
-    constexpr std::size_t kAlign = 16;
     const std::size_t start = (used_ + kAlign - 1) & ~(kAlign - 1);
     if (!ok() || start + size > size_) return nullptr;
 #if defined(__APPLE__)

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
-// Newport (XL8/XL24) graphics for the IP22 GFX slot: REX3 raster engine,
+// Newport XL24 graphics for the IP22 GFX slot: REX3 raster engine,
 // RB2 frame buffer, the display control bus (DCB) with VC2 video timing and
 // cursor, XMAP9 pixel-mode mapping, CMAP colour maps and the Bt445 RAMDAC.
 //
@@ -13,18 +13,17 @@
 #include <vector>
 
 #include "core/scheduler.h"
+#include "machine/ip22/gfx_board.h"
 #include "mem/bus.h"
 
 namespace sg::ip22 {
 
-class Newport final : public Device {
+class Newport final : public GfxBoard {
 public:
     struct Options {
-        bool xl24 = false;
         u8 monitor_id = 0xA;  // monitor sense: 0xA = 1280x1024 @ 60 Hz
-        // Board revision, 0-7, read from CMAP0; -1 for the usual one (2 for
-        // the XL8, 0 for the XL24). Drivers choose timings and cursor
-        // offsets by it, and see an 8-bit board only from revision 2.
+        // Board revision, 0-7, read from CMAP0; -1 for the usual one (0).
+        // Drivers choose timings and cursor offsets by it.
         int board_revision = -1;
     };
 
@@ -33,37 +32,51 @@ public:
     static constexpr int kRows = 1024;
 
     Newport(Scheduler& scheduler, double cpu_hz, const Options& options);
-    void reset();
+    void reset() override;
 
     const char* name() const override { return "newport"; }
     bool read(u32 offset, unsigned size, u64& value) override;
     bool write(u32 offset, unsigned size, u64 value) override;
 
-    // Vertical retrace interrupt (INT3 LOCAL1 bit 7).
-    void set_retrace_callback(std::function<void(bool)> cb) { retrace_cb_ = std::move(cb); }
+    // The slot as the board decodes it: REX3 at +0xF0000 (where read() and
+    // write() take their offsets from), the rest answering without a fault.
+    Device& slot_device() override { return slot_; }
 
     // Bumped by anything that can change the picture (frame buffer writes,
     // VC2, XMAP, CMAP, RAMDAC, TOPSCAN): a front end can skip render() while
     // it stays the same.
-    u64 display_version() const { return display_version_; }
+    u64 display_version() const override { return display_version_; }
     // Scans out the visible screen as 0xAARRGGBB pixels. Returns false when
     // video timing is not running (no signal); width/height come from the
     // VC2 timing tables. `argb` should hold the previous call's picture: only
     // the lines that changed since then are converted again (all of them if
     // the size differs or the display set-up changed).
-    bool render(std::vector<u32>& argb, unsigned& width, unsigned& height);
+    bool render(std::vector<u32>& argb, unsigned& width, unsigned& height) override;
     // The same picture, converted from scratch the straightforward way
     // (screenshots; render() is checked against it).
-    bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const;
-    u64 frames() const { return frames_; }
+    bool render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const override;
+    u64 frames() const override { return frames_; }
     // Where the system has put the hardware cursor (the VC2 shows it there
     // from the next vertical retrace): the top left of its glyph in screen
     // coordinates. False while the cursor is off.
-    bool cursor_position(int& x, int& y) const;
+    bool cursor_position(int& x, int& y) const override;
     // Pixels the REX3 has drawn (a measure of how busy the board is).
-    u64 pixels_drawn() const { return pixels_drawn_; }
+    u64 pixels_drawn() const override { return pixels_drawn_; }
 
 private:
+    class Slot final : public Device {
+    public:
+        explicit Slot(Newport& board) : board_(board) {}
+        const char* name() const override { return "gfx-slot"; }
+        bool read(u32 offset, unsigned size, u64& value) override;
+        bool write(u32 offset, unsigned size, u64 value) override;
+        bool read_is_pure(u32 offset, unsigned size) const override;
+
+    private:
+        Newport& board_;
+    };
+    Slot slot_{*this};
+
     // ---- REX3 ----
     u32 rex3_read(u32 reg);
     void rex3_write(u32 reg, u32 value);
@@ -123,7 +136,25 @@ private:
     u8 ramdac_read(unsigned crs);
 
     // ---- Display ----
-    bool screen_size(unsigned& width, unsigned& height) const;
+    // What the VC2's video timing table makes of the picture, worked out from
+    // its channels (VC2 spec, video timing channels): the visible size, the
+    // frame buffer column the first visible pixel shows, where cursor (0, 0)
+    // falls relative to the screen, and the frame's lines for the line
+    // counter. Recomputed when the VC2's registers or RAM change.
+    struct VideoTiming {
+        unsigned width = 0, height = 0;  // visible pixels and lines (0: no picture)
+        int scan_column = 2;             // frame buffer column of screen column 0
+        int cursor_x = 29, cursor_y = 31;  // the screen column/line of CURX/CURY 0, negated
+        unsigned lines = 1065;           // lines in the frame
+        unsigned counter_at_vint = 1054; // the line counter when the vertical interrupt comes
+    };
+    const VideoTiming& video_timing() const;
+    bool screen_size(unsigned& width, unsigned& height) const {
+        const VideoTiming& t = video_timing();
+        width = t.width;
+        height = t.height;
+        return width > 0 && height > 0;
+    }
     // Scan-out changes: a whole-picture change (timing, DID tables, cursor
     // glyph, maps, gamma) or just the lines the cursor covers.
     void picture_changed() {
@@ -145,7 +176,6 @@ private:
     u32 aux_mask(u32 mode, bool& underlay) const;
     bool pixel_value_nonzero(u32 mode, u32 pix) const;
     u32 pixel_colour(u32 mode, u32 pix) const;
-    u8 did_at(const std::vector<std::pair<int, u8>>& records, int x) const;
     unsigned cursor_pixel(int x, int y) const;
     void retrace();
     void set_vrint(bool level);
@@ -154,7 +184,6 @@ private:
     double cpu_hz_;
     Options opts_;
     Timer retrace_timer_;
-    std::function<void(bool)> retrace_cb_;
     u64 frames_ = 0;
     u64 pixels_drawn_ = 0;
 
@@ -193,6 +222,9 @@ private:
     void latch_shown();
 
     u64 display_version_ = 0;
+    u64 vc2_version_ = 1;                // bumped by VC2 register and RAM writes
+    mutable u64 timing_version_ = 0;     // vc2_version_ the cached video timing is for
+    mutable VideoTiming timing_;
     bool full_redraw_ = true;
     std::vector<u8> row_dirty_ = std::vector<u8>(kRows, 1);  // frame buffer rows written since the last render
     std::vector<std::pair<int, int>> cursor_rows_;          // screen lines [first, end) the cursor left or entered

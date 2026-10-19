@@ -121,6 +121,7 @@ private:
         u32 cbp = 0, ndbp = 0, ctrl = 0;
         u32 cdp = 0;  // descriptor last fetched (where receiving stopped)
         bool active = false;
+        bool rbo = false;  // receive: a packet was larger than its buffer
     };
     void enet_receive(const u8* frame, std::size_t length);
     void enet_transmit();
@@ -155,6 +156,11 @@ private:
     bool enet_irq_ = false, enet_loopback_ = false;
     bool enet_rx_ready() const;
     double enet_bits_per_second() const { return fast_io_ ? 1e9 : 10e6; }
+    // CPU cycles a frame of `bytes` (without FCS) takes on the wire, with its
+    // preamble, FCS and the gap after it.
+    u64 enet_wire_cycles(std::size_t bytes) const;
+    u64 enet_turnaround_cycles() const;
+    u64 enet_wire_free_ = 0;  // cycle the frame being sent is off the wire
     bool fast_io_ = false;
     bool enet_held_ = true;  // channel reset bit: set at power-on, holds the channel and the Seeq in reset
     u32 enet_dconfig_ = 0, enet_pconfig_ = 0;

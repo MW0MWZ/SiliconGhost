@@ -26,6 +26,7 @@ constexpr u32 kInt2Window = 0x59000;  // PBUS PIO channel 4 (Indigo2: INT2)
 constexpr u32 kInt2WindowEnd = kInt2Window + 0x400;
 constexpr u32 kIocWindow = 0x59800;  // PBUS PIO channel 6
 constexpr u32 kIocWindowEnd = kIocWindow + 0x400;
+constexpr unsigned kIocRegisters = 64;  // the IOC decodes 6 address bits: repeated through the window
 constexpr u32 kExtIo = kIocWindow + 4 * Ioc2::kExtIoIndex;  // Indigo2: 16 bits, in the low half of the word
 constexpr u32 kScsiWindow = 0x40000;  // WD33C93s, 0x8000 apart: SASR at word 0, data at word 1
 constexpr u32 kScsiWindowSize = 0x8000;
@@ -73,6 +74,7 @@ constexpr u32 kEnetReset = 0x15014, kEnetDmaCfg = 0x15018, kEnetPioCfg = 0x1501C
 constexpr u32 kEnetTxCbp = 0x16000, kEnetTxNdbp = 0x16004, kEnetTxBcd = 0x17000, kEnetTxCtrl = 0x17004;
 constexpr u32 kSeeqWindow = 0x54000, kSeeqWindowEnd = 0x54500;
 constexpr u32 kEnetCtrlEndian = 1u << 8, kEnetCtrlActive = 1u << 9, kEnetCtrlActiveMask = 1u << 10;
+constexpr u32 kEnetCtrlRbo = 1u << 11;  // receive buffer overflow, cleared by reading the register
 constexpr u32 kEnetResetChannel = 1u << 0, kEnetResetClearIrq = 1u << 1, kEnetResetLoopback = 1u << 2;
 // Ethernet descriptor count word
 constexpr u32 kEnetDescEnd = 1u << 31;        // end of chain (transmit) / ring (receive)
@@ -82,8 +84,10 @@ constexpr u32 kEnetDescTxDone = 1u << 15;     // set by the HPC once sent
 constexpr u32 kEnetDescOwn = 1u << 14;        // receive buffer handed to the HPC
 constexpr std::size_t kEnetMinFrame = 60;     // without the FCS
 constexpr std::size_t kEnetMaxFrame = 1518;
+// Battery-backed RAM: 32K words, of which the DS1386-8K decodes 13 address
+// lines, so it repeats four times.
 constexpr u32 kRtcWindow = 0x60000;
-constexpr u32 kRtcWindowEnd = 0x68000;
+constexpr u32 kRtcWindowEnd = 0x80000;
 
 // EEPROM register bits
 constexpr u32 kEepromPre = 1u << 0;  // protect register enable
@@ -115,6 +119,7 @@ void Hpc3::reset() {
     regs_.clear();
     written_.clear();
     eeprom_reg_ = 0;
+    enet_wire_free_ = 0;
     eeprom_.set_lines(false, false, false);
     for (unsigned ch = 0; ch < 2; ++ch) {
         scsi_[ch]->reset();
@@ -155,14 +160,37 @@ bool Hpc3::enet_rx_ready() const {
     return enet_rx_.active && bus_.read<u32>(enet_rx_.ndbp + 4, cnt) && (cnt & kEnetDescOwn);
 }
 
+// The least time from a frame leaving to the first frame back: the other
+// end's turnaround (200 us, about as quick as a host on the wire answered),
+// then a minimum frame's time on the wire. IRIX misses some replies that
+// come back much sooner (pings to the NAT's own addresses, with fast I/O
+// at 50 us).
+u64 Hpc3::enet_turnaround_cycles() const {
+    return static_cast<u64>(200e-6 * cpu_hz_) + enet_wire_cycles(kEnetMinFrame);
+}
+
+u64 Hpc3::enet_wire_cycles(std::size_t bytes) const {
+    const std::size_t wire = std::max(bytes, kEnetMinFrame) + 24;
+    return std::max<u64>(1, static_cast<u64>(static_cast<double>(wire) * 8 / enet_bits_per_second() * cpu_hz_));
+}
+
+// A frame from the host is in the guest's buffer only once it has crossed
+// the wire, which it can start doing only after the frame being sent is off
+// it and the other end has had time to answer: a reply the host makes at
+// once (the NAT answering a ping to its own address, an ARP reply) must not
+// land as the request leaves. IRIX loses such replies.
 void Hpc3::poll_network() {
-    if (net_ && !enet_poll_timer_->active() && net_->pending()) enet_poll_timer_->schedule_in(1);
+    if (net_ && !enet_poll_timer_->active() && net_->pending()) {
+        const u64 now = scheduler_.now();
+        enet_poll_timer_->schedule_in(std::max(now, enet_wire_free_) - now + enet_turnaround_cycles());
+    }
 }
 
 // Resets both channels and the Seeq (the interrupt is cleared as well).
 void Hpc3::enet_reset() {
     enet_rx_.active = enet_tx_.active = false;
     enet_rx_.ctrl = enet_tx_.ctrl = 0;
+    enet_rx_.rbo = false;
     enet_tx_timer_->cancel();
     seeq_.reset();
     enet_irq_ = false;
@@ -181,6 +209,10 @@ void Hpc3::enet_interrupt() {
 // includes the channel stopped at the end of its ring until restarted.
 void Hpc3::enet_poll() {
     if (!net_) return;
+    if (const u64 now = scheduler_.now(); now < enet_wire_free_) {  // still sending
+        enet_poll_timer_->schedule_in(enet_wire_free_ - now + enet_turnaround_cycles());
+        return;
+    }
     if (fast_io_ && !enet_held_ && !enet_rx_ready()) {
         enet_poll_timer_->schedule_in(std::max<u64>(1, static_cast<u64>(cpu_hz_ * 50e-6)));
         return;
@@ -188,8 +220,7 @@ void Hpc3::enet_poll() {
     std::vector<u8> frame;
     if (net_->receive(frame)) {
         enet_receive(frame.data(), frame.size());
-        const std::size_t wire = std::max(frame.size(), kEnetMinFrame) + 24;
-        enet_poll_timer_->schedule_in(std::max<u64>(1, static_cast<u64>(wire * 8 / enet_bits_per_second() * cpu_hz_)));
+        enet_poll_timer_->schedule_in(enet_wire_cycles(frame.size()));
     }
 }
 
@@ -197,50 +228,51 @@ void Hpc3::enet_poll() {
 // minimum length) and the receive status, starting a new descriptor. Only
 // descriptors the driver has handed over (OWN set) take data; the HPC clears
 // OWN and leaves the unused byte count in each one it fills.
+// Each packet goes into one descriptor's buffer (the HPC3 takes exactly one
+// per packet): two bytes of padding, the frame, then the Seeq's status byte.
+// A packet larger than the buffer fills it, sets RBO and stops the channel.
 void Hpc3::enet_receive(const u8* frame, std::size_t length) {
     if (!seeq_.accepts(frame, length) || length > kEnetMaxFrame) return;
     ++enet_rx_frames_;
     if (!enet_rx_.active) return;  // no buffers: the frame is lost
+    const u32 desc = enet_rx_.ndbp;
+    enet_rx_.cdp = desc;
+    u32 pbuf = 0, cnt = 0, next = 0;
+    bus_.read<u32>(desc, pbuf);
+    bus_.read<u32>(desc + 4, cnt);
+    bus_.read<u32>(desc + 8, next);
+    // The driver has not handed this buffer back yet (OWN is the drivers'
+    // convention; the HPC3 itself only stops at EOX): the frame is dropped
+    // rather than written over a buffer still in use, and the channel stays
+    // ready for the next one.
+    if (!(cnt & kEnetDescOwn)) return;
     std::vector<u8> data(2 + std::max(length, kEnetMinFrame) + 1, 0);
     std::memcpy(&data[2], frame, length);
-    u8 status = Seeq8003::kRxGood | Seeq8003::kRxEndOfFrame;
-    std::size_t done = 0;
-    bool irq = false;
-    for (int descs = 0; descs < 64; ++descs) {
-        const u32 desc = enet_rx_.ndbp;
-        enet_rx_.cdp = desc;
-        u32 pbuf = 0, cnt = 0, next = 0;
-        bus_.read<u32>(desc, pbuf);
-        bus_.read<u32>(desc + 4, cnt);
-        bus_.read<u32>(desc + 8, next);
-        if (!(cnt & kEnetDescOwn)) {
-            // The driver has not handed this buffer back yet (OWN is the
-            // drivers' convention; the HPC3 itself only stops at EOX). The
-            // frame is dropped rather than written over a buffer still in
-            // use, and the channel stays ready for the next one.
-            if (done == 0) return;
-            status = Seeq8003::kRxOverflow;
-            break;
-        }
-        const u32 room = cnt & kDescCountMask;
-        const u32 n = static_cast<u32>(std::min<std::size_t>(room, data.size() - done));
-        if (n == data.size() - done) data.back() = status;  // the status byte lands in this buffer
-        if (!bus_.write_block(pbuf, &data[done], n))
-            for (u32 i = 0; i < n; ++i) bus_.write<u8>(pbuf + i, data[done + i]);
-        done += n;
-        const bool last = done == data.size();
-        bus_.write<u32>(desc + 4, (cnt & ~(kDescCountMask | kEnetDescOwn)) | (room - n) | (last ? kEnetDescEndPacket : 0));
-        enet_rx_.cbp = pbuf + n;
-        irq |= (cnt & kEnetDescXie) != 0;
-        if (cnt & kEnetDescEnd) {  // end of the ring: receiving stops
-            enet_rx_.active = false;
-            if (!last) status = Seeq8003::kRxOverflow;
-            break;
-        }
-        enet_rx_.ndbp = next;
-        if (last) break;
+    data.back() = Seeq8003::kRxGood | Seeq8003::kRxEndOfFrame;
+    const u32 room = cnt & kDescCountMask;
+    const bool fits = data.size() <= room;
+    const u32 n = fits ? static_cast<u32>(data.size()) : room;
+    // Little-endian transfers carry byte n of each doubleword in its bits
+    // 8n+7..8n, which in the big-endian memory is the byte at address ^ 7.
+    if (enet_rx_.ctrl & kEnetCtrlEndian) {
+        for (u32 i = 0; i < n; ++i) bus_.write<u8>((pbuf + i) ^ 7, data[i]);
+    } else if (!bus_.write_block(pbuf, data.data(), n)) {
+        for (u32 i = 0; i < n; ++i) bus_.write<u8>(pbuf + i, data[i]);
     }
-    irq |= seeq_.received(status);
+    bus_.write<u32>(desc + 4, (cnt & ~(kDescCountMask | kEnetDescOwn)) | (room - n) | kEnetDescEndPacket);
+    enet_rx_.cbp = pbuf + n;
+    bool irq = (cnt & kEnetDescXie) != 0;
+    if (!fits) {
+        enet_rx_.rbo = true;
+        enet_rx_.active = false;
+        irq = true;
+    } else if (cnt & kEnetDescEnd) {  // end of the ring: receiving stops
+        enet_rx_.active = false;
+        irq = true;
+    } else {
+        enet_rx_.ndbp = next;
+    }
+    irq |= seeq_.received(data.back());  // the Seeq took the frame whole
     if (irq) enet_interrupt();
 }
 
@@ -248,7 +280,9 @@ void Hpc3::enet_receive(const u8* frame, std::size_t length) {
 void Hpc3::enet_transmit() {
     if (!enet_tx_.active) return;
     std::vector<u8> frame;
+    const bool little = enet_tx_.ctrl & kEnetCtrlEndian;  // see enet_receive
     bool irq = false, end_of_packet = false;
+    u32 first_desc = 0, first_cnt = 0;
     for (int descs = 0; descs < 64 && !end_of_packet; ++descs) {
         const u32 desc = enet_tx_.ndbp;
         u32 pbuf = 0, cnt = 0, next = 0;
@@ -258,34 +292,45 @@ void Hpc3::enet_transmit() {
         const u32 n = cnt & kDescCountMask;
         const std::size_t at = frame.size();
         frame.resize(std::min(at + n, kEnetMaxFrame));
-        for (std::size_t i = at; i < frame.size(); ++i) bus_.read<u8>(static_cast<u32>(pbuf + (i - at)), frame[i]);
-        bus_.write<u32>(desc + 4, cnt | kEnetDescTxDone);
+        for (std::size_t i = at; i < frame.size(); ++i)
+            bus_.read<u8>(static_cast<u32>(pbuf + (i - at)) ^ (little ? 7u : 0u), frame[i]);
+        if (descs == 0) first_desc = desc, first_cnt = cnt;
         enet_tx_.cbp = pbuf + n;
-        irq |= (cnt & kEnetDescXie) != 0;
         end_of_packet = cnt & kEnetDescEndPacket;
+        irq |= end_of_packet && (cnt & kEnetDescXie);  // XIE counts on a packet's last descriptor only
         if (cnt & kEnetDescEnd) {
             enet_tx_.active = false;
             break;
         }
         enet_tx_.ndbp = next;
     }
+    // Sent: TXD goes into the packet's first descriptor, clearing its count
+    // (bits 14:0).
+    bus_.write<u32>(first_desc + 4, (first_cnt & ~0x7FFFu) | kEnetDescTxDone);
     if (frame.size() < kEnetMinFrame) frame.resize(kEnetMinFrame, 0);
     ++enet_tx_frames_;
-    if (enet_loopback_) enet_receive(frame.data(), frame.size());
-    else if (net_) net_->send(frame.data(), frame.size());
-    irq |= seeq_.transmitted(end_of_packet ? Seeq8003::kTxDone : Seeq8003::kTxUnderflow);
+    if (enet_loopback_) {
+        if (seeq_.receives_own()) enet_receive(frame.data(), frame.size());
+    } else if (net_) {
+        net_->send(frame.data(), frame.size());
+        enet_wire_free_ = scheduler_.now() + enet_wire_cycles(frame.size());
+    }
+    irq |= seeq_.transmitted(end_of_packet ? Seeq8003::kTxDone : Seeq8003::kTxUnderflow, enet_loopback_ || net_);
     if (irq) enet_interrupt();
     // Preamble, FCS and the gap between frames: 24 bytes more on the wire.
-    if (enet_tx_.active)
-        enet_tx_timer_->schedule_in(static_cast<u64>((frame.size() + 24) * 8 / enet_bits_per_second() * cpu_hz_));
+    if (enet_tx_.active) enet_tx_timer_->schedule_in(enet_wire_cycles(frame.size()));
 }
 
 u32 Hpc3::enet_read(u32 offset) {
     switch (offset) {
         case kEnetRxCbp: return enet_rx_.cbp;
         case kEnetRxNdbp: return enet_rx_.ndbp;
-        case kEnetRxCtrl:
-            return seeq_.rx_status() | (enet_rx_.ctrl & kEnetCtrlEndian) | (enet_rx_.active ? kEnetCtrlActive : 0);
+        case kEnetRxCtrl: {
+            const u32 v = seeq_.rx_status() | (enet_rx_.ctrl & kEnetCtrlEndian) |
+                          (enet_rx_.active ? kEnetCtrlActive : 0) | (enet_rx_.rbo ? kEnetCtrlRbo : 0);
+            enet_rx_.rbo = false;
+            return v;
+        }
         case kEnetReset:
             return (enet_held_ ? kEnetResetChannel : 0) | (enet_irq_ ? kEnetResetClearIrq : 0) |
                    (enet_loopback_ ? kEnetResetLoopback : 0);
@@ -592,7 +637,14 @@ u32 Hpc3::scsi_dma(unsigned ch, const u8* src, u8* dst, u32 length) {
             continue;
         }
         const u32 n = std::min(d.bc, length - moved);
-        for (u32 done = 0; done < n;) {
+        if (d.ctrl & kScsiCtrlEndian) {  // little-endian: each byte at its address ^ 7 (see enet_receive)
+            for (u32 i = 0; i < n; ++i) {
+                const u32 addr = (d.cbp + i) ^ 7;
+                if (src) bus_.write<u8>(addr, src[moved + i]);
+                else bus_.read<u8>(addr, dst[moved + i]);
+            }
+        }
+        for (u32 done = (d.ctrl & kScsiCtrlEndian) ? n : 0; done < n;) {
             const u32 addr = d.cbp + done;
             const u32 chunk = std::min<u32>(n - done, static_cast<u32>(Bus::kPageSize - (addr & Bus::kPageMask)));
             if (src) {
@@ -623,6 +675,29 @@ void Hpc3::update_dma_irq() {
     ioc_.set_local1(Ioc2::kL1HpcDma, scsi_dma_[0].irq || scsi_dma_[1].irq || pbus);
 }
 
+// A register PIO moves one 32-bit word whatever the size asked for (the
+// address's two low bits are ignored), so every access reaches the device.
+// PBUS devices' registers are replicated to fill the word: an 8-bit
+// register's byte in all four lanes, a 16-bit one's halfword in both
+// halves. (Other external registers, the WD33C93's, use bits 7:0 and read
+// zero elsewhere.)
+namespace {
+// The register a read addresses (a doubleword read takes its low word's).
+u32 pbus_word(u32 offset, unsigned size, u32 window_base) {
+    return ((size == 8 ? offset + 4 : offset) - window_base) >> 2;
+}
+u64 replicated8(u8 v, unsigned size) {
+    const u64 w = v * 0x01010101ull;
+    return size == 8 ? (w << 32) | w : size == 4 ? w : size == 2 ? v * 0x0101u : v;
+}
+u64 lanes_of_word(u32 w, u32 offset, unsigned size) {
+    if (size == 8) return (u64{w} << 32) | w;
+    if (size == 4) return w;
+    const unsigned shift = (4 - size - (offset & 3)) * 8;
+    return (w >> shift) & ((1u << (size * 8)) - 1);
+}
+}  // namespace
+
 int Hpc3::byte_index(u32 offset, unsigned size, u32 window_base) {
     const u32 rel = offset - window_base;
     if (size == 1) return (rel & 3) == 3 ? static_cast<int>(rel >> 2) : -1;
@@ -637,32 +712,26 @@ bool Hpc3::read(u32 offset, unsigned size, u64& value) {
             value = 0;
             return true;
         }
-        const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kScsiWindow + ch * kScsiWindowSize);
-        value = idx < 0 ? 0 : (idx & 1) ? scsi_[ch]->read_data() : scsi_[ch]->read_aux_status();
+        const u32 word = pbus_word(offset, size, kScsiWindow + ch * kScsiWindowSize);
+        const u8 v = (word & 1) ? scsi_[ch]->read_data() : scsi_[ch]->read_aux_status();
+        value = size == 8 ? v : lanes_of_word(v, offset, size);
         return true;
     }
     if (full_house_ && offset >= kInt2Window && offset < kInt2WindowEnd) {
-        const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kInt2Window);
-        value = idx >= 0 ? ioc_.int2_read(static_cast<unsigned>(idx)) : 0;
+        value = replicated8(ioc_.int2_read(pbus_word(offset, size, kInt2Window)), size);
         return true;
     }
     if (full_house_ && (offset & ~3u) == kExtIo) {
-        const u32 w = ioc_.ext_io();
-        value = size >= 4 ? w : size == 2 ? ((offset & 2) ? w : 0) : ((offset & 3) == 3 ? w & 0xFF : (offset & 3) == 2 ? w >> 8 : 0);
+        const u32 w = ioc_.ext_io() & 0xFFFFu;
+        value = lanes_of_word(w | (w << 16), offset, size);
         return true;
     }
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
-        const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
-        value = idx >= 0 ? ioc_.read(static_cast<unsigned>(idx)) : 0;
+        value = replicated8(ioc_.read(pbus_word(offset, size, kIocWindow) % kIocRegisters), size);
         return true;
     }
     if (offset >= kRtcWindow && offset < kRtcWindowEnd) {
-        const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kRtcWindow);
-        value = idx >= 0 ? rtc_.read(static_cast<unsigned>(idx)) : 0;
+        value = replicated8(rtc_.read(pbus_word(offset, size, kRtcWindow) % rtc_.memory().size()), size);
         return true;
     }
     if (size == 8) {
@@ -681,15 +750,11 @@ bool Hpc3::read(u32 offset, unsigned size, u64& value) {
 
 bool Hpc3::read_is_pure(u32 offset, unsigned size) const {
     if (full_house_ && offset >= kInt2Window && offset < kInt2WindowEnd) {
-        const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kInt2Window);
-        return idx < 0 || ioc_.int2_read_is_pure(static_cast<unsigned>(idx));
+        return ioc_.int2_read_is_pure(pbus_word(offset, size, kInt2Window));
     }
     if (full_house_ && (offset & ~3u) == kExtIo) return true;
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
-        const u32 o = size == 8 ? offset + 4 : offset;
-        const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
-        return idx < 0 || ioc_.read_is_pure(static_cast<unsigned>(idx));
+        return ioc_.read_is_pure(pbus_word(offset, size, kIocWindow) % kIocRegisters);
     }
     return false;
 }
@@ -719,13 +784,13 @@ bool Hpc3::write(u32 offset, unsigned size, u64 value) {
     if (offset >= kIocWindow && offset < kIocWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kIocWindow);
-        if (idx >= 0) ioc_.write(static_cast<unsigned>(idx), static_cast<u8>(value));
+        if (idx >= 0) ioc_.write(static_cast<unsigned>(idx) % kIocRegisters, static_cast<u8>(value));
         return true;
     }
     if (offset >= kRtcWindow && offset < kRtcWindowEnd) {
         const u32 o = size == 8 ? offset + 4 : offset;
         const int idx = byte_index(o, size == 8 ? 4 : size, kRtcWindow);
-        if (idx >= 0) rtc_.write(static_cast<unsigned>(idx), static_cast<u8>(value));
+        if (idx >= 0) rtc_.write(static_cast<unsigned>(idx) % rtc_.memory().size(), static_cast<u8>(value));
         return true;
     }
     if (size == 8) {
@@ -816,7 +881,10 @@ u32 Hpc3::read_word(u32 offset) {
     if (offset >= kEnetStart && offset < kEnetEnd) return enet_read(offset);
     if (offset == kEnetRxCurDesc) return enet_rx_.cdp;
     if (offset >= kSeeqWindow && offset < kSeeqWindowEnd) return seeq_.read((offset - kSeeqWindow) >> 2);
-    if (offset >= kHal2Window && offset < kHal2WindowEnd) return hal2_.read(offset - kHal2Window);
+    if (offset >= kHal2Window && offset < kHal2WindowEnd) {  // a 16-bit PBUS device: both halves
+        const u32 v = hal2_.read(offset - kHal2Window) & 0xFFFFu;
+        return v | (v << 16);
+    }
     switch (offset) {
         case kIntStat0:
         case kIntStat1: {

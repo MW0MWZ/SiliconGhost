@@ -127,6 +127,7 @@ bool Bus::write_slow(u64 paddr, unsigned size, u64 value) {
         if (p.host) {
             SG_LOG(Debug, "bus", "write%u to ROM @ %08llx ignored", size * 8,
                    static_cast<unsigned long long>(paddr));
+            if (rom_write_handler_) rom_write_handler_(paddr);
             return true;
         }
     }

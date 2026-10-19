@@ -201,11 +201,13 @@ public:
     void ucomis(bool dbl, unsigned a, unsigned b) { xmm_rr(dbl ? 0x66 : 0, false, 0x2E, a, b); }
     void movq_to_xmm(unsigned x, Reg r, bool w = true) { xmm_rr(0x66, w, 0x6E, x, r); }
     void movq_from_xmm(Reg r, unsigned x, bool w = true) { xmm_rr(0x66, w, 0x7E, x, r); }
-    // cvtsd2si / cvttsd2si (and ss) to a 32-bit register; cvtsi2sd (ss) from one.
-    void cvt_to_int(bool dbl, bool truncate, Reg dst, unsigned src) {
-        xmm_rr(dbl ? 0xF2 : 0xF3, false, truncate ? 0x2C : 0x2D, dst, src);
+    // cvtsd2si / cvttsd2si (and ss) to a 32- or 64-bit register; cvtsi2sd (ss) from one.
+    void cvt_to_int(bool dbl, bool truncate, Reg dst, unsigned src, bool w64 = false) {
+        xmm_rr(dbl ? 0xF2 : 0xF3, w64, truncate ? 0x2C : 0x2D, dst, src);
     }
-    void cvt_from_int(bool dbl, unsigned dst, Reg src) { xmm_rr(dbl ? 0xF2 : 0xF3, false, 0x2A, dst, src); }
+    void cvt_from_int(bool dbl, unsigned dst, Reg src, bool w64 = false) {
+        xmm_rr(dbl ? 0xF2 : 0xF3, w64, 0x2A, dst, src);
+    }
     // xmm loads and stores of the low 32 or 64 bits, and a register copy.
     void movq_load(unsigned x, Mem m) { xmm_mem(0xF3, 0x7E, x, m); }
     void movd_load(unsigned x, Mem m) { xmm_mem(0x66, 0x6E, x, m); }
@@ -245,6 +247,17 @@ public:
     void jmp_to(std::size_t target) {
         byte(0xE9);
         u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(buf_.size() + 4)));
+    }
+    // A jump to `target`, this code being placed at `base`.
+    void jmp_abs(const u8* target, const u8* base) {
+        byte(0xE9);
+        u32v(static_cast<u32>(target - (base + buf_.size() + 4)));
+    }
+    // LEA r, [rip + rel32], bound like a jump; returns the patch site.
+    std::size_t lea_rip(Reg r) {
+        rex(true, r, 0), byte(0x8D), byte(((r & 7) << 3) | 5);
+        u32v(0);
+        return buf_.size();
     }
     // Points the jump ending at `site` to the current position.
     void bind(std::size_t site) {

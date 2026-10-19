@@ -260,6 +260,31 @@ TEST(cache_tag_round_trip) {
     CHECK_EQ(t.cpu.cp0_read(cop0::TagLo), 0xABCDEFC0ull);
 }
 
+// SC succeeds on the LLbit alone (a successful SC leaves it set); a CACHE
+// operation that invalidates the data line holding the link address clears
+// it, one on another line does not.
+TEST(cache_op_on_the_link_line_fails_store_conditional) {
+    constexpr auto LL = [](unsigned rt, s32 off, unsigned base) { return I(0x30, base, rt, off); };
+    constexpr auto SC = [](unsigned rt, s32 off, unsigned base) { return I(0x38, base, rt, off); };
+    Rig t;
+    t.cpu.gpr[t0] = 0xFFFFFFFF80001000ull;
+    t.cpu.gpr[t2] = t.cpu.gpr[t3] = 7;
+    t.load({LL(t1, 0, t0), SC(t2, 0, t0), SC(t3, 0, t0)});
+    t.steps(3);
+    CHECK_EQ(t.cpu.gpr[t2], 1ull);
+    CHECK_EQ(t.cpu.gpr[t3], 1ull);
+    t.cpu.gpr[t2] = 7;
+    t.load({LL(t1, 0, t0), CACHE(0x11, 0x100, t0), SC(t2, 0, t0)});  // Hit Invalidate D, another line
+    t.cpu.set_pc(kCode);
+    t.steps(3);
+    CHECK_EQ(t.cpu.gpr[t2], 1ull);
+    t.cpu.gpr[t2] = 7;
+    t.load({LL(t1, 0, t0), CACHE(0x11, 4, t0), SC(t2, 0, t0)});  // the link line
+    t.cpu.set_pc(kCode);
+    t.steps(3);
+    CHECK_EQ(t.cpu.gpr[t2], 0ull);
+}
+
 TEST(cache_secondary_size_probe) {
     // Store a zero tag at the base, then look for the power of two whose index wraps to it.
     Rig t;

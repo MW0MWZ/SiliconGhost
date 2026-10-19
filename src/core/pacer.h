@@ -12,9 +12,7 @@
 //             instruction adapts, so a fast host behaves like a faster CPU and a
 //             slow one like a slower CPU, while a guest second stays a second.
 //             While the guest times the CPU (calibrating its delay loops at
-//             boot) the CPU runs at a set speed (set_timed_speed): IRIX 5.3
-//             fails to boot when it measures a CPU much faster than real
-//             (seen: 350 million instructions a second boots, 360 does not).
+//             boot) the CPU runs at a set speed (set_timed_speed).
 //             Delay loops run at the real CPU's speed throughout, or at the
 //             timed speed if that is slower (see
 //             delay_cycles_per_instruction): the guest calibrates its

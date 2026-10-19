@@ -89,9 +89,12 @@ void usage(const char* argv0) {
                  "                   r5000sc or r5000pc\n"
                  "  --cpu-mhz N      pipeline clock: one the module shipped at (default 150)\n"
                  "  --any-clock      allow a clock no such machine shipped with\n"
-                 "  --graphics BOARD xl8 (8-bit Newport, the default), xl24 (24-bit) or none\n"
-                 "  --graphics-rev N the board revision it reports, 0-7 (default 2 for xl8, 0 for xl24)\n"
+                 "  --graphics BOARD xl24 (the 24-bit Newport, the default), solid-impact, high-impact or\n"
+                 "                   max-impact (Indigo2; not finished), or none\n"
+                 "  --graphics-rev N the board revision it reports, 0-7 (default 0)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only), as --graphics none\n"
+                 "  --console WHERE  graphics or serial: set the PROM's console in NVRAM at power-on\n"
+                 "                   (default: leave it as the NVRAM has it)\n"
                  "  --headless       no window: both serial ports use this terminal\n"
                  "  --foreground     keep the window's messages on this terminal (the window otherwise\n"
                  "                   runs in the background, writing them to siliconghost.log)\n"
@@ -105,8 +108,7 @@ void usage(const char* argv0) {
                  "                   free:     no waiting; guest time runs ahead (default with --max)\n"
                  "  --timed-speed X  realtime, max: the CPU runs X times as fast as the real one while the\n"
                  "                   system times it (default 2; delay loops run at the real speed,\n"
-                 "                   or this one if slower;\n"
-                 "                   IRIX 5.3 boots with clock x X up to about 350 MHz)\n"
+                 "                   or this one if slower)\n"
                  "  --max-speed X    realtime: run the CPU at most X times as fast as the real one\n"
                  "                   (default 0: as fast as the host allows)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
@@ -274,7 +276,7 @@ int main(int argc, char** argv) {
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},  {"--machine", "machine"},
                        {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"},
-                       {"--graphics-rev", "graphics_rev"}, {"--timing", "timing"},
+                       {"--graphics-rev", "graphics_rev"}, {"--console", "console"}, {"--timing", "timing"},
                        {"--timed-speed", "timed_speed"}, {"--max-speed", "max_speed"},
                        {"--log", "log"}};
         static const struct {

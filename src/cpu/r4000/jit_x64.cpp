@@ -135,6 +135,68 @@ bool R4000::jit_compile(Block& b) {
     // Linked blocks enter here, so the prologue must be the same everywhere.
     if (jit_link_offset_ == 0) jit_link_offset_ = top;
     if (top != jit_link_offset_) return false;
+    // The block-end code the translations share, once per buffer of code.
+    // The enter stub runs the translation of the block at rsi for pc rax if
+    // it fits in the budget rdx; the lookup stub first finds the block as
+    // run_block() would, through the fetch soft-TLB. Either goes back to r11
+    // when it can't, with rax, rdx and r11 as they were.
+    if (jit_stub_generation_ != jit_generation_) {
+        Emitter s;
+        std::vector<std::size_t> miss;
+        std::size_t enter_at[2], lookup_at[2];
+        for (unsigned a = 0; a < 2; ++a) {
+            enter_at[a] = s.size();
+            s.mov(rdi, Mem{rsi, static_cast<s32>(offsetof(Block, code))});
+            s.test(rdi, rdi);
+            miss.push_back(s.jcc(Cond::E));
+            s.cmp8_imm(Mem{rsi, static_cast<s32>(offsetof(Block, jit_addr64))}, static_cast<s32>(a));
+            miss.push_back(s.jcc(Cond::Ne));
+            s.mov(rcx, Mem{rsi, static_cast<s32>(offsetof(Block, count))}, false);
+            s.alu(Alu::Cmp, rdx, rcx);
+            miss.push_back(s.jcc(Cond::L));
+            s.mov(kTime, rdx);
+            s.mov(kPc, rax);
+            s.alu_imm(Alu::Add, rdi, static_cast<s32>(top));
+            s.jmp(rdi);
+        }
+        for (unsigned a = 0; a < 2; ++a) {
+            lookup_at[a] = s.size();
+            s.test_imm(rax, 3);
+            miss.push_back(s.jcc(Cond::Ne));
+            s.mov(rcx, rax);
+            s.shift_imm(Shift::Shr, rcx, 12, true);  // tag
+            s.mov(rsi, rcx);
+            s.alu(Alu::Or, rcx, m_asid_tag);
+            s.alu_imm(Alu::And, rsi, kFastEntries - 1, false);
+            s.shift_imm(Shift::Shl, rsi, 5, false);
+            s.alu(Alu::Add, rsi, kTlb);  // the load entry; the fetch table precedes it
+            s.alu(Alu::Cmp, rcx, Mem{rsi, static_cast<s32>(offsetof(FastEntry, tag)) - kTableBytes});
+            miss.push_back(s.jcc(Cond::Ne));
+            s.mov(rsi, Mem{rsi, static_cast<s32>(offsetof(FastEntry, host)) - kTableBytes});
+            s.test(rsi, rsi);
+            miss.push_back(s.jcc(Cond::E));
+            s.mov(rcx, rax);
+            s.alu_imm(Alu::And, rcx, 0xFFF, false);
+            s.alu(Alu::Add, rsi, rcx);  // host address of the instruction
+            s.mov(rcx, rsi);
+            s.shift_imm(Shift::Shr, rcx, 2, true);
+            s.alu_imm(Alu::And, rcx, (1u << kBlockBits) - 1, false);
+            s.imul_imm(rcx, rcx, static_cast<s32>(sizeof(Block)));
+            s.mov_imm64(rdi, reinterpret_cast<u64>(blocks_.data()));
+            s.alu(Alu::Add, rcx, rdi);
+            s.alu(Alu::Cmp, rsi, Mem{rcx, static_cast<s32>(offsetof(Block, host))});
+            miss.push_back(s.jcc(Cond::Ne));
+            s.mov(rsi, rcx);
+            s.jmp_to(enter_at[a]);
+        }
+        for (std::size_t site : miss) s.bind(site);
+        s.jmp(r11);
+        const u8* at = static_cast<const u8*>(jit_buf_->add(s.code().data(), s.size()));
+        if (!at) return false;
+        for (unsigned a = 0; a < 2; ++a) jit_enter_stub_[a] = at + enter_at[a], jit_lookup_stub_[a] = at + lookup_at[a];
+        jit_stub_generation_ = jit_generation_;
+    }
+    const u8* const base = jit_buf_->next();  // where this translation will go
     // Effective addresses follow the addressing mode the block is compiled
     // for; run_block() only calls it in that mode.
     const bool addr64 = addr64_;
@@ -551,11 +613,21 @@ bool R4000::jit_compile(Block& b) {
         }
     };
     // COP1, inline for the common case: the coprocessor usable, Status.FR as
-    // at translation, rounding to nearest with the inexact trap off, and
-    // operands the FPU handles in hardware. The host computes the result
-    // from a clean MXCSR; any flag but inexact, or a denormal result, leaves
-    // the result to the handler, which works it out again exactly.
+    // at translation, the inexact trap off, and operands the FPU handles in
+    // hardware. Rounding to nearest is worked out in line; other modes, out
+    // of line, by the host's flags under the same rounding. Any flag but
+    // inexact, or a denormal result, leaves the result to the handler, which
+    // works it out again exactly.
     jit_fp_control_ = host_fp_control();
+    // Another way through an operation, out of line: from the sites in
+    // `from`, `body` (which may add ways to the handler), then on at `join`.
+    using AltBody = std::function<void(std::vector<std::size_t>& slow)>;
+    struct AltPath {
+        std::vector<std::size_t> from;
+        AltBody body;
+        std::size_t join = 0;
+    };
+    std::vector<AltPath> alt_paths;  // of the operation being emitted
     const Mem m_status{kCpu, offset_of(this, &status_)};
     const Mem m_fcr31{kCpu, offset_of(this, &fcr31)};
     const Mem m_fp_control{kCpu, offset_of(this, &jit_fp_control_)};
@@ -567,11 +639,6 @@ bool R4000::jit_compile(Block& b) {
         e.mov(rax, m_status, false);
         e.alu_imm(Alu::And, rax, static_cast<s32>(sr::CU1 | sr::FR), false);
         e.alu_imm(Alu::Cmp, rax, static_cast<s32>(sr::CU1 | (fr ? sr::FR : 0)), false);
-        slow.push_back(e.jcc(Cond::Ne));
-    };
-    auto fp_nearest = [&](std::vector<std::size_t>& slow) {  // RM nearest, inexact trap off
-        e.mov(rax, m_fcr31, false);
-        e.test_imm(rax, 0x3u | 0x80u);
         slow.push_back(e.jcc(Cond::Ne));
     };
     auto touch_ = [&] { e.alu_imm(Alu::Add, m_change_epoch, 1); };
@@ -601,15 +668,6 @@ bool R4000::jit_compile(Block& b) {
         slow.push_back(e.jcc(Cond::E));
         e.bind(zero);
     };
-    // Runs one SSE operation from a clean MXCSR; any flag but inexact goes
-    // to the handler. The flags stay in the scratch slot.
-    auto fp_host = [&](auto&& op, std::vector<std::size_t>& slow) {
-        e.ldmxcsr(m_fp_control);
-        op();
-        e.stmxcsr(m_scratch);
-        e.test8_imm(m_scratch, 0x1F);  // invalid, denormal, divide by zero, overflow, underflow
-        slow.push_back(e.jcc(Cond::Ne));
-    };
     // fp_commit() of an inexact or exact result: Cause, and the sticky flag.
     auto fp_commit_inexact = [&] {
         e.mov(rdx, m_fcr31, false);
@@ -621,6 +679,48 @@ bool R4000::jit_compile(Block& b) {
         e.mov(m_fcr31, rdx, false);
     };
     auto fp_commit_exact = [&] { e.alu_imm(Alu::And, m_fcr31, static_cast<s32>(~kCauseMask), false); };
+    auto fp_trap_off = [&](std::vector<std::size_t>& slow) {  // the inexact trap off (any rounding)
+        e.test8_imm(m_fcr31, 0x80);
+        slow.push_back(e.jcc(Cond::Ne));
+    };
+    // Rounding other than to nearest: MXCSR set to a MIPS rounding mode (RM
+    // 0-3: nearest, toward zero, up, down; MXCSR RC 0, 3, 2, 1), FCR31.RM's
+    // or a fixed one, through the scratch slot; rax and rcx are clobbered.
+    constexpr int kGuestRounding = -1;
+    auto set_rounding = [&](int rm) {
+        if (rm == kGuestRounding) {
+            e.mov(rcx, m_fcr31, false);
+            e.mov_imm32(rax, 4);
+            e.alu(Alu::Sub, rax, rcx, false);
+            e.alu_imm(Alu::And, rax, 3, false);
+            e.shift_imm(Shift::Shl, rax, 13, false);
+            e.alu_imm(Alu::Or, rax, static_cast<s32>(jit_fp_control_), false);
+        } else {
+            e.mov_imm32(rax, jit_fp_control_ | ((4u - static_cast<unsigned>(rm)) & 3) << 13);
+        }
+        e.mov(m_scratch, rax, false);
+        e.ldmxcsr(m_scratch);
+    };
+    // Runs SSE operations under rounding `rm` from clean flags, MXCSR clean
+    // again afterwards; any flag but inexact goes to the handler. The flags
+    // stay in the scratch slot.
+    auto fp_host_rounded = [&](int rm, auto&& op, std::vector<std::size_t>& slow) {
+        set_rounding(rm);
+        op();
+        e.stmxcsr(m_scratch);
+        e.ldmxcsr(m_fp_control);
+        e.test8_imm(m_scratch, 0x1F);  // invalid, denormal, divide by zero, overflow, underflow
+        slow.push_back(e.jcc(Cond::Ne));
+    };
+    // Rounding to nearest goes on in line; any other mode takes `path` (out
+    // of line, after the region's code), which rejoins where fp_join() is
+    // called. The body sees the machine state at the split, so it must not
+    // use the register cache: only the xmm registers it was given.
+    auto fp_if_directed = [&](AltBody path) {
+        e.test8_imm(m_fcr31, 3);
+        alt_paths.push_back({{e.jcc(Cond::Ne)}, std::move(path), 0});
+    };
+    auto fp_join = [&] { alt_paths.back().join = e.size(); };
     auto emit_fpu = [&](u32 w, std::vector<std::size_t>& slow) -> bool {
         const unsigned opc = w >> 26;
         if (opc == 0x00 && (w & 63) == 0x01 && mips4_) {  // MOVF, MOVT
@@ -664,25 +764,68 @@ bool R4000::jit_compile(Block& b) {
                 fp_write_gpr(fs, fmt == 0x05, rax);
                 touch_();
                 return true;
+            case 0x02:  // CFC1
+                fp_usable(slow);
+                if (fs == 31) {
+                    e.mov(rax, m_fcr31, false);
+                    e.test_imm(rax, kFcrLazyI);
+                    slow.push_back(e.jcc(Cond::Ne));  // Cause.I to be worked out first
+                    e.movsxd(rax, rax);
+                } else {
+                    e.mov_imm64(rax, fs == 0 ? sext32(fir_) : 0);
+                }
+                write_nz(ft, rax);
+                touch_();
+                return true;
+            case 0x06:  // CTC1: FCR31 written, unless that raises an exception
+                fp_usable(slow);
+                if (fs == 31) {
+                    ensure(ft);
+                    read(rax, ft, false);
+                    e.alu_imm(Alu::And, rax, static_cast<s32>(mips4_ ? kFcrWriteMask | kFcrCondMips4 : kFcrWriteMask), false);
+                    e.mov(rcx, rax);
+                    e.shift_imm(Shift::Shr, rcx, 12, false);
+                    e.alu_imm(Alu::And, rcx, 0x3F, false);  // Cause
+                    e.mov(rdx, rax);
+                    e.shift_imm(Shift::Shr, rdx, 7, false);
+                    e.alu_imm(Alu::And, rdx, 0x1F, false);
+                    e.alu_imm(Alu::Or, rdx, 0x20, false);  // the enables, and E (always enabled)
+                    e.test(rcx, rdx);
+                    slow.push_back(e.jcc(Cond::Ne));
+                    e.mov(m_fcr31, rax, false);
+                }
+                touch_();
+                return true;
             case 0x10:
             case 0x11:
             case 0x14:
+            case 0x15:
                 break;
             default: return false;
         }
         const bool dbl = fmt == 0x11;
-        if (fmt == 0x14) {  // CVT.S.W, CVT.D.W
+        if (fmt == 0x14 || fmt == 0x15) {  // CVT.S.W, CVT.D.W, CVT.S.L, CVT.D.L
             if (func != 0x20 && func != 0x21) return false;
-            const bool to_d = func == 0x21;
+            const bool to_d = func == 0x21, from_l = fmt == 0x15;
+            if (from_l) need64(slow);
             fp_usable(slow);
-            fp_nearest(slow);
-            fp_read_gpr(rax, fs, false);
-            e.cvt_from_int(to_d, 0, rax);
-            if (to_d) {  // exact
+            fp_read_gpr(rdx, fs, from_l);
+            if (to_d && !from_l) {  // exact
+                e.cvt_from_int(true, 0, rdx);
                 fp_commit_exact();
+            } else if (from_l) {  // the host's flags, any rounding
+                fp_trap_off(slow);
+                fp_host_rounded(kGuestRounding, [&] { e.cvt_from_int(to_d, 0, rdx, true); }, slow);
+                fp_commit_inexact();
             } else {  // inexact if the single differs from the integer
+                fp_trap_off(slow);
+                fp_if_directed([=, &e](std::vector<std::size_t>& s) {
+                    fp_host_rounded(kGuestRounding, [&] { e.cvt_from_int(false, 0, rdx); }, s);
+                    fp_commit_inexact();
+                });
+                e.cvt_from_int(false, 0, rdx);
                 e.sse(Emitter::Sse::Cvt, false, 1, 0);
-                e.cvt_from_int(true, 2, rax);
+                e.cvt_from_int(true, 2, rdx);
                 e.ucomis(true, 1, 2);
                 e.setcc(Cond::Ne, rcx);
                 e.movzx8(rcx, rcx);
@@ -691,6 +834,7 @@ bool R4000::jit_compile(Block& b) {
                 e.imul_imm(rcx, rcx, static_cast<s32>(kCauseInexact | kFlagInexact));
                 e.alu(Alu::Or, rdx, rcx, false);
                 e.mov(m_fcr31, rdx, false);
+                fp_join();
             }
             fp_write_xmm(fd, to_d, 0);
             touch_();
@@ -795,8 +939,34 @@ bool R4000::jit_compile(Block& b) {
             const bool subtract = (func & 0x08) != 0, negate = (func & 0x10) != 0;
             need_mips4(slow);
             fp_usable(slow);
-            fp_nearest(slow);
+            fp_trap_off(slow);
             const unsigned a = fp_operand(fs, dbl, 4, slow), m = fp_operand(ft, dbl, 3, slow);
+            // Other rounding: the product and the sum under it, by the host's
+            // flags; fr from its cache register (brought in now) or memory.
+            const int kc = fp_slot(fr_reg, dbl);
+            const Mem m_fr = fp_mem(fr_reg, dbl);
+            fp_if_directed([=, &e](std::vector<std::size_t>& s) {
+                unsigned xc = 2;
+                if (kc >= 0) xc = kFpCacheRegs[kc];
+                else if (dbl) e.movq_load(2, m_fr);
+                else e.movd_load(2, m_fr);
+                e.movq_from_xmm(rax, xc, dbl);
+                fp_ordinary(rax, dbl, s);
+                fp_host_rounded(
+                    kGuestRounding,
+                    [&] {
+                        e.movapd(0, a);
+                        e.sse(Emitter::Sse::Mul, dbl, 0, m);
+                        e.movapd(1, 0);
+                        e.sse(subtract ? Emitter::Sse::Sub : Emitter::Sse::Add, dbl, 0, xc);
+                    },
+                    s);
+                e.movq_from_xmm(rax, 1, dbl);
+                fp_not_denormal(rax, dbl, s);  // a tiny product: the handler
+                e.movq_from_xmm(rax, 0, dbl);
+                fp_not_denormal(rax, dbl, s);
+                fp_commit_inexact();
+            });
             e.movapd(0, a);
             e.sse(Emitter::Sse::Mul, dbl, 0, m);
             e.movq_from_xmm(rax, 0, dbl);
@@ -836,6 +1006,7 @@ bool R4000::jit_compile(Block& b) {
             store_operand(m_lazy_c, c);
             pend_inexact();
             e.bind(sum_done);
+            fp_join();
             if (negate) {
                 e.movq_from_xmm(rax, 0, dbl);
                 if (dbl) e.mov_imm64(rcx, u64{1} << 63);
@@ -872,10 +1043,27 @@ bool R4000::jit_compile(Block& b) {
             return true;
         }
         const bool recip = func == 0x15 && mips4_;
+        // Other rounding for the operations below: by the host's flags.
+        auto directed = [&](unsigned op, unsigned a, unsigned c) {
+            fp_if_directed([=, &e](std::vector<std::size_t>& s) {
+                static constexpr Emitter::Sse kOps[] = {Emitter::Sse::Add, Emitter::Sse::Sub, Emitter::Sse::Mul,
+                                                        Emitter::Sse::Div, Emitter::Sse::Sqrt};
+                fp_host_rounded(
+                    kGuestRounding,
+                    [&] {
+                        e.movapd(0, a);
+                        e.sse(kOps[op], dbl, 0, op == 0x04 ? a : c);
+                    },
+                    s);
+                e.movq_from_xmm(rax, 0, dbl);
+                fp_not_denormal(rax, dbl, s);
+                fp_commit_inexact();
+            });
+        };
         if (func <= 0x01 || ((func <= 0x04 || recip) && (jit_fma_ || kDekker))) {  // ADD, SUB; MUL, DIV, SQRT, RECIP exactly
             if (recip) need_mips4(slow);
             fp_usable(slow);
-            fp_nearest(slow);
+            fp_trap_off(slow);
             unsigned a = 4;
             if (recip) {
                 if (dbl) e.mov_imm64(rax, 0x3FF0000000000000ull);
@@ -890,6 +1078,7 @@ bool R4000::jit_compile(Block& b) {
             std::function<void()> residual;
             std::optional<unsigned> lazy_b;
             if (func == 0x04) {  // SQRT: a zero or a positive number not too small
+                directed(func, a, a);  // (rax still holds the operand)
                 e.test(rax, rax);
                 if (!dbl) e.test_imm(rax, 0x80000000u);
                 const std::size_t positive = e.jcc(dbl ? Cond::Ge : Cond::E);
@@ -920,6 +1109,7 @@ bool R4000::jit_compile(Block& b) {
                 };
             } else {
                 const unsigned c = fp_operand(recip ? fs : ft, dbl, 3, slow);
+                directed(func, a, c);  // (rax still holds c)
                 if (func == 0x03) {  // DIV: a nonzero divisor, a dividend zero or not too small
                     e.mov(rcx, rax);
                     e.shift_imm(Shift::Shl, rcx, 1, dbl);
@@ -986,19 +1176,20 @@ bool R4000::jit_compile(Block& b) {
             if (lazy_b) store_operand(m_lazy_b, *lazy_b);
             pend_inexact();
             e.bind(done);
+            fp_join();
             fp_write_xmm(fd, dbl, 0);
             touch_();
             return true;
         }
         if (func <= 0x04) {  // MUL, DIV, SQRT without FMA: the host's flags
             fp_usable(slow);
-            fp_nearest(slow);
+            fp_trap_off(slow);
             const unsigned a = fp_operand(fs, dbl, 4, slow);
             const unsigned c = func == 0x04 ? a : fp_operand(ft, dbl, 3, slow);
             e.movapd(0, a);
             static constexpr Emitter::Sse kOps[] = {Emitter::Sse::Add, Emitter::Sse::Sub, Emitter::Sse::Mul,
                                                     Emitter::Sse::Div, Emitter::Sse::Sqrt};
-            fp_host([&] { e.sse(kOps[func], dbl, 0, func == 0x04 ? 0 : c); }, slow);
+            fp_host_rounded(kGuestRounding, [&] { e.sse(kOps[func], dbl, 0, func == 0x04 ? 0 : c); }, slow);
             e.movq_from_xmm(rax, 0, dbl);
             fp_not_denormal(rax, dbl, slow);
             fp_commit_inexact();
@@ -1033,9 +1224,15 @@ bool R4000::jit_compile(Block& b) {
             case 0x21: {  // CVT.D.S (exact)
                 if ((func == 0x20) != dbl) return false;  // CVT.S.S and CVT.D.D are unimplemented
                 fp_usable(slow);
-                if (dbl) fp_nearest(slow);
+                if (dbl) fp_trap_off(slow);
                 const unsigned x = fp_operand(fs, dbl, 4, slow);
                 if (dbl) {  // a zero, or a normal single, inexact if it differs from the double
+                    fp_if_directed([=, &e](std::vector<std::size_t>& s) {
+                        fp_host_rounded(kGuestRounding, [&] { e.sse(Emitter::Sse::Cvt, true, 0, x); }, s);
+                        e.movq_from_xmm(rax, 0, false);
+                        fp_not_denormal(rax, false, s);
+                        fp_commit_inexact();
+                    });
                     e.sse(Emitter::Sse::Cvt, true, 0, x);
                     e.movq_from_xmm(rax, 0, false);
                     e.mov(rcx, rax);
@@ -1056,6 +1253,7 @@ bool R4000::jit_compile(Block& b) {
                     e.setcc(Cond::Ne, rcx);
                     e.movzx8(rcx, rcx);
                     commit_inexact_rcx();
+                    fp_join();
                 } else {
                     e.sse(Emitter::Sse::Cvt, false, 0, x);
                     fp_commit_exact();
@@ -1064,16 +1262,42 @@ bool R4000::jit_compile(Block& b) {
                 touch_();
                 return true;
             }
-            case 0x0C:  // ROUND.W (to nearest even)
-            case 0x0D:  // TRUNC.W
-            case 0x24: {  // CVT.W (RM, here nearest)
+            case 0x08: case 0x09: case 0x0A: case 0x0B:  // ROUND/TRUNC/CEIL/FLOOR.L
+            case 0x0C: case 0x0D: case 0x0E: case 0x0F:  // ROUND/TRUNC/CEIL/FLOOR.W
+            case 0x24:                                   // CVT.W (FCR31.RM)
+            case 0x25: {                                 // CVT.L
+                const bool to_long = func == 0x25 || func < 0x0C;
+                if (to_long) need64(slow);
                 fp_usable(slow);
-                fp_nearest(slow);
+                fp_trap_off(slow);
                 const unsigned x = fp_operand(fs, dbl, 4, slow);
-                e.cvt_to_int(dbl, func == 0x0D, rax, x);
-                e.alu_imm(Alu::Cmp, rax, static_cast<s32>(0x80000000u), false);
-                slow.push_back(e.jcc(Cond::E));  // out of range (or exactly -2^31: the handler sorts it out)
-                e.cvt_from_int(true, 1, rax);    // inexact if the integer differs from the operand
+                // The direction in the function's low bits, in FCR31.RM's order.
+                auto convert = [=, &e](int rm) {
+                    if (rm == 0 || rm == 1) return e.cvt_to_int(dbl, rm == 1, rax, x, to_long);
+                    set_rounding(rm);
+                    e.cvt_to_int(dbl, false, rax, x, to_long);
+                    e.ldmxcsr(m_fp_control);
+                };
+                if (func >= 0x24) {
+                    fp_if_directed([=, &e](std::vector<std::size_t>&) {
+                        set_rounding(kGuestRounding);
+                        e.cvt_to_int(dbl, false, rax, x, to_long);
+                        e.ldmxcsr(m_fp_control);
+                    });
+                    convert(0);
+                    fp_join();
+                } else {
+                    convert(static_cast<int>(func & 3));
+                }
+                // Out of range (or exactly the most negative integer: the handler sorts it out).
+                if (to_long) {
+                    e.mov_imm64(rcx, u64{1} << 63);
+                    e.alu(Alu::Cmp, rax, rcx);
+                } else {
+                    e.alu_imm(Alu::Cmp, rax, static_cast<s32>(0x80000000u), false);
+                }
+                slow.push_back(e.jcc(Cond::E));
+                e.cvt_from_int(true, 1, rax, to_long);  // inexact if the integer differs from the operand
                 if (dbl) {
                     e.ucomis(true, 1, x);
                 } else {
@@ -1083,7 +1307,31 @@ bool R4000::jit_compile(Block& b) {
                 e.setcc(Cond::Ne, rcx);
                 e.movzx8(rcx, rcx);
                 commit_inexact_rcx();
-                fp_write_gpr(fd, false, rax);
+                fp_write_gpr(fd, to_long, rax);
+                touch_();
+                return true;
+            }
+            case 0x16: {  // RSQRT (MIPS IV): the square root rounded, then its reciprocal, by the host's flags
+                if (!mips4_) break;
+                need_mips4(slow);
+                fp_usable(slow);
+                fp_trap_off(slow);
+                const unsigned a = fp_operand(fs, dbl, 4, slow);
+                fp_host_rounded(
+                    kGuestRounding,
+                    [&] {
+                        e.sse(Emitter::Sse::Sqrt, dbl, 0, a);
+                        if (dbl) e.mov_imm64(rcx, 0x3FF0000000000000ull);
+                        else e.mov_imm32(rcx, 0x3F800000u);
+                        e.movq_to_xmm(1, rcx, dbl);
+                        e.sse(Emitter::Sse::Div, dbl, 1, 0);
+                        e.movapd(0, 1);
+                    },
+                    slow);
+                e.movq_from_xmm(rax, 0, dbl);
+                fp_not_denormal(rax, dbl, slow);
+                fp_commit_inexact();
+                fp_write_xmm(fd, dbl, 0);
                 touch_();
                 return true;
             }
@@ -1703,6 +1951,7 @@ bool R4000::jit_compile(Block& b) {
             pc_plus(rcx, 4 * i + 4);
             e.alu_imm(Alu::And, rcx, static_cast<s32>(0xF0000000u));
             e.alu_imm(Alu::Or, rcx, static_cast<s32>((w & 0x03FFFFFF) << 2));
+            add_successor(static_cast<s64>((w << 2) & 0xFFF) - static_cast<s64>(page_offset));  // if in this page
             if (opc == 0x03) {
                 pc_plus(rax, 4 * i + 8);
                 write(31, rax);
@@ -1826,6 +2075,7 @@ bool R4000::jit_compile(Block& b) {
         u64 dirty_before = 0, loaded_after = 0;
         std::size_t resume = 0;
         std::size_t k = 0;  // in rb[k]
+        std::vector<AltPath> alts;
     };
     std::vector<Cold> colds;
     // Each block of the region in turn: its code, then the way out of it,
@@ -1863,7 +2113,9 @@ bool R4000::jit_compile(Block& b) {
             // is placed after the region's code, out of the straight line.
             Cold cold;
             cold.dirty_before = dirty;
+            alt_paths.clear();
             const bool fast = emit_alu(w, cold.slow) || emit_fpu(w, cold.slow) || emit_memory(w, cold.slow);
+            cold.alts = std::move(alt_paths);
             if (fast) {
                 if (delay_slot && leave) leave_delay_slot(branch_by_handler);
                 cold.i = i, cold.delay_slot = delay_slot, cold.op = &op, cold.loaded_after = loaded, cold.k = k;
@@ -2033,22 +2285,9 @@ bool R4000::jit_compile(Block& b) {
         }
         const u64 dirty_end = dirty;
         flush(dirty_end);
-        // Enters the translation at rsi + top for pc rax if the block (at rcx)
-        // fits; the registers are written back.
-        auto enter = [&](Reg block) {
-            e.mov(rdi, Mem{block, static_cast<s32>(offsetof(Block, code))});
-            e.test(rdi, rdi);
-            to_finish.push_back(e.jcc(Cond::E));
-            e.cmp8_imm(Mem{block, static_cast<s32>(offsetof(Block, jit_addr64))}, addr64 ? 1 : 0);
-            to_finish.push_back(e.jcc(Cond::Ne));
-            e.mov(rcx, Mem{block, static_cast<s32>(offsetof(Block, count))}, false);
-            e.alu(Alu::Cmp, rdx, rcx);
-            to_finish.push_back(e.jcc(Cond::L));
-            e.mov(kTime, rdx);
-            e.mov(kPc, rax);
-            e.alu_imm(Alu::Add, rdi, static_cast<s32>(top));
-            e.jmp(rdi);
-        };
+        // On to the shared stubs (above), which come back to to_finish
+        // through r11 if they can't enter the next translation.
+        to_finish.push_back(e.lea_rip(r11));
         for (s64 delta : outside) {
             pc_plus(rcx, delta);
             e.alu(Alu::Cmp, rax, rcx);
@@ -2058,7 +2297,7 @@ bool R4000::jit_compile(Block& b) {
             e.mov_imm64(rcx, reinterpret_cast<u64>(host));
             e.alu(Alu::Cmp, rcx, Mem{rsi, static_cast<s32>(offsetof(Block, host))});
             to_finish.push_back(e.jcc(Cond::Ne));
-            enter(rsi);
+            e.jmp_abs(jit_enter_stub_[addr64], base);
             e.bind(next);
         }
         // A jump through a register to a place in the page with no link:
@@ -2078,37 +2317,12 @@ bool R4000::jit_compile(Block& b) {
             e.mov(rdx, kTime);
             e.alu_imm(Alu::Sub, rdx, static_cast<s32>(blk.count));
             e.mov(rax, m_pc);
+            to_finish.push_back(e.lea_rip(r11));  // the call may have changed it
             e.bind(other_page);
         }
         // Anywhere else (another page, or a jump through a register): look up
         // the fetch translation and the block as run_block() would.
-        e.test_imm(rax, 3);
-        to_finish.push_back(e.jcc(Cond::Ne));
-        e.mov(rcx, rax);
-        e.shift_imm(Shift::Shr, rcx, 12, true);  // tag
-        e.mov(rsi, rcx);
-        e.alu(Alu::Or, rcx, m_asid_tag);
-        e.alu_imm(Alu::And, rsi, kFastEntries - 1, false);
-        e.shift_imm(Shift::Shl, rsi, 5, false);
-        e.alu(Alu::Add, rsi, kTlb);  // the load entry; the fetch table precedes it
-        e.alu(Alu::Cmp, rcx, Mem{rsi, static_cast<s32>(offsetof(FastEntry, tag)) - kTableBytes});
-        to_finish.push_back(e.jcc(Cond::Ne));
-        e.mov(rsi, Mem{rsi, static_cast<s32>(offsetof(FastEntry, host)) - kTableBytes});
-        e.test(rsi, rsi);
-        to_finish.push_back(e.jcc(Cond::E));
-        e.mov(rcx, rax);
-        e.alu_imm(Alu::And, rcx, 0xFFF, false);
-        e.alu(Alu::Add, rsi, rcx);  // host address of the instruction
-        e.mov(rcx, rsi);
-        e.shift_imm(Shift::Shr, rcx, 2, true);
-        e.alu_imm(Alu::And, rcx, (1u << kBlockBits) - 1, false);
-        e.imul_imm(rcx, rcx, static_cast<s32>(sizeof(Block)));
-        e.mov_imm64(rdi, reinterpret_cast<u64>(blocks_.data()));
-        e.alu(Alu::Add, rcx, rdi);
-        e.alu(Alu::Cmp, rsi, Mem{rcx, static_cast<s32>(offsetof(Block, host))});
-        to_finish.push_back(e.jcc(Cond::Ne));
-        e.mov(rsi, rcx);
-        enter(rsi);
+        e.jmp_abs(jit_lookup_stub_[addr64], base);
 
         // Completed the block.
         for (std::size_t site : to_finish_dirty) e.bind(site);
@@ -2124,7 +2338,13 @@ bool R4000::jit_compile(Block& b) {
     // the checks after it, then back to where the inline form ends.
     for (const Cold& c : colds) {
         cur = rb[c.k], cur_k = c.k, page_offset = cur->offset;
-        for (std::size_t site : c.slow) e.bind(site);
+        std::vector<std::size_t> slow = c.slow;
+        for (const AltPath& a : c.alts) {
+            for (std::size_t site : a.from) e.bind(site);
+            a.body(slow);
+            e.jmp_to(a.join);
+        }
+        for (std::size_t site : slow) e.bind(site);
         emit_handler(c.i, c.delay_slot, *c.op, c.dirty_before);
         if (c.i + 1 == cur->count) exit_checks(c.i);
         restore(c.loaded_after);  // as the inline path leaves them
@@ -2157,7 +2377,7 @@ bool R4000::jit_compile(Block& b) {
     e.ret();
 
     const void* fn = jit_buf_->add(e.code().data(), e.size());
-    if (!fn) return false;
+    if (fn != base) return false;  // full
     b.code = reinterpret_cast<JitFn>(const_cast<void*>(fn));
     b.jit_region = rb.size() > 1;
     b.region = JitRegion{};

@@ -13,6 +13,7 @@ namespace {
 constexpr u8 kSysIdIndy = 0x26;       // Guinness, board revision 3, chip revision 1
 constexpr u8 kSysIdIndigo2 = 0x11;    // Full House, board revision 8, chip revision 0
 constexpr double kPitClock2 = 1.0e6;  // counter 2 input; its output clocks counters 0 and 1
+constexpr double kSccPclk = 3.672e6;  // the serial controller's PCLK (its baud rate generators' clock)
 
 // Front panel bits
 constexpr u8 kPanelPowerOn = 0x01;
@@ -26,6 +27,7 @@ constexpr u8 kPanelIntMask = kPanelPowerInt | kPanelVolDownInt | kPanelVolUpInt;
 // interrupt bit (pending until the driver writes a 1 to it) and its hold bit
 // (until it is released). IRIX writes 0xF3 to acknowledge everything.
 constexpr u8 kPanelReset = 0xF3;  // power on, nothing pending, buttons released
+constexpr u8 kResetKbc = 0x02;    // reset register: keyboard/mouse controller running
 
 enum Index : unsigned {
     kSccBCtrl = 0x0C, kSccBData = 0x0D, kSccACtrl = 0x0E, kSccAData = 0x0F,
@@ -43,12 +45,12 @@ constexpr unsigned int2_to_int3(unsigned i) {
     return i <= 6 ? kL0Status + i : i == 8 ? static_cast<unsigned>(kTimerClear) : ~0u;
 }
 // PORT_CONFIG: the retrace latch clear lines are active low.
-constexpr u8 kPconClrSgRetrace = 1u << 3;  // the expansion slot's is bit 4
+constexpr u8 kPconClrSgRetrace = 1u << 3, kPconClrS0Retrace = 1u << 4;
 
 }  // namespace
 
 Ioc2::Ioc2(Scheduler& scheduler, double cpu_hz, u64 scc_char_cycles, bool full_house)
-    : scc_(scheduler, scc_char_cycles), pit_(scheduler, cpu_hz, {0.0, 0.0, kPitClock2}), full_house_(full_house) {
+    : scc_(scheduler, scc_char_cycles, cpu_hz / kSccPclk), pit_(scheduler, cpu_hz, {0.0, 0.0, kPitClock2}), full_house_(full_house) {
     scc_.set_irq_callback([this](bool a) { set_mappable(kMapSerial, a); });
     kbc_.set_irq_callback([this](bool a) { set_mappable(kMapKeyboard, a); });
     pit_.set_output_callback([this](unsigned c, bool level) {
@@ -71,27 +73,43 @@ void Ioc2::reset() {
     pport_.fill(0);
     panel_ = kPanelReset;
     dmasel_ = reset_ = write_ = gc_select_ = gen_ctrl_ = 0;
+    kbc_.set_held(true);  // the reset register clears: the PROM releases it first thing
     local0_mask_ = local1_mask_ = map_mask0_ = map_mask1_ = map_pol_ = 0;
     err_stat_ = 0;
     ext_io_ = 0xFFFF;
     port_config_ = 0;
-    gfx_irq_.fill(false);
+    for (auto& s : slot_irq_) s.fill(false);
     timer_int_.fill(false);
     update_outputs();
 }
 
-// GIO interrupt 0 (FIFO) and 1 (graphics) go to local 0, 2 (retrace) to
-// local 1; EXTIO records the slot. The retrace is latched until the driver
-// pulses PORT_CONFIG's clear line.
-void Ioc2::set_gfx_slot_irq(unsigned gio_int, bool level) {
-    static constexpr u16 kExt[3] = {kExtSgIrq2, kExtSgIrq1, kExtSgRetrace};
-    if (gio_int > 2) return;
-    if (gio_int == 2 && !level) return;  // the latch holds it
-    gfx_irq_[gio_int] = level;
-    ext_io_ = static_cast<u16>(level ? (ext_io_ & ~kExt[gio_int]) : (ext_io_ | kExt[gio_int]));
-    if (gio_int == 0) set_local0(kL0Fifo, level);
-    else if (gio_int == 1) set_local0(kL0Graphics, level);
-    else set_local1(kL1Retrace, level);
+void Ioc2::set_gio_slot_irq(unsigned slot, unsigned gio_int, bool level) {
+    if (slot > 2 || gio_int > 2) return;
+    if (full_house_ && slot == 2) return;  // no lines from expansion slot 1
+    if (full_house_ && gio_int == 2 && !level) return;  // the retrace latch holds it
+    slot_irq_[slot][gio_int] = level;
+    update_slot_irqs();
+}
+
+void Ioc2::update_slot_irqs() {
+    const auto& s = slot_irq_;
+    if (full_house_) {
+        // GIO interrupt 0 (FIFO) and 1 (graphics) go to local 0, 2 (retrace)
+        // to local 1, shared by the slots; EXTIO tells them apart.
+        static constexpr u16 kExt[2][3] = {{kExtSgIrq2, kExtSgIrq1, kExtSgRetrace},
+                                           {kExtS0Irq2, kExtS0Irq1, kExtS0Retrace}};
+        u16 io = ext_io_;
+        for (unsigned slot = 0; slot < 2; ++slot)
+            for (unsigned i = 0; i < 3; ++i)
+                io = static_cast<u16>(s[slot][i] ? (io & ~kExt[slot][i]) : (io | kExt[slot][i]));
+        ext_io_ = io;
+    } else {
+        set_mappable(kMapGioExp0, s[1][0] || s[1][1] || s[1][2]);
+        set_mappable(kMapGioExp1, s[2][0] || s[2][1] || s[2][2]);
+    }
+    set_local0(kL0Fifo, s[0][0] || (full_house_ && s[1][0]));
+    set_local0(kL0Graphics, s[0][1] || (full_house_ && s[1][1]));
+    set_local1(kL1Retrace, s[0][2] || (full_house_ && s[1][2]));
 }
 
 void Ioc2::ext_io_write(u16 value) {
@@ -211,11 +229,9 @@ bool Ioc2::int2_read_is_pure(unsigned index) const {
 void Ioc2::int2_write(unsigned index, u8 value) {
     if (index == kInt2PortConfig) {
         // A clear line taken low (and released) clears that slot's retrace latch.
-        if (!(value & kPconClrSgRetrace) && gfx_irq_[2]) {
-            gfx_irq_[2] = false;
-            ext_io_ |= kExtSgRetrace;
-            set_local1(kL1Retrace, false);
-        }
+        if (!(value & kPconClrSgRetrace)) slot_irq_[0][2] = false;
+        if (!(value & kPconClrS0Retrace)) slot_irq_[1][2] = false;
+        update_slot_irqs();
         port_config_ = value;
         return;
     }
@@ -285,9 +301,9 @@ void Ioc2::write(unsigned index, u8 value) {
             update_outputs();
             return;
         case kDmaSel: dmasel_ = value; return;
-        case kReset:
-            if ((reset_ & 0x02) && !(value & 0x02)) kbc_.reset();  // keyboard/mouse held in reset
+        case kReset:  // bit 1 low holds the keyboard/mouse controller in reset
             reset_ = value;
+            kbc_.set_held(!(value & kResetKbc));
             return;
         case kWrite: write_ = value; return;
         default:

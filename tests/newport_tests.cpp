@@ -86,10 +86,10 @@ TEST(newport_dcb_vc2_ram_and_cmap_revision) {
     CHECK_EQ(t.r(kDcbData0) >> 16, 0xBEEFu);
     // CMAP1 revision carries the monitor sense in bits 7:4.
     t.w(kDcbMode, width(1) | crs(6) | slave(3));
-    CHECK_EQ(t.r(kDcbData0) >> 24, 0xA1u);
+    CHECK_EQ(t.r(kDcbData0) >> 24, 0xA2u);
     u64 b = 0;
     CHECK(t.np.read(kDcbData0 + 3, 1, b));  // byte access sees the same value
-    CHECK_EQ(b, 0xA1ull);
+    CHECK_EQ(b, 0xA2ull);
 }
 
 TEST(newport_block_fill_and_host_read) {
@@ -360,8 +360,22 @@ constexpr u32 kSa = 4, kMsa = 5;
 }  // namespace
 
 // Cb = Cs*Fs + Cd*Fd, factors normalised as (v + msb)/256.
+// A 24-bit RGB fast clear fills with COLORVRAM as an 8-8-8 colour, as IRIX
+// writes it.
+TEST(newport_rgb24_fast_clear_takes_an_rgb_colour) {
+    Rig t;
+    t.w(kDrawMode1, kRgb24 | (1u << 17));  // FASTCLEAR
+    t.w(kWrMask, 0xFFFFFF);
+    t.w(0x01C, 0xC06030);  // COLORVRAM
+    t.w(kXYStartI, (20u << 16) | 20u);
+    t.w(kXYEndI, (23u << 16) | 21u);
+    t.w(kDrawMode0 | kGo, 2u | (1u << 2) | (1u << 5) | (1u << 8) | (1u << 9));  // DRAW BLOCK
+    CHECK_EQ(read24(t, 20, 20), 0xC06030u);
+    CHECK_EQ(read24(t, 23, 21), 0xC06030u);
+}
+
 TEST(newport_blend_source_alpha_over_frame_buffer_and_colorback) {
-    Rig t(Newport::Options{true, 0xA});
+    Rig t;
     point24(t, 10, 10, 0x0000FF);  // red
     t.w(0x204, 0x80u << 11);       // COLORALPHA 128
     point24(t, 10, 10, 0xFF0000, kRgb24 | kBlend | factors(kSa, kMsa));  // blue at alpha 128
@@ -379,7 +393,7 @@ TEST(newport_blend_source_alpha_over_frame_buffer_and_colorback) {
 // Below 24 bits an RGB colour is rounded to the nearest stored value, after
 // blending on 8-bit channels; COLORBACK is 8-8-8 in RGB mode.
 TEST(newport_rgb_rounding_blend_and_colorback) {
-    Rig t(Newport::Options{true, 0xA});
+    Rig t;
     constexpr u32 kRgb12 = (kRgb24 & ~(3u << 3)) | (2u << 3);
     point24(t, 10, 10, 0x080808, kRgb12);  // half a step rounds up
     CHECK_EQ(read24(t, 10, 10), 0x111111u);
@@ -396,7 +410,7 @@ TEST(newport_rgb_rounding_blend_and_colorback) {
 
 // A slope written as minus zero leaves the iterator where it is.
 TEST(newport_minus_zero_slope_keeps_alpha) {
-    Rig t(Newport::Options{true, 0xA});
+    Rig t;
     for (int x = 20; x < 24; ++x) point24(t, x, 5, 0x0000FF);
     t.w(0x204, 0x80u << 11);  // COLORALPHA 128
     t.w(0x214, 0x80000000u);  // SLOPEALPHA -0
@@ -411,7 +425,7 @@ TEST(newport_minus_zero_slope_keeps_alpha) {
 // A_LINE: the two pixels across the exact line, weighted from AWEIGHT and
 // blended by coverage.
 TEST(newport_antialiased_line_coverage) {
-    Rig t(Newport::Options{true, 0xA});
+    Rig t;
     auto line = [&](double x1, double y1, double x2, double y2) {
         auto fixed = [](double v) { return static_cast<u32>(static_cast<s32>(v * 16)) << 7; };
         t.w(kDrawMode1, kRgb24 | kBlend | factors(kSa, kMsa));
@@ -480,7 +494,7 @@ TEST(newport_dcb_crs_increment_persists) {
 // The XMAP9 picks among the layers: a non-zero overlay over the pixel, the
 // pixel over the underlay, the underlay behind zero pixels.
 TEST(newport_overlay_and_underlay_layers) {
-    Rig t(Newport::Options{true});  // the XL24: 8 overlay bits per buffer
+    Rig t;  // the XL24: 8 overlay bits per buffer
     t.vc2_ram(0x000, {0x8380});
     t.vc2_ram(0x400, {0x000, 1, 0, 0});
     t.vc2_reg(0x1F, 1);
@@ -612,7 +626,7 @@ TEST(newport_ci_rounding) {
 
 // A double-buffered logic op takes its destination from the DBLSRC buffer.
 TEST(newport_logic_op_destination_from_dblsrc) {
-    Rig t(Newport::Options{true, 0xA});
+    Rig t;
     auto point = [&](u32 dm1, u32 mask, u32 ci) {
         t.w(kDrawMode1, dm1);
         t.w(kWrMask, mask);
@@ -628,17 +642,118 @@ TEST(newport_logic_op_destination_from_dblsrc) {
     CHECK_EQ(pixel8(t, 4, 4), 0xFFu);
 }
 
-// CMAP0 reports the board revision in bits 6:4, with the 8-bit flag.
+// CMAP0 reports the board revision in bits 6:4, with the 8-bit flag clear.
 TEST(newport_board_revision) {
     auto revision = [](Newport::Options o) {
         Rig t(o);
         t.w(kDcbMode, width(0) | crs(6) | slave(1));
         return t.r(kDcbData0) >> 24;
     };
-    CHECK_EQ(revision({}), 0xA1u);
-    CHECK_EQ(revision({true, 0xA}), 0x02u);
-    CHECK_EQ(revision({false, 0xA, 6}), 0xE1u);
-    CHECK_EQ(revision({true, 0xA, 4}), 0x42u);
+    CHECK_EQ(revision({}), 0x02u);
+    CHECK_EQ(revision({0xA, 4}), 0x42u);
+}
+
+// The cursor's origin and the first column scanned out follow the timing
+// table: HPOS ahead of the visible part (36 pixels in SGI's tables, the
+// glyph then at CURX - 29), the display enable against it, and the lines
+// from VPOS to the first visible one (32: CURY - 31).
+TEST(newport_cursor_origin_and_scan_column_follow_the_timing_table) {
+    // A state: duration in pixel clock pairs, channels as active-low bits
+    // (SA: VT<20:14>; VIS 14, HPOS 15, DISPLAY ENABLE 16; SB holds VPOS, 13).
+    auto table = [](Rig& t, unsigned hpos_ahead, unsigned enable_ahead, unsigned vpos_lines) {
+        constexpr u16 kAllOff = 0x7F, kVis = 1u << 0, kHpos = 1u << 1, kEnable = 1u << 2;
+        auto state = [](unsigned cycles, u16 sa, bool eol) {
+            return static_cast<u16>((eol ? 0x8000 : 0) | (cycles << 8) | 0x80 | sa);  // SB/SC unchanged
+        };
+        // Line 0 (VPOS): two words, the second setting SB with VPOS active.
+        t.vc2_ram(0x000, {static_cast<u16>(0x8000 | (10u << 8) | kAllOff), static_cast<u16>(0x8000 | ((0x7Fu & ~0x40u) << 8) | 0x80 | 0x7F), 0x000});
+        // Blank line, VPOS off again.
+        t.vc2_ram(0x010, {static_cast<u16>(0x8000 | (10u << 8) | kAllOff), static_cast<u16>(0x8000 | (0x7Fu << 8) | 0x80 | 0x7F), 0x010});
+        // Visible line: blank, HPOS (and the enable) ahead, then 62 visible pixels.
+        const unsigned lead = 20;
+        const u16 vis = static_cast<u16>(kAllOff & ~(kVis | kHpos | kEnable));
+        const u16 ahead_both = static_cast<u16>(kAllOff & ~(kHpos | kEnable)), ahead_hpos = static_cast<u16>(kAllOff & ~kHpos);
+        std::vector<u16> line = {state(lead, kAllOff, false)};
+        const unsigned h = hpos_ahead / 2, e = enable_ahead / 2;
+        if (h > e) line.push_back(state(h - e, ahead_hpos, false));
+        if (e) line.push_back(state(e, ahead_both, false));
+        line.push_back(state(31, vis, true));
+        line.push_back(0x020);
+        for (std::size_t i = 0; i < line.size(); ++i) t.vc2_ram(static_cast<u16>(0x020 + i), {line[i]});
+        t.vc2_ram(0x400, {0x000, 1, 0x010, static_cast<u16>(vpos_lines - 1), 0x020, 40, 0, 0});
+    };
+    auto origin = [&](unsigned hpos_ahead, unsigned enable_ahead, unsigned vpos_lines, int& x, int& y) {
+        Rig t;
+        table(t, hpos_ahead, enable_ahead, vpos_lines);
+        t.vc2_reg(0x1F, 1);
+        t.vc2_reg(0x00, 0x400);
+        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010 | 0x0080);
+        t.vc2_reg(0x02, 100);
+        t.vc2_reg(0x03, 100);
+        CHECK(t.np.cursor_position(x, y));
+        std::vector<u32> px;
+        unsigned w = 0, h = 0;
+        CHECK(t.np.render(px, w, h));
+        CHECK_EQ(w, 60u);  // 62 visible clocks less the 2-pixel data pipeline
+        CHECK_EQ(h, 40u);
+    };
+    int x = 0, y = 0;
+    origin(36, 0, 32, x, y);  // as SGI's tables
+    CHECK_EQ(x, 100 - 29);
+    CHECK_EQ(y, 100 - 31);
+    origin(44, 0, 36, x, y);  // HPOS 8 pixels earlier, VPOS 4 lines earlier
+    CHECK_EQ(x, 100 - 37);
+    CHECK_EQ(y, 100 - 35);
+    // The display enable 4 pixels ahead of the visible part: screen column 0
+    // shows frame buffer column 6 rather than 2.
+    for (unsigned enable : {0u, 4u}) {
+        Rig t;
+        table(t, 36, enable, 32);
+        t.vc2_reg(0x1F, 1);
+        t.vc2_reg(0x00, 0x400);
+        t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010);
+        t.w(kTopScan, 0x3FF);
+        t.cmap_entry(0x1E01, 0xFF0000);
+        t.cmap_entry(0x1E02, 0x00FF00);
+        t.fill(2, 0, 2, 0, 1);
+        t.fill(6, 0, 6, 0, 2);
+        t.xmap_mode(0, 0xF0 | (1u << 10));  // 8-bit colour index, MSB_CMAP 0x1E (0x1E00)
+        std::vector<u32> px;
+        unsigned w = 0, h = 0;
+        CHECK(t.np.render(px, w, h));
+        CHECK_EQ(px[0] & 0xFFFFFF, enable ? 0x00FF00u : 0xFF0000u);
+    }
+}
+
+// A DID record's X is the frame buffer column where its mode starts (IRIX
+// places a window's DID and its pixels at the same column): with the
+// screen 2 columns into the frame buffer, at screen column X - 2.
+TEST(newport_did_columns_are_frame_buffer_columns) {
+    Rig t;
+    constexpr unsigned kW = 60, kH = 4;
+    t.vc2_ram(0x000, {static_cast<u16>(0x8080 | ((kW + 2) << 7))});
+    t.vc2_ram(0x400, {0x000, kH, 0, 0});
+    t.vc2_ram(0x800, {static_cast<u16>((0u << 5) | 1), static_cast<u16>((20u << 5) | 2), 0xFFE0});  // mode 1, mode 2 from 20
+    for (unsigned y = 0; y < kH; ++y) t.vc2_ram(static_cast<u16>(0x600 + y), {0x800});
+    t.xmap_mode(1, 0xF0 | (1u << 10));  // 8-bit colour index, map 0x1E00
+    t.xmap_mode(2, 0xE8 | (1u << 10));  // 8-bit colour index, map 0x1D00
+    t.cmap_entry(0x1E07, 0xFF0000);
+    t.cmap_entry(0x1D07, 0x00FF00);
+    t.fill(0, 0, kW + 4, kH, 7);
+    t.vc2_reg(0x05, 0x600);
+    t.vc2_reg(0x1F, 1);
+    t.vc2_reg(0x00, 0x400);
+    t.vc2_reg(0x10, 0x0006 | 0x0008 | 0x0010);
+    t.w(kTopScan, 0x3FF);
+    t.now += 150000000 / 60 + 1;  // the DID pointer is taken at retrace
+    t.sched.run_due(t.now);
+    std::vector<u32> px, ref;
+    unsigned w = 0, h = 0;
+    CHECK(t.np.render(px, w, h));
+    CHECK_EQ(px[17] & 0xFFFFFF, 0xFF0000u);  // frame buffer column 19: mode 1
+    CHECK_EQ(px[18] & 0xFFFFFF, 0x00FF00u);  // column 20: mode 2
+    CHECK(t.np.render_full(ref, w, h));
+    CHECK(px == ref);
 }
 
 // The VC2 takes a new cursor position, and DID table, at vertical retrace.

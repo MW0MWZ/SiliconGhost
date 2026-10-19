@@ -58,9 +58,20 @@ public:
         kExtSgRetrace = 1u << 8, kExtSgIrq1 = 1u << 9, kExtSgIrq2 = 1u << 10, kExtSgIrq3 = 1u << 11,
         kExtS0Retrace = 1u << 12, kExtS0Irq1 = 1u << 13, kExtS0Irq2 = 1u << 14, kExtS0Irq3 = 1u << 15,
     };
-    // Full House: the graphics slot's GIO interrupts (FIFO, graphics,
-    // retrace), each setting its EXTIO bit and the shared local input.
-    void set_gfx_slot_irq(unsigned gio_int, bool level);
+    // A card's GIO interrupt lines (0 FIFO, 1 graphics, 2 retrace) in a
+    // slot (0 graphics, 1 and 2 the expansion slots). On the Full House the
+    // graphics slot and expansion slot 0 each set their EXTIO bits and share
+    // the local inputs (FIFO and graphics in local 0, the retrace latched in
+    // local 1 until PORT_CONFIG clears it); expansion slot 1 has no lines
+    // there. On the Indy the graphics slot's go to local 0 and 1 and each
+    // expansion slot's to its mappable input (GIO EXP0, EXP1).
+    void set_gio_slot_irq(unsigned slot, unsigned gio_int, bool level);
+    void set_gfx_slot_irq(unsigned gio_int, bool level) { set_gio_slot_irq(0, gio_int, level); }
+    // Full House: a graphics board's FIFO drain feedback lines (mappable
+    // inputs 6 and 7, the Indy's expansion slot interrupts).
+    void set_gfx_drain(unsigned line, bool level) {
+        if (full_house_ && line < 2) set_mappable(kMapGioExp0 + line, level);
+    }
 
     void set_local0(unsigned bit, bool level) { set_bit(local0_raw_, bit, level); }
     void set_local1(unsigned bit, bool level) { set_bit(local1_raw_, bit, level); }
@@ -100,7 +111,8 @@ private:
     bool full_house_;
     u16 ext_io_ = 0xFFFF;
     u8 port_config_ = 0;
-    std::array<bool, 3> gfx_irq_{};
+    std::array<std::array<bool, 3>, 3> slot_irq_{};  // [slot][GIO interrupt]; the retraces latched
+    void update_slot_irqs();
 
     // IOC registers
     std::array<u8, 10> pport_{};

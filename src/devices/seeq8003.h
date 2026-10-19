@@ -5,14 +5,24 @@
 // registers. The data moves through the host interface's DMA (HPC3 on the
 // Indy), which reports frames and their outcome here.
 //
-// Registers (byte-wide): writes to 0-5 load the station address (or, on the
-// 80C03, multicast filter bytes in register banks 1-2), 6 is the receive
-// command and 7 the transmit command; reads of 6 and 7 return the receive
-// and transmit status. Reading a status marks it old (bit 7), which drops
-// its interrupt. As on the 80C03 the Indy has, reads of 0-3 return its
-// collision counters (none on an emulated wire) and 4-5 read as zero.
+// Registers (byte-wide): writes to 0-5 load the station address, 6 is the
+// receive command and 7 the transmit command; reads of 6 and 7 return the
+// receive and transmit status. Reading a status marks it old (bit 7), which
+// drops its interrupt. The 80C03 the Indy has adds register banks, chosen by
+// transmit command bits 6:5: bank 1 takes multicast filter bytes 0-5, bank 2
+// bytes 6-7 in registers 0-1, the transmit control register in 3 and the
+// configuration register in 4. Reads of 0-3 return its collision counters
+// (none on an emulated wire), 4 reads as zero and 5 returns its flags: SQE,
+// set after a frame is sent, and no carrier, set when one is sent with no
+// cable; each is cleared by writing 0 to its control bit and kept only
+// while that bit is 1.
 //
-// References: Linux drivers/net/ethernet/seeq/sgiseeq.h.
+// The multicast filter's bytes are kept but not applied: its hash is not
+// known (no 80C03 data sheet), and with multicast frames received the guest
+// keeps or drops each group itself.
+//
+// References: Linux drivers/net/ethernet/seeq/sgiseeq.h; NetBSD
+// sys/dev/ic/seeq8003reg.h.
 #pragma once
 
 #include <array>
@@ -44,7 +54,11 @@ public:
     // The outcome of a received or transmitted frame (new status); true if
     // the event is one the commands ask to interrupt on.
     bool received(u8 status);
-    bool transmitted(u8 status);
+    // `carrier`: a cable was there to send on.
+    bool transmitted(u8 status, bool carrier = true);
+    // Configuration register: frames this station sent are not taken back
+    // (in loopback).
+    bool receives_own() const { return !(config_ & kCfgNoOwn); }
 
     u8 rx_status() const { return rx_status_; }
     u8 tx_status() const { return tx_status_; }
@@ -55,7 +69,10 @@ public:
 private:
     void update_irq();
 
+    static constexpr u8 kCfgGroupAddress = 0x01, kCfgNoOwn = 0x08;
     std::array<u8, 6> station_{};
+    std::array<u8, 8> multicast_filter_{};
+    u8 control_ = 0, config_ = 0, flags_ = 0;
     u8 rx_command_ = 0, tx_command_ = 0;
     u8 rx_status_ = 0, tx_status_ = 0;
     bool irq_ = false;

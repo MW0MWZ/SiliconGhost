@@ -95,6 +95,8 @@ void Wd33c93::reset_released() {
 void Wd33c93::release_bus() {
     target_ = nullptr;
     bus_phase_ = 0;
+    atn_ = false;
+    resume_phase_ = 0;
     buffer_.clear();
     buffer_pos_ = polled_end_ = 0;
     dma_wait_ = DmaWait::None;
@@ -128,6 +130,16 @@ void Wd33c93::select(ScsiTarget& target, bool atn) {
     target_ = &target;
     lun_ = regs_[kTargetLun] & 7;
     bus_phase_ = atn ? kBusMessageOut : kBusCommand;
+    resume_phase_ = kBusCommand;
+}
+
+// The target moves on to `phase`, by way of MESSAGE OUT if ATN is raised.
+void Wd33c93::next_phase(u8 phase) {
+    if (atn_ && phase != kBusMessageOut) {
+        resume_phase_ = phase;
+        phase = kBusMessageOut;
+    }
+    bus_phase_ = phase;
 }
 
 // The target has the whole CDB: it executes the command and asks for the
@@ -179,7 +191,9 @@ bool Wd33c93::receive_messages(const std::vector<u8>& m) {
             if (b == 0x0C && target_) target_->bus_reset();
             return false;
         } else {
-            if (b != 0x08) msg_in_.push_back(kMsgMessageReject);  // all but NO OPERATION
+            // NO OPERATION, and MESSAGE REJECT (of the target's last
+            // message, which it then does without), need no reply.
+            if (b != 0x08 && b != kMsgMessageReject) msg_in_.push_back(kMsgMessageReject);
             ++i;
         }
     }
@@ -241,8 +255,21 @@ void Wd33c93::transfer_data() {
         dma_wait_ = DmaWait::TransferInfo;
         return;
     }
-    if (buffer_pos_ == buffer_.size()) end_data();
-    finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.05 + moved / bytes_per_ms_);
+    data_phase_done(0.05 + moved / bytes_per_ms_);
+}
+
+// A Transfer Info in a data phase has moved what it could. If the target's
+// data ran out first it went on to STATUS with count left over: an
+// unexpected phase.
+void Wd33c93::data_phase_done(double ms) {
+    if (buffer_pos_ < buffer_.size()) {
+        finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), ms);
+        return;
+    }
+    end_data();
+    next_phase(kBusStatus);
+    const bool early = transfer_count() > 0;
+    finish_in(static_cast<u8>((early ? kStatusUnexpectedPhase : kStatusTransferDone) | bus_phase_), ms);
 }
 
 // Data is due but the host's DMA moved none: the chip keeps requesting.
@@ -281,10 +308,12 @@ void Wd33c93::start_polled_data(bool sat) {
 void Wd33c93::polled_data_done() {
     aux_status_ &= static_cast<u8>(~kAuxDbr);
     const bool more = buffer_pos_ < buffer_.size();
-    if (!more) end_data();
     if (!polled_sat_) {
-        finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.05);
-    } else if (more) {
+        data_phase_done(0.05);
+        return;
+    }
+    if (!more) end_data();
+    if (more) {
         regs_[kCommandPhase] = kPhaseTransferCount;
         finish_in(static_cast<u8>(kStatusUnexpectedPhase | bus_phase_), 0.05);
     } else {
@@ -339,7 +368,17 @@ void Wd33c93::end_pio_out() {
             finish_in(kStatusDisconnect, 0.01);
             return;
         }
-        bus_phase_ = msg_in_.empty() ? kBusCommand : kBusMessageIn;
+        atn_ = false;
+        if (!msg_in_.empty()) {
+            bus_phase_ = kBusMessageIn;
+        } else if (resume_phase_ == kBusMessageIn) {  // the message rejected was the target's last
+            release_bus();
+            pio_.clear();
+            finish_in(kStatusDisconnect, 0.01);
+            return;
+        } else {
+            bus_phase_ = resume_phase_;
+        }
         pio_.clear();
         finish_in(static_cast<u8>(kStatusTransferDone | bus_phase_), 0.01);
         return;
@@ -372,7 +411,15 @@ void Wd33c93::pio_in_taken() {
 
 void Wd33c93::negate_ack() {
     if (!target_ || bus_phase_ != kBusMessageIn) return;
-    if (!msg_in_.empty()) {
+    if (atn_) {  // the host rejects (or answers) the message: MESSAGE OUT first
+        // Message in comes before the command (a reply to negotiation) or
+        // after status (COMMAND COMPLETE, after which the target leaves the
+        // bus); the rest of a rejected message is not sent.
+        resume_phase_ = command_done_ ? kBusMessageIn : kBusCommand;
+        msg_in_.clear();
+        bus_phase_ = kBusMessageOut;
+        finish_in(static_cast<u8>(kStatusServiceRequired | kBusMessageOut), 0.01);
+    } else if (!msg_in_.empty()) {
         finish_in(static_cast<u8>(kStatusServiceRequired | kBusMessageIn), 0.01);
     } else if (command_done_) {  // after COMMAND COMPLETE the target releases the bus
         release_bus();
@@ -558,7 +605,9 @@ void Wd33c93::command(u8 cmd) {
             aux_status_ &= static_cast<u8>(~(kAuxBusy | kAuxDbr));
             release_bus();
             return;
-        case kCmdAssertAtn: return;
+        case kCmdAssertAtn:  // no interrupt; the target sees ATN at its next phase change
+            if (target_) atn_ = true;
+            return;
         default:
             if (level1) return;
             // Target-role and other commands the initiator cannot run here.

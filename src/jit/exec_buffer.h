@@ -25,10 +25,13 @@ public:
     // Copies `size` bytes of code in and returns its executable address, or
     // nullptr when the buffer is full.
     const void* add(const u8* code, std::size_t size);
+    // Where the next add() will place its code.
+    const u8* next() const { return exec_ + ((used_ + kAlign - 1) & ~(kAlign - 1)); }
     // Discards all code; addresses returned earlier become invalid.
     void clear() { used_ = 0; }
 
 private:
+    static constexpr std::size_t kAlign = 16;
     std::size_t size_ = 0, used_ = 0;
     u8* write_ = nullptr;
     u8* exec_ = nullptr;

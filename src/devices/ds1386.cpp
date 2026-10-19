@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Andy Taylor
 #include "devices/ds1386.h"
 
+#include <cmath>
 #include <ctime>
 
 namespace sg {
@@ -42,22 +43,92 @@ Ds1386::Ds1386(unsigned size_bytes) : mem_(size_bytes, 0) {
     source_ = [] { return static_cast<double>(std::time(nullptr)); };
     mem_[kRegCommand] = 0x80;  // TE set: clock registers track time
     load_registers();
+    alarm_from_ = watchdog_from_ = now();
 }
 
 void Ds1386::set_time_source(std::function<double()> source) {
     loaded_centis_ = kNotLoaded;
     const double t = now();
     source_ = std::move(source);
-    offset_ = t - source_();
+    set_now(t);
+    alarm_from_ = watchdog_from_ = t;
+}
+
+void Ds1386::set_now(double t) {
+    if (stopped_) stopped_at_ = t;
+    else offset_ = t - source_();
+}
+
+void Ds1386::update_oscillator() {
+    const bool stop = mem_[0x9] & 0x80;
+    if (stop == stopped_) return;
+    const double t = now();
+    stopped_ = stop;
+    set_now(t);
+}
+
+// The minute `minute` (minutes since the epoch, in the clock's time) against
+// the alarm registers: minutes, hours and day of the week each compared
+// unless their mask bit (bit 7) is set; all masked, it goes off every minute.
+bool Ds1386::alarm_matches(s64 minute) const {
+    const s64 day = minute >= 0 ? minute / 1440 : (minute - 1439) / 1440;
+    const unsigned m = static_cast<unsigned>(minute - day * 1440);
+    const unsigned hour = m / 60, min = m % 60;
+    const unsigned dow = static_cast<unsigned>(((day % 7) + 7 + 4) % 7) + 1;  // 1 = Sunday
+    if (!(mem_[0x3] & 0x80) && from_bcd(mem_[0x3] & 0x7F) != min) return false;
+    if (!(mem_[0x5] & 0x80)) {
+        unsigned h;
+        if (mem_[0x5] & 0x40) h = from_bcd(mem_[0x5] & 0x1F) % 12 + ((mem_[0x5] & 0x20) ? 12 : 0);
+        else h = from_bcd(mem_[0x5] & 0x3F);
+        if (h != hour) return false;
+    }
+    if (!(mem_[0x7] & 0x80) && (mem_[0x7] & 0x07) != dow) return false;
+    return true;
+}
+
+u8 Ds1386::alarm_flags() {
+    const double t = now();
+    const bool pulse = mem_[kRegCommand] & 0x10;
+    constexpr double kPulse = 0.003;
+    u8 flags = 0;
+    // Time of day: checked each second; the first matching minute after the
+    // alarm was last cleared sets TDF (a week holds every pattern).
+    if (tod_alarm_at_ < 0 && t > alarm_from_) {
+        const s64 first = static_cast<s64>(std::floor(alarm_from_ / 60)), last = static_cast<s64>(std::floor(t / 60));
+        for (s64 m = first; m <= last && m <= first + 7 * 1440; ++m) {
+            if (!alarm_matches(m)) continue;
+            // Every minute (all masked) it goes off as the seconds roll over to 00.
+            const bool every_minute = (mem_[0x3] & mem_[0x5] & mem_[0x7] & 0x80) != 0;
+            const double at = std::max(alarm_from_, static_cast<double>(m * 60));
+            if (every_minute && at != static_cast<double>(m * 60)) continue;
+            if (at <= t) {
+                tod_alarm_at_ = at;
+                break;
+            }
+        }
+        if (tod_alarm_at_ < 0) alarm_from_ = t;  // nothing yet: look on from here next time
+    }
+    if (tod_alarm_at_ >= 0 && (!pulse || t - tod_alarm_at_ < kPulse)) flags |= 0x01;
+    // Watchdog: the period counts down from the last access, over and over.
+    const double period = from_bcd(mem_[0xD]) + from_bcd(mem_[0xC]) / 100.0;
+    if (period > 0 && t - watchdog_from_ >= period) {
+        const double since = std::fmod(t - watchdog_from_, period);
+        if (!pulse || since < kPulse) flags |= 0x02;
+    }
+    return flags;
 }
 
 void Ds1386::power_on() {
     loaded_centis_ = kNotLoaded;
+    stopped_ = false;
     offset_ = 0;
     frozen_ = false;
     valid_ = true;
     mem_[kRegCommand] |= 0x80;  // TE
+    update_oscillator();  // a clock saved with its oscillator off stays stopped
     load_registers();
+    alarm_from_ = watchdog_from_ = now();  // the alarm and watchdog count from power-on
+    tod_alarm_at_ = -1;
 }
 
 void Ds1386::load_registers() {
@@ -123,13 +194,27 @@ void Ds1386::commit() {
     loaded_centis_ = kNotLoaded;
     s64 t;
     valid_ = registers_valid(t);
-    if (valid_) offset_ = static_cast<double>(t) + from_bcd(mem_[0x0] & 0xFF) / 100.0 - source_();
+    if (valid_) set_now(static_cast<double>(t) + from_bcd(mem_[0x0] & 0xFF) / 100.0);
 }
 
 u8 Ds1386::read(unsigned index) {
     index &= static_cast<unsigned>(mem_.size() - 1);  // smaller parts (the DS1286) repeat
-    if (index < kNumClockRegs && index != kRegCommand && !frozen_ && valid_) load_registers();
-    return mem_[index];
+    if (index == kRegCommand) return static_cast<u8>((mem_[index] & 0xFC) | alarm_flags());
+    if (index < kNumClockRegs && !frozen_ && valid_) load_registers();
+    const u8 v = mem_[index];
+    alarm_registers_touched(index);
+    return v;
+}
+
+// Reading or writing the time of day alarm registers clears TDF; the
+// watchdog's, WAF, and starts its count again.
+void Ds1386::alarm_registers_touched(unsigned index) {
+    if (index == 0x3 || index == 0x5 || index == 0x7) {
+        tod_alarm_at_ = -1;
+        alarm_from_ = now();
+    } else if (index == 0xC || index == 0xD) {
+        watchdog_from_ = now();
+    }
 }
 
 void Ds1386::write(unsigned index, u8 value) {
@@ -151,7 +236,9 @@ void Ds1386::write(unsigned index, u8 value) {
         // Writes land verbatim; the clock takes them up once they form a valid time.
         if (!frozen_ && valid_) load_registers();
         mem_[index] = value;
+        if (index == 0x9) update_oscillator();
         if (!frozen_) commit();
+        alarm_registers_touched(index);
         return;
     }
     if (mem_[index] != value) ++nvram_changes_;

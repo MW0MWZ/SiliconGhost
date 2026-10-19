@@ -52,6 +52,7 @@ constexpr u32 SW(unsigned rt, s32 off, unsigned base) { return I(0x2B, base, rt,
 constexpr u32 SWL(unsigned rt, s32 off, unsigned base) { return I(0x2A, base, rt, off); }
 constexpr u32 SWR(unsigned rt, s32 off, unsigned base) { return I(0x2E, base, rt, off); }
 constexpr u32 LD(unsigned rt, s32 off, unsigned base) { return I(0x37, base, rt, off); }
+constexpr u32 SD(unsigned rt, s32 off, unsigned base) { return I(0x3F, base, rt, off); }
 
 constexpr u32 MFC0(unsigned rt, unsigned rd) { return (0x10u << 26) | (0x00u << 21) | (rt << 16) | (rd << 11); }
 constexpr u32 MTC0(unsigned rt, unsigned rd) { return (0x10u << 26) | (0x04u << 21) | (rt << 16) | (rd << 11); }

@@ -148,6 +148,10 @@ public:
     ~R4000();
 
     void reset();
+    // A soft (warm) reset, from the Reset* signal: to the reset vector with
+    // Status SR, BEV and ERL set, TS clear and the restart PC in ErrorEPC;
+    // everything else is kept.
+    void soft_reset();
     void step();
     // Executes up to `max_instructions`; returns the number executed.
     u64 run(u64 max_instructions);
@@ -242,6 +246,8 @@ public:
     // still to be worked out, from fp_lazy_*. Translated code leaves it so
     // once the sticky Inexact flag is set, when only that bit would tell.
     static constexpr u32 kFcrLazyI = 1u << 18;
+    // FCR31 bits CTC1 writes (the R5000 adds condition codes 1-7).
+    static constexpr u32 kFcrWriteMask = 0x0183FFFFu, kFcrCondMips4 = 0xFE000000u;
     void resolve_fp_lazy();
 
 private:
@@ -361,7 +367,8 @@ private:
     // Successors of a decoded block within its page that a translation can
     // reach without a lookup: the offsets of the taken target of its
     // conditional branch and of the instruction after it (not after a
-    // branch-likely, whose untaken path leaves the translation).
+    // branch-likely, whose untaken path leaves the translation), or of where
+    // its JR or JALR went.
     void jit_successors(const Block& b, std::vector<u32>& offsets) const;
     // The page offsets recorded for `b`'s jump through a register (b may be
     // a copy decoded for a region: the recording is in its slot).
@@ -398,6 +405,7 @@ private:
     void execute_cop1(u32 inst);
     void execute_cop1x(u32 inst);  // MIPS IV indexed FPU loads and stores, multiply-add
     void execute_cache(u32 inst);
+    bool cache_op_changes_link(unsigned cache, unsigned operation, u64 vaddr, u64 paddr) const;
     void cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 paddr);
     void execute_wait();
     void wait_for_interrupt(u64 limit_cycle);
@@ -536,6 +544,7 @@ private:
     std::vector<std::array<JitVictim, kJitVictims>> jit_victims_;
     u32 jit_generation_ = 1;  // bumped whenever the code buffer is emptied
     u64 jit_compiles_ = 0, jit_reuses_ = 0;
+    u64 code_page_writes_ = 0, jit_buffer_flushes_ = 0;  // pages of decoded code written; code buffers filled
     void keep_translation(Block& b);
     void reuse_translation(Block& b);
     std::unique_ptr<jit::ExecBuffer> jit_buf_;  // null when the recompiler is off or unavailable
@@ -558,6 +567,11 @@ private:
     const u8* jit_block_host_ = nullptr;  // the block it should hold (it may need decoding again)
     u64 jit_entry_pc_ = 0;
     std::size_t jit_link_offset_ = 0;  // offset of the linked entry point in every translation
+    // Block-end code every translation shares (per addressing mode): enter
+    // a block's translation, and look a pc's block up then enter it.
+    const u8* jit_enter_stub_[2]{};
+    const u8* jit_lookup_stub_[2]{};
+    u32 jit_stub_generation_ = 0;  // the code buffer generation holding them
     static void jit_backward_branch(R4000* cpu, u64 target) { cpu->backward_branch(target); }
     // Translated code jumped through a register (in `jr`, the slot of the
     // block doing it) to a place in its page it had no link for: learn it,
@@ -668,6 +682,7 @@ private:
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
     u32 config_ = 0, prid_ = 0, pagemask_ = 0, count_offset_ = 0;
     u32 watchlo_ = 0, watchhi_ = 0, ecc_ = 0, cacheerr_ = 0, taglo_ = 0, taghi_ = 0, lladdr_ = 0;
+    u64 llvaddr_ = 0;  // the virtual address of the last LL (primary caches are virtually indexed)
     u64 entrylo0_ = 0, entrylo1_ = 0, context_ = 0, xcontext_ = 0, badvaddr_ = 0;
     u64 entryhi_ = 0, epc_ = 0, errorepc_ = 0;
     bool llbit_ = false;

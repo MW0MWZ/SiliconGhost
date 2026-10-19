@@ -58,7 +58,14 @@ void Kbc8042::reset() {
     update_irq();
 }
 
+void Kbc8042::set_held(bool held) {
+    if (held == held_) return;
+    held_ = held;
+    reset();
+}
+
 u8 Kbc8042::read_status() const {
+    if (held_) return 0;
     u8 s = kStatNotInhibited;
     if (!out_.empty()) {
         s |= kStatOutputFull;
@@ -70,7 +77,7 @@ u8 Kbc8042::read_status() const {
 }
 
 u8 Kbc8042::read_data() {
-    if (out_.empty()) return 0;
+    if (held_ || out_.empty()) return 0;
     const u8 b = out_.front().first;
     out_.pop_front();
     update_irq();
@@ -109,6 +116,7 @@ void Kbc8042::update_irq() {
 }
 
 void Kbc8042::write_command(u8 value) {
+    if (held_) return;
     last_was_command_ = true;
     switch (value) {
         case 0x20: push(command_byte_, false); break;          // read command byte
@@ -141,6 +149,7 @@ void Kbc8042::write_command(u8 value) {
 }
 
 void Kbc8042::write_data(u8 value) {
+    if (held_) return;
     last_was_command_ = false;
     const Pending p = pending_;
     pending_ = Pending::None;
@@ -260,15 +269,15 @@ void Kbc8042::mouse_command(u8 value) {
 }
 
 void Kbc8042::key_input(u8 scancode) {
-    if (!(command_byte_ & kCmdKbdDisable)) push_keyboard(scancode);
+    if (!held_ && !(command_byte_ & kCmdKbdDisable)) push_keyboard(scancode);
 }
 
 void Kbc8042::mouse_input(u8 byte) {
-    if (!(command_byte_ & kCmdAuxDisable)) push(byte, true);
+    if (!held_ && !(command_byte_ & kCmdAuxDisable)) push(byte, true);
 }
 
 void Kbc8042::mouse_motion(int dx, int dy, unsigned buttons) {
-    if (!mouse_reporting_ || (command_byte_ & kCmdAuxDisable)) return;
+    if (held_ || !mouse_reporting_ || (command_byte_ & kCmdAuxDisable)) return;
     buttons &= 7;
     do {
         // Movement is a 9-bit two's complement count per packet.

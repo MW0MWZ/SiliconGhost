@@ -12,6 +12,7 @@
 #include "devices/kbc8042.h"
 #include "devices/pit8254.h"
 #include "devices/scsi_disk.h"
+#include "devices/seeq8003.h"
 #include "devices/wd33c93.h"
 #include "devices/z85230.h"
 #include "test.h"
@@ -264,21 +265,191 @@ TEST(scc_transmit_and_interrupts) {
     scc.write_control(0, 0x12);  // WR1: Tx int enable, Rx int on all chars
     scc.write_control(0, 3);
     scc.write_control(0, 0xC1);  // WR3: Rx enable, 8 bits
-    scc.write_data(0, 'h');
-    CHECK(!(scc.read_control(0) & 0x04));  // Tx buffer full
-    clk.advance_to(60);
+    scc.write_data(0, 'h');  // straight into the shift register: the FIFO is empty again
     CHECK(scc.read_control(0) & 0x04);
-    CHECK(irq);
+    CHECK(irq);  // FIFO empty (WR7' D5, set at reset): transmit IP
     scc.write_control(0, 3);
     CHECK_EQ(scc.read_control(0) & 0x10, 0x10);  // RR3: channel A Tx IP
     scc.write_control(0, 0x28);                   // reset Tx int pending
     CHECK(!irq);
+    for (char ch : std::string("ello")) scc.write_data(0, ch);  // fills the 4-byte FIFO
+    CHECK(!(scc.read_control(0) & 0x04));  // entry location full
+    CHECK(!irq);
+    clk.advance_to(60);  // 'h' sent, 'e' to the shift register: there is room again
+    CHECK(scc.read_control(0) & 0x04);
+    CHECK(!irq);         // not until the FIFO is empty
+    clk.advance_to(260);
+    CHECK(irq);
+    scc.write_control(0, 0x28);
     scc.receive(0, 'x');
     CHECK(irq);
     CHECK(scc.read_control(0) & 0x01);
     CHECK_EQ(scc.read_data(0), 'x');
     CHECK(!irq);
-    CHECK(out == "h");
+    clk.advance_to(400);
+    CHECK(out == "hello");
+}
+
+namespace {
+void scc_wr(Z85230& scc, unsigned ch, unsigned reg, u8 v) {
+    if (reg >= 8) scc.write_control(ch, static_cast<u8>(0x08 | (reg - 8)));  // point high
+    else if (reg) scc.write_control(ch, static_cast<u8>(reg));
+    scc.write_control(ch, v);
+}
+u8 scc_rr(Z85230& scc, unsigned ch, unsigned reg) {
+    if (reg >= 8) scc.write_control(ch, static_cast<u8>(0x08 | (reg - 8)));
+    else if (reg) scc.write_control(ch, static_cast<u8>(reg));
+    return scc.read_control(ch);
+}
+}  // namespace
+
+// WR7' (WR15 D0 selects it) and the extended reads it enables: WR3, WR4,
+// WR5, WR7' and WR10 in RR9, RR4, RR5, RR14 and RR11.
+TEST(scc_wr7_prime_and_extended_read) {
+    Clock clk;
+    Z85230 scc(clk.sched, 50);
+    scc_wr(scc, 0, 3, 0xC0);
+    scc_wr(scc, 0, 4, 0x44);
+    scc_wr(scc, 0, 10, 0x80);
+    CHECK_EQ(scc_rr(scc, 0, 4), scc_rr(scc, 0, 0));  // RR4 images RR0 without it
+    scc_wr(scc, 0, 15, 0x01);                          // WR7' selected
+    scc_wr(scc, 0, 7, 0x60);                           // extended read, Tx FIFO empty level
+    CHECK_EQ(scc_rr(scc, 0, 14), 0x60);
+    CHECK_EQ(scc_rr(scc, 0, 4), 0x44);
+    CHECK_EQ(scc_rr(scc, 0, 9), 0xC0);
+    CHECK_EQ(scc_rr(scc, 0, 11), 0x80);
+    scc_wr(scc, 0, 9, 0x80);  // channel reset A: WR7' back to 0x20, extended read off
+    CHECK_EQ(scc_rr(scc, 0, 14), 0);  // RR14 images RR10 again
+}
+
+// Receive interrupt modes: first character (re-armed by WR0's Enable Int on
+// Next Rx Character), and a FIFO overrun as a special condition that locks
+// the exit until Error Reset; the vector reports which.
+TEST(scc_receive_modes_and_special_condition) {
+    Clock clk;
+    Z85230 scc(clk.sched, 50);
+    bool irq = false;
+    scc.set_irq_callback([&](bool a) { irq = a; });
+    scc_wr(scc, 1, 9, 0x08);  // MIE
+    scc_wr(scc, 1, 3, 0xC1);
+    scc_wr(scc, 1, 1, 0x08);  // Rx int on first character or special condition
+    scc.receive(1, 'a');
+    CHECK(irq);
+    CHECK_EQ(scc_rr(scc, 1, 2) & 0x0E, 0x04);  // channel B receive character available
+    scc.receive(1, 'b');
+    CHECK_EQ(scc.read_data(1), 'a');
+    CHECK(!irq);  // only the first character
+    CHECK_EQ(scc.read_data(1), 'b');
+    scc.write_control(1, 0x20);  // enable int on next Rx character
+    scc.receive(1, 'c');
+    CHECK(irq);
+    CHECK_EQ(scc.read_data(1), 'c');
+    // Nine characters into the 8-byte FIFO: the last overwrites the eighth, flagged overrun.
+    for (int i = 0; i < 9; ++i) scc.receive(1, static_cast<u8>('0' + i));
+    for (int i = 0; i < 7; ++i) scc.read_data(1);
+    CHECK(scc_rr(scc, 1, 1) & 0x20);  // the exit character has overrun
+    CHECK_EQ(scc.read_data(1), '8');
+    CHECK(irq);                                 // special condition: the FIFO is locked
+    CHECK_EQ(scc_rr(scc, 1, 2) & 0x0E, 0x06);  // special receive condition
+    CHECK_EQ(scc.read_data(1), '8');            // still at the exit
+    CHECK(scc_rr(scc, 1, 0) & 0x01);
+    scc.write_control(1, 0x30);  // error reset: unlocked, the character gone
+    CHECK(!irq);
+    CHECK(!(scc_rr(scc, 1, 0) & 0x01));
+    CHECK(!(scc_rr(scc, 1, 1) & 0x20));
+}
+
+// A software acknowledge (WR9 D5, then RR2) puts the highest pending source
+// under service: it and every lower one stop interrupting until Reset
+// Highest IUS, while a higher one still can.
+TEST(scc_software_acknowledge_and_ius) {
+    Clock clk;
+    Z85230 scc(clk.sched, 50);
+    bool irq = false;
+    scc.set_irq_callback([&](bool a) { irq = a; });
+    scc_wr(scc, 0, 9, 0x28);  // MIE, software INTACK
+    scc_wr(scc, 0, 2, 0x00);
+    for (unsigned ch : {0u, 1u}) {
+        scc_wr(scc, ch, 3, 0xC1);
+        scc_wr(scc, ch, 1, 0x10);  // Rx int on all characters
+    }
+    scc.receive(1, 'b');
+    CHECK(irq);
+    CHECK_EQ(scc_rr(scc, 1, 2), 0x04);  // acknowledged: channel B receive
+    CHECK(!irq);                         // under service
+    scc.read_data(1);
+    scc.receive(1, 'c');
+    CHECK(!irq);  // the same source waits for Reset Highest IUS
+    scc.receive(0, 'a');
+    CHECK(irq);   // channel A receive is higher: it interrupts
+    CHECK_EQ(scc_rr(scc, 1, 2), 0x0C);  // channel A receive
+    scc.read_data(0);
+    scc.write_control(0, 0x38);  // reset highest IUS: channel A's
+    CHECK(!irq);                 // channel B's is still under service
+    scc.write_control(0, 0x38);  // and now channel B's
+    CHECK(irq);                  // its pending character interrupts again
+}
+
+// External/status: the bits enabled in WR15 latch on a change; the latches
+// open again with Reset External/Status Interrupts. Here the Tx underrun
+// latch (set again when the transmitter runs dry after a Reset Tx
+// Underrun/EOM) and the baud rate generator's zero count.
+TEST(scc_external_status_latches) {
+    Clock clk;
+    Z85230 scc(clk.sched, 50, 10.0);  // 10 cycles a PCLK
+    bool irq = false;
+    scc.set_irq_callback([&](bool a) { irq = a; });
+    scc_wr(scc, 0, 9, 0x08);
+    scc_wr(scc, 0, 5, 0x68);
+    scc_wr(scc, 0, 15, 0x40);  // Tx underrun/EOM only
+    scc_wr(scc, 0, 1, 0x01);   // external/status interrupts
+    CHECK(scc_rr(scc, 0, 0) & 0x40);
+    scc.write_control(0, 0xC0);  // reset Tx underrun/EOM latch
+    CHECK(!(scc_rr(scc, 0, 0) & 0x40));
+    CHECK(!irq);  // that transition does not interrupt
+    scc.write_data(0, 'x');
+    clk.advance_to(100);  // sent, nothing more: underrun
+    CHECK(irq);
+    CHECK_EQ(scc_rr(scc, 0, 3), 0x08);  // channel A external/status
+    scc.write_control(0, 0x10);         // reset external/status interrupts
+    CHECK(!irq);
+    scc_wr(scc, 0, 12, 8);      // time constant 8: a zero every 10 PCLKs (100 cycles)
+    scc_wr(scc, 0, 13, 0);
+    scc_wr(scc, 0, 15, 0x02);   // zero count
+    scc_wr(scc, 0, 14, 0x03);   // generator on, from PCLK
+    clk.advance_to(150);
+    CHECK(!irq);
+    clk.advance_to(250);
+    CHECK(irq);
+    scc.write_control(0, 0x10);
+    CHECK(!irq);
+    clk.advance_to(400);
+    CHECK(irq);  // and again
+}
+
+// Local loopback hands transmitted characters to the receiver (and still to
+// TxD); auto echo sends received characters straight back out.
+TEST(scc_local_loopback_and_auto_echo) {
+    Clock clk;
+    Z85230 scc(clk.sched, 50);
+    std::string out;
+    scc.set_tx_sink([&](unsigned, u8 b) { out.push_back(static_cast<char>(b)); });
+    scc_wr(scc, 0, 3, 0xC1);
+    scc_wr(scc, 0, 5, 0x68);
+    scc_wr(scc, 0, 14, 0x10);  // local loopback
+    scc.write_data(0, 'L');
+    clk.advance_to(100);
+    CHECK(out == "L");
+    CHECK_EQ(scc.read_data(0), 'L');
+    scc.receive(0, 'z');  // RxD is not heard
+    CHECK(!(scc_rr(scc, 0, 0) & 0x01));
+    scc_wr(scc, 0, 14, 0x08);  // auto echo
+    scc.receive(0, 'e');
+    CHECK(out == "Le");
+    CHECK_EQ(scc.read_data(0), 'e');
+    scc.write_data(0, 'q');  // transmitted data is not seen
+    clk.advance_to(200);
+    CHECK(out == "Le");
 }
 
 TEST(wd33c93_reset_and_selection_timeout) {
@@ -790,6 +961,183 @@ TEST(wd33c93_manual_phases_command_status_message) {
     CHECK_EQ(status(), 0x20);
     wd_write(wd, 0x18, 0x03);
     CHECK_EQ(status(), 0x85);  // target released the bus
+}
+
+// A transfer count larger than the target's data: the target goes on to
+// STATUS first, and the Transfer Info ends with an unexpected phase and the
+// count left over.
+TEST(wd33c93_transfer_info_ended_early_by_the_target) {
+    const TempImage image(2);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, image.path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    std::vector<u8> memory;
+    wd.set_dma([&](const u8* d, u32 n) { memory.insert(memory.end(), d, d + n); return n; },
+               [&](u8*, u32) { return 0u; });
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, static_cast<u8>(n >> 16));
+        wd_write(wd, 0x13, static_cast<u8>(n >> 8));
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x07);  // SELECT (no ATN): COMMAND next
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8A);
+    count(6);
+    wd_write(wd, 0x18, 0x20);
+    for (u8 b : {u8{0x08}, u8{0}, u8{0}, u8{0}, u8{1}, u8{0}}) wd_write(wd, 0x19, b);  // READ(6), one block
+    CHECK_EQ(status(), 0x19);
+    wd_write(wd, 0x01, 0x80);  // DMA
+    count(4096);
+    wd_write(wd, 0x18, 0x20);
+    CHECK_EQ(status(), 0x4B);  // unexpected phase: STATUS
+    CHECK_EQ(memory.size(), 512u);
+    wd.write_address(0x12);
+    u32 left = u32{wd.read_data()} << 16;
+    left |= u32{wd.read_data()} << 8;
+    left |= wd.read_data();
+    CHECK_EQ(left, 4096u - 512u);
+}
+
+// The host rejects the target's negotiation reply: Assert ATN while the
+// message is held, then Negate ACK. The target takes MESSAGE OUT (MESSAGE
+// REJECT, which it does not answer) and goes on to COMMAND.
+TEST(wd33c93_assert_atn_rejects_a_message) {
+    const TempImage image(1);
+    ScsiDisk disk(ScsiDisk::Kind::Disk, image.path);
+    Clock clk;
+    Wd33c93 wd(clk.sched, 150000.0);
+    wd.attach(1, &disk);
+    u64 now = 0;
+    auto status = [&]() {
+        now += 150000;
+        clk.advance_to(now);
+        wd.write_address(0x17);
+        return wd.read_data();
+    };
+    auto count = [&](u32 n) {
+        wd_write(wd, 0x12, 0);
+        wd_write(wd, 0x13, 0);
+        wd_write(wd, 0x14, static_cast<u8>(n));
+    };
+    wd_write(wd, 0x15, 1);
+    wd_write(wd, 0x18, 0x06);
+    CHECK_EQ(status(), 0x11);
+    wd.write_address(0x17);
+    CHECK_EQ(wd.read_data(), 0x8E);
+    count(6);
+    wd_write(wd, 0x18, 0x20);
+    for (u8 b : {u8{0x80}, u8{0x01}, u8{0x03}, u8{0x01}, u8{0x32}, u8{0x0A}}) wd_write(wd, 0x19, b);
+    CHECK_EQ(status(), 0x1F);  // the SDTR reply waits in MESSAGE IN
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    wd.write_address(0x19);
+    CHECK_EQ(wd.read_data(), 0x01);  // first byte of the extended message
+    CHECK_EQ(status(), 0x20);
+    wd_write(wd, 0x18, 0x02);  // ASSERT ATN: no interrupt
+    CHECK(!(wd.read_aux_status() & 0x80));
+    wd_write(wd, 0x18, 0x03);  // NEGATE ACK
+    CHECK_EQ(status(), 0x8E);  // MESSAGE OUT
+    count(1);
+    wd_write(wd, 0x18, 0x20);
+    wd_write(wd, 0x19, 0x07);  // MESSAGE REJECT
+    CHECK_EQ(status(), 0x1A);  // no reply: COMMAND next
+}
+
+// 80C03 register banks: bank 2's transmit control enables the SQE and no
+// carrier flags in register 5 (writing 0 clears them); its configuration's
+// group address option matches the station address but for its low 4 bits.
+TEST(seeq80c03_flags_and_configuration) {
+    Seeq8003 s;
+    const u8 mac[6] = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x01};
+    for (unsigned i = 0; i < 6; ++i) s.write(i, mac[i]);
+    s.write(6, 0x80);  // station and broadcast
+    CHECK_EQ(s.read(5), 0);
+    s.write(7, 0x40);  // bank 2
+    s.write(3, 0x24);  // SQE and no carrier enabled
+    s.write(7, 0x00);
+    s.transmitted(Seeq8003::kTxDone, true);
+    CHECK_EQ(s.read(5), 0x01);  // SQE
+    s.transmitted(Seeq8003::kTxDone, false);
+    CHECK_EQ(s.read(5), 0x03);  // and no carrier
+    s.write(7, 0x40);
+    s.write(3, 0x20);  // SQE bit written 0: cleared
+    s.write(7, 0x00);
+    CHECK_EQ(s.read(5), 0x02);
+    CHECK_EQ(s.station_address()[0], 0x08);  // bank 2 writes left the address alone
+    u8 frame[14] = {0x08, 0x00, 0x69, 0x0c, 0x5e, 0x07};
+    CHECK(!s.accepts(frame, sizeof frame));
+    s.write(7, 0x40);
+    s.write(4, 0x01);  // group address
+    s.write(7, 0x00);
+    CHECK(s.accepts(frame, sizeof frame));
+    frame[5] = 0x17;
+    CHECK(!s.accepts(frame, sizeof frame));
+}
+
+// EOSC (months bit 7) stops the oscillator: the time stands still while it
+// is set and carries on from there when it is cleared.
+TEST(ds1386_oscillator_stop) {
+    Ds1386 rtc;
+    double host = 1700000000;
+    rtc.set_time_source([&] { return host; });
+    auto seconds = [&] {
+        auto bcd = [](u8 v) { return (v >> 4) * 10 + (v & 0x0F); };
+        return bcd(rtc.read(0x4) & 0x3F) * 3600 + bcd(rtc.read(0x2)) * 60 + bcd(rtc.read(0x1));
+    };
+    const int start = seconds();
+    rtc.write(0x9, static_cast<u8>(rtc.read(0x9) | 0x80));  // stop
+    host += 125;
+    CHECK_EQ(seconds(), start);
+    rtc.write(0x9, static_cast<u8>(rtc.read(0x9) & 0x7F));  // start
+    host += 5;
+    CHECK_EQ(seconds(), (start + 5) % 86400);
+}
+
+// The watchdog counts down its period (C and D, BCD) from the last access to
+// them, setting WAF each time it runs out; any access clears it. The time
+// of day alarm sets TDF when the time reaches its minute, hour and day
+// (each compared unless masked); accessing the alarm registers clears it.
+TEST(ds1386_watchdog_and_time_of_day_alarm) {
+    Ds1386 rtc;
+    double host = 1700000000;  // a Tuesday, 22:13:20 UTC
+    rtc.set_time_source([&] { return host; });
+    rtc.write(0xC, 0x50);  // 1.50 s
+    rtc.write(0xD, 0x01);
+    host += 1.4;
+    CHECK_EQ(rtc.read(Ds1386::kRegCommand) & 0x02, 0);
+    host += 0.2;
+    CHECK(rtc.read(Ds1386::kRegCommand) & 0x02);
+    rtc.read(0xD);  // accessed: cleared and counting again
+    CHECK_EQ(rtc.read(Ds1386::kRegCommand) & 0x02, 0);
+    host += 1.6;
+    CHECK(rtc.read(Ds1386::kRegCommand) & 0x02);
+    rtc.write(0xC, 0);
+    rtc.write(0xD, 0);  // zero: off
+    host += 10;
+    CHECK_EQ(rtc.read(Ds1386::kRegCommand) & 0x02, 0);
+    // The clock reads whatever it was set to: work the alarm out from it.
+    auto bcd = [](u8 v) { return (v >> 4) * 10 + (v & 0x0F); };
+    auto to_bcd = [](unsigned v) { return static_cast<u8>(((v / 10) << 4) | (v % 10)); };
+    const unsigned min = bcd(rtc.read(0x2)), sec = bcd(rtc.read(0x1));
+    rtc.write(0x3, to_bcd((min + 2) % 60));  // two minutes on, any hour and day
+    rtc.write(0x5, 0x80);
+    rtc.write(0x7, 0x80);
+    host += 60;
+    CHECK_EQ(rtc.read(Ds1386::kRegCommand) & 0x01, 0);
+    host += 60 - sec + 1;  // into the alarm's minute
+    CHECK(rtc.read(Ds1386::kRegCommand) & 0x01);
+    rtc.read(0x3);
+    CHECK_EQ(rtc.read(Ds1386::kRegCommand) & 0x01, 0);
 }
 
 TEST(ds1386_year_counted_from_a_base) {

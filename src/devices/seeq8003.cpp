@@ -9,11 +9,16 @@ namespace sg {
 namespace {
 constexpr u8 kRxModeMask = 0xC0, kRxAny = 0x40, kRxBroadcast = 0x80, kRxMulticast = 0xC0;
 constexpr u8 kTxBankMask = 0x60;  // 80C03 register bank for registers 0-5
+constexpr u8 kBank1 = 0x20, kBank2 = 0x40;
+// Transmit control (bank 2, register 3) and the flags (register 5)
+constexpr u8 kCtlSqe = 0x04, kCtlNoCarrier = 0x20;
+constexpr u8 kFlagSqe = 0x01, kFlagNoCarrier = 0x02;
 }  // namespace
 
 void Seeq8003::reset() {
     rx_command_ = tx_command_ = 0;
     rx_status_ = tx_status_ = kStatusOld;  // no new status yet
+    control_ = config_ = flags_ = 0;
     update_irq();
 }
 
@@ -31,7 +36,8 @@ u8 Seeq8003::read(unsigned reg) {
             update_irq();
             return v;
         }
-        default: return 0;  // collision counters and flags
+        case 5: return flags_;
+        default: return 0;  // collision counters (no collisions), test register
     }
 }
 
@@ -47,8 +53,21 @@ void Seeq8003::write(unsigned reg, u8 value) {
             update_irq();
             return;
         default:
-            if ((tx_command_ & kTxBankMask) == 0) station_[reg] = value;
-            return;
+            switch (tx_command_ & kTxBankMask) {
+                case 0: station_[reg] = value; return;
+                case kBank1: multicast_filter_[reg] = value; return;
+                case kBank2:
+                    if (reg < 2) multicast_filter_[6 + reg] = value;
+                    else if (reg == 3) {
+                        control_ = value;
+                        if (!(value & kCtlSqe)) flags_ &= static_cast<u8>(~kFlagSqe);
+                        if (!(value & kCtlNoCarrier)) flags_ &= static_cast<u8>(~kFlagNoCarrier);
+                    } else if (reg == 4) {
+                        config_ = value;
+                    }
+                    return;
+                default: return;
+            }
     }
 }
 
@@ -57,7 +76,11 @@ bool Seeq8003::accepts(const u8* frame, std::size_t length) const {
     const u8 mode = rx_command_ & kRxModeMask;
     if (mode == 0) return false;
     if (mode == kRxAny) return true;
-    if (std::equal(station_.begin(), station_.end(), frame)) return true;
+    // With the group address option the low 4 bits of the address are not compared.
+    const unsigned whole = (config_ & kCfgGroupAddress) ? 5 : 6;
+    if (std::equal(station_.begin(), station_.begin() + whole, frame) &&
+        (whole == 6 || ((frame[5] ^ station_[5]) & 0xF0) == 0))
+        return true;
     if (std::all_of(frame, frame + 6, [](u8 b) { return b == 0xFF; })) return mode == kRxBroadcast || mode == kRxMulticast;
     return (frame[0] & 1) && mode == kRxMulticast;  // the multicast filter is taken as passing everything
 }
@@ -68,7 +91,9 @@ bool Seeq8003::received(u8 status) {
     return (rx_status_ & rx_command_ & 0x3F) != 0;
 }
 
-bool Seeq8003::transmitted(u8 status) {
+bool Seeq8003::transmitted(u8 status, bool carrier) {
+    if ((status & kTxDone) && (control_ & kCtlSqe)) flags_ |= kFlagSqe;
+    if (!carrier && (control_ & kCtlNoCarrier)) flags_ |= kFlagNoCarrier;
     tx_status_ = status & ~kStatusOld;
     update_irq();
     return (tx_status_ & tx_command_ & 0x0F) != 0;

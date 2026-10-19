@@ -143,7 +143,7 @@ std::vector<std::string> configuration_notes(const Settings& s) {
         notes.push_back("IRIX 5.3 and 6.5 run (disks installed on an Indy boot unchanged).");
         notes.push_back("NetBSD and OpenBSD do not start with the 5.1 Indigo2 PROM: it loads only ECOFF programs and "
                         "their boot loaders are ELF.");
-        notes.push_back("Graphics: Newport (XL) only. The EISA slots are empty.");
+        notes.push_back("Graphics: Newport XL24, or IMPACT (not finished: no picture yet). The EISA slots are empty.");
     } else {
         notes.push_back("IRIX 5.3 and 6.5, NetBSD and OpenBSD run.");
     }
@@ -173,26 +173,30 @@ ip22::IndyConfig Settings::indy_config() const {
         c.scache_bytes = m->scache_bytes;
     }
     c.graphics = graphics;
-    c.xl24 = xl24;
+    using G = ip22::IndyConfig::GraphicsBoard;
+    c.graphics_board = graphics_board == "solid-impact"  ? G::SolidImpact
+                       : graphics_board == "high-impact" ? G::HighImpact
+                       : graphics_board == "max-impact"  ? G::MaxImpact
+                                                         : G::Xl24;
     c.graphics_revision = graphics_rev;
     c.test_device = test_device;
     c.test_run_config = test_run_config;
     c.disk_image = disk;
     c.cdrom_images = cdroms;
     c.mac = mac;
+    c.console = console == "graphics" ? 'g' : console == "serial" ? 'd' : 0;
     return c;
 }
 
 Settings first_run_settings() {
     Settings s;
     s.ram_mb = 256;
-    s.xl24 = true;
     s.cpu_mhz = 200;  // the fastest Indy R4400SC
     s.timed_speed = 1.2;
     return s;
 }
 
-const char* graphics_name(const Settings& s) { return !s.graphics ? "none" : s.xl24 ? "xl24" : "xl8"; }
+const char* graphics_name(const Settings& s) { return s.graphics ? s.graphics_board.c_str() : "none"; }
 
 const char* timing_name(Pacer::Mode mode) {
     switch (mode) {
@@ -282,10 +286,12 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
                                   ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2) &&
                                   (s.ram_mb = static_cast<unsigned>(n), true);  // checked against the board at power-on
     else if (key == "graphics") {
-        // xl8, xl24 or none (1 and 0 from older files: XL8, none)
+        // a board, or none (or 1 and 0)
         bool on = false;
-        if (v == "xl8" || v == "xl24" || v == "none") s.graphics = v != "none", s.xl24 = v == "xl24";
-        else if (parse_bool(v, on)) s.graphics = on, s.xl24 = false;
+        if (v == "none") s.graphics = false;
+        else if (v == "xl24" || v == "solid-impact" || v == "high-impact" || v == "max-impact")
+            s.graphics = true, s.graphics_board = v;
+        else if (parse_bool(v, on)) s.graphics = on;
         else ok = false;
     }
     else if (key == "graphics_rev") {
@@ -293,6 +299,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
         else ok = parse_number(v, n) && n >= 0 && n <= 7 && n == static_cast<int>(n) &&
                   (s.graphics_rev = static_cast<int>(n), true);
     }
+    else if (key == "console") ok = (v.empty() || v == "graphics" || v == "serial") && (s.console = v, true);
     else if (key == "mac") {
         std::array<u8, 6> mac{};
         if (v.empty()) s.mac.reset();
@@ -393,7 +400,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "machine=" << s.machine << "\ncpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
           << "\ngraphics_rev=" << (s.graphics_rev >= 0 ? std::to_string(s.graphics_rev) : "")
-          << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
+          << "\nconsole=" << s.console << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
         f << "timing=" << timing_name(s.timing) << "\ntimed_speed=" << s.timed_speed << "\nmax_speed=" << s.max_speed
           << "\nidle_skip=" << (s.idle_skip ? 1 : 0) << "\nquick_scsi_scan=" << (s.quick_scsi_scan ? 1 : 0)

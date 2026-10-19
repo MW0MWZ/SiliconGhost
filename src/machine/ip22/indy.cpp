@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Andy Taylor
 #include "machine/ip22/indy.h"
 
+#include "machine/ip22/impact.h"
+#include "machine/ip22/newport.h"
+
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -69,7 +72,6 @@ Indy::Indy(const IndyConfig& config)
       hpc3_(bus_, ioc_, scheduler_, config.cpu_hz, config.board == Board::Indigo2),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz,
           config.board == Board::Indigo2),
-      newport_(scheduler_, config.cpu_hz, Newport::Options{config.xl24, 0xA, config.graphics_revision}),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
     std::memset(prom_.get(), 0xFF, kPromMaxSize);
     scheduler_.set_clock([this] { return cpu_.cycles(); });
@@ -78,7 +80,19 @@ Indy::Indy(const IndyConfig& config)
     bus_.map_ram(kProm, kPromMaxSize, prom_.get(), /*writable=*/false);
     bus_.map_device(kMc, kMcSize, &mc_);
     bus_.map_device(kHpc3, kHpc3Size, &hpc3_);
-    if (config_.graphics) bus_.map_device(kGioGfx, kGioGfxSize, &gfx_slot_);
+    if (config_.graphics) {
+        using G = IndyConfig::GraphicsBoard;
+        if (config_.graphics_board == G::Xl24) {
+            gfx_ = std::make_unique<Newport>(scheduler_, config.cpu_hz, Newport::Options{0xA, config.graphics_revision});
+        } else {
+            if (config_.board != Board::Indigo2) throw std::invalid_argument("IMPACT graphics fit the Indigo2 only");
+            const Impact::Variant v = config_.graphics_board == G::SolidImpact  ? Impact::Variant::Solid
+                                      : config_.graphics_board == G::HighImpact ? Impact::Variant::High
+                                                                                : Impact::Variant::Max;
+            gfx_ = std::make_unique<Impact>(scheduler_, config.cpu_hz, v);
+        }
+        bus_.map_device(kGioGfx, kGioGfxSize, &gfx_->slot_device());
+    }
     if (config_.board == Board::Indigo2) bus_.map_device(kEisaIo, kEisaIoSize, &eisa_io_);
     // An R4600 or R5000 module with a secondary cache the processor does not
     // report: the PROM reads its size from the module's EEPROM.
@@ -112,16 +126,26 @@ Indy::Indy(const IndyConfig& config)
         cpu_.set_int_line(4, level);
     });
     mc_.set_dma_irq_callback([this](bool level) { ioc_.set_local0(Ioc2::kL0McDma, level); });
-    // The Newport's retrace: on the Indy its own interrupt line; on the
-    // Indigo2 the graphics slot's GIO interrupt 1 (the driver reads the
-    // retrace from the REX3's status there).
-    if (config_.board == Board::Indigo2)
-        newport_.set_retrace_callback([this](bool level) { ioc_.set_gfx_slot_irq(1, level); });
-    else
-        newport_.set_retrace_callback([this](bool level) { ioc_.set_local1(Ioc2::kL1Retrace, level); });
+    // The graphics board's interrupt (the Newport's retrace): on the Indy
+    // its own interrupt line; on the Indigo2 the graphics slot's GIO
+    // interrupt 1 (the Newport driver reads the retrace from the REX3's
+    // status there).
+    if (gfx_ && config_.graphics_board != IndyConfig::GraphicsBoard::Xl24)  // IMPACT: its three GIO lines
+        gfx_->set_irq_callback([this](unsigned line, bool level) { ioc_.set_gfx_slot_irq(line, level); });
+    else if (gfx_ && config_.board == Board::Indigo2)
+        gfx_->set_irq_callback([this](unsigned, bool level) { ioc_.set_gfx_slot_irq(1, level); });
+    else if (gfx_)
+        gfx_->set_irq_callback([this](unsigned, bool level) { ioc_.set_gio_slot_irq(0, 2, level); });
     mc_.set_reset_callback([this] {
         reset_pending_ = true;
         cpu_.request_stop();
+    });
+    mc_.set_cpu_reset_callback([this](bool warm) {
+        cpu_reset_pending_ = warm ? 2 : 1;
+        cpu_.request_stop();
+    });
+    bus_.set_rom_write_handler([this](u64 paddr) {
+        if (paddr >= kProm && paddr < kProm + kPromMaxSize) mc_.prom_written(static_cast<u32>(paddr));
     });
     ioc_.pit().set_latch_callback([this] {
         if (!timing_cpu()) cpu_.request_stop();
@@ -231,7 +255,7 @@ Indy::Activity Indy::activity() const {
     a.net_rx = hpc3_.enet_rx_frames();
     a.cycles = cpu_.cycles();
     a.idle_cycles = cpu_.idle_skipped_cycles();
-    a.pixels = newport_.pixels_drawn();
+    a.pixels = gfx_ ? gfx_->pixels_drawn() : 0;
     return a;
 }
 
@@ -261,27 +285,53 @@ void Indy::load_prom_image(const u8* data, std::size_t size) {
     std::memcpy(prom_.get(), data, size < kPromMaxSize ? size : kPromMaxSize);
 }
 
-// The factory programs each machine's Ethernet address into NVRAM bytes
-// 250-255 (on the Indigo2, of the serial EEPROM).
-void Indy::apply_ethernet_address() {
-    static constexpr std::array<u8, 6> kDefaultMac = {0x08, 0x00, 0x69, 0x0C, 0x5E, 0x01};  // SGI OUI
-    std::array<u8, 6> nv{};
-    std::vector<u16>& words = hpc3_.eeprom().words();
+u8 Indy::nvram_byte(unsigned offset) {
     if (config_.board == Board::Indigo2) {
-        for (unsigned i = 0; i < 6; ++i) nv[i] = static_cast<u8>(words[(kNvramEaddr + i) / 2] >> ((i & 1) ? 0 : 8));
-    } else {
-        std::copy_n(&rtc().memory()[kNvramBase + kNvramEaddr], 6, nv.begin());
+        const u16 w = hpc3_.eeprom().words()[offset / 2];
+        return static_cast<u8>((offset & 1) ? w : w >> 8);
     }
+    return rtc().memory()[kNvramBase + offset];
+}
+
+void Indy::set_nvram_byte(unsigned offset, u8 value) {
+    if (config_.board == Board::Indigo2) {
+        u16& w = hpc3_.eeprom().words()[offset / 2];
+        w = (offset & 1) ? static_cast<u16>((w & 0xFF00) | value) : static_cast<u16>((w & 0x00FF) | value << 8);
+    } else {
+        rtc().memory()[kNvramBase + offset] = value;
+    }
+}
+
+// The PROM's check on its environment: from 0xA5, each 16-bit word XORed in
+// (both bytes, but for the checksum byte itself), then rotated left by one.
+u8 Indy::nvram_checksum() {
+    u8 sum = 0xA5;
+    for (unsigned i = 0; i < kNvramBytes; i += 2) {
+        sum ^= nvram_byte(i + 1);
+        if (i != kNvramChecksum) sum ^= nvram_byte(i);
+        sum = static_cast<u8>(sum << 1 | sum >> 7);
+    }
+    return sum;
+}
+
+// The factory programs each machine's Ethernet address into NVRAM bytes
+// 250-255. The checksum covers them, and the console variable, so it is
+// brought up to date when the PROM's environment was valid to begin with.
+void Indy::apply_nvram_settings() {
+    static constexpr std::array<u8, 6> kDefaultMac = {0x08, 0x00, 0x69, 0x0C, 0x5E, 0x01};  // SGI OUI
+    const bool valid = nvram_checksum() == nvram_byte(kNvramChecksum);
+    std::array<u8, 6> nv{};
+    for (unsigned i = 0; i < 6; ++i) nv[i] = nvram_byte(kNvramEaddr + i);
     const bool blank = std::all_of(nv.begin(), nv.end(), [](u8 b) { return b == 0x00; }) ||
                        std::all_of(nv.begin(), nv.end(), [](u8 b) { return b == 0xFF; });
     if (config_.mac) nv = *config_.mac;
     else if (blank) nv = kDefaultMac;
-    else return;
-    if (config_.board == Board::Indigo2) {
-        for (unsigned i = 0; i < 6; i += 2) words[(kNvramEaddr + i) / 2] = static_cast<u16>(nv[i] << 8 | nv[i + 1]);
-    } else {
-        std::copy(nv.begin(), nv.end(), &rtc().memory()[kNvramBase + kNvramEaddr]);
+    for (unsigned i = 0; i < 6; ++i) set_nvram_byte(kNvramEaddr + i, nv[i]);
+    if (valid && config_.console) {
+        set_nvram_byte(kNvramConsole, static_cast<u8>(config_.console));
+        set_nvram_byte(kNvramConsole + 1, 0);
     }
+    if (valid) set_nvram_byte(kNvramChecksum, nvram_checksum());
 }
 
 std::size_t Indy::nvram_size() const {
@@ -312,17 +362,18 @@ void Indy::load_nvram_image(const std::vector<u8>& image) {
 }
 
 void Indy::reset() {
-    apply_ethernet_address();
+    apply_nvram_settings();
     if (disk_) disk_->reset();
     if (cdrom_) cdrom_->reset();
     mc_.reset();
     ioc_.reset();
     hpc3_.reset();
-    newport_.reset();
+    if (gfx_) gfx_->reset();
     cpu_.reset();
     for (unsigned line = 0; line < 5; ++line) cpu_.set_int_line(line, false);
     serial_timer_.cancel();  // run() starts it again while input is queued
     reset_pending_ = false;
+    cpu_reset_pending_ = 0;
     powered_off_ = false;
 }
 
@@ -374,6 +425,12 @@ u64 Indy::run(u64 cycles) {
             SG_LOG(Info, "indy", "system reset");
             reset();
         }
+        if (cpu_reset_pending_) {  // the processor alone; the rest of the machine carries on
+            if (cpu_reset_pending_ == 2) cpu_.soft_reset();
+            else cpu_.reset();
+            cpu_reset_pending_ = 0;
+            cpu_.clear_stop();
+        }
         if (disc_change_.exchange(false, std::memory_order_acq_rel)) next_disc();
         // Host input (serial bytes, Ethernet frames) is taken in by timers
         // that run only while there is some.
@@ -381,7 +438,7 @@ u64 Indy::run(u64 cycles) {
         hpc3_.poll_network();
         cpu_.run_until(end, scheduler_.next_event_ptr());
         scheduler_.run_due(cpu_.cycles());
-        if (cpu_.stop_requested() && !reset_pending_) break;
+        if (cpu_.stop_requested() && !reset_pending_ && !cpu_reset_pending_) break;
     }
     return cpu_.cycles() - start;
 }
@@ -416,29 +473,6 @@ void Indy::pump_serial_input() {
         }
     }
     serial_timer_.schedule_in(static_cast<u64>(config_.cpu_hz / 1000));
-}
-
-namespace {
-constexpr u32 kRex3InSlot = kNewportRex3 - kGioGfx, kRex3WindowSize = 0x10000;
-}  // namespace
-
-// The Newport's slot is pipelined: reads that no register answers do not
-// fault but return the width of the access in bytes (4, 2 or 1), as seen on
-// Indys and relied on by OpenBSD to tell a Newport from an empty slot.
-bool Indy::GfxSlot::read(u32 offset, unsigned size, u64& value) {
-    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read(offset - kRex3InSlot, size, value);
-    value = size;
-    return true;
-}
-
-bool Indy::GfxSlot::write(u32 offset, unsigned size, u64 value) {
-    if (offset - kRex3InSlot < kRex3WindowSize) return board_.write(offset - kRex3InSlot, size, value);
-    return true;
-}
-
-bool Indy::GfxSlot::read_is_pure(u32 offset, unsigned size) const {
-    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read_is_pure(offset - kRex3InSlot, size);
-    return true;
 }
 
 }  // namespace sg::ip22

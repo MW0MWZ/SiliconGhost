@@ -106,6 +106,8 @@ private:
     void end_pio_out();
     void pio_in_taken();
     void negate_ack();
+    void next_phase(u8 phase);
+    void data_phase_done(double ms);
 
     // Approximate bus throughput for completion timing: 5 MB/s (or 1 GB/s
     // with fast transfers).
@@ -133,8 +135,12 @@ private:
     u8 target_status_ = 0;
     u8 lun_ = 0;                    // logical unit addressed (Target LUN register or IDENTIFY)
     bool command_done_ = false;     // status sent; COMMAND COMPLETE follows
-    bool single_byte_ = false;
-    enum class DmaWait { None, TransferInfo, SelectAndTransfer } dma_wait_ = DmaWait::None;      // the current command moves one byte, leaving the count alone
+    bool single_byte_ = false;      // the current command moves one byte, leaving the count alone
+    enum class DmaWait { None, TransferInfo, SelectAndTransfer } dma_wait_ = DmaWait::None;
+    // ATN raised (Assert ATN): the target takes MESSAGE OUT at its next
+    // phase change, then goes on to the phase it would have requested.
+    bool atn_ = false;
+    u8 resume_phase_ = 0;
     std::vector<u8> buffer_;        // data phase bytes
     std::size_t buffer_pos_ = 0;
     std::size_t polled_end_ = 0;    // end of the current polled data chunk

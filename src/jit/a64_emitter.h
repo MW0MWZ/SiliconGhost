@@ -71,7 +71,7 @@ public:
     std::size_t size() const { return code_.size(); }
 
     // --- labels: a site is the offset of a branch to patch -----------------
-    enum class Fix : u8 { B26, B19, B14 };
+    enum class Fix : u8 { B26, B19, B14, Adr };
     struct Site {
         std::size_t at = 0;
         Fix kind = Fix::B26;
@@ -79,10 +79,13 @@ public:
     // Points the branch at `site` to the current position (or `target`).
     void bind(const Site& s) { bind_to(s, code_.size()); }
     void bind_to(const Site& s, std::size_t target) {
-        const s64 delta = (static_cast<s64>(target) - static_cast<s64>(s.at)) / 4;
+        const s64 bytes = static_cast<s64>(target) - static_cast<s64>(s.at), delta = bytes / 4;
         u32 w;
         std::memcpy(&w, &code_[s.at], 4);
         switch (s.kind) {
+            case Fix::Adr:
+                w = (w & 0x9F00001Fu) | ((static_cast<u32>(bytes) & 3) << 29) | ((static_cast<u32>(bytes >> 2) & 0x7FFFFu) << 5);
+                break;
             case Fix::B26: w = (w & 0xFC000000u) | (static_cast<u32>(delta) & 0x03FFFFFFu); break;
             case Fix::B19: w = (w & 0xFF00001Fu) | ((static_cast<u32>(delta) & 0x7FFFFu) << 5); break;
             case Fix::B14: w = (w & 0xFFF8001Fu) | ((static_cast<u32>(delta) & 0x3FFFu) << 5); break;
@@ -102,6 +105,12 @@ public:
         return emit_site(0x36000000u | ((bit >> 5) << 31) | ((bit & 31) << 19) | r, Fix::B14);
     }
     void b_to(std::size_t target) { bind_to(b(), target); }
+    // A branch to `target`, this code being placed at `base` (within 128 MiB).
+    void b_abs(const u8* target, const u8* base) {
+        emit(0x14000000u | (static_cast<u32>((target - (base + code_.size())) / 4) & 0x03FFFFFFu));
+    }
+    // ADR: d = the address the site is bound to.
+    Site adr(Reg d) { return emit_site(0x10000000u | d, Fix::Adr); }
     void br(Reg r) { emit(0xD61F0000u | (u32{r} << 5)); }
     void blr(Reg r) { emit(0xD63F0000u | (u32{r} << 5)); }
     void ret() { emit(0xD65F03C0u); }
@@ -262,11 +271,21 @@ public:
     void fcmp(bool dbl, unsigned n, unsigned m) { emit(0x1E202000u | (dbl ? 0x400000u : 0) | (m << 16) | (n << 5)); }
     void fcvt_to_single(unsigned d, unsigned n) { emit(0x1E624000u | (n << 5) | d); }  // FCVT Sd, Dn
     void fcvt_to_double(unsigned d, unsigned n) { emit(0x1E22C000u | (n << 5) | d); }  // FCVT Dd, Sn
-    // To a 32-bit integer, nearest even (FCVTNS) or toward zero (FCVTZS); saturating.
-    void fcvt_to_int(bool dbl, bool truncate, Reg d, unsigned n) {
-        emit((truncate ? 0x1E380000u : 0x1E200000u) | (dbl ? 0x400000u : 0) | (n << 5) | d);
+    // To a 32- or 64-bit integer, rounding as MIPS RM `rm` (0 nearest even:
+    // FCVTNS, 1 toward zero: FCVTZS, 2 up: FCVTPS, 3 down: FCVTMS); saturating.
+    void fcvt_to_int(bool dbl, unsigned rm, Reg d, unsigned n, bool x64 = false) {
+        static constexpr u32 kRmode[] = {0, 0x180000u, 0x080000u, 0x100000u};
+        emit(0x1E200000u | (x64 ? 0x80000000u : 0) | kRmode[rm & 3] | (dbl ? 0x400000u : 0) | (n << 5) | d);
     }
-    void scvtf(bool dbl, unsigned d, Reg n) { emit(0x1E220000u | (dbl ? 0x400000u : 0) | (u32{n} << 5) | d); }  // from Wn
+    // From Wn, or Xn.
+    void scvtf(bool dbl, unsigned d, Reg n, bool x64 = false) {
+        emit(0x1E220000u | (x64 ? 0x80000000u : 0) | (dbl ? 0x400000u : 0) | (u32{n} << 5) | d);
+    }
+    // MRS and MSR of FPCR and FPSR.
+    void mrs_fpcr(Reg t) { emit(0xD53B4400u | t); }
+    void msr_fpcr(Reg t) { emit(0xD51B4400u | t); }
+    void mrs_fpsr(Reg t) { emit(0xD53B4420u | t); }
+    void msr_fpsr(Reg t) { emit(0xD51B4420u | t); }
     void fmov_to_gpr(Reg d, unsigned n, bool dbl) { emit((dbl ? 0x9E660000u : 0x1E260000u) | (n << 5) | d); }
     void fmov_from_gpr(unsigned d, Reg n, bool dbl) { emit((dbl ? 0x9E670000u : 0x1E270000u) | (u32{n} << 5) | d); }
     // LDR/STR of an S (size 4) or D (size 8) register, any offset.

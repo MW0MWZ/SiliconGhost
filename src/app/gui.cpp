@@ -523,7 +523,7 @@ bool Gui::auto_capture(float x, float y) {
         return false;
     }
     auto* m = session_.machine();
-    ip22::Newport* np = m ? m->newport() : nullptr;
+    ip22::GfxBoard* np = m ? m->graphics() : nullptr;
     int cx = 0, cy = 0;
     if (!capture_armed_ || !session_.settings().mouse_auto_capture || !np || !np->cursor_position(cx, cy) ||
         !(SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) || SDL_GetMouseState(nullptr, nullptr) ||
@@ -545,7 +545,7 @@ void Gui::mouse_frame() {
     int x = static_cast<int>(dx_), y = static_cast<int>(dy_);
     dx_ -= static_cast<float>(x);
     dy_ -= static_cast<float>(y);
-    ip22::Newport* np = m->newport();
+    ip22::GfxBoard* np = m->graphics();
     int cx = 0, cy = 0;
     const bool cursor = np && np->cursor_position(cx, cy) && tex_w_ && tex_h_;
     if (syncing_) {
@@ -724,7 +724,7 @@ void Gui::handle_event(const SDL_Event& ev) {
 
 void Gui::update_picture() {
     auto* machine = session_.machine();
-    ip22::Newport* newport = machine ? machine->newport() : nullptr;
+    ip22::GfxBoard* newport = machine ? machine->graphics() : nullptr;
     if (!newport) {
         picture_ = false;
         return;
@@ -1245,11 +1245,37 @@ void Gui::draw_settings() {
                 ImGui::EndCombo();
             }
             label("Graphics");
-            ImGui::SetNextItemWidth(-1);
-            int gfx = !edit_.graphics ? 2 : edit_.xl24 ? 1 : 0;
-            ImGui::Combo("##gfx", &gfx, "Newport XL8 (8-bit)\0Newport XL24 (24-bit)\0None (serial console only)\0");
-            edit_.graphics = gfx != 2;
-            edit_.xl24 = gfx == 1;
+            {
+                // The boards the machine takes, then none.
+                static const char* const kBoards[] = {"xl24", "solid-impact", "high-impact", "max-impact"};
+                static const char* const kNames[] = {"Newport XL24 (24-bit)", "Solid IMPACT (not finished)",
+                                                     "High IMPACT (not finished)", "Maximum IMPACT (not finished)"};
+                const bool indigo2 = edit_.machine == "indigo2";
+                const int boards = indigo2 ? 4 : 1;
+                int gfx = boards;
+                for (int i = 0; i < boards; ++i)
+                    if (edit_.graphics && edit_.graphics_board == kBoards[i]) gfx = i;
+                if (gfx == boards && edit_.graphics) gfx = 0;  // (an IMPACT setting on an Indy)
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##gfx", gfx < boards ? kNames[gfx] : "None (serial console only)")) {
+                    for (int i = 0; i <= boards; ++i)
+                        if (ImGui::Selectable(i < boards ? kNames[i] : "None (serial console only)", gfx == i)) gfx = i;
+                    ImGui::EndCombo();
+                }
+                edit_.graphics = gfx < boards;
+                if (edit_.graphics) edit_.graphics_board = kBoards[gfx];
+            }
+            if (edit_.graphics) {
+                label("Console");
+                ImGui::SetNextItemWidth(-1);
+                int con = edit_.console == "graphics" ? 1 : edit_.console == "serial" ? 2 : 0;
+                if (ImGui::Combo("##console", &con, "As the NVRAM has it\0Graphics screen and keyboard\0Serial port 1\0"))
+                    edit_.console = con == 1 ? "graphics" : con == 2 ? "serial" : "";
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Where the PROM and the system show their console: the PROM's console\n"
+                                      "variable, written to NVRAM at power-on. A new NVRAM takes it from the\n"
+                                      "second power-on, once the PROM has set it up.");
+            }
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
@@ -1358,7 +1384,7 @@ void Gui::draw_settings() {
             }
             if (net_mode_ == 0) {
                 ImGui::SetCursorPosX(label_w);
-                ImGui::TextDisabled("The guest is 10.0.2.15; the host and gateway 10.0.2.2, DNS 10.0.2.3");
+                ImGui::TextDisabled("Guest 10.0.2.15, gateway (the host) 10.0.2.2, DNS 10.0.2.3");
             }
             if (net_mode_ == 1) {
                 label("TAP interface");
@@ -1386,6 +1412,43 @@ void Gui::draw_settings() {
                 if (ImGui::Button("Add")) forward_texts_.emplace_back("tcp:2222:22");
                 ImGui::TextDisabled("A port on the host's loopback interface, passed to the guest");
                 ImGui::EndGroup();
+                ImGui::Spacing();
+                if (ImGui::CollapsingHeader("Setting up the guest")) {
+                    const auto heading = [](const char* text) {
+                        ImGui::Spacing();
+                        ImGui::TextUnformatted(text);
+                    };
+                    const auto lines = [](const char* text) { ImGui::TextDisabled("%s", text); };
+                    heading("IRIX, as root (lasts until the next restart):");
+                    lines("  ifconfig ec0 10.0.2.15 netmask 255.255.255.0 up\n"
+                          "  route add default 10.0.2.2 1\n"
+                          "  echo nameserver 10.0.2.3 > /etc/resolv.conf");
+                    heading("Keeping the address (IRIX):");
+                    lines("  in /etc/hosts, under the name in /etc/sys_id");
+                    heading("Keeping the route (IRIX 6.5):");
+                    lines("  add to /etc/config/static-route.options:\n"
+                          "  $ROUTE $QUIET add -net default 10.0.2.2");
+                    heading("Keeping the route (IRIX 5.3):");
+                    lines("  an executable /etc/init.d/network.local,\n"
+                          "  linked as /etc/rc2.d/S31network:\n"
+                          "    #!/bin/sh\n"
+                          "    case \"$1\" in\n"
+                          "    start) /usr/etc/route add default 10.0.2.2 1 ;;\n"
+                          "    esac");
+                    heading("NetBSD and OpenBSD:");
+                    lines("  DHCP sets everything; or 10.0.2.2 in /etc/mygate");
+                    heading("Checks, in order:");
+                    lines("  netstat -rn         a default route to 10.0.2.2\n"
+                          "  ping 10.0.2.2       the gateway\n"
+                          "  ping 1.1.1.1        the way out\n"
+                          "  ping www.sgi.com    the name server");
+                    heading("If names fail:");
+                    lines("  the host needs an IPv4 name server, or give the\n"
+                          "  guest a public one (nameserver 1.1.1.1). On macOS 15\n"
+                          "  and later, allow Silicon Ghost (or the terminal that\n"
+                          "  started it) in System Settings > Privacy & Security >\n"
+                          "  Local Network.");
+                }
             }
             ImGui::EndTabItem();
         }
@@ -1408,11 +1471,7 @@ void Gui::draw_settings() {
                                       "length; everything else runs as fast as the host allows.");
                 ImGui::SameLine();
                 const double timed_mhz = edit_.cpu_mhz * edit_.timed_speed;
-                const bool too_fast = timed_mhz > 350;
-                ImGui::TextColored(too_fast ? ImVec4(1.0f, 0.6f, 0.3f, 1.0f) : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled],
-                                   too_fast ? "%.0f MHz: too fast for IRIX 5.3" : "%.0f MHz", timed_mhz);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("IRIX 5.3 times the CPU at boot and fails beyond about 350 MHz (clock x speed)");
+                ImGui::TextDisabled("%.0f MHz", timed_mhz);
                 if (timing == 0) {
                     label("Speed limit");
                     bool cap = edit_.max_speed > 0;

@@ -20,6 +20,9 @@ public:
 
     Kbc8042();
     void reset();
+    // Held in reset (the IOC's reset register): it answers nothing, takes
+    // no input and drops what it holds; released, it starts afresh.
+    void set_held(bool held);
 
     u8 read_data();
     u8 read_status() const;
@@ -54,6 +57,7 @@ private:
 
     std::deque<std::pair<u8, bool>> out_;  // (byte, from aux device)
     u8 command_byte_ = 0x47;
+    bool held_ = false;
     bool system_flag_ = false;
     bool last_was_command_ = false;
     Pending pending_ = Pending::None;

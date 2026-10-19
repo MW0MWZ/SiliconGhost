@@ -1090,6 +1090,116 @@ TEST(cpu_jit_fpu_cause_matches_interpreter) {
     R4000::set_jit_fma(true);
 }
 
+// Rounding modes other than nearest, the integer conversions in every
+// direction and width, RSQRT and the multiply-adds, and CFC1/CTC1: FCR31 and
+// the result after each, in each rounding mode, the same in every engine.
+TEST(cpu_jit_fpu_rounding_and_conversions_match_interpreter) {
+    auto cop1 = [](unsigned fmt, unsigned ft, unsigned fs, unsigned fd, unsigned func) {
+        return (0x11u << 26) | (fmt << 21) | (ft << 16) | (fs << 11) | (fd << 6) | func;
+    };
+    auto move = [](unsigned op, unsigned rt, unsigned fs) { return (0x11u << 26) | (op << 21) | (rt << 16) | (fs << 11); };
+    auto dbits = [](double v) {
+        u64 b;
+        std::memcpy(&b, &v, 8);
+        return b;
+    };
+    auto fbits = [](float v) {
+        u32 b;
+        std::memcpy(&b, &v, 4);
+        return u64{b};
+    };
+    // f0..f5 doubles 3, 1/3, 2.5, -2.5, 2^40 + 0.5, 2; f6..f10 singles 3, 1/3, -2.5, 2, 1e10;
+    // f11 the long 2^60 + 1, f12 the word 16777217
+    const std::vector<u64> values = {dbits(3.0),  dbits(1.0 / 3), dbits(2.5),  dbits(-2.5),
+                                     dbits(1099511627776.5), dbits(2.0), fbits(3.0f), fbits(1.0f / 3),
+                                     fbits(-2.5f), fbits(2.0f), fbits(1e10f), (u64{1} << 60) + 1, 16777217};
+    for (bool mips4 : {false, true}) {
+        std::vector<u32> body;
+        s32 slot = 0;
+        auto op = [&](u32 w) {  // the operation, then FCR31 and the result to the data area
+            body.push_back(w);
+            body.push_back(move(0x02, t0, 31));  // CFC1
+            body.push_back(SW(t0, slot, s0));
+            body.push_back(move(0x01, t1, 20));  // DMFC1 f20
+            body.push_back(SD(t1, slot + 8, s0));
+            slot += 16;
+        };
+        for (unsigned func : {0u, 1u, 2u, 3u}) {
+            op(cop1(17, 1, 0, 20, func));  // 3 op 1/3
+            op(cop1(16, 7, 6, 20, func));  // single 3 op 1/3
+        }
+        op(cop1(17, 0, 5, 20, 4));     // SQRT.D 2
+        op(cop1(16, 0, 9, 20, 4));     // SQRT.S 2
+        op(cop1(17, 0, 1, 20, 0x20));  // CVT.S.D 1/3
+        for (unsigned func : {0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x24u, 0x25u}) {
+            op(cop1(17, 0, 2, 20, func));  // 2.5
+            op(cop1(17, 0, 3, 20, func));  // -2.5
+            op(cop1(16, 0, 8, 20, func));  // single -2.5
+        }
+        op(cop1(17, 0, 4, 20, 0x25));  // CVT.L.D 2^40 + 0.5
+        op(cop1(16, 0, 10, 20, 0x0B)); // FLOOR.L.S 1e10
+        op(cop1(16, 0, 10, 20, 0x0C)); // ROUND.W.S 1e10: out of range
+        op(cop1(21, 0, 11, 20, 0x21)); // CVT.D.L 2^60 + 1
+        op(cop1(21, 0, 11, 20, 0x20)); // CVT.S.L
+        op(cop1(20, 0, 12, 20, 0x20)); // CVT.S.W 16777217
+        op(cop1(20, 0, 12, 20, 0x21)); // CVT.D.W
+        op(move(0x02, t2, 0));         // CFC1 FIR
+        if (mips4) {
+            op(cop1(17, 0, 0, 20, 0x16));  // RSQRT.D 3
+            op(cop1(16, 0, 6, 20, 0x16));  // RSQRT.S 3
+            op(cop1(17, 0, 1, 20, 0x15));  // RECIP.D 1/3
+            for (unsigned f : {0x21u, 0x29u, 0x31u, 0x39u})  // MADD, MSUB, NMADD, NMSUB.D: f1 * f0 +- f2
+                op((0x13u << 26) | (2u << 21) | (0u << 16) | (1u << 11) | (20u << 6) | f);
+            op((0x13u << 26) | (8u << 21) | (6u << 16) | (7u << 11) | (20u << 6) | 0x20);  // MADD.S
+        }
+        // CTC1: the next rounding mode, then back (Cause clear, so no trap).
+        body.push_back(move(0x02, t0, 31));
+        body.push_back(ADDIU(t1, t0, 1));
+        body.push_back(move(0x06, t1, 31));
+        body.push_back(move(0x02, t2, 31));
+        body.push_back(SW(t2, slot, s0));
+        body.push_back(move(0x06, t0, 31));
+        std::vector<u32> prog = {ADDIU(s1, zero, 20)};
+        const s32 loop = static_cast<s32>(prog.size());
+        prog.insert(prog.end(), body.begin(), body.end());
+        prog.push_back(ADDIU(s1, s1, -1));
+        prog.push_back(BNE(s1, zero, loop - static_cast<s32>(prog.size()) - 1));
+        prog.push_back(NOP);
+        prog.push_back(BEQ(zero, zero, -1));
+        prog.push_back(NOP);
+        for (bool fma : {true, false}) {
+            R4000::set_jit_fma(fma);
+            for (u32 rm = 0; rm < 4; ++rm) {
+                auto run = [&](Engine engine) {
+                    Rig t(mips4 ? r5000_options() : R4000::Options{});
+                    use_engine(t, engine);
+                    t.cpu.set_idle_skip(false);
+                    t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::FR);
+                    t.cpu.fcr31 = rm | (1u << 24);  // FS: tiny results flushed rather than trapped
+                    for (std::size_t i = 0; i < values.size(); ++i) t.cpu.fpr[i] = values[i];
+                    t.cpu.gpr[s0] = 0xFFFFFFFF80010000ull;
+                    u64 paddr = 0x1000;
+                    for (u32 w : prog) {
+                        t.w32(paddr, w);
+                        paddr += 4;
+                    }
+                    // Exceptions (out-of-range conversions) are counted and skipped.
+                    t.load({MFC0(k0, cop0::EPC), ADDIU(k0, k0, 4), MTC0(k0, cop0::EPC), LUI(k1, 0x8001),
+                            LW(k0, 0xFFC, k1), ADDIU(k0, k0, 1), SW(k0, 0xFFC, k1), ERET},
+                           0x180);
+                    t.cpu.set_pc(0xFFFFFFFF80001000ull);
+                    t.cpu.run_until(60000);
+                    return capture(t, 0x10000, 0x1000);
+                };
+                const CpuState reference = run(Engine::Interpreter);
+                CHECK(run(Engine::Blocks) == reference);
+                CHECK(run(Engine::Jit) == reference);
+            }
+        }
+        R4000::set_jit_fma(true);
+    }
+}
+
 TEST(cpu_block_cache_and_jit_match_interpreter_on_random_fpu_programs) {
     check_random_fpu_programs();
     R4000::set_jit_fma(false);

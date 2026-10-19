@@ -115,6 +115,8 @@ TEST(settings_round_trip_and_validation) {
     CHECK(app::set_option(s, "timing", "cycle", error));
     CHECK(app::set_option(s, "jit", "0", error));
     CHECK(app::set_option(s, "mouse_auto_capture", "0", error));
+    CHECK(app::set_option(s, "console", "serial", error));
+    CHECK(!app::set_option(s, "console", "d", error));
     CHECK(!s.quick_scsi_scan && s.quick_scsi_scan_max);  // the defaults
     CHECK(app::set_option(s, "quick_scsi_scan", "1", error));
     CHECK(app::set_option(s, "quick_scsi_scan_max", "0", error));
@@ -139,12 +141,14 @@ TEST(settings_round_trip_and_validation) {
     CHECK(loaded.timing == Pacer::Mode::Cycle);
     CHECK(!loaded.jit);
     CHECK(!loaded.mouse_auto_capture);
+    CHECK_STR(loaded.console, std::string("serial"));
     CHECK(loaded.quick_scsi_scan && !loaded.quick_scsi_scan_max);
     CHECK(app::set_option(loaded, "quick_scsi_scan_all", "0", error));  // --no-quick-scsi-scan
     CHECK(!loaded.quick_scsi_scan && !loaded.quick_scsi_scan_max);
     const auto config = loaded.indy_config();
     CHECK_EQ(config.prid, 0x0430u);
     CHECK_EQ(config.cpu_hz, 175.0e6);
+    CHECK_EQ(config.console, 'd');
     std::filesystem::remove(path);
 }
 

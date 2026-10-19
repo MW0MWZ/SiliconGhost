@@ -11,6 +11,7 @@
 
 #include "core/endian.h"
 #include "core/log.h"
+#include "machine/ip22/memmap.h"
 
 namespace sg::ip22 {
 
@@ -524,6 +525,9 @@ void Newport::iterate_shade() {
     }
 }
 
+// COLORVRAM is an 8-8-8 B-G-R colour in RGB mode (the REX3 takes it in for
+// the DRAWDEPTH and RGBMODE set when it is written, as its specification
+// asks): IRIX clears its windows' backgrounds with greys such as 0xC1C1C1.
 u32 Newport::default_color(u32 src) const {
     const unsigned depth = (drawmode1_ >> 3) & 3;
     u32 c = fastclear_ ? colorvram_ : src;
@@ -780,7 +784,7 @@ void Newport::store(int px, int py, u32 colour) {
             default: v = ~0u; break;
         }
     }
-    const u32 mask = wrmask_ & (opts_.xl24 ? 0xFFFFFFu : 0xFFu);
+    const u32 mask = wrmask_ & 0xFFFFFFu;
     const u32 updated = (dst & ~mask) | (v & mask);
     if (updated != dst) {
         dst = updated;
@@ -1261,6 +1265,7 @@ void Newport::vc2_write(unsigned crs, u8 b) {
                                  vc2_.index == kVc2CurCursorX || vc2_.index == kVc2CursorEntry ||
                                  vc2_.index == kVc2DidEntry;
             vc2_.reg[vc2_.index] = v;
+            ++vc2_version_;
             if (vc2_.index == kVc2RamAddr) {
                 vc2_.reg[kVc2RamAddr] = v & 0x7FFF;
                 vc2_.ram_hi_pending = vc2_.ram_read_hi = true;
@@ -1278,6 +1283,7 @@ void Newport::vc2_write(unsigned crs, u8 b) {
                 u16& addr = vc2_.reg[kVc2RamAddr];
                 vc2_.ram[addr & 0x7FFF] = static_cast<u16>((vc2_.data_hi << 8) | b);
                 addr = (addr + 1) & 0x7FFF;
+                ++vc2_version_;
                 vc2_.ram_hi_pending = true;
                 picture_changed();  // timing, DID tables or the cursor glyph
             }
@@ -1289,11 +1295,10 @@ void Newport::vc2_write(unsigned crs, u8 b) {
 u8 Newport::vc2_read(unsigned crs) {
     auto reg = [this](unsigned i) -> u16 {
         if (i == kVc2LineCounter) {
-            // The beam's line in the frame (1065 lines with SGI's tables):
-            // the vertical interrupt comes on line 1064, the counter then
-            // reading about 1054 (it counts from the start of the timing
-            // table's frame, ahead of the display).
-            constexpr u64 kLines = 1065, kAtInterrupt = 1054;
+            // The beam's line in the frame, counted from the line after
+            // VPOS (1065 lines with SGI's tables, the vertical interrupt
+            // coming with the counter at 1054): see video_timing().
+            const u64 kLines = video_timing().lines, kAtInterrupt = video_timing().counter_at_vint;
             const u64 frame = static_cast<u64>(cpu_hz_ / 60);
             const u64 since = (scheduler_.now() - last_retrace_) % frame;
             return static_cast<u16>((kAtInterrupt + since * kLines / frame) % kLines);
@@ -1347,7 +1352,7 @@ u8 Newport::xmap_read(unsigned which, unsigned crs) {
     const Xmap& x = xmap_[which];
     switch (crs) {
         case 0: return x.config;  // as written: the chip never changes it
-        case 1: return opts_.xl24 ? 3 : 1;
+        case 1: return 3;  // revision (a 24-bit board's XMAP9)
         case 2: return 0x02;  // FIFO empty: all entries available
         case 3: return x.cursor_msb;
         case 4: return x.pup_msb;
@@ -1401,13 +1406,13 @@ u8 Newport::cmap_read(unsigned which, unsigned crs) {
         case 3: return c.command;
         case 4: return static_cast<u8>(0x18 | (c.rgb & 3));  // write FIFO empty; the R/G/B byte counter
         case 6:
-            // CMAP0: 8-bit flag, board revision (6:4) and CMAP revision;
-            // CMAP1: monitor sense.
+            // CMAP0: the 8-bit flag (bit 7, clear: 24 bitplanes), board
+            // revision (6:4) and CMAP revision; CMAP1: monitor sense.
             if (which == 0) {
-                const int rev = opts_.board_revision >= 0 ? opts_.board_revision & 7 : opts_.xl24 ? 0 : 2;
-                return static_cast<u8>((opts_.xl24 ? 0x02 : 0x81) | (rev << 4));
+                const int rev = opts_.board_revision >= 0 ? opts_.board_revision & 7 : 0;
+                return static_cast<u8>(0x02 | (rev << 4));
             }
-            return static_cast<u8>((opts_.monitor_id << 4) | (opts_.xl24 ? 0x02 : 0x01));
+            return static_cast<u8>((opts_.monitor_id << 4) | 0x02);
         case 7: return c.crs7;
         default: return 0;
     }
@@ -1503,7 +1508,7 @@ u8 Newport::ramdac_read(unsigned crs) {
 void Newport::set_vrint(bool level) {
     if (vrint_ == level) return;
     vrint_ = level;
-    if (retrace_cb_) retrace_cb_(level);
+    set_irq(0, level);  // the retrace
 }
 
 void Newport::retrace() {
@@ -1514,44 +1519,90 @@ void Newport::retrace() {
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
 }
 
-bool Newport::screen_size(unsigned& width, unsigned& height) const {
-    width = height = 0;
-    unsigned vep = vc2_.reg[kVc2VideoEntry];
+// Video timing channels (active low) in a state's 21 bits: SA is VT<20:14>,
+// SB VT<13:7>, SC VT<6:0>.
+namespace {
+constexpr unsigned kChVpos = 13, kChVisible = 14, kChHpos = 15, kChDisplayEnable = 16, kChVertInt = 0;
+constexpr bool channel(u32 vt, unsigned ch) { return !((vt >> ch) & 1); }
+}  // namespace
+
+// SGI's tables put HPOS 36 pixels ahead of the visible part of each line,
+// and with them the glyph's left edge shows at screen column CURX - 29: the
+// cursor's own pipeline is 7 pixels. Frame buffer data takes 2 pixel
+// clocks from the display enable to the screen, which software allows for
+// by placing the screen 2 columns into the frame buffer (XYWIN x = 0x1002).
+// Vertically the line counter, and cursor Y, start at the line after VPOS.
+const Newport::VideoTiming& Newport::video_timing() const {
+    if (timing_version_ == vc2_version_) return timing_;
+    timing_version_ = vc2_version_;
+    VideoTiming t;
+    constexpr int kCursorPipeline = 7, kDataPipeline = 2;
+    unsigned vep = vc2_.reg[kVc2VideoEntry], line = 0, vis_cols = 0;
+    int vpos_line = -1, first_visible = -1, vint_line = -1;
+    bool horizontal = false;
     for (int entries = 0; entries < 1024; ++entries) {
         const unsigned ptr0 = vc2_.ram[vep++ & 0x7FFF];
-        const unsigned lines = vc2_.ram[vep++ & 0x7FFF];
-        if (lines == 0) break;
-        unsigned ptr = ptr0, cols = 0;
-        u16 w;
-        int guard = 0;
-        do {
-            w = vc2_.ram[ptr++ & 0x7FFF];
-            if (!(w & 1)) cols += (w >> 7) & 0xFE;
-            if (!(w & 0x80)) w = vc2_.ram[ptr++ & 0x7FFF];
-        } while (!(w & 0x8000) && ++guard < 256);
-        if (cols) {
-            width = std::max(width, cols);
-            height += lines;
+        const unsigned count = vc2_.ram[vep++ & 0x7FFF];
+        if (count == 0) break;
+        // One line of the run (SGI's runs repeat a line that points to itself).
+        unsigned ptr = ptr0, x = 0;
+        u32 vt = 0x1FFFFF;  // all channels inactive
+        int vis_x = -1, hpos_x = -1, enable_x = -1;
+        bool vpos = false, vint = false;
+        unsigned cols = 0;
+        for (int guard = 0; guard < 256; ++guard) {
+            const u16 w = vc2_.ram[ptr++ & 0x7FFF];
+            u32 sbsc = vt & 0x3FFF;
+            if (!(w & 0x80)) {
+                const u16 w2 = vc2_.ram[ptr++ & 0x7FFF];
+                sbsc = (u32{(w2 >> 8) & 0x7Fu} << 7) | (w2 & 0x7Fu);
+            }
+            const u32 prev = vt;
+            vt = (u32{w & 0x7Fu} << 14) | sbsc;
+            const unsigned run = 2 * ((w >> 8) & 0x7F);  // durations count pixel clock pairs
+            auto edge = [&](unsigned ch, int& at) {
+                if (at < 0 && channel(vt, ch) && (x == 0 || !channel(prev, ch))) at = static_cast<int>(x);
+            };
+            edge(kChVisible, vis_x);
+            edge(kChHpos, hpos_x);
+            edge(kChDisplayEnable, enable_x);
+            if (channel(vt, kChVisible)) cols += run;
+            vpos |= channel(vt, kChVpos);
+            vint |= channel(vt, kChVertInt);
+            x += run;
+            if (w & 0x8000) break;
         }
+        if (vpos && vpos_line < 0) vpos_line = static_cast<int>(line);
+        if (vint) vint_line = static_cast<int>(line + count - 1);
+        if (cols) {
+            if (first_visible < 0) first_visible = static_cast<int>(line);
+            vis_cols = std::max(vis_cols, cols);
+            t.height += count;
+            // (HPOS must come ahead of the visible part, the display enable
+            // no later than it; a table that does otherwise keeps SGI's values.)
+            if (!horizontal && vis_x >= 0 && hpos_x >= 0 && hpos_x < vis_x) {
+                horizontal = true;
+                t.cursor_x = vis_x - hpos_x - kCursorPipeline;
+                if (enable_x >= 0 && enable_x <= vis_x) t.scan_column = kDataPipeline + vis_x - enable_x;
+            }
+        }
+        line += count;
     }
-    return width > 0 && height > 0;
+    t.width = vis_cols > kDataPipeline ? std::min(vis_cols - kDataPipeline, 2048u) : 0;
+    t.height = std::min(t.height, 2048u);
+    if (!t.width) t.height = 0;
+    if (line) t.lines = line;
+    if (vpos_line >= 0 && first_visible > vpos_line) t.cursor_y = first_visible - vpos_line - 1;
+    if (vpos_line >= 0 && vint_line >= 0)
+        t.counter_at_vint = static_cast<unsigned>((vint_line - vpos_line - 1 + static_cast<int>(t.lines)) % static_cast<int>(t.lines));
+    timing_ = t;
+    return timing_;
 }
 
-u8 Newport::did_at(const std::vector<std::pair<int, u8>>& records, int x) const {
-    u8 did = 0;
-    for (const auto& [rx, d] : records) {
-        if (rx > x) break;
-        did = d;
-    }
-    return did;
-}
-
-// The glyph's origin is pixel 31 for both sizes. Horizontally the cursor
-// comes out of the VC2 at HPOS time and runs through the XMAP9's longer
-// cursor pipeline; with SGI's timing tables that puts the glyph's left edge
-// at screen column CURX - 29 (frame buffer column CURX - 27), as IRIX and
-// Linux allow for. Rows: CURY - 31.
-constexpr int kCursorScreenX = 29, kCursorScreenY = 31, kScanDelay = 2;
+// The cursor's place on the screen follows the timing table (see
+// video_timing()): with SGI's tables the glyph's left edge is at screen
+// column CURX - 29 (frame buffer column CURX - 27) and its top on line
+// CURY - 31, as IRIX and Linux allow for.
 constexpr u8 kXmapPupEnable = 0x01;  // XMAP9 config: pop-up planes shown
 constexpr u8 kXmapEightBit = 0x04;   // XMAP9 config: 8-bit system (the XL8)
 
@@ -1560,8 +1611,9 @@ constexpr u8 kXmapEightBit = 0x04;   // XMAP9 config: 8-bit system (the XL8)
 unsigned Newport::cursor_pixel(int x, int y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible)) return 0;
-    const int col = x - (static_cast<int>(shown_.cursor_x) - kCursorScreenX + kScanDelay);
-    const int row = y - (static_cast<int>(shown_.cursor_y) - kCursorScreenY);
+    const VideoTiming& t = video_timing();
+    const int col = x - (static_cast<int>(shown_.cursor_x) - t.cursor_x + t.scan_column);
+    const int row = y - (static_cast<int>(shown_.cursor_y) - t.cursor_y);
     if (dcr & kDcrCrosshair) return col == 0 || row == 0 ? 1 : 0;
     const bool large = dcr & kDcrLargeCursor;
     const int size = large ? 64 : 32;
@@ -1576,8 +1628,9 @@ unsigned Newport::cursor_pixel(int x, int y) const {
 bool Newport::cursor_position(int& x, int& y) const {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(dcr & kDcrCursorFunc) || !(dcr & kDcrCursorVisible) || (dcr & kDcrCrosshair)) return false;
-    x = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - kCursorScreenX;  // screen (picture) coordinates
-    y = static_cast<int>(vc2_.reg[kVc2CursorY]) - kCursorScreenY;
+    const VideoTiming& t = video_timing();
+    x = static_cast<int>(vc2_.reg[kVc2CurCursorX]) - t.cursor_x;  // screen (picture) coordinates
+    y = static_cast<int>(vc2_.reg[kVc2CursorY]) - t.cursor_y;
     return true;
 }
 
@@ -1595,7 +1648,7 @@ void Newport::latch_shown() {
             cursor_rows_.clear();
         }
         for (const u16 y : {shown_.cursor_y, now.cursor_y}) {
-            const int first = static_cast<int>(y) - kCursorScreenY;
+            const int first = static_cast<int>(y) - video_timing().cursor_y;
             cursor_rows_.emplace_back(first, first + size);
         }
     }
@@ -1656,9 +1709,12 @@ u32 Newport::direct_colour(u32 mode, u32 pix) const {
     return 0xFF000000u | rgb;
 }
 
-// A pixel's value in the buffer and size its display mode reads.
+// A pixel's value in the buffer and size its display mode reads. (24 bits
+// is "not allowed" for colour index (XMAP9 spec, mode register): taken as
+// 8-bit colour index.)
 static u32 pixel_value(u32 mode, u32 pix) {
     const unsigned pix_size = (mode >> 10) & 3, buf = mode & 1;
+    if (pix_size == 3 && ((mode >> 8) & 3) == 0) return pix & 0xFF;
     switch (pix_size) {
         case 0: return (pix >> (buf ? 4 : 0)) & 0xF;
         case 1: return pix & 0xFF;
@@ -1768,10 +1824,7 @@ u32 Newport::special_colour(u32 mode, u32 pix, u32 aux, unsigned cursor) const {
 bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) {
     const u16 dcr = vc2_.reg[kVc2Control];
     if (!(vc2_.reg[kVc2Config] & 1) || !(dcr & kDcrVTiming) || !screen_size(width, height)) return false;
-    constexpr unsigned kPipelineDelay = 2;  // see render_full()
-    if (width <= kPipelineDelay) return false;
-    width = std::min(width - kPipelineDelay, 2048u);
-    height = std::min(height, 2048u);
+    const unsigned pipeline_delay = static_cast<unsigned>(video_timing().scan_column);  // see render_full()
     const std::size_t total = static_cast<std::size_t>(width) * height;
     if (!(dcr & kDcrDisplay)) {  // blanked
         argb.assign(total, 0xFF000000u);
@@ -1788,8 +1841,9 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
     const bool cursor_on = (dcr & kDcrCursorFunc) && (dcr & kDcrCursorVisible);
     const bool crosshair = dcr & kDcrCrosshair;
     const int cursor_size = (dcr & kDcrLargeCursor) ? 64 : 32;
-    const int cursor_x0 = static_cast<int>(shown_.cursor_x) - kCursorScreenX + kScanDelay;  // frame buffer column
-    const int cursor_y0 = static_cast<int>(shown_.cursor_y) - kCursorScreenY;
+    const VideoTiming& timing = video_timing();
+    const int cursor_x0 = static_cast<int>(shown_.cursor_x) - timing.cursor_x + timing.scan_column;  // frame buffer column
+    const int cursor_y0 = static_cast<int>(shown_.cursor_y) - timing.cursor_y;
 
     std::vector<std::pair<int, u8>> records;
     for (unsigned y = 0; y < height; ++y) {
@@ -1815,16 +1869,14 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
         u32* const out = &argb[static_cast<std::size_t>(y) * width];
         std::size_t rec = 0;
         u8 did = 0;
-        unsigned x = kPipelineDelay;  // scan-out position
-        const unsigned end = width + kPipelineDelay;
+        unsigned x = pipeline_delay;  // scan-out position
+        const unsigned end = width + pipeline_delay;
         while (x < end) {
-            // DID records give screen columns; x here is the frame buffer column.
-            while (rec < records.size() && records[rec].first + static_cast<int>(kPipelineDelay) <= static_cast<int>(x))
-                did = records[rec++].second;
+            // DID records give frame buffer columns, as x is here.
+            while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
             // A run of one display mode: up to the next DID change.
             unsigned stop = end;
-            if (rec < records.size())
-                stop = std::min<unsigned>(stop, static_cast<unsigned>(std::max(records[rec].first + static_cast<int>(kPipelineDelay), 0)));
+            if (rec < records.size()) stop = std::min<unsigned>(stop, static_cast<unsigned>(std::max(records[rec].first, 0)));
             if (stop <= x) stop = x + 1;
             const ModeTable& t = mode_table(did);
             const u32 mode = t.mode;
@@ -1839,7 +1891,7 @@ bool Newport::render(std::vector<u32>& argb, unsigned& width, unsigned& height) 
                             (cursor_on && crosshair && (static_cast<int>(x) == cursor_x0 || static_cast<int>(y) == cursor_y0))
                         ? cursor_pixel(static_cast<int>(x), static_cast<int>(y))
                         : 0;
-                u32& o = out[x - kPipelineDelay];
+                u32& o = out[x - pipeline_delay];
                 if (cp || (aux & special) || underlay) o = special_colour(mode, pix, aux, cp);
                 else if (t.direct) o = direct_colour(mode, pix);
                 else o = t.lut[(pix >> t.shift) & t.mask];
@@ -1857,11 +1909,9 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
     if (!(vc2_.reg[kVc2Config] & 1) || !(dcr & kDcrVTiming) || !screen_size(width, height)) return false;
     // The first pixel clocks of each active line fill the display pipeline;
     // software allows for it by placing the screen that far into the
-    // framebuffer (XYWIN x = 0x1002), and the timing tables count them.
-    constexpr unsigned kPipelineDelay = 2;
-    if (width <= kPipelineDelay) return false;
-    width = std::min(width - kPipelineDelay, 2048u);
-    height = std::min(height, 2048u);
+    // framebuffer (XYWIN x = 0x1002), and the timing tables count them
+    // (video_timing()).
+    const unsigned pipeline_delay = static_cast<unsigned>(video_timing().scan_column);
     argb.assign(static_cast<std::size_t>(width) * height, 0xFF000000u);
     if (!(dcr & kDcrDisplay)) return true;  // blanked
 
@@ -1883,8 +1933,8 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
         std::size_t rec = 0;
         u8 did = 0;
         for (unsigned ox = 0; ox < width; ++ox) {
-            const unsigned x = ox + kPipelineDelay;  // frame buffer column; DID records give screen columns
-            while (rec < records.size() && records[rec].first <= static_cast<int>(ox)) did = records[rec++].second;
+            const unsigned x = ox + pipeline_delay;  // frame buffer column, as DID records give
+            while (rec < records.size() && records[rec].first <= static_cast<int>(x)) did = records[rec++].second;
             const u32 mode = xm.mode[did];
             const std::size_t idx = static_cast<std::size_t>(row) * kPitch + x;
             const u32 pix = x < static_cast<unsigned>(kPitch) && row < static_cast<unsigned>(kRows) ? rgbci_[idx] : 0;
@@ -1892,6 +1942,29 @@ bool Newport::render_full(std::vector<u32>& argb, unsigned& width, unsigned& hei
             out[ox] = special_colour(mode, pix, aux, cursor_pixel(static_cast<int>(x), static_cast<int>(y)));
         }
     }
+    return true;
+}
+
+namespace {
+constexpr u32 kRex3InSlot = kNewportRex3 - kGioGfx, kRex3WindowSize = 0x10000;
+}  // namespace
+
+// The Newport's slot is pipelined: reads that no register answers do not
+// fault but return the width of the access in bytes (4, 2 or 1), as seen on
+// Indys and relied on by OpenBSD to tell a Newport from an empty slot.
+bool Newport::Slot::read(u32 offset, unsigned size, u64& value) {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read(offset - kRex3InSlot, size, value);
+    value = size;
+    return true;
+}
+
+bool Newport::Slot::write(u32 offset, unsigned size, u64 value) {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.write(offset - kRex3InSlot, size, value);
+    return true;
+}
+
+bool Newport::Slot::read_is_pure(u32 offset, unsigned size) const {
+    if (offset - kRex3InSlot < kRex3WindowSize) return board_.read_is_pure(offset - kRex3InSlot, size);
     return true;
 }
 

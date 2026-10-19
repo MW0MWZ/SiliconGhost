@@ -20,7 +20,7 @@
 #include "machine/ip22/hpc3.h"
 #include "machine/ip22/ioc2.h"
 #include "machine/ip22/mc.h"
-#include "machine/ip22/newport.h"
+#include "machine/ip22/gfx_board.h"
 #include "mem/bus.h"
 
 namespace sg::ip22 {
@@ -44,9 +44,10 @@ struct IndyConfig {
     u32 prid = 0x00000450;      // R4400 revision 5.0
     u32 cpu_config = mips::R4000::kDefaultConfig;  // Config register at reset (cache geometry)
     u32 scache_bytes = 1u << 20;                    // secondary cache; 0 for a PC module
-    bool graphics = true;       // a Newport board in the GFX slot
-    bool xl24 = false;          // the 24-bit board (XL24) rather than the 8-bit XL8
-    int graphics_revision = -1;  // its board revision, 0-7; -1 for the usual one
+    bool graphics = true;       // a board in the GFX slot
+    enum class GraphicsBoard { Xl24, SolidImpact, HighImpact, MaxImpact };
+    GraphicsBoard graphics_board = GraphicsBoard::Xl24;  // which (IMPACT: Indigo2 only)
+    int graphics_revision = -1;  // the Newport's board revision, 0-7; -1 for the usual one
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
     // SCSI CD-ROM (ID 4) discs, raw 512-byte blocks (IRIX media layout). The
     // first is in the drive at power-on; ejecting moves on to the next.
@@ -55,6 +56,11 @@ struct IndyConfig {
     // Ethernet address, kept in NVRAM. Unset: keep the NVRAM's own address, or
     // use a default when the NVRAM has none (IRIX requires one).
     std::optional<std::array<u8, 6>> mac;
+    // The PROM's console variable, written to NVRAM at power-on: 'g'
+    // (graphics) or 'd' (serial port 1); 0 leaves what the NVRAM has. Only
+    // an environment the PROM has already set up is changed: a blank or
+    // damaged one is left for the PROM to fill with its defaults.
+    char console = 0;
     // The bare-metal test device in GIO expansion slot 0 (see TestDevice),
     // and the run configuration it reports.
     bool test_device = false;
@@ -147,29 +153,22 @@ public:
     // Wd33c93::set_quick_selection_timeout).
     void set_quick_scsi_scan(bool quick) { hpc3_.set_quick_scsi_scan(quick); }
     Mc& mc() { return mc_; }
-    Newport* newport() { return config_.graphics ? &newport_ : nullptr; }
+    GfxBoard* graphics() { return gfx_.get(); }
 
 private:
+    // The PROM's environment: 256 bytes, in the DS1386 from byte 0x40 on the
+    // Indy, in the serial EEPROM (big-endian words) on the Indigo2.
     static constexpr unsigned kNvramBase = 0x40;   // NVRAM byte 0 within the DS1386
+    static constexpr unsigned kNvramBytes = 256;
+    static constexpr unsigned kNvramChecksum = 0;  // over every other byte
+    static constexpr unsigned kNvramConsole = 2;   // "g" or "d", 2 bytes
     static constexpr unsigned kNvramEaddr = 250;   // Ethernet address, 6 bytes
     void pump_serial_input();
-    void apply_ethernet_address();
+    u8 nvram_byte(unsigned offset);
+    void set_nvram_byte(unsigned offset, u8 value);
+    u8 nvram_checksum();
+    void apply_nvram_settings();
     void next_disc();
-
-    // The graphics slot as the board decodes it: REX3 at +0xF0000, and the
-    // rest of the slot answering (reads as zero) rather than timing out, so
-    // probes of the slot base find a board there.
-    class GfxSlot final : public Device {
-    public:
-        explicit GfxSlot(Newport& board) : board_(board) {}
-        const char* name() const override { return "gfx-slot"; }
-        bool read(u32 offset, unsigned size, u64& value) override;
-        bool write(u32 offset, unsigned size, u64 value) override;
-        bool read_is_pure(u32 offset, unsigned size) const override;
-
-    private:
-        Newport& board_;
-    };
 
     IndyConfig config_;
     Scheduler scheduler_;
@@ -180,8 +179,7 @@ private:
     Ioc2 ioc_;
     Hpc3 hpc3_;
     Mc mc_;
-    Newport newport_;
-    GfxSlot gfx_slot_{newport_};
+    std::unique_ptr<GfxBoard> gfx_;  // in the graphics slot, if fitted
     Timer serial_timer_;
     std::unique_ptr<ScsiDisk> disk_, cdrom_;
     std::unique_ptr<TestDevice> test_device_;
@@ -223,6 +221,7 @@ private:
     bool disc_loaded_ = false;
     std::atomic<bool> disc_change_{false};  // host asked for the next disc
     bool reset_pending_ = false;
+    int cpu_reset_pending_ = 0;  // MC CPUCTRL0: 1 the processor's reset, 2 a warm reset
     bool powered_off_ = false;
     u64 timing_cpu_until_ = 0;
 };

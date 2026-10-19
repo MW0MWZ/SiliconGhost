@@ -102,9 +102,9 @@ Uses inline_uses(u32 w) {
         case 0x0D:
         case 0x0E: return {bit(rs), bit(rt)};
         case 0x0F: return {0, bit(rt)};
-        case 0x11:  // MFC1, DMFC1, MTC1, DMTC1; MOVZ.fmt, MOVN.fmt read rt
-            if (rs == 0x00 || rs == 0x01) return {0, bit(rt)};
-            if (rs == 0x04 || rs == 0x05) return {bit(rt), 0};
+        case 0x11:  // MFC1, DMFC1, CFC1, MTC1, DMTC1, CTC1; MOVZ.fmt, MOVN.fmt read rt
+            if (rs == 0x00 || rs == 0x01 || rs == 0x02) return {0, bit(rt)};
+            if (rs == 0x04 || rs == 0x05 || rs == 0x06) return {bit(rt), 0};
             if ((rs == 0x10 || rs == 0x11) && ((w & 63) == 0x12 || (w & 63) == 0x13)) return {bit(rt), 0};
             return {};
         case 0x13:  // COP1X indexed loads and stores: base + index
@@ -209,11 +209,14 @@ void R4000::jit_successors(const Block& b, std::vector<u32>& offsets) const {
             likely = (opc >= 0x14 && opc <= 0x17) || (opc == 0x01 && (f_rt(w) & 2));
         }
         if ((w >> 26) == 0 && ((w & 63) == 0x08 || (w & 63) == 0x09)) return jr_targets(b, offsets);  // JR, JALR
-        if (!conditional) return;  // jumps: the target depends on the pc
+        // Jumps: their target depends on the pc. (A J or JAL is linked to
+        // its target's own translation instead: copying the targets in made
+        // translations much larger.)
+        if (!conditional) return;
         add(static_cast<s64>(b.offset) + 4 * (b.count - 2) + delta);
         if (!likely) add(end);
     } else if (!is_branch_word(b.ops[b.count - 1].inst)) {
-        add(end);  // straight on (the block ended at its length limit or after a CP0 operation)
+        add(end);  // straight on (the block ended at its length limit)
     }
 }
 
@@ -289,7 +292,8 @@ void R4000::jit_fp_uses(u32 w, const std::function<void(unsigned, bool, bool)>& 
         case 0x04:
         case 0x05: return use(fs, fmt == 0x05, true);  // MTC1, DMTC1
         case 0x14:  // CVT.S.W, CVT.D.W
-            if (func == 0x20 || func == 0x21) use(fs, false, false), use(fd, func == 0x21, true);
+        case 0x15:  // CVT.S.L, CVT.D.L
+            if (func == 0x20 || func == 0x21) use(fs, fmt == 0x15, false), use(fd, func == 0x21, true);
             return;
         case 0x10:
         case 0x11: break;
@@ -298,14 +302,16 @@ void R4000::jit_fp_uses(u32 w, const std::function<void(unsigned, bool, bool)>& 
     const bool dbl = fmt == 0x11;
     if (func <= 0x03) {
         use(fs, dbl, false), use(ft, dbl, false), use(fd, dbl, true);
-    } else if (func <= 0x07 || func == 0x15) {  // SQRT, ABS, MOV, NEG, RECIP
+    } else if (func <= 0x07 || func == 0x15 || func == 0x16) {  // SQRT, ABS, MOV, NEG, RECIP, RSQRT
         use(fs, dbl, false), use(fd, dbl, true);
     } else if (func >= 0x11 && func <= 0x13) {  // MOVF/MOVT, MOVZ, MOVN.fmt: fd may keep its value
         use(fs, dbl, false), use(fd, dbl, false), use(fd, dbl, true);
     } else if ((func == 0x20 && dbl) || (func == 0x21 && !dbl)) {  // CVT.S.D, CVT.D.S
         use(fs, dbl, false), use(fd, !dbl, true);
-    } else if (func == 0x0C || func == 0x0D || func == 0x24) {  // ROUND.W, TRUNC.W, CVT.W
+    } else if ((func >= 0x0C && func <= 0x0F) || func == 0x24) {  // ROUND/TRUNC/CEIL/FLOOR.W, CVT.W
         use(fs, dbl, false), use(fd, false, true);
+    } else if ((func >= 0x08 && func <= 0x0B) || func == 0x25) {  // ROUND/TRUNC/CEIL/FLOOR.L, CVT.L
+        use(fs, dbl, false), use(fd, true, true);
     } else if (func >= 0x30) {  // C.cond
         use(fs, dbl, false), use(ft, dbl, false);
     }

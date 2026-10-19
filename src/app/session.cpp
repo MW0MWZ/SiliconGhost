@@ -174,7 +174,7 @@ void Session::save_nvram() {
 bool Session::save_screenshot(const std::string& path) {
     std::vector<u32> pixels;
     unsigned w = 0, h = 0;
-    if (!machine_ || !machine_->newport() || !machine_->newport()->render(pixels, w, h)) return false;
+    if (!machine_ || !machine_->graphics() || !machine_->graphics()->render(pixels, w, h)) return false;
     std::ofstream f(path, std::ios::binary);
     f << "P6\n" << w << " " << h << "\n255\n";
     for (u32 p : pixels) {

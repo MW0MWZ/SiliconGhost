@@ -94,7 +94,12 @@ R4000::R4000(Bus& bus, const Options& options)
     reset();
 }
 
-R4000::~R4000() = default;
+R4000::~R4000() {
+    if (jit_compiles_ || code_page_writes_)
+        SG_LOG(Info, "cpu", "recompiler: %llu translations, %llu reused, %llu code pages written, %llu buffer flushes",
+               static_cast<unsigned long long>(jit_compiles_), static_cast<unsigned long long>(jit_reuses_),
+               static_cast<unsigned long long>(code_page_writes_), static_cast<unsigned long long>(jit_buffer_flushes_));
+}
 
 void R4000::set_jit(bool enabled) {
     if (enabled && !jit_buf_) {
@@ -233,6 +238,16 @@ void R4000::reset() {
     set_pc(kResetVector);
 }
 
+void R4000::soft_reset() {
+    errorepc_ = next_delay_ ? pc - 4 : pc;  // in a delay slot, the branch restarts
+    status_ = (status_ | sr::SR | sr::BEV | sr::ERL) & ~sr::TS;
+    waiting_ = false;
+    in_delay_ = next_delay_ = false;
+    update_mode();
+    flush_fast_tlb();
+    set_pc(kResetVector);
+}
+
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
@@ -325,12 +340,9 @@ bool is_branch(u32 w) {
     }
 }
 
-// Instructions after which fetch translation or the code itself may differ:
-// all of CP0 (MTC0, ERET, TLB writes...) and CACHE.
-bool ends_block(u32 w) {
-    const unsigned op = w >> 26;
-    return (op == 0x10 && ((w >> 21) & 0x1F) != 0x08) || op == 0x2F;
-}
+// ERET, which goes elsewhere with no delay slot. (Other CP0 operations stay
+// in the block; the run loops leave it if one changes the fetch translation.)
+bool ends_block(u32 w) { return (w >> 26) == 0x10 && (w & 0x0200003Fu) == 0x02000018u; }
 
 }  // namespace
 
@@ -475,6 +487,7 @@ u64 R4000::run_delay_loop(const Block& b, u64 t, u64 safe) {
 
 // `page` is the host address of a 4 KiB page that was written.
 void R4000::invalidate_code_page(const u8* page) {
+    ++code_page_writes_;
     if (u8* flag = bus_.code_flag(page)) *flag = 0;
     for (u32 off = 0; off < 0x1000; off += 4) {
         Block& b = blocks_[block_index(page + off)];
@@ -520,6 +533,13 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         return std::min(stop, timer);
     };
     u64 safe = safe_time();
+    // Whether the page of `at` (in block b) no longer fetches from b's page
+    // in the current mode: a CP0 operation changed the mode or translation.
+    auto fetch_moved = [&](u64 at, const Block& b) {
+        const u64 vp = at >> 12;
+        const FastEntry& f = fast_[mode_][static_cast<unsigned>(Access::Fetch)][vp & (kFastEntries - 1)];
+        return f.tag != (vp | asid_tag_) || f.host != b.host - b.offset;
+    };
     bool check_irq = true;
     bool first = true;  // the caller has checked the run limit for the first instruction
     for (unsigned linked = 0; linked < kMaxLinkedBlocks; ++linked) {
@@ -547,6 +567,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
         if (jit_buf_ && !start && !blk->code && blk->delay.test == DelayLoop::None && ++blk->runs == kJitThreshold) {
             if (!jit_compile(*blk)) {
                 jit_flush();  // the code buffer is full: start afresh
+                ++jit_buffer_flushes_;
                 jit_compile(*blk);
             }
             if (blk->code) {
@@ -586,7 +607,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                     check_irq = true;
                     safe = safe_time();
                 }
-                leave = pc != ipc || block_invalidated_ || idle_ready_;
+                leave = pc != ipc || block_invalidated_ || idle_ready_ || (io_ && fetch_moved(jit_entry_pc_, *blk));
             }
         }
         for (; !leave && i < blk->count; ++i, ipc += 4) {
@@ -638,11 +659,13 @@ void R4000::run_block(u64 cycle, const u64* limit) {
             gpr[0] = 0;
             t = time_fp_;
             synced = true;
+            bool moved = false;
             if (SG_UNLIKELY(io_)) {  // a device or CP0 may have raised an interrupt or moved an event
                 check_irq = true;
                 safe = safe_time();
+                moved = fetch_moved(ipc, *blk);  // the rest of the block was fetched another way
             }
-            if (pc != ipc + 4 || block_invalidated_ || idle_ready_) break;
+            if (moved || pc != ipc + 4 || block_invalidated_ || idle_ready_) break;
         }
         if (i == blk->count) {  // ran off the end of the block
             time_fp_ = t;
@@ -1391,6 +1414,7 @@ void R4000::execute(u32 inst) {
             debug_translate(va, paddr);
             r[rt] = sext32(v);
             lladdr_ = static_cast<u32>(paddr >> 4);
+            llvaddr_ = va;
             llbit_ = true;
             break;
         }
@@ -1403,6 +1427,7 @@ void R4000::execute(u32 inst) {
             debug_translate(va, paddr);
             r[rt] = v;
             lladdr_ = static_cast<u32>(paddr >> 4);
+            llvaddr_ = va;
             llbit_ = true;
             break;
         }
@@ -2036,7 +2061,20 @@ void R4000::execute_cop0(u32 inst) {
     // Reading a constant register (PRId, Config, Status...) is pure; Count
     // and Random change with time, and everything else alters CP0 state.
     if (f_rs(inst) > 0x01 || rd == cop0::Count || rd == cop0::Random) touch();
-    if (f_rs(inst) > 0x01) io_ = true;  // interrupt enables, Compare or translation may change
+    // Interrupts, the timer or the fetch translation may change: the run
+    // loops look again. (The other registers stage a TLB write or are read
+    // back; TLBP only reads the TLB.)
+    switch (f_rs(inst)) {
+        case 0x00: case 0x01: break;
+        case 0x04: case 0x05:
+            if (rd == cop0::EntryHi || rd == cop0::Count || rd == cop0::Compare || rd == cop0::Cause ||
+                rd == cop0::Config || rd == cop0::WatchLo || rd == cop0::WatchHi)
+                io_ = true;
+            break;
+        default:
+            if ((inst & 0x0200003Fu) != 0x02000008u) io_ = true;
+            break;
+    }
     switch (f_rs(inst)) {
         case 0x00: gpr[rt] = sext32(cp0_read(rd)); break;  // MFC0
         case 0x01:                                          // DMFC0
@@ -2272,6 +2310,9 @@ void R4000::execute_cache(u32 inst) {
     if (!translate<true>(vaddr, Access::Load, paddr)) return;
 
     const unsigned cache = op & 3, operation = op >> 2;
+    // The LLbit is cleared by a change of state of the cache line holding the
+    // link address (R4000 manual, Load Linked Store Conditional Operation).
+    if (llbit_ && cache_op_changes_link(cache, operation, vaddr, paddr)) llbit_ = false;
     if (two_way_) return cache_op_2way(cache, operation, vaddr, paddr);
     if (cache >= 2 && stag_.empty()) return;  // no secondary cache: undefined, ignore
 
@@ -2343,6 +2384,35 @@ void R4000::execute_cache(u32 inst) {
             if (secondary) set_ch(hit);
             break;
     }
+}
+
+// Whether a CACHE operation invalidates, retags or creates the data (or
+// secondary) cache line that holds the link address: Hit operations on that
+// line, Index operations on its index (in either way of a 2-way cache), and
+// the R5000's secondary cache flash and page invalidates.
+bool R4000::cache_op_changes_link(unsigned cache, unsigned operation, u64 vaddr, u64 paddr) const {
+    if (cache == 0) return false;  // the instruction cache holds no data
+    const u64 link = u64{lladdr_} << 4;
+    if (opts_.core == Core::R5000 && cache == 3) {
+        if (stag_.empty()) return false;
+        if (operation == 0) return true;                                              // Flash Invalidate
+        if (operation == 5) return (paddr >> 12) == (link >> 12);                     // Page Invalidate
+        if (operation == 2) return (paddr / 32) % stag_.size() == (link / 32) % stag_.size();  // Index Store Tag
+        return false;
+    }
+    if (operation == 1 || operation >= 6) return false;  // Load Tag, Hit Writeback, Hit Set Virtual: no change
+    const bool index_op = operation == 0 || operation == 2;
+    if (cache == 1) {
+        const u32 line = 16u << ((config_ >> 4) & 1);
+        u32 size = 1u << (12 + ((config_ >> 6) & 7));
+        if (two_way_) size /= 2;
+        if (index_op) return ((vaddr & (size - 1)) / line) == ((llvaddr_ & (size - 1)) / line);
+        return paddr / line == link / line;
+    }
+    if (stag_.empty()) return false;
+    const u32 sline = 16u << ((config_ >> 22) & 3);
+    if (index_op) return (paddr / sline) % stag_.size() == (link / sline) % stag_.size();
+    return paddr / sline == link / sline;
 }
 
 // The R4600 and R5000: 2-way primary caches (the way an Index operation

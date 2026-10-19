@@ -63,11 +63,11 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | Memory controller | MC: memory configuration, GIO bus errors | working |
 | Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
 | Interrupts/timers | IOC2 / INT3 (Indy), INT2 and EXTIO (Indigo²), 8254 PIT | working |
-| Serial | Zilog 85230 SCC (two ports) | working |
+| Serial | Zilog 85C30 with the 85230's FIFOs (the IOC2's 85CX30, two ports): asynchronous mode, interrupts with acknowledge and under-service, loopback and echo | working |
 | Real-time clock/NVRAM | Dallas DS1386; on the Indigo², settings in the 93CS56 serial EEPROM | working, saved as it changes |
 | SCSI | WD33C93 with disk and CD-ROM targets (a second controller on the Indigo²) | working |
 | EISA (Indigo²) | the bus, with no cards fitted | working |
-| Graphics | Newport XL8 and XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working (8-bit and 24-bit boards) |
+| Graphics | Newport XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
 | Audio | HAL2 | working (playback and recording) |
@@ -181,8 +181,9 @@ Main options (`siliconghost --help` lists them all):
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc` | processor module (default R4400SC) |
 | `--cpu-mhz N` | CPU clock: one the module shipped at on that platform (default: the module's usual clock) |
 | `--any-clock` | allow a `--cpu-mhz` no such machine shipped with |
-| `--graphics xl8\|xl24\|none` | the 8-bit Newport (default), the 24-bit one, or no board (the console is then on the first serial port) |
-| `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 2 for the XL8, 0 for the XL24); drivers pick timings and cursor offsets by it, and see an 8-bit board only from revision 2 |
+| `--graphics xl24\|none` | the 24-bit Newport (default) or no board (the console is then on the first serial port) |
+| `--console graphics\|serial` | write the PROM's console setting to the NVRAM at power-on: the screen and keyboard, or serial port 1 (default: leave it as the NVRAM has it) |
+| `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 0); drivers pick timings and cursor offsets by it |
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
@@ -265,8 +266,11 @@ why it could not open a window.
   them, including the numeric keypad and the UK keys `#~` and `\|`; IRIX's
   keyboard layout setting decides what they produce.
 - **Console:** with the NVRAM's `console` set to `g` (the PROM's default on
-  a machine with graphics), the PROM and IRIX use the screen; set it to `d`
-  from the Command Monitor (`setenv console d`) to use the serial port.
+  a machine with graphics), the PROM and IRIX use the screen; set to `d`
+  they use serial port 1 (View → Serial Port 1). Choose it in Settings →
+  Machine → Console or with `--console`, which write it to the NVRAM at
+  power-on, or from the Command Monitor (`setenv console d`). A new NVRAM
+  takes the setting from its second power-on, once the PROM has set it up.
 
 ### Installing IRIX on a new disk
 
@@ -295,27 +299,60 @@ the board. To add them to a system installed without graphics, start
 the kernel.
 
 With `--no-graphics`, an NVRAM set to `console=g` disables autoboot; choose
-*Start System* from the menu.
+*Start System* from the menu, or start with `--console serial`.
 
 ### Networking
 
 With `--net user` the Indy sits behind a NAT on 10.0.2.0/24: use 10.0.2.15
 for it, 10.0.2.2 (the host) as its gateway and 10.0.2.3 as its name server.
 A DHCP server on the NAT hands out these settings, which systems with a DHCP
-client (such as NetBSD) pick up by themselves. IRIX 5.3 is configured by
-hand, for example as root:
+client (such as NetBSD and OpenBSD) pick up by themselves; otherwise put
+10.0.2.2 in `/etc/mygate` for the default route. IRIX is configured by hand,
+as root:
 
 ```sh
 ifconfig ec0 10.0.2.15 netmask 255.255.255.0 up
 route add default 10.0.2.2 1
+echo nameserver 10.0.2.3 > /etc/resolv.conf
 ```
 
-To keep the address, put it in `/etc/hosts` under the system's name
-(`/etc/sys_id`); IRIX 5.3 takes static routes such as the default gateway
-from a script `/etc/init.d/network.local`, linked as `/etc/rc2.d/S31network`
-(see the comments in `/etc/init.d/network`). Connections from the host
-reach the guest through forwarded ports, e.g. `--hostfwd tcp:2323:23` and
-`telnet localhost 2323`.
+These last until the next restart. To keep the address, put it in
+`/etc/hosts` under the system's name (`/etc/sys_id`). To keep the default
+route, on IRIX 6.5 add this line to `/etc/config/static-route.options`:
+
+```sh
+$ROUTE $QUIET add -net default 10.0.2.2
+```
+
+IRIX 5.3 has no such file: it runs `/etc/init.d/network.local`, linked as
+`/etc/rc2.d/S31network` (see the comments in `/etc/init.d/network`):
+
+```sh
+#!/bin/sh
+case "$1" in
+start) /usr/etc/route add default 10.0.2.2 1 ;;
+esac
+```
+
+```sh
+chmod 755 /etc/init.d/network.local
+ln -s ../init.d/network.local /etc/rc2.d/S31network
+```
+
+To find where a connection stops, check in order: `netstat -rn` (a
+`default` route to 10.0.2.2), `ping 10.0.2.2` (the gateway), `ping 1.1.1.1`
+(the way out) and `ping www.sgi.com` (the name server). The same notes are
+under *Setting up the guest* in Settings → Network.
+
+Connections from the host reach the guest through forwarded ports, e.g.
+`--hostfwd tcp:2323:23` and `telnet localhost 2323`.
+
+The name server at 10.0.2.3 passes queries to the host's first IPv4 name
+server; if the host has none (only IPv6 ones), give the guest a public name
+server's address instead. On macOS 15 and later, reaching machines on the
+local network, the router's name server among them, needs the program's
+Local Network permission (System Settings → Privacy & Security → Local
+Network: Silicon Ghost, or the terminal it was started from).
 
 With `--net tap:NAME` frames go to an existing TAP interface (created with
 `ip tuntap add mode tap user $USER name tap0` and bridged or routed as your
@@ -330,10 +367,10 @@ network needs), and the Indy is configured like any machine on that network.
 | Installation over the network (HTTP/FTP) | yes | yes |
 | Installed system boots multi-user from disk | yes | yes |
 | Serial console | yes | yes |
-| Newport (graphics) console | 9.0 and 11.0: no text shown; NetBSD-current: yes (8- and 24-bit boards) | yes, text console |
+| Newport (graphics) console | 9.0 and 11.0: no text shown; NetBSD-current: yes | yes, text console |
 | PS/2 keyboard | yes | yes |
 | PS/2 mouse | detected (not exercised without X) | detected (not exercised without X) |
-| X11 | NetBSD-current: yes, on the 8-bit board (see below); 9.0: not tried | no (OpenBSD's Newport driver has no frame buffer for X) |
+| X11 | NetBSD-current: yes (see below); 9.0: not tried | no (OpenBSD's Newport driver has no frame buffer for X) |
 | SCSI disk and CD-ROM | yes | yes |
 | Ethernet | yes | yes |
 | Audio playback | yes | no (no driver) |
@@ -345,8 +382,11 @@ devices, its Newport console showing no text either; the rest of the table
 was checked on 9.0, apart from what is marked NetBSD-current.
 
 X on NetBSD-current runs with its `newport` driver (twm, xterm, xclock and
-the like). Start it with `-depth 8` on the 8-bit board (the driver defaults
-to 24 and gives up otherwise), and give it a monitor section for 1280x1024
+the like). Start it with `-depth 8`: at its default depth of 24 the driver
+gives the REX3 its fast-clear colour already in the frame buffer's bit
+layout, which the REX3 produces itself (IRIX gives it as an RGB colour), so
+the root window and other cleared areas show the wrong colours. Give it a
+monitor section for 1280x1024
 (without one it picks 1024x768). The kernel points the XMAP9's cursor
 colour map at entries 0-3, so X's cursor colours overwrite palette entries 1
 and 2 and the default white pixel shows as the cursor's black: give clients
@@ -354,8 +394,8 @@ explicit colours (`xterm -bg ... -fg ...`).
 
 ### Running NetBSD
 
-NetBSD/sgimips 9.0 runs on the serial console (start with `--no-graphics`
-and an NVRAM set to `console=d`; see the limitations below about its
+NetBSD/sgimips 9.0 runs on the serial console (start with `--no-graphics
+--console serial`; see the limitations below about its
 graphics console). To start its installer from the CD image, from the
 Command Monitor:
 
@@ -426,10 +466,7 @@ so guest clocks always agree with each other.
 - **realtime** (default): guest time follows the wall clock. A fast host
   makes the CPU look faster, while a guest second stays a second.
   While the PROM or a kernel times the CPU at boot, the CPU runs at
-  `--timed-speed`, because IRIX 5.3 fails on a CPU it measures as much
-  faster than real: keep the clock times the timed speed at about 350 MHz
-  or less (175 MHz x 2 boots, 200 MHz x 1.8 does not). IRIX 6.5 boots at
-  250 MHz x 1.8. Delay loops (a register counted down, nothing else) run
+  `--timed-speed`. Delay loops (a register counted down, nothing else) run
   at the real CPU's speed, or the timed speed if that is slower: systems
   calibrate their delays by timing one against a timer, and at the real
   speed enough of it is timed for the timer's resolution, so delays come
@@ -475,10 +512,10 @@ with performance layers on top that must give exactly the same results:
   specification does not give it).
 - NetBSD 9.0's and 11.0's Newport console shows no text: these releases
   read the board's revision just after a VC2 register access, a read whose
-  result on real hardware is not known, and on the emulated board they take
-  it for a 24-bit board. A NetBSD-current kernel (11.99), which reads the
-  revision directly, finds the board and runs its console on both the 8-bit
-  and the 24-bit board. With 9.0 or 11.0, use the serial console.
+  result on real hardware is not known, and their console then draws
+  nothing. A NetBSD-current kernel (11.99), which reads the revision
+  directly, runs its console on the board. With 9.0 or 11.0, use the serial
+  console.
 - IRIX 5.3, IRIX 6.5, NetBSD 9.0 and 11.0 and OpenBSD 6.9 are the systems
   tested so far (on the Indigo², IRIX: its 5.1 PROM loads only ECOFF
   programs, and the NetBSD and OpenBSD boot loaders are ELF); Linux has not been tried. (Current Debian releases no longer include

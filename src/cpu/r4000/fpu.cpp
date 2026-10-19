@@ -35,8 +35,6 @@ namespace {
 constexpr u32 kFcrRoundMask = 0x3u;
 constexpr u32 kFcrCond = 1u << 23;
 constexpr u32 kFcrFS = 1u << 24;
-constexpr u32 kFcrWriteMask = 0x0183FFFFu;
-constexpr u32 kFcrCondMips4 = 0xFE000000u;  // condition codes 1-7
 constexpr u32 kCauseMask = 0x0003F000u;
 constexpr u32 kCauseE = 1u << 17;
 constexpr u32 kCauseV = 1u << 16;
