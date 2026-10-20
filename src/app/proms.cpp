@@ -161,9 +161,18 @@ std::vector<PromImage> scan_proms(const std::string& folder) {
     return found;
 }
 
+// The PROM system a board needs.
+static const char* prom_system(ip22::Board board) {
+    switch (board) {
+        case ip22::Board::Indigo2: return "ip22";
+        case ip22::Board::Indigo2R10000: return "ip28";
+        default: return "ip24";
+    }
+}
+
 bool prom_fits(const PromImage& p, const Settings& s, std::string& why) {
     const ip22::Board board = board_of(s);
-    const std::string needed = board == ip22::Board::Indigo2 ? "ip22" : "ip24";
+    const std::string needed = prom_system(board);
     const std::string name = std::filesystem::path(p.path).filename().string();
     if (p.system.empty()) {
         why = name + " is not an SGI PROM image this emulator knows";
@@ -218,7 +227,7 @@ bool select_prom(const Settings& s, PromImage& out, std::string& error) {
     const std::vector<PromImage> found = scan_proms(folder);
     for (const PromImage& p : found) {
         if (!prom_fits(p, s, why)) {
-            if (p.system == (board_of(s) == ip22::Board::Indigo2 ? "ip22" : "ip24")) unsuitable.push_back(why);
+            if (p.system == prom_system(board_of(s))) unsuitable.push_back(why);
             continue;
         }
         if (!best || p.rank > best->rank) best = &p;
@@ -227,10 +236,12 @@ bool select_prom(const Settings& s, PromImage& out, std::string& error) {
         out = *best;
         return true;
     }
-    const bool indigo2 = board_of(s) == ip22::Board::Indigo2;
-    error = std::string("no ") + (indigo2 ? "Indigo2 (IP22)" : "Indy (IP24)") + " boot PROM for this configuration in " +
-            folder + ": put a dump there, such as " +
-            (indigo2 ? "ip22prom.070-1367-002.bin" : "ip24prom.070-9101-011.bin");
+    const std::string system = prom_system(board_of(s));
+    error = std::string("no ") + system_name(system) + " boot PROM for this configuration in " + folder +
+            ": put a dump there, such as " +
+            (system == "ip22"   ? "ip22prom.070-1367-002.bin"
+             : system == "ip28" ? "ip28prom.070-1477-002.bin"
+                                : "ip24prom.070-9101-011.bin");
     for (const std::string& u : unsuitable) error += "\n  (" + u + ")";
     return false;
 }

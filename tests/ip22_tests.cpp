@@ -43,6 +43,11 @@ struct IndyRig {
         IndyConfig c;
         c.board = board;
         c.ram_mb = ram_mb;
+        if (board == Board::Indigo2R10000) {
+            c.cpu_core = mips::Core::R10000;
+            c.prid = 0x0926;
+            c.cpu_config = mips::R4000::kR10000Config;
+        }
         return c;
     }()) {
         std::vector<u8> prom(8);
@@ -1497,4 +1502,31 @@ TEST(indigo2_takes_r4000_family_modules_only) {
         threw = true;
     }
     CHECK(threw);
+}
+
+// ---------------------------------------------------------------------------
+// R10000 Indigo2 (IP28)
+// ---------------------------------------------------------------------------
+
+// The IP28's MC (revision 5) counts bank registers in 16 MiB and decodes a
+// 512 MiB high window; ALIAS_BIG takes the low alias from 0x20000000; the
+// ECC board's register answers where bank 3 points at 0x60000000.
+TEST(ip28_mc_large_banks_alias_and_ecc_board) {
+    IndyRig t(256, Board::Indigo2R10000);
+    CHECK_EQ(t.r32(kMcSysId) & 0xF, 5u);
+    CHECK_EQ(t.r8(ioc_addr(0x58)), 0x1Bu);  // Full House, board revision 13 (below: an IP26 baseboard)
+    // Bank 0: 256 MiB at 0x30000000, beyond the IP22's 128 MiB high window.
+    t.w32(kMcMemCfg0, (0x2000u | (15u << 8) | (0x30000000u >> 24)) << 16);
+    t.w32(0x30000000 + (200u << 20), 0x12345678);
+    CHECK_EQ(t.r32(0x30000000 + (200u << 20)), 0x12345678u);
+    // Bank 0 at 0x20000000 with ALIAS_BIG: its first 512 KiB also appear at 0.
+    t.w32(kMcMemCfg0, (0x2000u | (15u << 8) | (0x20000000u >> 24)) << 16);
+    t.w32(0x1FA000D4, t.r32(0x1FA000D4) | (1u << 29));
+    t.w32(0x20000100, 0xA5A55A5A);
+    CHECK_EQ(t.r32(0x100), 0xA5A55A5Au);
+    // The ECC register: bus errors until bank 3 points at it.
+    u32 v = 0;
+    CHECK(!t.m.bus().read<u32>(0x60000000, v));
+    t.w32(0x1FA000CC, 0x2060);
+    CHECK(t.m.bus().write<u64>(0x60000000, 0));
 }

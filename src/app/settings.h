@@ -26,9 +26,11 @@ struct CpuModel {
     u32 prid;
     u32 config;
     u32 scache_bytes;
-    std::vector<double> indy_mhz, indigo2_mhz;  // the first is the default
+    std::vector<double> indy_mhz, indigo2_mhz, ip28_mhz;  // the first is the default
     const std::vector<double>& mhz(ip22::Board board) const {
-        return board == ip22::Board::Indigo2 ? indigo2_mhz : indy_mhz;
+        return board == ip22::Board::Indigo2         ? indigo2_mhz
+               : board == ip22::Board::Indigo2R10000 ? ip28_mhz
+                                                     : indy_mhz;
     }
     bool fits(ip22::Board board) const { return !mhz(board).empty(); }
 };
@@ -49,12 +51,12 @@ struct Settings {
     std::string prom;      // a specific PROM image instead of choosing from the folder
     std::string nvram, disk;
     std::vector<std::string> cdroms;
-    std::string machine = "indy";  // indy | indigo2
+    std::string machine = "indy";  // indy | indigo2 | indigo2-r10000
     std::string cpu = "r4400sc";
     double cpu_mhz = 150.0;
     unsigned ram_mb = 64;
     bool graphics = true;  // a graphics board fitted
-    std::string graphics_board = "xl24";  // xl24, or solid-, high- or max-impact (Indigo2)
+    std::string graphics_board = "xl24";  // xl24, or max-impact (Indigo2)
     int graphics_rev = -1;  // its board revision, 0-7; -1 for the usual one
     // Where the PROM puts its console, written to NVRAM at power-on (see
     // IndyConfig::console): "graphics", "serial", or empty to leave it.

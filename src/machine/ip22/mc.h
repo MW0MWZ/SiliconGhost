@@ -69,7 +69,19 @@ public:
     // 128, 32 and 8 MiB banks are built from double-sided SIMMs (two
     // sub-banks); 64, 16 and 4 MiB banks from single-sided ones.
     // `eisa`: the board has an EISA bus (the Indigo2), reported in SYSID.
-    Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa = false);
+    // `large_banks`: the later MC of the R8000 and R10000 Indigo2 boards
+    // (revision 5): bank registers count in 16 MiB rather than 4 MiB, the
+    // high memory window is 512 MiB, and banks of 64, 128 and 256 MiB are
+    // fitted (256 MiB double-sided).
+    Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa = false,
+       bool large_banks = false);
+    // A device the board decodes through a bank register, at `base` (the
+    // IP28's ECC board, mapped by a bank at 0x60000000 to reach its register).
+    void set_bank_device(u32 base, u64 size, Device* device) {
+        bank_device_ = device;
+        bank_device_base_ = base;
+        bank_device_size_ = size;
+    }
 
     void reset();
     const char* name() const override { return "mc"; }
@@ -152,6 +164,11 @@ private:
     EmptyBank empty_bank_;
     Eeprom93Cxx cpu_eeprom_;
     bool eisa_;
+    bool large_banks_;
+    unsigned bank_shift_;  // of a bank register's base and size fields
+    Device* bank_device_ = nullptr;
+    u32 bank_device_base_ = 0;
+    u64 bank_device_size_ = 0;
     u8* ram_;
     std::vector<Bank> banks_;
     std::vector<std::pair<u32, u64>> mapped_;  // memory windows currently mapped

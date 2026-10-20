@@ -121,7 +121,7 @@ TEST(settings_round_trip_and_validation) {
     CHECK(app::set_option(s, "quick_scsi_scan", "1", error));
     CHECK(app::set_option(s, "quick_scsi_scan_max", "0", error));
     CHECK(!app::set_option(s, "ram_mb", "100", error));  // not a multiple of 16
-    CHECK(!app::set_option(s, "cpu", "r10000", error));
+    CHECK(!app::set_option(s, "cpu", "r12000", error));
     CHECK(!app::set_option(s, "hostfwd", "tcp:0:22", error));
     CHECK(!app::set_option(s, "colour", "blue", error));
 
@@ -187,6 +187,24 @@ TEST(settings_platform_limits_processor_clock_and_memory) {
     CHECK_EQ(app::find_cpu_model("r4400sc")->mhz(Board::Indy).back(), 200.0);
     CHECK_EQ(app::ram_sizes(Board::Indy, nullptr).back(), 256u);
     CHECK_EQ(app::ram_sizes(Board::Indigo2, nullptr).back(), 384u);
+    // The R10000 Indigo2 takes the R10000 only, and the R10000 nothing else.
+    CHECK(app::find_cpu_model("r10000")->fits(Board::Indigo2R10000));
+    CHECK(!app::find_cpu_model("r10000")->fits(Board::Indigo2));
+    CHECK(!app::find_cpu_model("r4400sc")->fits(Board::Indigo2R10000));
+    CHECK_EQ(app::ram_sizes(Board::Indigo2R10000, nullptr).front(), 64u);
+    CHECK_EQ(app::ram_sizes(Board::Indigo2R10000, nullptr).back(), 768u);
+    {
+        app::Settings r;
+        r.machine = "indigo2-r10000";
+        app::make_consistent(r, false);
+        CHECK_STR(r.cpu, std::string("r10000"));
+        CHECK_EQ(r.cpu_mhz, 175.0);
+        CHECK_STR(r.graphics_board, std::string("max-impact"));  // no Newport driver there
+        std::string error;
+        CHECK(app::check_hardware(r, false, error));
+        r.graphics_board = "xl24";
+        CHECK(!app::check_hardware(r, false, error));
+    }
 
     // Indy R5000SC at 180 MHz with 256 MiB moved to the Indigo2: an R4400SC
     // at its first clock; the memory fits as it is.

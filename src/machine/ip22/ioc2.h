@@ -39,6 +39,9 @@ public:
     Ioc2(Scheduler& scheduler, double cpu_hz, u64 scc_char_cycles, bool full_house = false);
     void reset();
     bool full_house() const { return full_house_; }
+    // The system ID register: system type (bit 0, Full House), board revision
+    // (4:1) and chip revision (7:5).
+    void set_sysid(u8 sysid) { sysid_ = sysid; }
 
     u8 read(unsigned index);  // index = register byte offset / 4
     bool read_is_pure(unsigned index) const;
@@ -109,6 +112,7 @@ private:
     Kbc8042 kbc_;
     Pit8254 pit_;
     bool full_house_;
+    u8 sysid_;
     u16 ext_io_ = 0xFFFF;
     u8 port_config_ = 0;
     std::array<std::array<bool, 3>, 3> slot_irq_{};  // [slot][GIO interrupt]; the retraces latched

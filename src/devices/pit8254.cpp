@@ -134,9 +134,32 @@ void Pit8254::load_count(unsigned c, u16 raw) {
     schedule_next(c);
 }
 
+void Pit8254::set_quiet(unsigned c, bool quiet) {
+    refresh_out(c);
+    quiet_[c] = quiet;
+    schedule_next(c);
+}
+
+bool Pit8254::periodic_quiet(unsigned c) const {
+    const Counter& k = counters_[c];
+    return quiet_[c] && (k.mode == 2 || k.mode == 3);
+}
+
+// A quiet periodic counter's OUT level now, as its edges would have left it.
+void Pit8254::refresh_out(unsigned c) {
+    if (!periodic_quiet(c) || !counters_[c].running) return;
+    Counter& k = counters_[c];
+    const double now = now_ticks(c);
+    take_pending(c, now);
+    const double e = now - k.start_tick;
+    if (e < 0) return;
+    const u64 n = k.reload, el = static_cast<u64>(e);
+    set_out(c, k.mode == 2 ? el % n != n - 1 : el % n < (n + 1) / 2);
+}
+
 void Pit8254::schedule_next(unsigned c) {
     Counter& k = counters_[c];
-    if (!k.running) {
+    if (!k.running || periodic_quiet(c)) {
         k.timer->cancel();
         return;
     }
@@ -293,6 +316,7 @@ void Pit8254::write(unsigned reg, u8 value) {
                     k.read_msb_next = false;
                 }
                 if (!(value & 0x10) && !k.status_latched) {
+                    refresh_out(c);
                     k.status = status_byte(c);
                     k.status_latched = true;
                 }

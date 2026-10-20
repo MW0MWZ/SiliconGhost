@@ -33,6 +33,11 @@ public:
     // Frequency of a counter's OUT pin when it runs periodically (modes 2/3), else 0.
     double output_frequency(unsigned counter) const;
     void set_output_callback(OutputCallback cb) { on_output_ = std::move(cb); }
+    // Nothing watches this counter's OUT pin edge by edge (only its rate, or
+    // its level in a status read-back): in modes 2 and 3 its level is worked
+    // out when it is read instead of timing every edge. A fast prescaler
+    // (count 2 at 1 MHz) would otherwise cost a timer event a microsecond.
+    void set_quiet(unsigned counter, bool quiet);
     // Called when software latches a count to read it (as it does when it
     // times something against a counter).
     void set_latch_callback(std::function<void()> cb) { on_latch_ = std::move(cb); }
@@ -74,10 +79,13 @@ private:
     void schedule_next(unsigned c);
     void on_timer(unsigned c);
     u8 status_byte(unsigned c) const;
+    bool periodic_quiet(unsigned c) const;
+    void refresh_out(unsigned c);
 
     Scheduler& scheduler_;
     double cpu_hz_;
     std::array<double, 3> clock_hz_;
+    std::array<bool, 3> quiet_{};
     std::array<Counter, 3> counters_;
     OutputCallback on_output_;
     std::function<void()> on_latch_;

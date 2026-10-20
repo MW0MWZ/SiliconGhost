@@ -1247,18 +1247,18 @@ void Gui::draw_settings() {
             label("Graphics");
             {
                 // The boards the machine takes, then none.
-                static const char* const kBoards[] = {"xl24", "solid-impact", "high-impact", "max-impact"};
-                static const char* const kNames[] = {"Newport XL24 (24-bit)", "Solid IMPACT (not finished)",
-                                                     "High IMPACT (not finished)", "Maximum IMPACT (not finished)"};
-                const bool indigo2 = edit_.machine == "indigo2";
-                const int boards = indigo2 ? 4 : 1;
+                static const char* const kBoards[] = {"xl24", "max-impact"};
+                static const char* const kNames[] = {"Newport XL24 (24-bit)", "Maximum IMPACT, 4 MB texture (not finished)"};
+                // The Indy takes the Newport, the R10000 Indigo2 IMPACT, the Indigo2 either.
+                const int first = board == ip22::Board::Indigo2R10000 ? 1 : 0;
+                const int boards = ip22::full_house(board) ? 2 : 1;
                 int gfx = boards;
-                for (int i = 0; i < boards; ++i)
+                for (int i = first; i < boards; ++i)
                     if (edit_.graphics && edit_.graphics_board == kBoards[i]) gfx = i;
-                if (gfx == boards && edit_.graphics) gfx = 0;  // (an IMPACT setting on an Indy)
+                if (gfx == boards && edit_.graphics) gfx = first;  // (a board this machine does not take)
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::BeginCombo("##gfx", gfx < boards ? kNames[gfx] : "None (serial console only)")) {
-                    for (int i = 0; i <= boards; ++i)
+                    for (int i = first; i <= boards; ++i)
                         if (ImGui::Selectable(i < boards ? kNames[i] : "None (serial console only)", gfx == i)) gfx = i;
                     ImGui::EndCombo();
                 }

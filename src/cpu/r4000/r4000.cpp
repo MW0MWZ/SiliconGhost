@@ -51,6 +51,13 @@ constexpr u64 kNormalBase = 0xFFFFFFFF80000000ull;
 constexpr u64 kEntryHiMask = 0xC00000FFFFFFE0FFull;  // R | VPN2 | ASID
 constexpr u64 kVpn2Mask = 0xC00000FFFFFFE000ull;     // R | VPN2
 constexpr u64 kEntryLoMask = 0x3FFFFFFFull;          // PFN | C | D | V | G
+// The R10000's: 44-bit virtual addresses, 40-bit physical, and EntryLo's
+// uncached attribute in bits 63:62.
+constexpr u64 kEntryHiMaskR10k = 0xC0000FFFFFFFE0FFull;
+constexpr u64 kVpn2MaskR10k = 0xC0000FFFFFFFE000ull;
+constexpr u64 kEntryLoMaskR10k = 0xC0000003FFFFFFFFull;
+constexpr u32 kConfigK0 = 0x7u;
+constexpr u32 kConfigR10kSS = 7u << 16;  // secondary cache size
 constexpr u32 kPageMaskMask = 0x01FFE000u;
 constexpr u32 kStatusWriteMask = 0xFE77FFFFu;
 constexpr u32 kCauseWriteMask = 0x00000300u;  // IP1:IP0 (software interrupts)
@@ -66,7 +73,6 @@ constexpr u32 kStatusCH = 1u << 18;
 
 constexpr u64 k32BitCompatBase = 0xFFFFFFFF80000000ull;
 constexpr u64 kKseg2Base = 0xFFFFFFFFC0000000ull;
-constexpr u64 kXuseg = u64{1} << 40;  // R4000 implements 40 virtual address bits
 // How long (in cycles) a secondary tag written with Index Store Tag is reported
 // back verbatim by Index Load Tag; see execute_cache().
 constexpr u64 kScacheTagWindow = 10'000'000;
@@ -83,9 +89,23 @@ inline u64 f_zimm(u32 i) { return i & 0xFFFF; }
 
 R4000::R4000(Bus& bus, const Options& options)
     : bus_(bus), opts_(options), blocks_(1u << kBlockBits), jit_victims_(1u << kBlockBits) {
-    mips4_ = opts_.core == Core::R5000;
+    r10k_ = opts_.core == Core::R10000;
+    mips4_ = opts_.core == Core::R5000 || r10k_;
     two_way_ = opts_.core != Core::R4000;
-    // FCR0: the R4000/R4400 FPU is implementation 5; the R4600's and R5000's
+    if (r10k_) {
+        vseg_size_ = u64{1} << 44;
+        pa_mask_ = 0xFFFFFFFFFFull;
+        vpn2_mask_ = kVpn2MaskR10k;
+        entryhi_mask_ = kEntryHiMaskR10k;
+        entrylo_mask_ = kEntryLoMaskR10k;
+        pfn_mask_ = 0xFFFFFFF;
+        tlb_entries_ = 64;
+    } else {
+        vpn2_mask_ = kVpn2Mask;
+        entryhi_mask_ = kEntryHiMask;
+        entrylo_mask_ = kEntryLoMask;
+    }
+    // FCR0: the R4000/R4400 FPU is implementation 5; the R4600's, R5000's and R10000's
     // carry the CPU's implementation and revision numbers.
     fir_ = opts_.core == Core::R4000 ? 0x0500u : (opts_.prid & 0xFFFFu);
     bus_.set_code_write_handler([this](const u8* page) { invalidate_code_page(page); });
@@ -201,29 +221,59 @@ void R4000::reset() {
             config_ |= opts_.scache_bytes ? (ss << 20) : (kConfigNoScache | kConfigR5000SS);
             break;
         }
+        case Core::R10000: {  // SS: 512 KiB to 16 MiB (there is always a secondary cache)
+            u32 ss = 0;
+            while (ss < 5 && (512u << 10 << ss) < opts_.scache_bytes) ++ss;
+            config_ = (opts_.config & ~kConfigR10kSS) | (ss << 16);
+            break;
+        }
     }
     waiting_ = false;
     prid_ = opts_.prid;
     index_ = wired_ = compare_ = pagemask_ = count_offset_ = 0;
     watchlo_ = watchhi_ = ecc_ = cacheerr_ = taglo_ = taghi_ = lladdr_ = 0;
+    framemask_ = 0;
+    perf_.fill(0);
     entrylo0_ = entrylo1_ = context_ = xcontext_ = badvaddr_ = 0;
     entryhi_ = epc_ = errorepc_ = 0;
     asid_tag_ = 0;
     llbit_ = false;
-    random_base_ = cycles();                               // Random restarts at 47
+    random_base_ = cycles();                               // Random restarts at its top
     count_offset_ = 0u - static_cast<u32>(cycles() >> 1);  // Count restarts at 0
     tlb_.fill(TlbEntry{});
+    for (unsigned i = tlb_entries_; i < kTlbEntries; ++i) tlb_[i].present = false;
 
-    // Tag arrays sized for the smallest line size the Config register allows.
-    const u32 icache = 1u << (12 + ((config_ >> 9) & 7));
-    const u32 dcache = 1u << (12 + ((config_ >> 6) & 7));
-    itag_.assign(icache / 16, 0);
-    dtag_.assign(dcache / 16, 0);
-    ilru_.assign(two_way_ ? icache / 64 : 0, 0);
-    dlru_.assign(two_way_ ? dcache / 64 : 0, 0);
-    const u32 sline = opts_.core == Core::R5000 ? 32u : 16u << ((config_ >> 22) & 3);
-    stag_.assign(opts_.core == Core::R4600 ? 0 : opts_.scache_bytes / sline, 0);
-    stag_stored_at_.assign(stag_.size(), kNeverStored);
+    if (r10k_) {
+        // 32 KiB 2-way primary caches (I: 64-byte lines, D: 32-byte), the
+        // secondary 2-way with 64- or 128-byte lines (Config.SB).
+        auto make = [](R10kCache& c, u32 bytes, u32 line, u32 check_unit) {
+            c.line = line;
+            c.sets = bytes / 2 / line;
+            c.tags.assign(2 * c.sets, 0);
+            c.data.assign(bytes / (check_unit == 16 ? 8 : 4), 0);
+            c.check.assign(bytes / check_unit, 0);
+        };
+        make(r10k_icache_, 32u << 10, 64, 4);
+        make(r10k_dcache_, 32u << 10, 32, 4);
+        make(r10k_scache_, 512u << 10 << ((config_ >> 16) & 7), (config_ & (1u << 13)) ? 128 : 64, 16);
+        itag_.clear();
+        dtag_.clear();
+        ilru_.clear();
+        dlru_.clear();
+        stag_.clear();
+        stag_stored_at_.clear();
+    } else {
+        // Tag arrays sized for the smallest line size the Config register allows.
+        const u32 icache = 1u << (12 + ((config_ >> 9) & 7));
+        const u32 dcache = 1u << (12 + ((config_ >> 6) & 7));
+        itag_.assign(icache / 16, 0);
+        dtag_.assign(dcache / 16, 0);
+        ilru_.assign(two_way_ ? icache / 64 : 0, 0);
+        dlru_.assign(two_way_ ? dcache / 64 : 0, 0);
+        const u32 sline = opts_.core == Core::R5000 ? 32u : 16u << ((config_ >> 22) & 3);
+        stag_.assign(opts_.core == Core::R4600 ? 0 : opts_.scache_bytes / sline, 0);
+        stag_stored_at_.assign(stag_.size(), kNeverStored);
+    }
     stag_valid_ = false;
 
     // The cycle counter is the machine's master clock and keeps running
@@ -907,8 +957,11 @@ void R4000::address_error(u64 vaddr, Access acc) {
 void R4000::tlb_exception(Exc code, u64 vaddr, bool refill, bool xtlb) {
     badvaddr_ = vaddr;
     context_ = (context_ & ~0x7FFFFFull) | ((vaddr >> 9) & 0x7FFFF0ull);
-    xcontext_ = (xcontext_ & ~0x1FFFFFFFFull) | (((vaddr >> 62) & 3) << 31) | ((vaddr >> 9) & 0x7FFFFFF0ull);
-    entryhi_ = (entryhi_ & 0xFF) | (vaddr & kVpn2Mask);
+    if (r10k_)  // R in 36:35, BadVPN2 (vaddr 43:13) in 34:4
+        xcontext_ = (xcontext_ & ~0x1FFFFFFFFFull) | (((vaddr >> 62) & 3) << 35) | ((vaddr >> 9) & 0x7FFFFFFF0ull);
+    else
+        xcontext_ = (xcontext_ & ~0x1FFFFFFFFull) | (((vaddr >> 62) & 3) << 31) | ((vaddr >> 9) & 0x7FFFFFF0ull);
+    entryhi_ = (entryhi_ & 0xFF) | (vaddr & vpn2_mask_);
     raise(code, refill, xtlb);
 }
 
@@ -997,7 +1050,7 @@ bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
     switch (mode_) {
         case kUser:
             if (status_ & sr::UX) {
-                if (vaddr < kXuseg) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
+                if (vaddr < vseg_size_) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
             } else if (vaddr < 0x80000000ull) {
                 return tlb_lookup<kRaise>(vaddr, acc, false, paddr);
             }
@@ -1006,8 +1059,8 @@ bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
         case kSupervisor: {
             const bool csseg = vaddr >= kKseg2Base && vaddr < 0xFFFFFFFFE0000000ull;
             if (status_ & sr::SX) {
-                const bool xsseg = (vaddr >> 62) == 1 && (vaddr & 0x3FFFFF0000000000ull) == 0;
-                if (vaddr < kXuseg || xsseg || csseg) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
+                const bool xsseg = (vaddr >> 62) == 1 && (vaddr & 0x3FFFFFFFFFFFFFFFull) < vseg_size_;
+                if (vaddr < vseg_size_ || xsseg || csseg) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
             } else if (vaddr < 0x80000000ull || csseg) {
                 return tlb_lookup<kRaise>(vaddr, acc, false, paddr);
             }
@@ -1031,19 +1084,24 @@ bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
                 return tlb_lookup<kRaise>(vaddr, acc, kx, paddr);
             }
             if (!kx) break;
-            if (vaddr < kXuseg) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);  // xkuseg
+            if (vaddr < vseg_size_) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);  // xkuseg
             switch (vaddr >> 62) {
                 case 1:  // xksseg
-                    if ((vaddr & 0x3FFFFF0000000000ull) == 0) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
+                    if ((vaddr & 0x3FFFFFFFFFFFFFFFull) < vseg_size_) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
                     break;
-                case 2:  // xkphys: bits 61:59 select cache algorithm, 58:36 must be zero
-                    if ((vaddr & 0x07FFFFF000000000ull) == 0) {
-                        paddr = vaddr & 0xFFFFFFFFFull;
+                case 2: {  // xkphys: bits 61:59 select cache algorithm, those above the physical address must be zero
+                    // (on the R10000, uncached algorithms 2 and 7 carry the uncached attribute in 58:57)
+                    const unsigned cca = static_cast<unsigned>(vaddr >> 59) & 7;
+                    const u64 attr = r10k_ && (cca == 2 || cca == 7) ? 0x0600000000000000ull : 0;
+                    if ((vaddr & 0x07FFFFFFFFFFFFFFull & ~pa_mask_ & ~attr) == 0) {
+                        paddr = vaddr & pa_mask_;
                         return true;
                     }
                     break;
-                case 3:  // xkseg
-                    if (vaddr <= 0xC00000FF7FFFFFFFull) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
+                }
+                case 3:  // xkseg, up to the 32-bit compatibility space's size below its end
+                    if ((vaddr & 0x3FFFFFFFFFFFFFFFull) < vseg_size_ - 0x80000000ull)
+                        return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
                     break;
             }
             break;
@@ -1057,7 +1115,7 @@ template <bool kRaise>
 bool R4000::tlb_lookup(u64 vaddr, Access acc, bool xtlb, u64& paddr) {
     const u64 asid = entryhi_ & 0xFF;
     for (const TlbEntry& e : tlb_) {
-        if (((vaddr ^ e.hi) & kVpn2Mask & ~e.mask) != 0) continue;
+        if (((vaddr ^ e.hi) & vpn2_mask_ & ~e.mask) != 0 || !e.present) continue;
         if (!e.global && (e.hi & 0xFF) != asid) continue;
 
         const u64 offset_mask = (e.mask >> 1) | 0xFFF;
@@ -1071,15 +1129,38 @@ bool R4000::tlb_lookup(u64 vaddr, Access acc, bool xtlb, u64& paddr) {
             if constexpr (kRaise) tlb_exception(Exc::Mod, vaddr, false, xtlb);
             return false;
         }
-        paddr = ((((entry_lo >> 6) & 0xFFFFFF) << 12) & ~offset_mask) | (vaddr & offset_mask);
+        paddr = ((((entry_lo >> 6) & pfn_mask_) << 12) & ~offset_mask) | (vaddr & offset_mask);
         return true;
     }
     if constexpr (kRaise) tlb_exception(acc == Access::Store ? Exc::TLBS : Exc::TLBL, vaddr, true, xtlb);
     return false;
 }
 
+unsigned R4000::cache_algorithm(u64 vaddr) const {
+    if (vaddr >= k32BitCompatBase && vaddr < kKseg2Base)
+        return vaddr < 0xFFFFFFFFA0000000ull ? config_ & kConfigK0 : 2;  // kseg0, kseg1
+    if ((vaddr >> 62) == 2) return static_cast<unsigned>(vaddr >> 59) & 7;  // xkphys
+    if (mode_ == kKernelErl && vaddr < 0x80000000ull) return 2;              // ERL: kuseg unmapped
+    const u64 asid = entryhi_ & 0xFF;
+    for (const TlbEntry& e : tlb_) {
+        if (((vaddr ^ e.hi) & vpn2_mask_ & ~e.mask) != 0 || !e.present) continue;
+        if (!e.global && (e.hi & 0xFF) != asid) continue;
+        const u64 entry_lo = e.lo[(vaddr & (((e.mask >> 1) | 0xFFF) + 1)) ? 1 : 0];
+        return static_cast<unsigned>(entry_lo >> 3) & 7;
+    }
+    return 2;
+}
+
 bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     if (!translate<true>(vaddr, acc, paddr)) return false;
+    if (SG_UNLIKELY(paddr >= opts_.uncached_only_base && paddr < opts_.uncached_only_end)) {
+        const unsigned alg = cache_algorithm(vaddr);
+        if (alg != 2 && alg != 7) {  // cached: refused by the system (no soft-TLB entry, so every access asks)
+            touch();
+            raise(acc == Access::Fetch ? Exc::IBE : Exc::DBE);
+            return false;
+        }
+    }
     const u64 ppage = paddr & ~u64{0xFFF};
     const bool is_store = acc == Access::Store;
     host = is_store ? bus_.host_write_ptr(ppage) : bus_.host_read_ptr(ppage);
@@ -1129,7 +1210,13 @@ template <typename T>
 SG_FORCEINLINE bool R4000::phys_read(u64 paddr, T& out, Access acc) {
     io_ = true;
     if (acc != Access::Load || !bus_.read_is_pure(paddr, sizeof(T))) touch();
-    if (SG_LIKELY(bus_.read<T>(paddr, out))) return true;
+    if (SG_LIKELY(bus_.read<T>(paddr, out))) {
+        if (bus_.read_stall) {  // an uncached read across a slower bus: the pipeline waits
+            time_fp_ += u64{bus_.read_stall} << kCycleFracBits;
+            bus_.read_stall = 0;
+        }
+        return true;
+    }
     raise(acc == Access::Fetch ? Exc::IBE : Exc::DBE);
     return false;
 }
@@ -2075,6 +2162,14 @@ void R4000::execute_cop0(u32 inst) {
             if ((inst & 0x0200003Fu) != 0x02000008u) io_ = true;
             break;
     }
+    if (r10k_ && rd == cop0::PerfCounter && f_rs(inst) <= 0x05 && (f_rs(inst) & 3) <= 1) {
+        // The R10000's performance counters: the instruction's low bits pick
+        // control 0, counter 0, control 1 or counter 1. No events are counted.
+        u32& r = perf_[inst & 3];
+        if (f_rs(inst) <= 0x01) gpr[rt] = sext32(r);
+        else r = static_cast<u32>(gpr[rt]) & ((inst & 1) ? 0xFFFFFFFFu : 0x1FFu);
+        return;
+    }
     switch (f_rs(inst)) {
         case 0x00: gpr[rt] = sext32(cp0_read(rd)); break;  // MFC0
         case 0x01:                                          // DMFC0
@@ -2094,7 +2189,7 @@ void R4000::execute_cop0(u32 inst) {
                     case 0x06: tlb_write(random()); return;       // TLBWR
                     case 0x08: tlb_probe(); return;               // TLBP
                     case 0x20:                                    // WAIT (R4600, R5000)
-                        if (opts_.core == Core::R4000) break;
+                        if (opts_.core == Core::R4000 || r10k_) break;
                         execute_wait();
                         return;
                     case 0x18:                                    // ERET
@@ -2118,9 +2213,9 @@ void R4000::execute_cop0(u32 inst) {
 }
 
 u32 R4000::random() const {
-    if (wired_ >= kTlbEntries) return kTlbEntries - 1;
-    const u32 range = kTlbEntries - wired_;
-    return (kTlbEntries - 1) - static_cast<u32>((cycles() - random_base_) % range);
+    if (wired_ >= tlb_entries_) return tlb_entries_ - 1;
+    const u32 range = tlb_entries_ - wired_;
+    return (tlb_entries_ - 1) - static_cast<u32>((cycles() - random_base_) % range);
 }
 
 u64 R4000::cp0_read(unsigned reg) const {
@@ -2150,7 +2245,8 @@ u64 R4000::cp0_read(unsigned reg) const {
         case cop0::TagLo: return taglo_;
         case cop0::TagHi: return taghi_;
         case cop0::ErrorEPC: return errorepc_;
-        default: return 0;
+        case cop0::FrameMask: return r10k_ ? framemask_ : 0;
+        default: return 0;  // the R10000's Diagnostic register reads as zero (no ITLB or branch state)
     }
 }
 
@@ -2158,20 +2254,20 @@ void R4000::cp0_write(unsigned reg, u64 v) {
     const u32 v32 = static_cast<u32>(v);
     switch (reg) {
         case cop0::Index: index_ = (index_ & 0x80000000u) | (v32 & 0x3F); break;
-        case cop0::EntryLo0: entrylo0_ = v & kEntryLoMask; break;
-        case cop0::EntryLo1: entrylo1_ = v & kEntryLoMask; break;
+        case cop0::EntryLo0: entrylo0_ = v & entrylo_mask_; break;
+        case cop0::EntryLo1: entrylo1_ = v & entrylo_mask_; break;
         case cop0::Context: context_ = (v & ~0x7FFFFFull) | (context_ & 0x7FFFF0ull); break;
         case cop0::PageMask: pagemask_ = v32 & kPageMaskMask; break;
         case cop0::Wired:
             wired_ = v32 & 0x3F;
-            random_base_ = cycles();  // Random restarts at 47
+            random_base_ = cycles();  // Random restarts at its top
             break;
         case cop0::Count:
             count_offset_ = v32 - static_cast<u32>(cycles() >> 1);
             reschedule_timer();
             break;
         case cop0::EntryHi: {
-            set_entryhi(v & kEntryHiMask);
+            set_entryhi(v & entryhi_mask_);
             break;
         }
         case cop0::Compare:
@@ -2190,22 +2286,31 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         case cop0::Cause: cause_ = (cause_ & ~kCauseWriteMask) | (v32 & kCauseWriteMask); break;
         case cop0::EPC: epc_ = v; break;
         case cop0::Config: {
-            const u32 mask = opts_.core == Core::R4000   ? kConfigWriteMask
-                             : opts_.core == Core::R4600 ? kConfigWriteMaskR4600
-                                                         : kConfigWriteMaskR5000;
+            const u32 mask = opts_.core == Core::R4000    ? kConfigWriteMask
+                             : opts_.core == Core::R4600  ? kConfigWriteMaskR4600
+                             : opts_.core == Core::R10000 ? kConfigK0  // the rest is the boot mode bits
+                                                          : kConfigWriteMaskR5000;
             config_ = (config_ & ~mask) | (v32 & mask);
             break;
         }
-        case cop0::LLAddr: lladdr_ = v32; break;
+        case cop0::LLAddr: lladdr_ = v32; break;  // (the R10000's is a scratch register)
         case cop0::WatchLo:  // the R4600 and R5000 have no watch registers
             if (opts_.core == Core::R4000) watchlo_ = v32;
+            if (r10k_) watchlo_ = v32 & ~4u;
             break;
         case cop0::WatchHi:
             if (opts_.core == Core::R4000) watchhi_ = v32;
+            if (r10k_) watchhi_ = v32 & 0xFF;
             break;
-        case cop0::XContext: xcontext_ = (v & ~0x1FFFFFFFFull) | (xcontext_ & 0x1FFFFFFF0ull); break;
-        case cop0::ECC: ecc_ = v32; break;
-        case cop0::CacheErr: cacheerr_ = v32; break;
+        case cop0::XContext:
+            if (r10k_) xcontext_ = (v & ~0x1FFFFFFFFFull) | (xcontext_ & 0x1FFFFFFFF0ull);
+            else xcontext_ = (v & ~0x1FFFFFFFFull) | (xcontext_ & 0x1FFFFFFF0ull);
+            break;
+        case cop0::ECC: ecc_ = r10k_ ? v32 & 0x3FF : v32; break;
+        case cop0::CacheErr:  // read-only on the R10000
+            if (!r10k_) cacheerr_ = v32;
+            break;
+        case cop0::FrameMask: framemask_ = v32 & 0xFFFF; break;
         case cop0::TagLo: taglo_ = v32; break;
         case cop0::TagHi: taghi_ = v32; break;
         case cop0::ErrorEPC: errorepc_ = v; break;
@@ -2214,23 +2319,42 @@ void R4000::cp0_write(unsigned reg, u64 v) {
 }
 
 void R4000::tlb_write(unsigned index) {
-    if (index >= kTlbEntries) {
+    if (index >= tlb_entries_) {
         SG_LOG(Warn, "cpu", "TLB write to invalid index %u", index);
         return;
     }
     TlbEntry& e = tlb_[index];
     flush_fast_tlb_entry(e);  // the mapping being replaced
+    // The R10000 passes EntryLo through FrameMask (bits 15:0 clear PFN bits 33:18).
+    const u64 frame = r10k_ ? ~(u64{framemask_} << 18) : ~u64{0};
     e.mask = pagemask_;
     e.hi = entryhi_ & ~u64{pagemask_};
-    e.lo[0] = entrylo0_ & ~u64{1};
-    e.lo[1] = entrylo1_ & ~u64{1};
+    e.lo[0] = entrylo0_ & ~u64{1} & frame;
+    e.lo[1] = entrylo1_ & ~u64{1} & frame;
     e.global = (entrylo0_ & entrylo1_ & 1) != 0;
+    e.present = true;
+    if (r10k_) {
+        // An entry that would match the same addresses as others: those are
+        // invalidated (even wired ones) and Status.TS is set; TS is cleared
+        // by a write that finds none.
+        bool shadowed = false;
+        for (unsigned i = 0; i < tlb_entries_; ++i) {
+            TlbEntry& o = tlb_[i];
+            if (i == index || !o.present) continue;
+            if (((o.hi ^ e.hi) & vpn2_mask_ & ~(o.mask | e.mask)) != 0) continue;
+            if (!o.global && !e.global && ((o.hi ^ e.hi) & 0xFF) != 0) continue;
+            flush_fast_tlb_entry(o);
+            o.present = false;
+            shadowed = true;
+        }
+        status_ = shadowed ? (status_ | sr::TS) : (status_ & ~sr::TS);
+    }
     flush_fast_tlb_entry(e);  // and any slot the new one could shadow
 }
 
 void R4000::tlb_read() {
     const unsigned index = index_ & 63;
-    if (index >= kTlbEntries) return;
+    if (index >= tlb_entries_) return;
     const TlbEntry& e = tlb_[index];
     pagemask_ = static_cast<u32>(e.mask);
     set_entryhi(e.hi);
@@ -2240,9 +2364,9 @@ void R4000::tlb_read() {
 
 void R4000::tlb_probe() {
     const u64 asid = entryhi_ & 0xFF;
-    for (unsigned i = 0; i < kTlbEntries; ++i) {
+    for (unsigned i = 0; i < tlb_entries_; ++i) {
         const TlbEntry& e = tlb_[i];
-        if (((entryhi_ ^ e.hi) & kVpn2Mask & ~e.mask) == 0 && (e.global || (e.hi & 0xFF) == asid)) {
+        if (e.present && ((entryhi_ ^ e.hi) & vpn2_mask_ & ~e.mask) == 0 && (e.global || (e.hi & 0xFF) == asid)) {
             index_ = i;
             return;
         }
@@ -2309,6 +2433,7 @@ void R4000::execute_cache(u32 inst) {
     u64 paddr;
     if (!translate<true>(vaddr, Access::Load, paddr)) return;
 
+    if (r10k_) return cache_op_r10k(op, vaddr, paddr);
     const unsigned cache = op & 3, operation = op >> 2;
     // The LLbit is cleared by a change of state of the cache line holding the
     // link address (R4000 manual, Load Linked Store Conditional Operation).
@@ -2497,6 +2622,128 @@ void R4000::cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 pad
             break;
         case 6: break;  // Hit Writeback: data is never held, nothing to write
         default: break;
+    }
+}
+
+// The R10000's CACHE operations (R10000 manual, chapter 10). The primary
+// caches are indexed by the virtual address, the secondary by the physical;
+// an Index operation's way is address bit 0. Tags read back as Index Store
+// Tag wrote them (the fields the processor keeps) and Hit operations compare
+// them; the data arrays hold only what Index Store Data put there, as
+// cached accesses go to memory, which is always current.
+void R4000::cache_op_r10k(unsigned op, u64 vaddr, u64 paddr) {
+    const unsigned cache = op & 3, operation = op >> 2;
+    if (cache == 2 || op == 0x14) return;  // reserved; Cache Barrier (only orders accesses)
+    const bool icache = cache == 0, secondary = cache == 3;
+    R10kCache& c = icache ? r10k_icache_ : cache == 1 ? r10k_dcache_ : r10k_scache_;
+    const u64 index_addr = secondary ? paddr : vaddr;
+    const unsigned way = static_cast<unsigned>(index_addr & 1);
+    const u32 set = static_cast<u32>((index_addr / c.line) % c.sets);
+    // The fields each array keeps, as TagHi << 32 | TagLo.
+    constexpr u64 kIFields = 0x0000000FFFFFFF4Dull;   // Tag[39:12], state, LRU, parities
+    constexpr u64 kDFields = 0xE000000FFFFFFFCFull;   // ... state 7:6, SCWay, StateMod 63:61
+    constexpr u64 kSFields = 0x8000000FFFFFCDFFull;   // MRU, Tag[39:18], state 11:10, PIdx 8:7, ECC 6:0
+    const u64 fields = icache ? kIFields : secondary ? kSFields : kDFields;
+    const u64 tag_mask = secondary ? 0xFFFFFC0000ull : 0xFFFFFFF000ull;  // the address bits a tag holds
+    auto tag_addr = [&](u64 t) {
+        return ((t >> 32 & 0xF) << 36) | (secondary ? (t >> 14 & 0x3FFFF) << 18 : (t >> 8 & 0xFFFFFF) << 12);
+    };
+    auto valid = [&](u64 t) { return (t & (secondary ? 0xC00u : icache ? 0x40u : 0xC0u)) != 0; };
+    auto hit = [&](unsigned w) {
+        const u64 t = c.tags[w * c.sets + set];
+        return valid(t) && tag_addr(t) == (paddr & tag_mask);
+    };
+    // Invalid, with the primary data cache's SCWay clear and StateMod Normal.
+    auto invalidate = [&](u64& t) { t = icache ? t & ~0x40ull : secondary ? t & ~0xC00ull : (t & ~0xE0000000000000C2ull) | (1ull << 61); };
+    // A secondary line's primary subset blocks, found from the address and
+    // the virtual index the secondary tag records.
+    auto invalidate_subsets = [&](u64 stag) {
+        const u64 pa = tag_addr(stag) | (paddr & ~tag_mask & 0xFFFFFFFFFFull & ~u64{c.line - 1});
+        const u64 va = ((stag >> 7 & 3) << 12) | (pa & 0xFFF);
+        for (R10kCache* p : {&r10k_icache_, &r10k_dcache_})
+            for (u64 off = 0; off < c.line; off += p->line) {
+                const u32 ps = static_cast<u32>(((va + off) / p->line) % p->sets);
+                for (unsigned w = 0; w < 2; ++w) {
+                    u64& t = p->tags[w * p->sets + ps];
+                    const bool is_i = p == &r10k_icache_;
+                    const u64 ta = ((t >> 32 & 0xF) << 36) | ((t >> 8 & 0xFFFFFF) << 12);
+                    if ((t & (is_i ? 0x40u : 0xC0u)) && ta == ((pa + off) & 0xFFFFFFF000ull))
+                        t = is_i ? t & ~0x40ull : (t & ~0xE0000000000000C2ull) | (1ull << 61);
+                }
+            }
+    };
+    auto set_ch = [this](bool h) { status_ = h ? (status_ | kStatusCH) : (status_ & ~kStatusCH); };
+    u64& tag = c.tags[way * c.sets + set];
+
+    switch (operation) {
+        case 0:  // Index Invalidate (I), Index Writeback Invalidate (D, S)
+            if (secondary && valid(tag)) {
+                invalidate_subsets(tag);
+                // The tag is rewritten with the instruction's address and virtual index.
+                tag = (tag & 0x8000000000000000ull) | ((paddr >> 36 & 0xF) << 32) | ((paddr >> 18 & 0x3FFFF) << 14) |
+                      ((vaddr >> 12 & 3) << 7);
+            } else {
+                invalidate(tag);
+            }
+            break;
+        case 1:  // Index Load Tag
+            taglo_ = static_cast<u32>(tag);
+            taghi_ = static_cast<u32>(tag >> 32);
+            break;
+        case 2: {  // Index Store Tag
+            const u64 t = ((u64{taghi_} << 32) | taglo_) & fields;
+            tag = t;
+            if (secondary) {  // MRU belongs to the set: both ways show it
+                u64& other = c.tags[(way ^ 1) * c.sets + set];
+                other = (other & ~0x8000000000000000ull) | (t & 0x8000000000000000ull);
+            }
+            break;
+        }
+        case 4:    // Hit Invalidate
+        case 5: {  // Hit Writeback Invalidate (D, S); 0x14 (Cache Barrier) is handled above
+            int w = hit(0) ? 0 : hit(1) ? 1 : -1;
+            if (w >= 0) {
+                u64& t = c.tags[static_cast<unsigned>(w) * c.sets + set];
+                if (secondary) {
+                    invalidate_subsets(t);
+                    t = (t & 0x8000000000000000ull) | ((paddr >> 36 & 0xF) << 32) | ((paddr >> 18 & 0x3FFFF) << 14) |
+                        ((vaddr >> 12 & 3) << 7);
+                } else {
+                    invalidate(t);
+                }
+            }
+            if (secondary) set_ch(w >= 0);
+            break;
+        }
+        case 6:  // Index Load Data
+        case 7: {  // Index Store Data
+            const bool store = operation == 7;
+            if (secondary) {
+                const u64 way_bytes = u64{c.sets} * c.line;
+                const std::size_t dw = static_cast<std::size_t>(way * (way_bytes / 8) + (paddr % way_bytes) / 8);
+                if (store) {
+                    c.data[dw] = (u64{taghi_} << 32) | taglo_;
+                    c.data[dw ^ 1] = 0;  // the rest of the quadword
+                    c.check[dw / 2] = static_cast<u16>(ecc_ & 0x3FF);
+                } else {
+                    taghi_ = static_cast<u32>(c.data[dw] >> 32);
+                    taglo_ = static_cast<u32>(c.data[dw]);
+                    ecc_ = c.check[dw / 2];
+                }
+            } else {
+                const std::size_t word = way * 4096u + ((vaddr >> 2) & 0xFFF);  // 16 KiB a way
+                if (store) {
+                    c.data[word] = icache ? (u64{taghi_ & 0xF} << 32) | taglo_ : taglo_;
+                    c.check[word] = static_cast<u16>(ecc_ & (icache ? 1 : 0xF));
+                } else {
+                    taglo_ = static_cast<u32>(c.data[word]);
+                    if (icache) taghi_ = static_cast<u32>(c.data[word] >> 32);
+                    ecc_ = c.check[word];
+                }
+            }
+            break;
+        }
+        default: break;  // not an R10000 operation: undefined
     }
 }
 

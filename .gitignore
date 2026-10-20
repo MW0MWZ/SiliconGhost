@@ -16,3 +16,4 @@ disks/
 *.vhd
 *.qcow2
 *.nvram
+*.orig

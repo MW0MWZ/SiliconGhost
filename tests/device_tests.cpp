@@ -100,6 +100,28 @@ TEST(pit_readback_status) {
     CHECK(status & 0x40);           // null count until loaded
 }
 
+// A quiet counter (nothing watches its OUT edges) running in mode 3 sets
+// no timers, yet a status read-back reports its OUT level as the edges
+// would have left it, and its rate still clocks what it feeds.
+TEST(pit_quiet_counter_reports_out_without_timers) {
+    Clock clk;
+    Pit8254 pit(clk.sched, 100.0e6, {1.0e6, 1.0e6, 1.0e6});
+    pit.set_quiet(2, true);
+    pit.write(3, 0xB6);  // counter 2, LSB+MSB, mode 3
+    pit.write(2, 10);
+    pit.write(2, 0);
+    CHECK(clk.sched.next_event() == ~0ull);  // no edges timed
+    CHECK_EQ(pit.output_frequency(2), 100000.0);
+    auto out = [&](u64 tick) {
+        clk.advance_to(100 * tick);
+        pit.write(3, 0xE8);  // read-back status of counter 2
+        return (pit.read(2) & 0x80) != 0;
+    };
+    CHECK(out(3));    // high for the first half of the period (loaded at tick 1)
+    CHECK(!out(8));   // low for the second
+    CHECK(out(12));   // high again in the next period
+}
+
 // Only writes that change the battery-backed RAM count as changes to save.
 TEST(ds1386_counts_nvram_changes) {
     Ds1386 rtc;

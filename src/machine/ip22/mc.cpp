@@ -13,6 +13,7 @@ namespace sg::ip22 {
 namespace {
 
 constexpr u32 kSysIdRevC = 0x03;     // MC revision C
+constexpr u32 kSysIdRev5 = 0x05;     // the R8000 and R10000 Indigo2's
 constexpr u32 kSysIdEisa = 1u << 4;  // EISA bus present
 
 constexpr u32 kCpuCtrl0Dog = 1u << 8;       // watchdog enabled
@@ -34,8 +35,9 @@ constexpr u32 kBankSubbanks = 1u << 14;
 
 // Main memory may only be decoded into the low and high system memory windows.
 constexpr u32 kLowWindow = 0x08000000, kLowWindowEnd = 0x18000000;
-constexpr u32 kHighWindow = 0x20000000, kHighWindowEnd = 0x30000000;
+constexpr u32 kHighWindow = 0x20000000, kHighWindowEnd = 0x30000000, kHighWindowEndLarge = 0x40000000;
 constexpr u32 kLowAliasSize = 0x80000;
+constexpr u32 kCpuMemAccAliasBig = 1u << 29;
 
 // GIO64 space: the graphics and expansion slots, and the EXP area below
 // the HPC3.
@@ -55,10 +57,13 @@ constexpr u32 kTlbValid = 1u << 1, kPteValid = 1u << 1, kPteDirty = 1u << 2;
 
 }  // namespace
 
-Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa)
+Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, double sysclk_hz, bool eisa,
+       bool large_banks)
     : bus_(bus),
       scheduler_(scheduler),
       eisa_(eisa),
+      large_banks_(large_banks),
+      bank_shift_(large_banks ? 24 : 22),
       ram_(ram),
       cycles_per_sysclk_(cpu_hz / sysclk_hz),
       dma_timer_(scheduler, [this] { finish_dma(); }),
@@ -75,9 +80,11 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
     std::fill(cpu_eeprom_.words().begin(), cpu_eeprom_.words().end(), u16{0});
     // Split installed memory into decodable banks, largest first.
     u64 remaining = ram_size, offset = 0;
-    for (u64 size = u64{128} << 20; size >= (u64{4} << 20) && banks_.size() < 4;) {
+    const u64 largest = u64{large_banks ? 256u : 128u} << 20, smallest = u64{large_banks ? 64u : 4u} << 20;
+    for (u64 size = largest; size >= smallest && banks_.size() < 4;) {
         if (remaining >= size) {
-            const bool double_sided = size == (u64{128} << 20) || size == (u64{32} << 20) || size == (u64{8} << 20);
+            const bool double_sided = size == (u64{256} << 20) || size == (u64{128} << 20) ||
+                                      size == (u64{32} << 20) || size == (u64{8} << 20);
             Bank b;
             b.offset = offset;
             b.subbanks = double_sided ? 2 : 1;
@@ -209,7 +216,7 @@ u32 Mc::read_reg(u32 reg) {
         return v;
     }
     switch (reg) {
-        case kSysId: return kSysIdRevC | (eisa_ ? kSysIdEisa : 0);
+        case kSysId: return (large_banks_ ? kSysIdRev5 : kSysIdRevC) | (eisa_ ? kSysIdEisa : 0);
         case kDogc: return dog_count() & ((1u << kDogBits) - 1);
         case kRefCtr: {
             const u64 period = u64{regs_[kCtrld]} + 1;
@@ -333,6 +340,12 @@ void Mc::write_reg(u32 reg, u32 value) {
             regs_[reg] = value & 0x7FFF7FFF;
             remap_memory();
             return;
+        case kCpuMemAcc: {  // ALIAS_BIG moves the low alias's source (revision 5)
+            const bool changed = large_banks_ && ((regs_[reg] ^ value) & kCpuMemAccAliasBig);
+            regs_[reg] = value;
+            if (changed) remap_memory();
+            return;
+        }
         case kCpuErrorStat:
             cpu_error_stat_ = 0;
             cpu_error_addr_ = 0;
@@ -374,7 +387,7 @@ void Mc::map_banks_as_post() {
     for (std::size_t i = 0; i < banks_.size(); ++i) {
         const u64 size = banks_[i].subbank_size * banks_[i].subbanks;
         halves[i] = kBankValid | (banks_[i].subbanks == 2 ? kBankSubbanks : 0) |
-                    static_cast<u32>(((size >> 22) - 1) << 8) | (base >> 22);
+                    static_cast<u32>(((size >> bank_shift_) - 1) << 8) | (base >> bank_shift_);
         base += static_cast<u32>(size);
     }
     regs_[kMemCfg0] = halves[0] << 16 | halves[1];
@@ -393,10 +406,15 @@ void Mc::remap_memory() {
         const Bank fitted = bank < banks_.size() ? banks_[bank] : Bank{};
         if (!(field & kBankValid)) continue;
 
-        const u32 base = (field & 0xFF) << 22;
-        const u64 size = static_cast<u64>(((field >> 8) & 0x1F) + 1) << 22;
+        const u32 base = (field & 0xFF) << bank_shift_;
+        const u64 size = static_cast<u64>(((field >> 8) & 0x1F) + 1) << bank_shift_;
+        if (bank_device_ && base == bank_device_base_) {
+            bus_.map_device(base, bank_device_size_, bank_device_);
+            mapped_.emplace_back(base, bank_device_size_);
+            continue;
+        }
         const bool in_low = base >= kLowWindow && base + size <= kLowWindowEnd;
-        const bool in_high = base >= kHighWindow && base + size <= kHighWindowEnd;
+        const bool in_high = base >= kHighWindow && base + size <= (large_banks_ ? kHighWindowEndLarge : kHighWindowEnd);
         if (!in_low && !in_high) {
             SG_LOG(Warn, "mc", "bank %u configured outside the memory windows (%08x + %llu MiB); ignored", bank,
                    base, static_cast<unsigned long long>(size >> 20));
@@ -425,8 +443,10 @@ void Mc::remap_memory() {
                static_cast<unsigned long long>(size >> 20), base, configured_subbanks, fitted.subbanks,
                static_cast<unsigned long long>(fitted.subbank_size >> 20));
     }
-    // The first 512 KiB of whatever is decoded at 0x08000000 also appear at 0.
-    if (u8* low = bus_.host_write_ptr(kLowWindow)) bus_.map_ram(0, kLowAliasSize, low);
+    // The first 512 KiB of whatever is decoded at 0x08000000 also appear at 0
+    // (on revision 5 with ALIAS_BIG, of 0x20000000, where those boards' memory is).
+    const u32 alias = large_banks_ && (regs_[kCpuMemAcc] & kCpuMemAccAliasBig) ? kHighWindow : kLowWindow;
+    if (u8* low = bus_.host_write_ptr(alias)) bus_.map_ram(0, kLowAliasSize, low);
 }
 
 void Mc::report_bus_error(u64 paddr, unsigned size, bool is_write) {

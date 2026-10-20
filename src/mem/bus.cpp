@@ -101,10 +101,16 @@ bool Bus::read_is_pure(u64 paddr, unsigned size) const {
     return p.device && p.device->read_is_pure(static_cast<u32>(paddr) - p.device_base, size);
 }
 
+void Bus::set_read_stall(u32 base, u64 size, u16 cycles) {
+    check_range(base, size);
+    for (u64 a = base; a < u64{base} + size; a += kPageSize) pages_[a >> kPageShift].read_stall = cycles;
+}
+
 bool Bus::read_slow(u64 paddr, unsigned size, u64& out) {
     if ((paddr >> 32) == 0) {
         const Page& p = pages_[paddr >> kPageShift];
         if (p.device && p.device->read(static_cast<u32>(paddr) - p.device_base, size, out)) {
+            read_stall += size > 4 ? 2u * p.read_stall : p.read_stall;
             if (device_read_hook) [[unlikely]]
                 device_read_hook(paddr, size, out);
             return true;

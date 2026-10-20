@@ -81,16 +81,17 @@ void usage(const char* argv0) {
                    "                   interface to the guest (may be repeated)\n",
                    stderr);
     std::fprintf(stderr,
-                 "  --machine BOARD  indy (default) or indigo2\n"
+                 "  --machine BOARD  indy (default), indigo2, or indigo2-r10000 (IP28; not finished)\n"
                  "  --ram MB         memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256\n"
                  "                   (one or two banks of 16, 32, 64 or 128; default 64); on the\n"
-                 "                   indigo2 up to three banks, to 384\n"
+                 "                   indigo2 up to three banks, to 384; on the indigo2-r10000 up to\n"
+                 "                   three banks of 64, 128 or 256, to 768\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc, r4000pc, r4600sc, r4600pc,\n"
-                 "                   r5000sc or r5000pc\n"
+                 "                   r5000sc or r5000pc; r10000 on the indigo2-r10000\n"
                  "  --cpu-mhz N      pipeline clock: one the module shipped at (default 150)\n"
                  "  --any-clock      allow a clock no such machine shipped with\n"
-                 "  --graphics BOARD xl24 (the 24-bit Newport, the default), solid-impact, high-impact or\n"
-                 "                   max-impact (Indigo2; not finished), or none\n"
+                 "  --graphics BOARD xl24 (the 24-bit Newport, the default), max-impact (Maximum IMPACT\n"
+                 "                   with 4 MB of texture memory; Indigo2s; not finished), or none\n"
                  "  --graphics-rev N the board revision it reports, 0-7 (default 0)\n"
                  "  --no-graphics    leave the GFX slot empty (serial console only), as --graphics none\n"
                  "  --console WHERE  graphics or serial: set the PROM's console in NVRAM at power-on\n"
@@ -250,8 +251,13 @@ int main(int argc, char** argv) {
     std::string screenshot, settings_file;
     unsigned long long max_cycles = ~0ull;
     bool trace = false, dump = false, headless = false, timing_given = false, foreground = false, log_given = false;
-    bool any_clock = false, cpu_given = false, mhz_given = false;
+    bool any_clock = false, cpu_given = false, mhz_given = false, graphics_given = false;
     sg::log::set_level(sg::log::Level::Warn);
+#if defined(SIGPIPE)
+    // A write to a connection the far end has closed (a forwarded port's
+    // client going away) is an error to handle, not the end of the machine.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Options that describe a machine. Finder on older macOS passes a process
     // serial number, which is not one, nor is --foreground.
@@ -296,6 +302,7 @@ int main(int argc, char** argv) {
             if (key == "timing") timing_given = true;
             if (key == "cpu") cpu_given = true;
             if (key == "cpu_mhz") mhz_given = true;
+            if (key == "graphics") graphics_given = true;
             if (!sg::app::set_option(settings, key, value, error)) {
                 std::fprintf(stderr, "error: %s %s\n", a, error.c_str());
                 return 2;
@@ -329,6 +336,16 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // A platform chosen here without a processor or graphics board gets the
+    // ones it takes (the R10000 Indigo2 takes only the R10000, and IMPACT).
+    const sg::ip22::Board board = sg::app::board_of(settings);
+    if (!cpu_given)
+        if (const sg::app::CpuModel* m = sg::app::find_cpu_model(settings.cpu); !m || !m->fits(board)) {
+            settings.cpu = board == sg::ip22::Board::Indigo2R10000 ? "r10000" : "r4400sc";
+            cpu_given = true;
+        }
+    if (!graphics_given && board == sg::ip22::Board::Indigo2R10000 && settings.graphics_board == "xl24")
+        settings.graphics_board = "max-impact";
     // A module chosen here without a clock runs at the one it shipped with.
     if (cpu_given && !mhz_given)
         if (const sg::app::CpuModel* m = sg::app::find_cpu_model(settings.cpu))

@@ -50,9 +50,12 @@ constexpr u8 kPconClrSgRetrace = 1u << 3, kPconClrS0Retrace = 1u << 4;
 }  // namespace
 
 Ioc2::Ioc2(Scheduler& scheduler, double cpu_hz, u64 scc_char_cycles, bool full_house)
-    : scc_(scheduler, scc_char_cycles, cpu_hz / kSccPclk), pit_(scheduler, cpu_hz, {0.0, 0.0, kPitClock2}), full_house_(full_house) {
+    : scc_(scheduler, scc_char_cycles, cpu_hz / kSccPclk), pit_(scheduler, cpu_hz, {0.0, 0.0, kPitClock2}), full_house_(full_house),
+      sysid_(full_house ? kSysIdIndigo2 : kSysIdIndy) {
     scc_.set_irq_callback([this](bool a) { set_mappable(kMapSerial, a); });
     kbc_.set_irq_callback([this](bool a) { set_mappable(kMapKeyboard, a); });
+    // Counter 2 only clocks counters 0 and 1 (by its rate).
+    pit_.set_quiet(2, true);
     pit_.set_output_callback([this](unsigned c, bool level) {
         // Counters 0 and 1 interrupt on their output's rising edge; the
         // request is held until cleared through the timer clear register.
@@ -182,7 +185,7 @@ u8 Ioc2::read(unsigned index) {
         case kGenCtrl: return gen_ctrl_;  // nothing drives the pins set as inputs
         case kRead: return 0x50;  // twisted-pair link (bit 7 low), Ethernet +12 V and SCSI +5 V present
         case kPanel: return panel_;
-        case kSysId: return full_house_ ? kSysIdIndigo2 : kSysIdIndy;
+        case kSysId: return sysid_;
         case kDmaSel: return dmasel_;
         case kReset: return reset_;
         case kWrite: return write_;

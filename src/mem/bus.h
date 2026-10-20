@@ -47,6 +47,13 @@ public:
 
     Bus();
 
+    // Reads of the devices mapped at [base, base + size) stall the reader
+    // for `cycles` CPU cycles a word (twice that for a doubleword): the
+    // time an uncached read across a slower bus takes. The stall is left in
+    // `read_stall` for the CPU to charge. Set after the devices are mapped.
+    void set_read_stall(u32 base, u64 size, u16 cycles);
+    u32 read_stall = 0;
+
     // Base and size must be multiples of kPageSize. Later mappings replace
     // earlier ones; the remap handler is told (cached host pointers, such as
     // the CPU's soft TLB, must then be dropped).
@@ -134,6 +141,7 @@ private:
         Device* device = nullptr;
         u32 device_base = 0;
         u8* code = nullptr;  // code flags for this page's 4 KiB pieces (host-backed only)
+        u16 read_stall = 0;  // CPU cycles a device word read waits (see set_read_stall)
     };
     // A distinct piece of host memory, however many times it is mapped.
     struct Region {

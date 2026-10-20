@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
-// MIPS R4000/R4400, R4600 and R5000 CPUs - reference interpreter.
+// MIPS R4000/R4400, R4600, R5000 and R10000 CPUs - reference interpreter.
 //
 // This interpreter is the correctness baseline for the whole project: the
 // future JIT is validated against it instruction-for-instruction. It favours
@@ -52,6 +52,10 @@ enum Reg : unsigned {
     TagLo = 28,
     TagHi = 29,
     ErrorEPC = 30,
+    // R10000
+    FrameMask = 21,
+    Diagnostic = 22,
+    PerfCounter = 25,
 };
 }  // namespace cop0
 
@@ -110,6 +114,8 @@ enum class Core : u8 {
     R4000,  // R4000 / R4400: MIPS III, direct-mapped primary caches, on-chip secondary cache control
     R4600,  // MIPS III, 2-way 16 KiB primary caches, no secondary cache interface, WAIT
     R5000,  // MIPS IV, 2-way 32 KiB primary caches, its own secondary cache interface, WAIT
+    R10000, // MIPS IV, out of order (not modelled), 2-way 32 KiB primary and secondary caches, 64-entry TLB,
+            // 44-bit virtual and 40-bit physical addresses
 };
 
 struct TlbEntry {
@@ -117,11 +123,12 @@ struct TlbEntry {
     u64 hi = 0;    // R | VPN2 | ASID
     u64 lo[2] = {0, 0};
     bool global = false;
+    bool present = true;  // false: matches nothing (beyond the TLB's size, or invalidated by an R10000 TLB write)
 };
 
 class R4000 {
 public:
-    static constexpr unsigned kTlbEntries = 48;
+    static constexpr unsigned kTlbEntries = 64;  // the most any core has (R10000; the others have 48)
     static constexpr u64 kResetVector = 0xFFFFFFFFBFC00000ull;
 
     // R4400SC as fitted to the Indy: SysClock = PClock/3, 128-byte secondary
@@ -134,6 +141,10 @@ public:
         u32 prid = 0x00000450;          // R4400 rev 5.0 (150 MHz Indy)
         u32 config = kDefaultConfig;
         u32 scache_bytes = 1u << 20;    // 0 = no secondary cache (R4x00PC)
+        // Physical addresses a cached access fails at with a bus error: a
+        // system that keeps the R10000's speculative accesses out of its I/O
+        // space (the IP28 board). Empty: none.
+        u64 uncached_only_base = 0, uncached_only_end = 0;
     };
     // Config at reset for the R4600 and R5000 (Indy modules): 32-byte
     // primary lines, parity, sub-block ordering, big-endian, SysClock =
@@ -142,6 +153,12 @@ public:
     // and SS fields are derived from scache_bytes.
     static constexpr u32 kR4600Config = 0x1002E4B3u;
     static constexpr u32 kR5000Config = 0x1041E6F3u;
+    // The R10000's Config is its boot mode bits (the system sets them; the
+    // IP28's): 32 KiB primary caches, SCClk = PClk/1.5, big-endian, 32-word
+    // secondary lines, SysClk = PClk/3.5, one outstanding request (IRIX
+    // calls more a prototype configuration on the IP28), kseg0 cacheable
+    // noncoherent. SS (secondary size) is derived from scache_bytes.
+    static constexpr u32 kR10000Config = 0x6C11AC03u;
 
     explicit R4000(Bus& bus) : R4000(bus, Options{}) {}
     R4000(Bus& bus, const Options& options);
@@ -172,6 +189,7 @@ public:
     }
 
     Core core() const { return opts_.core; }
+    unsigned tlb_entries() const { return tlb_entries_; }
     // COP0 access with DMFC0/DMTC0 semantics (masks applied, side effects included).
     u64 cp0_read(unsigned reg) const;
     void cp0_write(unsigned reg, u64 value);
@@ -407,11 +425,14 @@ private:
     void execute_cache(u32 inst);
     bool cache_op_changes_link(unsigned cache, unsigned operation, u64 vaddr, u64 paddr) const;
     void cache_op_2way(unsigned cache, unsigned operation, u64 vaddr, u64 paddr);
+    void cache_op_r10k(unsigned op, u64 vaddr, u64 paddr);
     void execute_wait();
     void wait_for_interrupt(u64 limit_cycle);
-    // MIPS IV instructions: on an R5000, in kernel mode or with Status.XX.
+    // MIPS IV instructions: on an R5000, in kernel mode or with Status.XX;
+    // on an R10000 in supervisor mode too.
     bool mips4_enabled() const {
-        return mips4_ && (mode_ == kKernel || mode_ == kKernelErl || (status_ & sr::XX));
+        return mips4_ && (mode_ == kKernel || mode_ == kKernelErl || (status_ & sr::XX) ||
+                          (r10k_ && mode_ == kSupervisor));
     }
     // FPU condition code n (MIPS IV has eight; the R4000 only code 0): its FCR31 bit.
     static u32 fcc_bit(unsigned n) { return n ? 1u << (24 + n) : 1u << 23; }
@@ -463,6 +484,9 @@ private:
     template <bool kRaise>
     bool tlb_lookup(u64 vaddr, Access acc, bool xtlb, u64& paddr);
     bool lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr);
+    // The cache algorithm an access at `vaddr` uses (Config.K0, xkphys bits
+    // 61:59 or the TLB entry's C field); 2 (uncached) for unmapped uncached space.
+    unsigned cache_algorithm(u64 vaddr) const;
     template <Access A>
     bool lookup(u64 vaddr, u8*& host, u64& paddr);
     void flush_fast_tlb();
@@ -515,7 +539,15 @@ private:
 
     Bus& bus_;
     Options opts_;
-    bool mips4_ = false;   // the R5000's MIPS IV instructions
+    bool mips4_ = false;   // MIPS IV instructions (R5000, R10000)
+    bool r10k_ = false;
+    // Address widths: the R4000/R4600/R5000 have 40-bit virtual and 36-bit
+    // physical addresses, the R10000 44 and 40.
+    u64 vseg_size_ = u64{1} << 40;      // size of xuseg, xsseg and xkseg
+    u64 pa_mask_ = 0xFFFFFFFFFull;
+    u64 vpn2_mask_ = 0, entryhi_mask_ = 0, entrylo_mask_ = 0;
+    u64 pfn_mask_ = 0xFFFFFF;           // EntryLo PFN field (bits 6 up)
+    unsigned tlb_entries_ = 48;
     bool two_way_ = false;  // 2-way set-associative primary caches (R4600, R5000)
     u32 fir_ = 0;          // FCR0
     bool waiting_ = false;  // stalled in WAIT until an interrupt is requested
@@ -682,6 +714,8 @@ private:
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
     u32 config_ = 0, prid_ = 0, pagemask_ = 0, count_offset_ = 0;
     u32 watchlo_ = 0, watchhi_ = 0, ecc_ = 0, cacheerr_ = 0, taglo_ = 0, taghi_ = 0, lladdr_ = 0;
+    u32 framemask_ = 0;                 // R10000
+    std::array<u32, 4> perf_{};         // R10000: control 0, counter 0, control 1, counter 1
     u64 llvaddr_ = 0;  // the virtual address of the last LL (primary caches are virtually indexed)
     u64 entrylo0_ = 0, entrylo1_ = 0, context_ = 0, xcontext_ = 0, badvaddr_ = 0;
     u64 entryhi_ = 0, epc_ = 0, errorepc_ = 0;
@@ -695,6 +729,15 @@ private:
     std::vector<u8> ilru_, dlru_;  // 2-way caches: the way to replace next in each set
     std::vector<u64> stag_stored_at_;  // cycle of the last Index Store Tag per S$ line
     bool stag_valid_ = false;          // R5000: some S$ tag may be valid
+    // R10000: the tags as Index Store Tag wrote them (TagHi << 32 | TagLo),
+    // way 0 then way 1, and the data arrays Index Store Data writes (the
+    // caches hold no other data: memory is always current).
+    struct R10kCache {
+        std::vector<u64> tags, data;
+        std::vector<u16> check;  // parity / ECC bits stored with the data
+        u32 sets = 0, line = 0;
+    };
+    R10kCache r10k_icache_, r10k_dcache_, r10k_scache_;
 
     // Separate tables for fetch, load and store (indexed by Access), so code
     // and data pages that share low address bits do not evict each other.

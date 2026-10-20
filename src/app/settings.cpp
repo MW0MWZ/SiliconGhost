@@ -25,16 +25,18 @@ const std::vector<CpuModel>& cpu_models() {
     using mips::R4000;
     static const std::vector<CpuModel> models = {
         {"r4400sc", "R4400SC (1 MiB secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 1u << 20,
-         {150, 175, 200}, {150, 175, 200, 250}},
-        {"r4400pc", "R4400PC (no secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 0, {100}, {}},
-        {"r4000sc", "R4000SC (1 MiB secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 1u << 20, {100}, {100}},
-        {"r4000pc", "R4000PC (no secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 0, {100}, {}},
-        {"r4600pc", "R4600PC (no secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 0, {100, 133}, {}},
+         {150, 175, 200}, {150, 175, 200, 250}, {}},
+        {"r4400pc", "R4400PC (no secondary cache)", Core::R4000, 0x0450, R4000::kDefaultConfig, 0, {100}, {}, {}},
+        {"r4000sc", "R4000SC (1 MiB secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 1u << 20, {100}, {100}, {}},
+        {"r4000pc", "R4000PC (no secondary cache)", Core::R4000, 0x0430, 0x10C08263u, 0, {100}, {}, {}},
+        {"r4600pc", "R4600PC (no secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 0, {100, 133}, {}, {}},
         {"r4600sc", "R4600SC (512 KiB secondary cache)", Core::R4600, 0x2020, R4000::kR4600Config, 512u << 10, {133},
-         {}},
-        {"r5000pc", "R5000PC (no secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 0, {150}, {}},
+         {}, {}},
+        {"r5000pc", "R5000PC (no secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 0, {150}, {}, {}},
         {"r5000sc", "R5000SC (512 KiB secondary cache)", Core::R5000, 0x2321, R4000::kR5000Config, 512u << 10,
-         {180, 150}, {}},
+         {180, 150}, {}, {}},
+        {"r10000", "R10000 (1 MiB secondary cache)", Core::R10000, 0x0926, R4000::kR10000Config, 1u << 20, {}, {},
+         {175, 195}},
     };
     return models;
 }
@@ -49,6 +51,7 @@ const std::vector<Platform>& platforms() {
     static const std::vector<Platform> list = {
         {"indy", "Indy (IP24)", ip22::Board::Indy},
         {"indigo2", "Indigo2 (IP22)", ip22::Board::Indigo2},
+        {"indigo2-r10000", "Indigo2 R10000 (IP28)", ip22::Board::Indigo2R10000},
     };
     return list;
 }
@@ -67,7 +70,7 @@ ip22::Board board_of(const Settings& s) {
 std::vector<unsigned> ram_sizes(ip22::Board board, const CpuModel* cpu) {
     (void)cpu;
     std::vector<unsigned> sizes;
-    for (unsigned mb = 16; mb <= 384; mb += 16)
+    for (unsigned mb = 16; mb <= 768; mb += 16)
         if (ip22::ram_size_fits(mb, board)) sizes.push_back(mb);
     return sizes;
 }
@@ -76,7 +79,7 @@ void make_consistent(Settings& s, bool cpu_changed) {
     const ip22::Board board = board_of(s);
     const CpuModel* cpu = find_cpu_model(s.cpu);
     if (!cpu || !cpu->fits(board)) {
-        cpu = find_cpu_model("r4400sc");
+        cpu = find_cpu_model(board == ip22::Board::Indigo2R10000 ? "r10000" : "r4400sc");
         s.cpu = cpu->id;
         cpu_changed = true;
     }
@@ -89,6 +92,8 @@ void make_consistent(Settings& s, bool cpu_changed) {
             if (mb <= s.ram_mb) best = mb;
         s.ram_mb = best;
     }
+    // The R10000 Indigo2 takes IMPACT graphics only.
+    if (board == ip22::Board::Indigo2R10000 && s.graphics_board == "xl24") s.graphics_board = "max-impact";
 }
 
 bool check_hardware(const Settings& s, bool any_clock, std::string& error) {
@@ -98,7 +103,9 @@ bool check_hardware(const Settings& s, bool any_clock, std::string& error) {
         error = "unknown platform or processor";
         return false;
     }
-    const char* name = platform->board == ip22::Board::Indigo2 ? "Indigo2" : "Indy";
+    const char* name = platform->board == ip22::Board::Indigo2         ? "Indigo2"
+                       : platform->board == ip22::Board::Indigo2R10000 ? "R10000 Indigo2"
+                                                                       : "Indy";
     auto list = [](const auto& items, const char* unit) {
         std::string text;
         for (const auto& i : items) {
@@ -127,8 +134,18 @@ bool check_hardware(const Settings& s, bool any_clock, std::string& error) {
     const std::vector<unsigned> sizes = ram_sizes(platform->board, cpu);
     if (std::find(sizes.begin(), sizes.end(), s.ram_mb) == sizes.end()) {
         error = std::string("the ") + name + " cannot hold " + std::to_string(s.ram_mb) + " MiB (" +
-                (platform->board == ip22::Board::Indigo2 ? "up to three" : "one or two") +
-                " banks of 16, 32, 64 or 128 MiB, the largest first); it takes " + list(sizes, "");
+                (ip22::full_house(platform->board) ? "up to three" : "one or two") +
+                (platform->board == ip22::Board::Indigo2R10000 ? " banks of 64, 128 or 256 MiB"
+                                                               : " banks of 16, 32, 64 or 128 MiB") +
+                ", the largest first); it takes " + list(sizes, "");
+        return false;
+    }
+    if (s.graphics && platform->board == ip22::Board::Indigo2R10000 && s.graphics_board == "xl24") {
+        error = "the R10000 Indigo2 takes IMPACT graphics (its PROM and IRIX have no Newport driver)";
+        return false;
+    }
+    if (s.graphics && platform->board == ip22::Board::Indy && s.graphics_board != "xl24") {
+        error = "IMPACT graphics fit the Indigo2 only";
         return false;
     }
     return true;
@@ -139,7 +156,10 @@ std::vector<std::string> configuration_notes(const Settings& s) {
     const ip22::Board board = board_of(s);
     const CpuModel* cpu = find_cpu_model(s.cpu);
     char text[160];
-    if (board == ip22::Board::Indigo2) {
+    if (board == ip22::Board::Indigo2R10000) {
+        notes.push_back("Not finished: the R10000 and the IP28 board are being brought up (PROM first).");
+        notes.push_back("Graphics: IMPACT (not finished: no picture yet), or none.");
+    } else if (board == ip22::Board::Indigo2) {
         notes.push_back("IRIX 5.3 and 6.5 run (disks installed on an Indy boot unchanged).");
         notes.push_back("NetBSD and OpenBSD do not start with the 5.1 Indigo2 PROM: it loads only ECOFF programs and "
                         "their boot loaders are ELF.");
@@ -153,7 +173,7 @@ std::vector<std::string> configuration_notes(const Settings& s) {
         const auto& speeds = cpu->mhz(board);
         if (std::find(speeds.begin(), speeds.end(), s.cpu_mhz) == speeds.end()) {
             std::snprintf(text, sizeof text, "No %s shipped with this module at %.0f MHz.",
-                          board == ip22::Board::Indigo2 ? "Indigo2" : "Indy", s.cpu_mhz);
+                          ip22::full_house(board) ? "Indigo2" : "Indy", s.cpu_mhz);
             notes.push_back(text);
         }
     }
@@ -174,10 +194,7 @@ ip22::IndyConfig Settings::indy_config() const {
     }
     c.graphics = graphics;
     using G = ip22::IndyConfig::GraphicsBoard;
-    c.graphics_board = graphics_board == "solid-impact"  ? G::SolidImpact
-                       : graphics_board == "high-impact" ? G::HighImpact
-                       : graphics_board == "max-impact"  ? G::MaxImpact
-                                                         : G::Xl24;
+    c.graphics_board = graphics_board == "max-impact" ? G::MaxImpact : G::Xl24;
     c.graphics_revision = graphics_rev;
     c.test_device = test_device;
     c.test_run_config = test_run_config;
@@ -282,14 +299,15 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "machine") ok = find_platform(v) && (s.machine = v, true);
     else if (key == "cpu") ok = find_cpu_model(v) && (s.cpu = v, true);
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 1000 && (s.cpu_mhz = n, true);
-    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 384 && n == static_cast<unsigned>(n) &&
-                                  ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2) &&
+    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 768 && n == static_cast<unsigned>(n) &&
+                                  (ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2) ||
+                                   ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2R10000)) &&
                                   (s.ram_mb = static_cast<unsigned>(n), true);  // checked against the board at power-on
     else if (key == "graphics") {
         // a board, or none (or 1 and 0)
         bool on = false;
         if (v == "none") s.graphics = false;
-        else if (v == "xl24" || v == "solid-impact" || v == "high-impact" || v == "max-impact")
+        else if (v == "xl24" || v == "max-impact")
             s.graphics = true, s.graphics_board = v;
         else if (parse_bool(v, on)) s.graphics = on;
         else ok = false;

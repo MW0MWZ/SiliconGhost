@@ -26,6 +26,12 @@ mips::R4000::Options cpu_options(const IndyConfig& c) {
     o.prid = c.prid;
     o.config = c.cpu_config;
     o.scache_bytes = c.scache_bytes;
+    // The IP28 keeps the R10000's (possibly speculative) cached accesses out
+    // of GIO and the I/O devices: they end in a bus error. The PROM is cacheable.
+    if (c.board == Board::Indigo2R10000) {
+        o.uncached_only_base = 0x1F000000;
+        o.uncached_only_end = 0x1FC00000;
+    }
     return o;
 }
 
@@ -33,12 +39,15 @@ mips::R4000::Options cpu_options(const IndyConfig& c) {
 
 // An Indy has two memory banks, an Indigo2 three, each empty or holding
 // 16, 32, 64 or 128 MiB (four SIMMs of 4, 8, 16 or 32 MiB), the larger
-// first; the PROM sizes them.
+// first; the PROM sizes them. The R10000 Indigo2's banks hold 64, 128 or
+// 256 MiB.
 bool ram_size_fits(unsigned mb, Board board) {
-    for (unsigned a : {16u, 32u, 64u, 128u})
-        for (unsigned b : {0u, 16u, 32u, 64u, 128u})
-            for (unsigned c : {0u, 16u, 32u, 64u, 128u})
-                if (b <= a && c <= b && (board == Board::Indigo2 || c == 0) && a + b + c == mb) return true;
+    const bool large = board == Board::Indigo2R10000;
+    const unsigned sizes[] = {0u, large ? 64u : 16u, large ? 128u : 32u, large ? 256u : 64u, large ? 0u : 128u};
+    for (unsigned a : sizes)
+        for (unsigned b : sizes)
+            for (unsigned c : sizes)
+                if (a && b <= a && c <= b && (full_house(board) || c == 0) && a + b + c == mb) return true;
     return false;
 }
 
@@ -47,8 +56,12 @@ namespace {
 u64 checked_ram_bytes(const IndyConfig& c) {
     if (c.board == Board::Indigo2 && c.cpu_core != mips::Core::R4000)
         throw std::invalid_argument("the Indigo2 takes R4000 and R4400 processor modules");
+    if ((c.board == Board::Indigo2R10000) != (c.cpu_core == mips::Core::R10000))
+        throw std::invalid_argument("the R10000 fits the R10000 Indigo2 (IP28) only, and that takes nothing else");
     if (!ram_size_fits(c.ram_mb, c.board)) {
-        if (c.board == Board::Indigo2)
+        if (c.board == Board::Indigo2R10000)
+            throw std::invalid_argument("R10000 Indigo2 RAM must be one to three banks of 64, 128 or 256 MiB (64-768 MiB)");
+        if (full_house(c.board))
             throw std::invalid_argument("Indigo2 RAM must be one to three banks of 16, 32, 64 or 128 MiB (16-384 MiB)");
         throw std::invalid_argument("Indy RAM must be one or two banks of 16, 32, 64 or 128 MiB (16-256 MiB, not 112, 176, 208, 224 or 240)");
     }
@@ -63,15 +76,20 @@ constexpr u64 kSccCharCycles = 2000;
 
 }  // namespace
 
+bool Indy::EccBoard::write(u32 offset, unsigned, u64 value) {
+    SG_LOG(Debug, "ecc", "control %03x <- %llx", offset, static_cast<unsigned long long>(value));
+    return true;
+}
+
 Indy::Indy(const IndyConfig& config)
     : config_(config),
       ram_(checked_ram_bytes(config)),
       prom_(std::make_unique<u8[]>(kPromMaxSize)),
       cpu_(bus_, cpu_options(config)),
-      ioc_(scheduler_, config.cpu_hz, kSccCharCycles, config.board == Board::Indigo2),
-      hpc3_(bus_, ioc_, scheduler_, config.cpu_hz, config.board == Board::Indigo2),
+      ioc_(scheduler_, config.cpu_hz, kSccCharCycles, full_house(config.board)),
+      hpc3_(bus_, ioc_, scheduler_, config.cpu_hz, full_house(config.board)),
       mc_(bus_, scheduler_, ram_.get(), checked_ram_bytes(config), config.cpu_hz, config.sysclk_hz,
-          config.board == Board::Indigo2),
+          full_house(config.board), config.board == Board::Indigo2R10000),
       serial_timer_(scheduler_, [this] { pump_serial_input(); }) {
     std::memset(prom_.get(), 0xFF, kPromMaxSize);
     scheduler_.set_clock([this] { return cpu_.cycles(); });
@@ -85,15 +103,18 @@ Indy::Indy(const IndyConfig& config)
         if (config_.graphics_board == G::Xl24) {
             gfx_ = std::make_unique<Newport>(scheduler_, config.cpu_hz, Newport::Options{0xA, config.graphics_revision});
         } else {
-            if (config_.board != Board::Indigo2) throw std::invalid_argument("IMPACT graphics fit the Indigo2 only");
-            const Impact::Variant v = config_.graphics_board == G::SolidImpact  ? Impact::Variant::Solid
-                                      : config_.graphics_board == G::HighImpact ? Impact::Variant::High
-                                                                                : Impact::Variant::Max;
-            gfx_ = std::make_unique<Impact>(scheduler_, config.cpu_hz, v);
+            if (!full_house(config_.board)) throw std::invalid_argument("IMPACT graphics fit the Indigo2 only");
+            auto impact = std::make_unique<Impact>(scheduler_, config.cpu_hz);
+            impact->set_bus(&bus_);  // its DMA engine is a GIO bus master
+            gfx_ = std::move(impact);
         }
         bus_.map_device(kGioGfx, kGioGfxSize, &gfx_->slot_device());
     }
-    if (config_.board == Board::Indigo2) bus_.map_device(kEisaIo, kEisaIoSize, &eisa_io_);
+    if (full_house(config_.board)) bus_.map_device(kEisaIo, kEisaIoSize, &eisa_io_);
+    if (config_.board == Board::Indigo2R10000) {
+        ioc_.set_sysid(kSysIdIp28);
+        mc_.set_bank_device(kEccBoard, kEccBoardSize, &ecc_board_);
+    }
     // An R4600 or R5000 module with a secondary cache the processor does not
     // report: the PROM reads its size from the module's EEPROM.
     if (config_.cpu_core != mips::Core::R4000 && config_.scache_bytes) {
@@ -114,6 +135,16 @@ Indy::Indy(const IndyConfig& config)
         test_device_ = std::make_unique<TestDevice>(std::move(hooks), config_.test_run_config);
         bus_.map_device(kGioExp0, kTestDeviceSize, test_device_.get());
     }
+    // Uncached CPU reads of GIO devices (the graphics and expansion slots,
+    // the HPC3 and its peripherals) wait for the GIO64 bus: the MC moves
+    // PIO reads at 13 MB/s (MC specification), about 300 ns a word. Polling
+    // loops sized for the real machine depend on it. (Writes are posted.)
+    {
+        const u16 stall = static_cast<u16>(4.0 / 13.0e6 * config_.cpu_hz + 0.5);
+        bus_.set_read_stall(kGioGfx, 0xA00000, stall);
+        bus_.set_read_stall(kHpc3, kHpc3Size, stall);
+        if (test_device_) bus_.set_read_stall(kGioExp0, kTestDeviceSize, 0);  // not real hardware
+    }
     bus_.set_error_handler([this](u64 paddr, unsigned size, bool is_write) {
         mc_.report_bus_error(paddr, size, is_write);
     });
@@ -132,7 +163,7 @@ Indy::Indy(const IndyConfig& config)
     // status there).
     if (gfx_ && config_.graphics_board != IndyConfig::GraphicsBoard::Xl24)  // IMPACT: its three GIO lines
         gfx_->set_irq_callback([this](unsigned line, bool level) { ioc_.set_gfx_slot_irq(line, level); });
-    else if (gfx_ && config_.board == Board::Indigo2)
+    else if (gfx_ && full_house(config_.board))
         gfx_->set_irq_callback([this](unsigned, bool level) { ioc_.set_gfx_slot_irq(1, level); });
     else if (gfx_)
         gfx_->set_irq_callback([this](unsigned, bool level) { ioc_.set_gio_slot_irq(0, 2, level); });
@@ -286,7 +317,7 @@ void Indy::load_prom_image(const u8* data, std::size_t size) {
 }
 
 u8 Indy::nvram_byte(unsigned offset) {
-    if (config_.board == Board::Indigo2) {
+    if (full_house(config_.board)) {
         const u16 w = hpc3_.eeprom().words()[offset / 2];
         return static_cast<u8>((offset & 1) ? w : w >> 8);
     }
@@ -294,7 +325,7 @@ u8 Indy::nvram_byte(unsigned offset) {
 }
 
 void Indy::set_nvram_byte(unsigned offset, u8 value) {
-    if (config_.board == Board::Indigo2) {
+    if (full_house(config_.board)) {
         u16& w = hpc3_.eeprom().words()[offset / 2];
         w = (offset & 1) ? static_cast<u16>((w & 0xFF00) | value) : static_cast<u16>((w & 0x00FF) | value << 8);
     } else {
@@ -336,12 +367,12 @@ void Indy::apply_nvram_settings() {
 
 std::size_t Indy::nvram_size() const {
     const std::size_t rtc_bytes = hpc3_.rtc().memory().size();
-    return config_.board == Board::Indigo2 ? 2 * hpc3_.eeprom().words().size() + rtc_bytes : rtc_bytes;
+    return full_house(config_.board) ? 2 * hpc3_.eeprom().words().size() + rtc_bytes : rtc_bytes;
 }
 
 std::vector<u8> Indy::nvram_image() {
     std::vector<u8> image;
-    if (config_.board == Board::Indigo2)
+    if (full_house(config_.board))
         for (u16 w : hpc3_.eeprom().words()) image.push_back(static_cast<u8>(w >> 8)), image.push_back(static_cast<u8>(w));
     const auto& mem = rtc().memory();
     image.insert(image.end(), mem.begin(), mem.end());
@@ -350,7 +381,7 @@ std::vector<u8> Indy::nvram_image() {
 
 void Indy::load_nvram_image(const std::vector<u8>& image) {
     std::size_t at = 0;
-    if (config_.board == Board::Indigo2) {
+    if (full_house(config_.board)) {
         for (u16& w : hpc3_.eeprom().words()) {
             if (at + 2 > image.size()) return;
             w = static_cast<u16>(image[at] << 8 | image[at + 1]);

@@ -5,9 +5,10 @@
 
 # SiliconGhost
 
-An open-source emulator for the SGI **Indy** and **Indigo²** (IP22): MIPS
-R4000, R4400, R4600 and R5000 processor modules, the MC/HPC3/IOC2 chipset
-and **Newport (REX3)** graphics. The aim is to run the
+An open-source emulator for the SGI **Indy** and **Indigo²** (IP22, and the
+R10000 Indigo², IP28): MIPS R4000, R4400, R4600, R5000 and R10000
+processors, the MC/HPC3/IOC2 chipset, **Newport (REX3)** graphics and, on
+the Indigo², **IMPACT** graphics. The aim is to run the
 original boot PROM and IRIX unmodified, at or above the speed of the real
 machine. Linux is the primary host; it also builds and runs on macOS, and
 builds for Windows.
@@ -32,8 +33,9 @@ SiliconGhost is under active development. What works today:
   installs to disk with its own installer (over the network) and boots
   multi-user on the serial console, with networking and sound.
 - **OpenBSD 6.9/sgi:** boots its installer from the official install CD,
-  installs to disk (sets over the network) and boots multi-user on the
-  serial console or the Newport text console, with networking.
+  installs to disk (sets over the network or from the CD) and boots
+  multi-user on the serial console or the Newport text console, with
+  networking; on the R10000 Indigo² likewise, with the IMPACT text console.
 - **Audio:** what the machine plays goes to the host's sound output, with or
   without the display window, at the volume the guest sets; with
   `--audio-in` it can also record from the host's audio input.
@@ -44,6 +46,13 @@ SiliconGhost is under active development. What works today:
   PROM (5.1), IRIX 5.3 and 6.5 boot from the same disks as on the Indy, to
   the graphical desktop on a Newport (XL) board; IRIX finds the EISA bus and
   both SCSI controllers. Up to 384 MiB of memory in three banks.
+- **R10000 Indigo² (IP28) with IMPACT (work in progress):** with
+  `--machine indigo2-r10000` and the IP28 PROM, IRIX 6.5 installs from its
+  CDs and boots to the 4Dwm desktop on a Maximum IMPACT board, with keyboard,
+  mouse, networking and sound. OpenGL programs draw through the board's
+  geometry engines (lit and smooth-shaded triangles, lines, points, depth,
+  stencil, blending, mipmapped textures, pixel images, bitmaps and display
+  lists).
 - **CPU:** the full R4000/R4400 and R4600 (MIPS III) and R5000 (MIPS IV)
   integer and floating-point instruction sets, TLB, exceptions, 32/64-bit
   addressing and cache tag operations, with or without a secondary cache.
@@ -60,6 +69,7 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | Component | Model | State |
 |---|---|---|
 | CPU | MIPS R4000, R4400, R4600 or R5000 (PC or SC module), FPU, 48-entry TLB | complete |
+| CPU (IP28) | MIPS R10000 (MIPS IV, 64-entry TLB, primary and secondary caches) | working |
 | Memory controller | MC: memory configuration, GIO bus errors | working |
 | Peripheral controller | HPC3: SCSI, PBUS and Ethernet DMA | working |
 | Interrupts/timers | IOC2 / INT3 (Indy), INT2 and EXTIO (Indigo²), 8254 PIT | working |
@@ -68,6 +78,7 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | SCSI | WD33C93 with disk and CD-ROM targets (a second controller on the Indigo²) | working |
 | EISA (Indigo²) | the bus, with no cards fitted | working |
 | Graphics | Newport XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working |
+| Graphics (Indigo²) | Maximum IMPACT with 4 MB texture memory (HQ3, two GE11s and RE4s, PP1, TE1, VC3, XMAP, CMAP, RAMDAC) | in progress: 2D and the X server complete; OpenGL mostly |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
 | Audio | HAL2 | working (playback and recording) |
@@ -174,14 +185,14 @@ Main options (`siliconghost --help` lists them all):
 |---|---|
 | `--prom-dir DIR` | folder of boot PROM dumps, from which the one the machine needs is chosen (default `./roms`, else `roms` in the SiliconGhost folder) |
 | `--prom FILE` | a specific boot PROM image instead (raw, big-endian); it must suit the machine |
-| `--machine indy\|indigo2` | the system board (default Indy); the Indigo² needs its own PROM and takes R4000/R4400 modules. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
+| `--machine indy\|indigo2\|indigo2-r10000` | the system board (default Indy); each Indigo² needs its own PROM; the IP22 Indigo² takes R4000/R4400 modules, the IP28 an R10000 at 175 or 195 MHz. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
 | `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
-| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384) |
-| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc` | processor module (default R4400SC) |
+| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384); on the IP28 up to three banks of 64, 128 or 256 (768) |
+| `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc\|r10000` | processor module (default R4400SC; R10000 on the IP28, its only choice) |
 | `--cpu-mhz N` | CPU clock: one the module shipped at on that platform (default: the module's usual clock) |
 | `--any-clock` | allow a `--cpu-mhz` no such machine shipped with |
-| `--graphics xl24\|none` | the 24-bit Newport (default) or no board (the console is then on the first serial port) |
+| `--graphics xl24\|max-impact\|none` | the 24-bit Newport (default), Maximum IMPACT with 4 MB of texture memory (Indigo²; the only graphics on the IP28, and its default), or no board (the console is then on the first serial port) |
 | `--console graphics\|serial` | write the PROM's console setting to the NVRAM at power-on: the screen and keyboard, or serial port 1 (default: leave it as the NVRAM has it) |
 | `--graphics-rev N` | the board revision the Newport reports, 0-7 (default 0); drivers pick timings and cursor offsets by it |
 | `--headless` | no window: both serial ports use the terminal |
@@ -458,6 +469,19 @@ The console follows the NVRAM's `console` setting: the Newport text console
 Newport (its driver offers no frame buffer to map). OpenBSD has no driver
 for the Indy's audio.
 
+On the R10000 Indigo² (`--machine indigo2-r10000`) the loader is the 64-bit
+one and the kernel `bsd.rd.IP28`; the CD-ROM is `scsi(0)cdrom(4)`:
+
+```
+boot -f scsi(0)cdrom(4)partition(8)boot64 scsi(0)cdrom(4)partition(0)/bsd.rd.IP28
+```
+
+The installed system boots as above, with the partitions named in full
+(`setenv OSLoadPartition scsi(0)disk(1)rdisk(0)partition(0)` and `setenv
+SystemPartition scsi(0)disk(1)rdisk(0)partition(8)`). OpenBSD uses the IMPACT
+board as its console only when the PROM has brought it up (console `g`); its
+X server does not run there either (no frame buffer to map).
+
 ### Timing
 
 The CPU's cycle counter is the master clock for every timer in the machine,
@@ -531,8 +555,9 @@ with performance layers on top that must give exactly the same results:
 
 - Linux/mips; NetBSD on the graphics console
 - Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
-- Indigo² graphics other than Newport (GR2 XZ/Extreme, IMPACT)
-- Indigo² R8000 and R10000 (IP26, IP28)
+- IMPACT: the remaining OpenGL details; the IP22 PROM
+  has no IMPACT console (IRIX still drives the board)
+- Indigo² graphics GR2 (XZ/Extreme)
 
 ## Legal
 

@@ -60,6 +60,9 @@ add_library(sg_emu STATIC
   src/machine/ip22/ioc2.cpp
   src/machine/ip22/mc.cpp
   src/machine/ip22/impact.cpp
+  src/machine/ip22/impact_ge.cpp
+  src/machine/ip22/impact_gl.cpp
+  src/machine/ip22/impact_te.cpp
   src/machine/ip22/newport.cpp
   src/net/net_backend.cpp
   src/net/slirp_backend.cpp
@@ -200,6 +203,7 @@ if(SG_BUILD_TESTS)
     tests/test_main.cpp
     tests/cpu_tests.cpp
     tests/cpu_model_tests.cpp
+    tests/r10000_tests.cpp
     tests/misc_tests.cpp
     tests/device_tests.cpp
     tests/fpu_cache_tests.cpp

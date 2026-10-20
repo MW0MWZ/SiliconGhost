@@ -493,12 +493,14 @@ u8 Wd33c93::read_data() {
             break;
         default: v = regs_[reg]; break;
     }
+    SG_LOG(Trace, "wd33c93", "read %02x = %02x", reg, v);
     advance_address();
     return v;
 }
 
 void Wd33c93::write_data(u8 value) {
     const unsigned reg = address_;
+    SG_LOG(Trace, "wd33c93", "write %02x = %02x", reg, value);
     switch (reg) {
         case kCommand:
             regs_[kCommand] = value;

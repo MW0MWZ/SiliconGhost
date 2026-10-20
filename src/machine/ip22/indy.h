@@ -28,8 +28,11 @@ namespace sg::ip22 {
 // The IP22 boards: the Indy ("Guinness", IP24 PROM) and the Indigo2
 // ("Full House"). They share the chipset; the Indigo2 adds an EISA bus, a
 // second SCSI channel, a third memory bank and slot interrupt routing, and
-// keeps the PROM's settings in a serial EEPROM.
-enum class Board { Indy, Indigo2 };
+// keeps the PROM's settings in a serial EEPROM. The R10000 Indigo2 (IP28)
+// is a Full House board for the R10000, with an ECC memory system.
+enum class Board { Indy, Indigo2, Indigo2R10000 };
+// The Indigo2's chipset and slots (both Indigo2 boards).
+constexpr bool full_house(Board b) { return b != Board::Indy; }
 
 // Whether `mb` MiB of RAM can be fitted: one or two banks (three on the
 // Indigo2) of 16, 32, 64 or 128 MiB.
@@ -45,7 +48,7 @@ struct IndyConfig {
     u32 cpu_config = mips::R4000::kDefaultConfig;  // Config register at reset (cache geometry)
     u32 scache_bytes = 1u << 20;                    // secondary cache; 0 for a PC module
     bool graphics = true;       // a board in the GFX slot
-    enum class GraphicsBoard { Xl24, SolidImpact, HighImpact, MaxImpact };
+    enum class GraphicsBoard { Xl24, MaxImpact };
     GraphicsBoard graphics_board = GraphicsBoard::Xl24;  // which (IMPACT: Indigo2 only)
     int graphics_revision = -1;  // the Newport's board revision, 0-7; -1 for the usual one
     std::string disk_image;     // SCSI disk (ID 1), raw 512-byte blocks
@@ -198,6 +201,25 @@ private:
         bool write(u32, unsigned, u64) override { return true; }
     };
     ScacheControl scache_control_;
+    // The R10000 Indigo2's ECC memory board: its control register appears
+    // where a memory bank is pointed at 0x60000000 (software maps it there
+    // through MEMCFG1 to switch between the slow and fast memory modes and
+    // clear errors). The memory is never in error, so writes only set modes.
+    class EccBoard final : public Device {
+    public:
+        const char* name() const override { return "ip28-ecc"; }
+        bool read(u32, unsigned, u64& value) override {
+            value = 0;
+            return true;
+        }
+        bool write(u32 offset, unsigned, u64 value) override;
+    };
+    EccBoard ecc_board_;
+    static constexpr u32 kEccBoard = 0x60000000;
+    static constexpr u64 kEccBoardSize = 0x10000;
+    // Full House, board revision 13: IRIX takes revisions below 13 for the
+    // R8000 Indigo2's (IP26) baseboard.
+    static constexpr u8 kSysIdIp28 = 0x1B;
     // The Indigo2's EISA I/O space with no cards: reads float high (all
     // ones), writes go nowhere.
     class EisaIo final : public Device {
