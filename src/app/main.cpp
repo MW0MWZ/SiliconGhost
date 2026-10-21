@@ -85,7 +85,7 @@ void usage(const char* argv0) {
                  "  --ram MB         memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256\n"
                  "                   (one or two banks of 16, 32, 64 or 128; default 64); on the\n"
                  "                   indigo2 up to three banks, to 384; on the indigo2-r10000 up to\n"
-                 "                   three banks of 64, 128 or 256, to 768\n"
+                 "                   three banks of 64, 128, 256 or 512 (512 in two at most), to 1024\n"
                  "  --cpu MODEL      r4400sc (default), r4400pc, r4000sc, r4000pc, r4600sc, r4600pc,\n"
                  "                   r5000sc or r5000pc; r10000 on the indigo2-r10000\n"
                  "  --cpu-mhz N      pipeline clock: one the module shipped at (default 150)\n"

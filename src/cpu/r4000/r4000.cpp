@@ -232,8 +232,11 @@ void R4000::reset() {
     prid_ = opts_.prid;
     index_ = wired_ = compare_ = pagemask_ = count_offset_ = 0;
     watchlo_ = watchhi_ = ecc_ = cacheerr_ = taglo_ = taghi_ = lladdr_ = 0;
+    watch_ = 0, watch_addr_ = 0, watch_delayed_ = false;
     framemask_ = 0;
     perf_.fill(0);
+    perf_active_ = false, perf_bit_ = 0, perf_mark_fp_ = 0, perf_insn_rem_ = 0;
+    timer_ip7_ = false;
     entrylo0_ = entrylo1_ = context_ = xcontext_ = badvaddr_ = 0;
     entryhi_ = epc_ = errorepc_ = 0;
     asid_tag_ = 0;
@@ -316,7 +319,7 @@ SG_FORCEINLINE void R4000::step_inline() {
     next_delay_ = false;
 
     if (SG_UNLIKELY(interrupt_pending())) {
-        raise(Exc::Int);
+        take_interrupt();
         return;
     }
 
@@ -683,7 +686,7 @@ void R4000::run_block(u64 cycle, const u64* limit) {
                     cur_pc_ = ipc;
                     in_delay_ = next_delay_;
                     next_delay_ = false;
-                    raise(Exc::Int);
+                    take_interrupt();
                     break;
                 }
             }
@@ -914,8 +917,16 @@ void R4000::set_int_line(unsigned line, bool asserted) {
 }
 
 void R4000::timer_fire() {
-    cause_ |= kCauseIP7;
+    if (time_fp_ >= compare_event_fp_) timer_ip7_ = true;
+    if (perf_active_) perf_sync();
+    update_ip7();
     reschedule_timer();
+}
+
+// IP7 is the timer's, and on the R10000 the performance counters' too.
+void R4000::update_ip7() {
+    if (timer_ip7_ || perf_overflow()) cause_ |= kCauseIP7;
+    else cause_ &= ~kCauseIP7;
 }
 
 // Count increments every other pipeline cycle; compute the cycle at which it
@@ -924,7 +935,98 @@ void R4000::reschedule_timer() {
     const u64 now_half = cycles() >> 1;
     const u32 k = compare_ - count();
     const u64 delta = k ? k : (u64{1} << 32);
-    timer_event_fp_ = ((now_half + delta) << 1) << kCycleFracBits;
+    compare_event_fp_ = ((now_half + delta) << 1) << kCycleFracBits;
+    timer_event_fp_ = compare_event_fp_;
+    if (perf_active_) timer_event_fp_ = std::min(timer_event_fp_, perf_overflow_time());
+}
+
+// ---------------------------------------------------------------------------
+// R10000 performance counters
+// ---------------------------------------------------------------------------
+//
+// Each counter counts its event in the modes its control register names:
+// U, S, K (kernel with EXL and ERL clear) or EXL; nothing while ERL is set.
+// The architectural events are counted: cycles, instructions (issued and
+// graduated alike: there is no out-of-order pipeline here), and TLB refill
+// exceptions. Events of the pipeline and caches (misses, mispredictions,
+// write-backs, interventions) are not modelled and stay at zero. Counters
+// catch up from the cycle count whenever they are read or written and
+// whenever the processor mode changes; an overflow (bit 31 becoming set)
+// with IE raises IP7 when it happens.
+
+namespace {
+constexpr u32 kPerfIe = 1u << 4;
+unsigned perf_event(u32 control) { return (control >> 5) & 0xF; }
+}  // namespace
+
+// The control-register mode bit counting applies in now.
+u32 R4000::perf_mode_bit() const {
+    if (status_ & sr::ERL) return 0;
+    if (status_ & sr::EXL) return 1;
+    switch ((status_ & sr::KSU_MASK) >> 3) {
+        case 0: return 2;
+        case 1: return 4;
+        default: return 8;
+    }
+}
+
+// Whether counter k (0 or 1) counts cycles (1), instructions (2) or neither (0).
+unsigned R4000::perf_kind(unsigned k) const {
+    const u32 ev = perf_event(perf_[2 * k]);
+    if (ev == 0) return 1;
+    if (k == 0 ? (ev == 1 || ev == 15) : ev == 1) return 2;
+    return 0;
+}
+
+void R4000::perf_sync() {
+    const u64 t = time_fp_;
+    const u64 dc = (t >> kCycleFracBits) - (perf_mark_fp_ >> kCycleFracBits);
+    const u64 di = (t - perf_mark_fp_ + perf_insn_rem_) / weight_;
+    perf_insn_rem_ = (t - perf_mark_fp_ + perf_insn_rem_) % weight_;
+    perf_mark_fp_ = t;
+    for (unsigned k = 0; k < 2; ++k) {
+        if (!(perf_[2 * k] & perf_bit_)) continue;
+        const unsigned kind = perf_kind(k);
+        if (kind) perf_[2 * k + 1] += static_cast<u32>(kind == 1 ? dc : di);
+    }
+    perf_bit_ = perf_mode_bit();
+}
+
+bool R4000::perf_overflow() const {
+    for (unsigned k = 0; k < 2; ++k)
+        if ((perf_[2 * k] & kPerfIe) && (perf_[2 * k + 1] & 0x80000000u)) return true;
+    return false;
+}
+
+// The guest time at which a counting counter with IE next sets bit 31.
+u64 R4000::perf_overflow_time() const {
+    u64 when = ~u64{0};
+    for (unsigned k = 0; k < 2; ++k) {
+        const u32 c = perf_[2 * k], n = perf_[2 * k + 1];
+        if (!(c & kPerfIe) || !(c & perf_bit_) || (n & 0x80000000u)) continue;
+        const unsigned kind = perf_kind(k);
+        if (!kind) continue;
+        const u64 left = 0x80000000u - n;
+        const u64 dt = kind == 1 ? left << kCycleFracBits : left * weight_;
+        when = std::min(when, perf_mark_fp_ + dt);
+    }
+    return when;
+}
+
+// A counter or control register written, or the counters' activity changed.
+void R4000::perf_changed() {
+    perf_active_ = ((perf_[0] | perf_[2]) & 0xF) != 0;
+    perf_mark_fp_ = time_fp_;
+    perf_insn_rem_ = 0;
+    perf_bit_ = perf_mode_bit();
+    update_ip7();
+    reschedule_timer();
+}
+
+// A TLB refill exception, for counter 1's event 7.
+void R4000::perf_tlb_refill() {
+    perf_sync();
+    if ((perf_[2] & perf_bit_) && perf_event(perf_[2]) == 7) perf_[3] += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1035,7 @@ void R4000::reschedule_timer() {
 
 void R4000::raise(Exc code, bool tlb_refill, bool xtlb, unsigned ce) {
     touch();
+    if (SG_UNLIKELY(perf_active_) && tlb_refill) perf_tlb_refill();
     if (exception_hook) [[unlikely]]
         exception_hook(static_cast<unsigned>(code), cur_pc_, status_);
     const bool exl = (status_ & sr::EXL) != 0;
@@ -970,6 +1073,11 @@ void R4000::tlb_exception(Exc code, u64 vaddr, bool refill, bool xtlb) {
 // ---------------------------------------------------------------------------
 
 void R4000::update_mode() {
+    if (SG_UNLIKELY(perf_active_)) {  // count what went before in the old mode
+        perf_sync();
+        update_ip7();
+        reschedule_timer();
+    }
     if (status_ & sr::ERL) {
         mode_ = kKernelErl;
     } else if (status_ & sr::EXL) {
@@ -1045,8 +1153,15 @@ void R4000::flush_fast_tlb_entry(const TlbEntry& e) {
     }
 }
 
+// The R10000 differs from the R4400 in two ways here (R10000 manual, 16.3):
+// the 64-bit user space is reachable from 64-bit Supervisor and Kernel
+// modes only with UX set, the 64-bit supervisor space from Kernel mode only
+// with SX set; and a TLB refill takes the 32- or 64-bit vector by the
+// extended-addressing bit of the space the address lies in (UX, SX or KX),
+// not of the current mode.
 template <bool kRaise>
 bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
+    const bool ux = (status_ & sr::UX) != 0, sx = (status_ & sr::SX) != 0;
     switch (mode_) {
         case kUser:
             if (status_ & sr::UX) {
@@ -1060,9 +1175,11 @@ bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
             const bool csseg = vaddr >= kKseg2Base && vaddr < 0xFFFFFFFFE0000000ull;
             if (status_ & sr::SX) {
                 const bool xsseg = (vaddr >> 62) == 1 && (vaddr & 0x3FFFFFFFFFFFFFFFull) < vseg_size_;
+                if (r10k_ && vaddr < 0x80000000ull) return tlb_lookup<kRaise>(vaddr, acc, ux, paddr);
+                if (r10k_ && vaddr < vseg_size_ && !ux) break;  // xsuseg needs UX
                 if (vaddr < vseg_size_ || xsseg || csseg) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
             } else if (vaddr < 0x80000000ull || csseg) {
-                return tlb_lookup<kRaise>(vaddr, acc, false, paddr);
+                return tlb_lookup<kRaise>(vaddr, acc, r10k_ && vaddr < 0x80000000ull && ux, paddr);
             }
             break;
         }
@@ -1074,19 +1191,25 @@ bool R4000::translate(u64 vaddr, Access acc, u64& paddr) {
                     paddr = vaddr & 0x1FFFFFFFull;
                     return true;
                 }
-                return tlb_lookup<kRaise>(vaddr, acc, kx, paddr);  // ksseg / kseg3
+                // ksseg (supervisor space) / kseg3
+                if (r10k_ && vaddr < 0xFFFFFFFFE0000000ull) return tlb_lookup<kRaise>(vaddr, acc, sx, paddr);
+                return tlb_lookup<kRaise>(vaddr, acc, kx, paddr);
             }
             if (vaddr < 0x80000000ull) {
                 if (mode_ == kKernelErl) {  // ERL: kuseg is unmapped and uncached
                     paddr = vaddr;
                     return true;
                 }
-                return tlb_lookup<kRaise>(vaddr, acc, kx, paddr);
+                return tlb_lookup<kRaise>(vaddr, acc, r10k_ ? ux : kx, paddr);
             }
             if (!kx) break;
-            if (vaddr < vseg_size_) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);  // xkuseg
+            if (vaddr < vseg_size_) {  // xkuseg
+                if (r10k_ && !ux) break;
+                return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
+            }
             switch (vaddr >> 62) {
                 case 1:  // xksseg
+                    if (r10k_ && !sx) break;
                     if ((vaddr & 0x3FFFFFFFFFFFFFFFull) < vseg_size_) return tlb_lookup<kRaise>(vaddr, acc, true, paddr);
                     break;
                 case 2: {  // xkphys: bits 61:59 select cache algorithm, those above the physical address must be zero
@@ -1151,8 +1274,38 @@ unsigned R4000::cache_algorithm(u64 vaddr) const {
     return 2;
 }
 
+void R4000::set_uncached_store_check(bool on) {
+    if (on == uncached_store_check_) return;
+    uncached_store_check_ = on;
+    flush_fast_tlb();  // uncached stores made while it was off may have entries
+}
+
+// The watch registers changed: whether loads or stores are watched, and
+// where. The watched page gets no soft-TLB entries, so every access to it
+// comes through lookup_slow to be compared.
+void R4000::watch_update() {
+    watch_addr_ = (u64{watchhi_} << 32) | (watchlo_ & ~7u);
+    watch_ = watchlo_ & 3;
+    flush_fast_tlb();
+}
+
 bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     if (!translate<true>(vaddr, acc, paddr)) return false;
+    bool watched_page = false;
+    if (SG_UNLIKELY(watch_) && acc != Access::Fetch && (paddr & ~u64{0xFFF}) == (watch_addr_ & ~u64{0xFFF})) {
+        watched_page = true;
+        if ((paddr & ~u64{7}) == watch_addr_ && (watch_ & (acc == Access::Store ? 1u : 2u))) {
+            // Postponed while EXL or ERL is set: the access completes and the
+            // exception waits for both to clear.
+            if (status_ & (sr::EXL | sr::ERL)) {
+                watch_delayed_ = true;
+            } else {
+                touch();
+                raise(Exc::WATCH);
+                return false;
+            }
+        }
+    }
     if (SG_UNLIKELY(paddr >= opts_.uncached_only_base && paddr < opts_.uncached_only_end)) {
         const unsigned alg = cache_algorithm(vaddr);
         if (alg != 2 && alg != 7) {  // cached: refused by the system (no soft-TLB entry, so every access asks)
@@ -1164,6 +1317,17 @@ bool R4000::lookup_slow(u64 vaddr, Access acc, u8*& host, u64& paddr) {
     const u64 ppage = paddr & ~u64{0xFFF};
     const bool is_store = acc == Access::Store;
     host = is_store ? bus_.host_write_ptr(ppage) : bus_.host_read_ptr(ppage);
+    if (SG_UNLIKELY(uncached_store_check_) && is_store && host) {
+        const unsigned alg = cache_algorithm(vaddr);
+        if (alg == 2 || alg == 7) {  // uncached: reported each time, so no soft-TLB entry
+            if (uncached_store_hook) uncached_store_hook(paddr);
+            watched_page = true;
+        }
+    }
+    if (SG_UNLIKELY(watched_page)) {  // no soft-TLB entry: every access comes back here
+        if (is_store) store_code_ = host ? bus_.code_flag(host) : nullptr;
+        return true;
+    }
     FastEntry& e = fast_[mode_][static_cast<unsigned>(acc)][(vaddr >> 12) & (kFastEntries - 1)];
     if (vaddr >= 0x80000000ull && vaddr < k32BitCompatBase) wide_cached_ |= 1u << mode_;
     e.tag = (vaddr >> 12) | asid_tag_;
@@ -1373,6 +1537,7 @@ void R4000::execute(u32 inst) {
         {
             const unsigned z = (inst >> 26) & 3;
             if (!(status_ & (sr::CU0 << z))) raise(Exc::CpU, false, false, z);
+            else if (z == 2 && opts_.core == Core::R4000 && ((inst >> 21) & 0x1F) != 0x08) return;  // no COP2: its operations do nothing
             else raise(Exc::RI);
             return;
         }
@@ -2164,10 +2329,15 @@ void R4000::execute_cop0(u32 inst) {
     }
     if (r10k_ && rd == cop0::PerfCounter && f_rs(inst) <= 0x05 && (f_rs(inst) & 3) <= 1) {
         // The R10000's performance counters: the instruction's low bits pick
-        // control 0, counter 0, control 1 or counter 1. No events are counted.
+        // control 0, counter 0, control 1 or counter 1.
+        if (perf_active_) perf_sync();
         u32& r = perf_[inst & 3];
-        if (f_rs(inst) <= 0x01) gpr[rt] = sext32(r);
-        else r = static_cast<u32>(gpr[rt]) & ((inst & 1) ? 0xFFFFFFFFu : 0x1FFu);
+        if (f_rs(inst) <= 0x01) {
+            gpr[rt] = sext32(r);
+        } else {
+            r = static_cast<u32>(gpr[rt]) & ((inst & 1) ? 0xFFFFFFFFu : 0x1FFu);
+            perf_changed();
+        }
         return;
     }
     switch (f_rs(inst)) {
@@ -2272,7 +2442,8 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         }
         case cop0::Compare:
             compare_ = v32;
-            cause_ &= ~kCauseIP7;
+            timer_ip7_ = false;
+            update_ip7();
             reschedule_timer();
             break;
         case cop0::Status: {
@@ -2295,12 +2466,15 @@ void R4000::cp0_write(unsigned reg, u64 v) {
         }
         case cop0::LLAddr: lladdr_ = v32; break;  // (the R10000's is a scratch register)
         case cop0::WatchLo:  // the R4600 and R5000 have no watch registers
-            if (opts_.core == Core::R4000) watchlo_ = v32;
-            if (r10k_) watchlo_ = v32 & ~4u;
+            if (opts_.core != Core::R4000 && !r10k_) break;
+            watchlo_ = v32 & ~4u;
+            watch_delayed_ = false;  // a write clears a delayed watch
+            watch_update();
             break;
-        case cop0::WatchHi:
-            if (opts_.core == Core::R4000) watchhi_ = v32;
-            if (r10k_) watchhi_ = v32 & 0xFF;
+        case cop0::WatchHi:  // physical address bits 35:32 (R4000), 39:32 (R10000)
+            if (opts_.core != Core::R4000 && !r10k_) break;
+            watchhi_ = v32 & (r10k_ ? 0xFFu : 0xFu);
+            watch_update();
             break;
         case cop0::XContext:
             if (r10k_) xcontext_ = (v & ~0x1FFFFFFFFFull) | (xcontext_ & 0x1FFFFFFFF0ull);
@@ -2385,7 +2559,9 @@ u32 R4000::fpr_read32(unsigned n) const {
 
 void R4000::fpr_write32(unsigned n, u32 v) {
     if (status_ & sr::FR) {
-        fpr[n] = (fpr[n] & 0xFFFFFFFF00000000ull) | v;
+        // The R10000 clears the upper half (MTC1, LWC1, single and word
+        // results); the others keep it.
+        fpr[n] = r10k_ ? v : (fpr[n] & 0xFFFFFFFF00000000ull) | v;
     } else {
         const unsigned shift = (n & 1) * 32;
         u64& reg = fpr[n & ~1u];
@@ -2423,12 +2599,15 @@ bool secondary_hit(u32 tag, u64 paddr) { return (tag & kSStateMask) && (tag >> 1
 }  // namespace
 
 void R4000::execute_cache(u32 inst) {
-    touch();
+    const unsigned op = f_rt(inst);
+    // The R10000's Cache Barrier changes nothing (it only orders accesses),
+    // so a loop holding one can still be an idle spin (IP28 code puts them
+    // ahead of stores and at branch targets, poll loops included).
+    if (!(r10k_ && op == 0x14)) touch();
     if (!cop0_usable()) {
         raise(Exc::CpU);
         return;
     }
-    const unsigned op = f_rt(inst);
     const u64 vaddr = effective_address(gpr[f_rs(inst)], f_simm(inst));
     u64 paddr;
     if (!translate<true>(vaddr, Access::Load, paddr)) return;

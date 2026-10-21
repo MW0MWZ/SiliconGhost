@@ -6,6 +6,8 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <deque>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -140,23 +142,21 @@ void send_key(ip22::Indy& m, SDL_Scancode sc, bool down, bool repeat) {
 
 namespace {
 
-// Plays HAL2 DAC output. The stream follows the guest's sample rate and
-// voice count; when the guest runs ahead of real time (or the device stalls)
-// more than a quarter of a second, new samples are dropped rather than
-// letting the delay grow.
 // One SDL audio stream in the guest's current format, reopened when that
 // changes. A format the device refuses is not retried until it changes.
+// `feed`, if given, is called on the device's thread for the data it needs.
 class AudioStream {
 public:
     ~AudioStream() { close(); }
-    SDL_AudioStream* get(SDL_AudioDeviceID device, unsigned voices, double rate, const char* what) {
+    SDL_AudioStream* get(SDL_AudioDeviceID device, unsigned voices, double rate, const char* what,
+                         SDL_AudioStreamCallback feed = nullptr, void* user = nullptr) {
         const int freq = static_cast<int>(rate + 0.5);
         if (freq == freq_ && static_cast<int>(voices) == voices_) return stream_;
         close();
         freq_ = freq;
         voices_ = static_cast<int>(voices);
         const SDL_AudioSpec spec{SDL_AUDIO_S16, voices_, freq_};
-        stream_ = SDL_OpenAudioDeviceStream(device, &spec, nullptr, nullptr);
+        stream_ = SDL_OpenAudioDeviceStream(device, &spec, feed, user);
         if (!stream_) {
             SG_LOG(Warn, "audio", "cannot open audio %s: %s", what, SDL_GetError());
             return nullptr;
@@ -167,11 +167,13 @@ public:
     // A quarter of a second of audio in this format, in bytes.
     int quarter_second() const { return freq_ * voices_ * static_cast<int>(sizeof(s16)) / 4; }
 
-private:
     void close() {
         if (stream_) SDL_DestroyAudioStream(stream_);
         stream_ = nullptr;
+        freq_ = voices_ = 0;
     }
+
+private:
     SDL_AudioStream* stream_ = nullptr;
     int freq_ = 0, voices_ = 0;
 };
@@ -204,11 +206,79 @@ public:
     AudioOut& operator=(const AudioOut&) = delete;
 
 private:
+    // Plays HAL2 DAC output. The guest hands over its samples as its DMA
+    // takes them, in guest time, so they arrive just as they are due: a
+    // device fed them directly would run dry at every hiccup of the host.
+    // They wait in `pending_` instead, and the device starts taking them once
+    // a lead of them are waiting (or no more have come for kLead: a short
+    // sound on its own), and again after it has run dry. Each time the
+    // guest's samples come late enough to run it dry mid-sound, the lead
+    // grows (up to kMaxLead) so that the next hiccup of that size is covered;
+    // after kSteady without one it shrinks back a step at a time. When the
+    // guest runs ahead of real time (or the device stalls) more than a quarter
+    // of a second beyond the extra lead, new samples are dropped rather than
+    // letting the delay grow.
+    static constexpr double kLead = 0.08, kMaxLead = 0.2, kLeadStep = 0.04;  // seconds
+    static constexpr u64 kSteady = 5'000'000'000;                          // ns
+
     void play(const s16* samples, std::size_t frames, unsigned voices, double rate) {
-        SDL_AudioStream* stream = playback_->get(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, voices, rate, "output");
+        // (Opened outside the lock: closing a stream waits for its thread.)
+        SDL_AudioStream* stream =
+            playback_->get(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, voices, rate, "output", &AudioOut::feed, this);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (voices != voices_ || rate != rate_) {
+            pending_.clear();
+            started_ = dry_ = false;
+            lead_ = kLead;
+            voices_ = voices;
+            rate_ = rate;
+        }
         if (!stream) return;
-        if (SDL_GetAudioStreamQueued(stream) > playback_->quarter_second()) return;
-        SDL_PutAudioStreamData(stream, samples, static_cast<int>(frames * voices * sizeof(s16)));
+        const std::size_t n = frames * voices;
+        const std::size_t extra = static_cast<std::size_t>(rate_ * (lead_ - kLead)) * voices_ * sizeof(s16);
+        if ((pending_.size() + n) * sizeof(s16) > static_cast<std::size_t>(playback_->quarter_second()) + extra) return;
+        pending_.insert(pending_.end(), samples, samples + n);
+        last_put_ns_ = SDL_GetTicksNS();
+    }
+
+    // The device's thread: `wanted` more bytes are needed now.
+    static void SDLCALL feed(void* user, SDL_AudioStream* stream, int wanted, int) {
+        auto* self = static_cast<AudioOut*>(user);
+        std::vector<s16> out(static_cast<std::size_t>(wanted) / sizeof(s16), 0);
+        {
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            const u64 now = SDL_GetTicksNS();
+            if (self->dry_ && !self->pending_.empty()) {  // more soon after running dry: late, not the end
+                if (now - self->dry_ns_ < 500'000'000) self->lead_ = std::min(kMaxLead, self->lead_ + kLeadStep);
+                self->dry_ = false;
+                self->steady_ns_ = now;
+            }
+            if (self->started_ && self->lead_ > kLead && now - self->steady_ns_ > kSteady) {
+                self->lead_ = std::max(kLead, self->lead_ - 0.01);
+                self->steady_ns_ = now;
+            }
+            const std::size_t lead = static_cast<std::size_t>(self->rate_ * self->lead_) * self->voices_;
+            const bool quiet = now - self->last_put_ns_ > static_cast<u64>(kLead * 1e9);
+            if (!self->started_ && !self->pending_.empty() && (self->pending_.size() >= lead || quiet))
+                self->started_ = true;
+            if (self->started_) {
+                // The guest's clock and the device's drift apart a little:
+                // play a touch faster or slower (at most 0.5%, too little to
+                // hear) to keep about the lead waiting.
+                const double waiting = static_cast<double>(self->pending_.size()), want = static_cast<double>(lead);
+                const double off = (waiting - want) / want;
+                SDL_SetAudioStreamFrequencyRatio(stream, 1.0 + 0.005 * std::clamp(off, -1.0, 1.0));
+                const std::size_t n = std::min(out.size(), self->pending_.size());
+                std::copy_n(self->pending_.begin(), n, out.begin());
+                self->pending_.erase(self->pending_.begin(), self->pending_.begin() + static_cast<std::ptrdiff_t>(n));
+                if (self->pending_.empty()) {  // ran dry: build the lead up again
+                    self->started_ = false;
+                    self->dry_ = true;
+                    self->dry_ns_ = now;
+                }
+            }
+        }
+        SDL_PutAudioStreamData(stream, out.data(), static_cast<int>(out.size() * sizeof(s16)));
     }
 
     // The recording device opens when the guest first records. What it has
@@ -231,6 +301,15 @@ private:
 
     ip22::Indy& machine_;
     bool ok_ = false;
+    std::mutex mutex_;              // pending_ and the playback state, shared with the device's thread
+    std::deque<s16> pending_;       // samples played but not yet taken by the device
+    bool started_ = false;          // the device is taking them (the lead was reached)
+    bool dry_ = false;              // it ran dry (at dry_ns_) and nothing has come since
+    u64 dry_ns_ = 0, steady_ns_ = 0;  // when it ran dry; when the lead last changed
+    double lead_ = kLead;           // seconds of samples to gather before starting
+    unsigned voices_ = 0;
+    double rate_ = 0;
+    u64 last_put_ns_ = 0;
     std::optional<AudioStream> playback_{std::in_place}, recording_{std::in_place};
 };
 

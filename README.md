@@ -188,7 +188,7 @@ Main options (`siliconghost --help` lists them all):
 | `--machine indy\|indigo2\|indigo2-r10000` | the system board (default Indy); each Indigo² needs its own PROM; the IP22 Indigo² takes R4000/R4400 modules, the IP28 an R10000 at 175 or 195 MHz. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
 | `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
-| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384); on the IP28 up to three banks of 64, 128 or 256 (768) |
+| `--ram MB` | memory size: 16, 32, 48, 64, 80, 96, 128, 144, 160, 192 or 256 (one or two banks of 16, 32, 64 or 128; default 64); on the Indigo² up to three banks (384); on the IP28 up to three banks of 64, 128, 256 or 512 (512 in two at most; 1024 in all) |
 | `--cpu r4400sc\|r4400pc\|r4000sc\|r4000pc\|r4600sc\|r4600pc\|r5000sc\|r5000pc\|r10000` | processor module (default R4400SC; R10000 on the IP28, its only choice) |
 | `--cpu-mhz N` | CPU clock: one the module shipped at on that platform (default: the module's usual clock) |
 | `--any-clock` | allow a `--cpu-mhz` no such machine shipped with |
@@ -229,7 +229,10 @@ the terminal, and `--headless` always runs there.
 
 The Newport screen fills the window between a menu bar and a status bar;
 the window can be resized and made full screen. The machine's sound plays
-with or without the window (unless turned off).
+with or without the window (unless turned off), about 80 ms behind the
+machine so that a busy moment on the host does not break it up. A host too
+slow to draw every frame and keep the machine at real time shows fewer frames
+a second instead.
 
 If no window appears, check the start-up messages: a build made without
 SDL3 says so (CMake also warns when it cannot find SDL3), and SDL reports

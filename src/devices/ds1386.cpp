@@ -135,10 +135,19 @@ void Ds1386::load_registers() {
     const double t = now();
     // Software polls the clock constantly; only re-derive the registers when
     // the time they show (to the hundredth) has moved on.
-    const s64 centis = static_cast<s64>(t * 100);
+    const s64 centis = static_cast<s64>(std::floor(t * 100));
     if (centis == loaded_centis_) return;
     loaded_centis_ = centis;
-    s64 days = static_cast<s64>(t) / 86400, secs = static_cast<s64>(t) % 86400;
+    // Every register comes from this one count of hundredths. Rounding `t`
+    // again for the hundredths could land on the other side of a boundary:
+    // the register would keep the old hundredth until the next one, and the
+    // value in between would never show.
+    s64 whole = centis / 100, part = centis % 100;
+    if (part < 0) {
+        part += 100;
+        --whole;
+    }
+    s64 days = whole / 86400, secs = whole % 86400;
     if (secs < 0) {
         secs += 86400;
         --days;
@@ -148,7 +157,7 @@ void Ds1386::load_registers() {
     civil_from_days(days, year, month, day);
     const unsigned hour = static_cast<unsigned>(secs / 3600), minute = static_cast<unsigned>(secs / 60 % 60);
     const unsigned second = static_cast<unsigned>(secs % 60);
-    const unsigned hundredths = static_cast<unsigned>((t - static_cast<double>(static_cast<s64>(t))) * 100) % 100;
+    const unsigned hundredths = static_cast<unsigned>(part);
     const unsigned dow = static_cast<unsigned>(((days % 7) + 7 + 4) % 7) + 1;  // 1970-01-01 was a Thursday; 1 = Sunday
 
     mem_[0x0] = to_bcd(hundredths);

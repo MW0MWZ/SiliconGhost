@@ -338,10 +338,17 @@ bool R4000::jit_compile(Block& b) {
         loaded |= u64{1} << d;
         dirty |= u64{1} << d;
     };
+    // The R10000 with FR set clears a register's upper half on every
+    // 32-bit write (MTC1, LWC1, single and word results).
+    const bool clear_hi = r10k_ && fr;
     auto fp_store_key = [&](std::size_t k) {
         const Mem m{kCpu, fpr_base + fp_keys[k].off};
-        if (fp_keys[k].width == 8) e.movq_store(m, kFpCacheRegs[k]);
-        else e.movd_store(m, kFpCacheRegs[k]);
+        if (fp_keys[k].width == 8) {
+            e.movq_store(m, kFpCacheRegs[k]);
+        } else {
+            e.movd_store(m, kFpCacheRegs[k]);
+            if (clear_hi) e.mov_store_imm32(Mem{kCpu, fpr_base + fp_keys[k].off + 4}, 0);
+        }
     };
     auto fp_load_key = [&](std::size_t k) {
         const Mem m{kCpu, fpr_base + fp_keys[k].off};
@@ -391,7 +398,11 @@ bool R4000::jit_compile(Block& b) {
     };
     auto fp_write_gpr = [&](unsigned n, bool dbl, Reg r) {
         const int k = fp_slot(n, dbl);
-        if (k < 0) return e.mov(fp_mem(n, dbl), r, dbl);
+        if (k < 0) {
+            e.mov(fp_mem(n, dbl), r, dbl);
+            if (clear_hi && !dbl) e.mov_store_imm32(Mem{kCpu, fpr_base + fp_storage(n, dbl) + 4}, 0);
+            return;
+        }
         e.movq_to_xmm(kFpCacheRegs[k], r, dbl);
         loaded |= fp_bit(k);
         dirty |= fp_bit(k);
@@ -408,8 +419,12 @@ bool R4000::jit_compile(Block& b) {
     auto fp_write_xmm = [&](unsigned n, bool dbl, unsigned x) {
         const int k = fp_slot(n, dbl);
         if (k < 0) {
-            if (dbl) e.movq_store(fp_mem(n, dbl), x);
-            else e.movd_store(fp_mem(n, dbl), x);
+            if (dbl) {
+                e.movq_store(fp_mem(n, dbl), x);
+            } else {
+                e.movd_store(fp_mem(n, dbl), x);
+                if (clear_hi) e.mov_store_imm32(Mem{kCpu, fpr_base + fp_storage(n, dbl) + 4}, 0);
+            }
             return;
         }
         e.movapd(kFpCacheRegs[k], x);
@@ -1040,6 +1055,7 @@ bool R4000::jit_compile(Block& b) {
             }
             fp_write_xmm(fd, dbl, x);
             e.bind(skip);
+            if (clear_hi && !dbl) fp_write_xmm(fd, false, fp_src(fd, false, 1));  // upper half cleared either way
             return true;
         }
         const bool recip = func == 0x15 && mips4_;
@@ -1267,6 +1283,7 @@ bool R4000::jit_compile(Block& b) {
             case 0x24:                                   // CVT.W (FCR31.RM)
             case 0x25: {                                 // CVT.L
                 const bool to_long = func == 0x25 || func < 0x0C;
+                if (to_long && r10k_) return false;  // the R10000's 51-bit limit: the interpreter's
                 if (to_long) need64(slow);
                 fp_usable(slow);
                 fp_trap_off(slow);

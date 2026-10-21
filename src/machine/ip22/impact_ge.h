@@ -360,6 +360,7 @@ private:
     void colour_write_masks(u32& lsb, u32& msb) const;
     std::array<int, 4> scissor_rect() const;
 
+    const Mat4& mv_inverse() const;
     bool te_write(u32 reg, u32 v);
     u32 te_reg(u32 reg) const;
     bool texturing() const;
@@ -380,6 +381,9 @@ private:
     State s_;
     GeDraw draw_;
     bool bracket_ = false;
+    // mv_inverse's cache: the modelview it was made from, and its inverse.
+    mutable Mat4 inv_of_, inv_;
+    mutable bool inv_valid_ = false;
     // The colour tables (glPixelMap, INIT_COLOR_TABLE): the board's, not a
     // context's; libGLcore sends them before each operation using them.
     std::vector<u32> lut_ = std::vector<u32>(0x1000);

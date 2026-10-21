@@ -256,7 +256,13 @@ bool R4000::jit_compile(Block& b) {
         loaded |= u64{1} << g;
         dirty |= u64{1} << g;
     };
-    auto fp_store_key = [&](std::size_t k) { e.fstr(kFpCacheRegs[k], kCpu, fpr_base + fp_keys[k].off, fp_keys[k].width); };
+    // The R10000 with FR set clears a register's upper half on every
+    // 32-bit write (MTC1, LWC1, single and word results).
+    const bool clear_hi = r10k_ && fr;
+    auto fp_store_key = [&](std::size_t k) {
+        e.fstr(kFpCacheRegs[k], kCpu, fpr_base + fp_keys[k].off, fp_keys[k].width);
+        if (clear_hi && fp_keys[k].width == 4) e.str(xzr, kCpu, fpr_base + fp_keys[k].off + 4, 4);
+    };
     auto fp_load_key = [&](std::size_t k) { e.fldr(kFpCacheRegs[k], kCpu, fpr_base + fp_keys[k].off, fp_keys[k].width); };
     auto flush = [&](u64 mask) {
         for (unsigned g = 1; g < 32; ++g)
@@ -298,7 +304,11 @@ bool R4000::jit_compile(Block& b) {
     };
     auto fp_write_gpr = [&](unsigned n, bool dbl, Reg r) {
         const int k = fp_slot(n, dbl);
-        if (k < 0) return e.str(r, kCpu, fpr_base + fp_storage(n, dbl), dbl ? 8 : 4);
+        if (k < 0) {
+            e.str(r, kCpu, fpr_base + fp_storage(n, dbl), dbl ? 8 : 4);
+            if (clear_hi && !dbl) e.str(xzr, kCpu, fpr_base + fp_storage(n, dbl) + 4, 4);
+            return;
+        }
         e.fmov_from_gpr(kFpCacheRegs[k], r, dbl);
         loaded |= fp_bit(k);
         dirty |= fp_bit(k);
@@ -311,7 +321,11 @@ bool R4000::jit_compile(Block& b) {
     };
     auto fp_write_v = [&](unsigned n, bool dbl, unsigned v) {
         const int k = fp_slot(n, dbl);
-        if (k < 0) return e.fstr(v, kCpu, fpr_base + fp_storage(n, dbl), dbl ? 8 : 4);
+        if (k < 0) {
+            e.fstr(v, kCpu, fpr_base + fp_storage(n, dbl), dbl ? 8 : 4);
+            if (clear_hi && !dbl) e.str(xzr, kCpu, fpr_base + fp_storage(n, dbl) + 4, 4);
+            return;
+        }
         e.fmov(dbl, kFpCacheRegs[k], v);
         loaded |= fp_bit(k);
         dirty |= fp_bit(k);
@@ -832,6 +846,7 @@ bool R4000::jit_compile(Block& b) {
             }
             fp_write_v(fd, dbl, v);
             e.bind(skip);
+            if (clear_hi && !dbl) fp_write_v(fd, false, fp_src(fd, false, 1));  // upper half cleared either way
             return true;
         }
         // Other rounding for the operations below: by the host's flags.
@@ -986,6 +1001,7 @@ bool R4000::jit_compile(Block& b) {
             case 0x24:                                   // CVT.W (FCR31.RM)
             case 0x25: {                                 // CVT.L
                 const bool to_long = func == 0x25 || func < 0x0C;
+                if (to_long && r10k_) return false;  // the R10000's 51-bit limit: the interpreter's
                 if (to_long) need64(slow);
                 fp_usable(slow);
                 fp_trap_off(slow);

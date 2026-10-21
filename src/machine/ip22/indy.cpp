@@ -39,15 +39,18 @@ mips::R4000::Options cpu_options(const IndyConfig& c) {
 
 // An Indy has two memory banks, an Indigo2 three, each empty or holding
 // 16, 32, 64 or 128 MiB (four SIMMs of 4, 8, 16 or 32 MiB), the larger
-// first; the PROM sizes them. The R10000 Indigo2's banks hold 64, 128 or
-// 256 MiB.
+// first; the PROM sizes them. The R10000 Indigo2's banks hold 64, 128,
+// 256 or 512 MiB (SIMMs of 16 to 128 MiB), 128 MiB SIMMs in two banks at
+// most, and 1 GiB in all.
 bool ram_size_fits(unsigned mb, Board board) {
     const bool large = board == Board::Indigo2R10000;
-    const unsigned sizes[] = {0u, large ? 64u : 16u, large ? 128u : 32u, large ? 256u : 64u, large ? 0u : 128u};
+    const unsigned sizes[] = {0u, large ? 64u : 16u, large ? 128u : 32u, large ? 256u : 64u, large ? 512u : 128u};
     for (unsigned a : sizes)
         for (unsigned b : sizes)
             for (unsigned c : sizes)
-                if (a && b <= a && c <= b && (full_house(board) || c == 0) && a + b + c == mb) return true;
+                if (a && b <= a && c <= b && (full_house(board) || c == 0) && a + b + c == mb &&
+                    (!large || (c < 512 && mb <= 1024)))
+                    return true;
     return false;
 }
 
@@ -60,7 +63,7 @@ u64 checked_ram_bytes(const IndyConfig& c) {
         throw std::invalid_argument("the R10000 fits the R10000 Indigo2 (IP28) only, and that takes nothing else");
     if (!ram_size_fits(c.ram_mb, c.board)) {
         if (c.board == Board::Indigo2R10000)
-            throw std::invalid_argument("R10000 Indigo2 RAM must be one to three banks of 64, 128 or 256 MiB (64-768 MiB)");
+            throw std::invalid_argument("R10000 Indigo2 RAM must be one to three banks of 64, 128, 256 or 512 MiB (512 in two at most), 64-1024 MiB");
         if (full_house(c.board))
             throw std::invalid_argument("Indigo2 RAM must be one to three banks of 16, 32, 64 or 128 MiB (16-384 MiB)");
         throw std::invalid_argument("Indy RAM must be one or two banks of 16, 32, 64 or 128 MiB (16-256 MiB, not 112, 176, 208, 224 or 240)");
@@ -76,8 +79,17 @@ constexpr u64 kSccCharCycles = 2000;
 
 }  // namespace
 
+// Control commands (bits 18:16): 0 fast (normal) mode, 1 slow mode, 2
+// write the low bits to the chip, 3 clear interrupts, 5 / 6 enable /
+// disable ECC error generation (OpenBSD imcreg.h).
 bool Indy::EccBoard::write(u32 offset, unsigned, u64 value) {
     SG_LOG(Debug, "ecc", "control %03x <- %llx", offset, static_cast<unsigned long long>(value));
+    if (offset != 0) return true;
+    switch ((value >> 16) & 7) {
+        case 0: indy_.cpu_.set_uncached_store_check(true); break;
+        case 1: indy_.cpu_.set_uncached_store_check(false); break;
+        default: break;
+    }
     return true;
 }
 
@@ -114,6 +126,7 @@ Indy::Indy(const IndyConfig& config)
     if (config_.board == Board::Indigo2R10000) {
         ioc_.set_sysid(kSysIdIp28);
         mc_.set_bank_device(kEccBoard, kEccBoardSize, &ecc_board_);
+        cpu_.uncached_store_hook = [this](u64 paddr) { mc_.report_fast_uncached_write(paddr); };
     }
     // An R4600 or R5000 module with a secondary cache the processor does not
     // report: the PROM reads its size from the module's EEPROM.
@@ -180,7 +193,7 @@ Indy::Indy(const IndyConfig& config)
     });
     ioc_.pit().set_latch_callback([this] {
         if (!timing_cpu()) cpu_.request_stop();
-        timing_cpu_until_ = cpu_.cycles() + static_cast<u64>(config_.cpu_hz / 2);
+        timing_cpu_until_ = cpu_.cycles() + static_cast<u64>(config_.cpu_hz / 20);
     });
     ioc_.set_power_off_callback([this] {
         powered_off_ = true;
@@ -401,6 +414,7 @@ void Indy::reset() {
     hpc3_.reset();
     if (gfx_) gfx_->reset();
     cpu_.reset();
+    cpu_.set_uncached_store_check(false);  // the ECC board starts in slow mode
     for (unsigned line = 0; line < 5; ++line) cpu_.set_int_line(line, false);
     serial_timer_.cancel();  // run() starts it again while input is queued
     reset_pending_ = false;

@@ -90,6 +90,9 @@ public:
 
     // Called by the bus for accesses nobody answered.
     void report_bus_error(u64 paddr, unsigned size, bool is_write);
+    // R10000 Indigo2 (ECC memory): an uncached CPU write to memory while the
+    // ECC board is in fast mode (FUW in the CPU error status).
+    void report_fast_uncached_write(u64 paddr);
 
     // IP6: asynchronous bus error interrupt.
     void set_irq_callback(std::function<void(bool)> cb) { irq_cb_ = std::move(cb); }

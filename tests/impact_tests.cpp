@@ -541,6 +541,28 @@ TEST(impact_gl_triangle_lands_in_the_window_smooth_shaded) {
     CHECK_EQ(t.board.pixel_word(0x240, 99, 200) & 0xFFFFFF, 0u);  // left of the window
 }
 
+// A triangle far larger than its window: what lies in the window is drawn,
+// up to its long edge (x + y = 64 in window pixels), and nothing outside.
+TEST(impact_gl_large_triangle_keeps_to_the_window) {
+    Rig t;
+    gl_context(t, 0x1000, true);
+    gl_rgb24(t);
+    tok(t, 0x01A);
+    colour(t, 1, 1, 1), vertex(t, -3, -3);
+    colour(t, 1, 1, 1), vertex(t, 3, -3);
+    colour(t, 1, 1, 1), vertex(t, -3, 3);
+    tok(t, 0x024);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            if (x + y + 1 == 64) continue;  // on the edge
+            CHECK_EQ(gl_pixel(t, x, y), x + y + 1 < 64 ? 0xFFFFFFu : 0u);
+        }
+    for (int k = -1; k <= 64; ++k) {
+        CHECK_EQ(gl_pixel(t, -1, k), 0u);
+        CHECK_EQ(gl_pixel(t, k, -1), 0u);
+    }
+}
+
 // Depth: with the test on (LESS), the nearer of two overlapping triangles
 // wins whatever the order; the clear sets the buffer to its value.
 TEST(impact_gl_depth_test_keeps_the_nearer_surface) {
@@ -831,4 +853,80 @@ TEST(impact_gl_set_data_reads_back) {
     tok(t, 0x0ED, {0xB6A, 0x405});
     tok(t, 0x0A2, {0xB6A, 1, 1});
     CHECK_EQ(t.r(0x70014), 0x405u);
+}
+
+// Only display-control writes that change what is shown make the picture out
+// of date: the X server sets the XMAP's index every frame to poll it.
+TEST(impact_display_changes_only_with_shown_state) {
+    Rig t;
+    u64 v = t.board.display_version();
+    t.w(dcb(7, 1, 1), 8u << 24);  // XMAP index
+    CHECK_EQ(t.board.display_version(), v);
+    t.w(dcb(7, 1, 1), 0u << 24);
+    t.w(dcb(7, 4, 1), 0x05u << 24);  // main mode byte 0
+    CHECK(t.board.display_version() != v);
+    v = t.board.display_version();
+    t.w(dcb(7, 1, 1), 0u << 24);
+    t.w(dcb(7, 4, 1), 0x05u << 24);  // the same again
+    CHECK_EQ(t.board.display_version(), v);
+    auto vc3_reg = [&](unsigned i, u16 value) { t.w(dcb(8, 0, 3), (i << 24) | (u32{value} << 8)); };
+    vc3_reg(2, 100);  // cursor X
+    CHECK(t.board.display_version() != v);
+    v = t.board.display_version();
+    vc3_reg(2, 100);
+    CHECK_EQ(t.board.display_version(), v);
+}
+
+TEST(impact_render_converts_only_what_changed) {
+    Rig t;
+    t.console_setup();
+    std::vector<u32> argb, full;
+    unsigned width = 0, height = 0, fw = 0, fh = 0;
+    auto same = [&] {
+        CHECK(t.board.render(argb, width, height));
+        CHECK(t.board.render_full(full, fw, fh));
+        CHECK_EQ(width, fw);
+        CHECK_EQ(height, fh);
+        CHECK(argb == full);
+    };
+    same();
+    // Rows not written keep the last picture: poison one and see it stay.
+    argb[0] = 0x12345678u;
+    t.fill(10, 20, 4, 3, 0x0000FF);
+    CHECK(t.board.render(argb, width, height));
+    CHECK_EQ(argb[0], 0x12345678u);
+    CHECK_EQ(argb[20 * width + 10], 0xFFFF0000u);
+    argb[0] = 0xFF000000u;
+    same();
+    t.fill(1000, 1000, 8, 24, 0x00FF00);  // across a page row boundary, both engines
+    t.fill(180, 500, 30, 1, 0xFF0000);    // across a tile boundary
+    same();
+    // The cursor: its old and new rows.
+    t.w(dcb(3, 0, 2), 0x0100u << 16);
+    t.w(dcb(3, 2, 3), 0x0000FFu << 8);
+    auto vc3_reg = [&](unsigned i, u16 v) { t.w(dcb(8, 0, 3), (i << 24) | (u32{v} << 8)); };
+    vc3_reg(1, 0x4000);
+    vc3_reg(7, 0x4000);
+    t.w(dcb(8, 3, 2), 0x8000u << 16);
+    vc3_reg(2, 31 + 40);
+    vc3_reg(3, 31 + 30);
+    vc3_reg(0x1D, 3);
+    same();
+    vc3_reg(3, 31 + 300);
+    same();
+    vc3_reg(2, 31 + 41);
+    same();
+    t.w(dcb(3, 0, 2), 0x0005u << 16);  // its colours: from entry 4 on (config bits 10:0, times 4)
+    t.w(dcb(3, 2, 3), 0x00FF00u << 8);
+    t.w(dcb(7, 1, 1), 3u << 24);
+    t.w(dcb(7, 2, 1), 1u << 24);
+    same();
+    vc3_reg(0x1D, 0);
+    same();
+    // A colour map change redraws everything.
+    t.w(0x61E00, 0x7A0);  // main mode 0: colour index
+    same();
+    t.w(dcb(3, 0, 2), 0x00FFu << 16);
+    t.w(dcb(3, 2, 3), 0x00FF00u << 8);
+    same();
 }

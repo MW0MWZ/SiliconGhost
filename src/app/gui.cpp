@@ -178,6 +178,7 @@ private:
     bool native_menus_ = false;                   // macOS: the system menu bar has the menus
     std::vector<std::function<void()>> posted_;  // actions chosen there, run from the main loop
     int pending_frames_ = 3;
+    u64 picture_ns_ = 0;  // host time the last picture of the display took to make
 
     bool captured_ = false;
     // Following the guest's hardware cursor (see mouse_frame)
@@ -397,6 +398,16 @@ int Gui::run() {
         mouse_frame();
         frame();
         for (auto& t : terminal_windows_) t->frame(now);
+        // The machine runs for at least as long again as making the picture
+        // took, and four times as long while it is behind real time: a host
+        // slow to draw shows fewer frames a second, rather than leaving the
+        // machine (and its sound) behind.
+        if (picture_ns_) {
+            const Pacer* pacer = session_.pacer();
+            const u64 share = pacer && pacer->lag() > 0.05 ? 4 : 1;
+            next_frame_ns = std::max(next_frame_ns, SDL_GetTicksNS() + share * picture_ns_);
+        }
+        picture_ns_ = 0;
     }
 
     if (!options_.screenshot.empty() && session_.on() && !session_.save_screenshot(options_.screenshot))
@@ -734,7 +745,9 @@ void Gui::update_picture() {
     shown_version_ = newport->display_version();
     unsigned w = 0, h = 0;
     const bool had = picture_;
+    const u64 start = SDL_GetTicksNS();
     picture_ = newport->render(pixels_, w, h);
+    picture_ns_ = SDL_GetTicksNS() - start;
     if (picture_ != had) update_title();
     if (!picture_) return;
     if (!texture_ || w != tex_w_ || h != tex_h_) {

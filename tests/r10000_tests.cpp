@@ -88,7 +88,7 @@ TEST(r10000_reports_its_identity_and_configuration) {
 }
 
 TEST(r10000_tlb_maps_44_bit_addresses_and_40_bit_frames) {
-    Rig t;
+    Rig t(r10000(), sr::CU1 | sr::KX | sr::UX);  // xkuseg needs UX on the R10000
     // xuseg reaches 16 TiB: map 0x00000F0000000000 to physical 0x2000, entry 63.
     const u64 va = 0x00000F0000000000ull;
     t.tlb_write(63, va, entrylo(0x2000), 0);
@@ -205,13 +205,13 @@ TEST(r10000_cache_tags_and_data_read_back_and_hit_operations_compare_tags) {
 
 TEST(r10000_performance_counters_are_selected_by_the_instruction) {
     Rig t;
-    t.cpu.gpr[t0] = 0x1FF;
+    t.cpu.gpr[t0] = 0xFFFFFFF0u;  // control: 9 bits kept; no mode bits, so nothing counts
     t.cpu.gpr[t1] = 0x12345678;
     t.load({MTC0(t0, cop0::PerfCounter) | 0, MTC0(t1, cop0::PerfCounter) | 1, MTC0(t1, cop0::PerfCounter) | 3,
             MFC0(a0, cop0::PerfCounter) | 0, MFC0(a1, cop0::PerfCounter) | 1, MFC0(a2, cop0::PerfCounter) | 2,
             MFC0(a3, cop0::PerfCounter) | 3});
     t.steps(7);
-    CHECK_EQ(t.cpu.gpr[a0], 0x1FFull);
+    CHECK_EQ(t.cpu.gpr[a0], 0x1F0ull);
     CHECK_EQ(t.cpu.gpr[a1], 0x12345678ull);
     CHECK_EQ(t.cpu.gpr[a2], 0ull);
     CHECK_EQ(t.cpu.gpr[a3], 0x12345678ull);
@@ -239,4 +239,165 @@ TEST(r10000_cached_accesses_to_an_uncached_only_range_fail) {
     CHECK_EQ(t.cpu.pc, kGeneralVector);
     CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::DBE));
     CHECK_EQ(t.cpu.cp0_read(cop0::EPC), kCode + 4);
+}
+
+// Performance counters count cycles (event 0) and graduated instructions
+// (counter 1 event 1) in the modes their control registers name; an
+// overflow with IE raises IP7 (as the timer does) until bit 31 is cleared.
+TEST(r10000_performance_counters_count_and_interrupt_on_overflow) {
+    Rig t;
+    std::vector<u32> nops(64, NOP);
+    for (std::size_t i = 0; i < nops.size(); ++i) store_be<u32>(&t.ram[0x1000 + 4 * i], nops[i]);
+    auto mtpc = [&](unsigned sel, u32 v) {
+        t.cpu.gpr[t0] = v;
+        t.load({MTC0(t0, cop0::PerfCounter) | sel}, 0x3000);
+        const u64 pc = t.cpu.pc;
+        t.cpu.set_pc(0xFFFFFFFF80003000ull);
+        t.steps(1);
+        t.cpu.set_pc(pc);
+    };
+    auto mfpc = [&](unsigned sel) {
+        t.load({MFC0(t1, cop0::PerfCounter) | sel}, 0x3000);
+        const u64 pc = t.cpu.pc;
+        t.cpu.set_pc(0xFFFFFFFF80003000ull);
+        t.steps(1);
+        t.cpu.set_pc(pc);
+        return static_cast<u32>(t.cpu.gpr[t1]);
+    };
+    mtpc(1, 0);
+    mtpc(3, 0);
+    mtpc(0, 0 << 5 | 2);  // counter 0: cycles, kernel mode
+    mtpc(2, 1 << 5 | 8);  // counter 1: graduated instructions, user mode only
+    t.steps(20);
+    const u32 c0 = mfpc(1);
+    CHECK(c0 >= 20 && c0 <= 23);
+    CHECK_EQ(mfpc(3), 0u);  // nothing counted outside user mode
+    // Overflow: counter 0 near bit 31 with IE; IP7 rises and stays until cleared.
+    t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::KX | sr::IE | (0x80u << 8));
+    t.cpu.cp0_write(cop0::Compare, 0xFFFFFFF0u);  // the timer out of the way
+    mtpc(1, 0x7FFFFFF8u);
+    mtpc(0, 0 << 5 | 0x10 | 2);
+    t.steps(4);
+    CHECK(!(t.cpu.cp0_read(cop0::Cause) & (1u << 15)));
+    t.steps(10);
+    CHECK(t.cpu.cp0_read(cop0::Cause) & (1u << 15));
+    CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::Int));
+    t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::KX);
+    mtpc(1, 5);  // bit 31 cleared: the interrupt goes
+    CHECK(!(t.cpu.cp0_read(cop0::Cause) & (1u << 15)));
+}
+
+// R10000 FPU details: with FR set a single-precision write (LWC1, MTC1, an
+// S result, MOVN.S whose condition fails) clears the register's upper half;
+// CVT.L of a value beyond 51 bits is left to software; undefined COP1
+// opcodes are reserved instructions, undefined formats unimplemented.
+TEST(r10000_fpu_clears_upper_halves_and_limits_long_conversions) {
+    Rig t(r10000(), sr::CU1 | sr::KX | sr::FR);
+    auto fpr = [&](unsigned n) { return t.cpu.fpr[n]; };
+    t.cpu.fpr[2] = 0xAAAAAAAA3F800000ull;  // 1.0f in the low half
+    t.cpu.fpr[4] = 0xBBBBBBBB40000000ull;  // 2.0f
+    t.cpu.fpr[6] = 0xCCCCCCCC00000000ull;
+    t.cpu.gpr[t0] = 0x12345678;
+    t.cpu.gpr[t1] = 1;  // MOVN's condition: nonzero, so a MOVN.S with t2 (0) fails
+    t.load({0x46041180,  // add.s $f6, $f2, $f4
+            0x44884000,  // mtc1 t0, $f8
+            0x460A2213});  // movn.s $f8, $f4, t2  (t2 = 0: no move)
+    t.cpu.fpr[8] = 0xDDDDDDDD00000000ull;
+    t.steps(1);
+    CHECK_EQ(fpr(6), 0x40400000ull);  // 3.0f, upper half cleared
+    t.steps(1);
+    CHECK_EQ(fpr(8), 0x12345678ull);
+    t.cpu.fpr[8] = 0xEEEEEEEE12345678ull;
+    t.steps(1);
+    CHECK_EQ(fpr(8), 0x12345678ull);  // condition false, upper half cleared all the same
+    // CVT.L.D of 2^52: beyond 51 bits, an Unimplemented Operation exception.
+    Rig u(r10000(), sr::CU1 | sr::KX | sr::FR);
+    u.cpu.fpr[2] = 0x4330000000000000ull;  // 2^52
+    u.load({0x46201265});                   // cvt.l.d $f9, $f2
+    u.steps(1);
+    CHECK_EQ(u.exc_code(), static_cast<unsigned>(Exc::FPE));
+    CHECK(u.cpu.cp0_read(cop0::EPC) == kCode);
+    // Undefined COP1: opcode (rs 0x03) reserved, format (rs 0x18) unimplemented.
+    Rig v(r10000(), sr::CU1 | sr::KX);
+    v.load({0x44600000});
+    v.steps(1);
+    CHECK_EQ(v.exc_code(), static_cast<unsigned>(Exc::RI));
+    Rig w(r10000(), sr::CU1 | sr::KX);
+    w.load({0x47000000});
+    w.steps(1);
+    CHECK_EQ(w.exc_code(), static_cast<unsigned>(Exc::FPE));
+}
+
+// The R10000's address spaces: xkuseg from Kernel mode needs UX (an address
+// error without it, where the R4400 maps it), and a TLB refill for a kuseg
+// address takes the vector UX selects (32-bit with UX clear), where the
+// R4400 goes by KX.
+TEST(r10000_user_space_privileges_and_refill_vector_follow_ux) {
+    Rig t(r10000(), sr::CU1 | sr::KX);
+    t.cpu.gpr[t0] = 0x0000000100000000ull;  // xkuseg, above 4 GiB
+    t.load({LW(t1, 0, t0)});
+    t.steps(1);
+    CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::AdEL));
+    Rig r(r10000(), sr::CU1 | sr::KX);
+    r.cpu.gpr[t0] = 0x10000000;  // kuseg, unmapped: a refill
+    r.load({LW(t1, 0, t0)});
+    r.steps(1);
+    CHECK_EQ(r.cpu.pc, 0xFFFFFFFF80000000ull);  // the 32-bit refill vector
+    Rig x(r10000(), sr::CU1 | sr::KX | sr::UX);
+    x.cpu.gpr[t0] = 0x10000000;
+    x.load({LW(t1, 0, t0)});
+    x.steps(1);
+    CHECK_EQ(x.cpu.pc, 0xFFFFFFFF80000080ull);  // UX set: the 64-bit one
+    Rig q(R4000::Options{}, sr::KX);
+    q.cpu.gpr[t0] = 0x10000000;
+    q.load({LW(t1, 0, t0)});
+    q.steps(1);
+    CHECK_EQ(q.cpu.pc, 0xFFFFFFFF80000080ull);  // the R4400: by KX
+}
+
+// With the uncached store check on (the IP28's ECC board in fast mode), a
+// store to RAM through kseg1 is reported (and done); a kseg0 store is not;
+// with the check off nothing is reported.
+TEST(r10000_uncached_store_check_reports_uncached_stores_to_ram) {
+    Rig t;
+    std::vector<u64> seen;
+    t.cpu.uncached_store_hook = [&](u64 pa) { seen.push_back(pa); };
+    t.cpu.set_uncached_store_check(true);
+    t.cpu.gpr[t0] = 0xFFFFFFFFA0002000ull;  // kseg1
+    t.cpu.gpr[t1] = 0xFFFFFFFF80002000ull;  // kseg0
+    t.cpu.gpr[t2] = 0x1234;
+    t.load({SW(t2, 0, t0), SW(t2, 4, t1), SW(t2, 8, t0)});
+    t.steps(3);
+    CHECK_EQ(seen.size(), 2u);
+    if (seen.size() == 2) CHECK_EQ(seen[1], 0x2008ull);
+    CHECK_EQ(load_be<u32>(&t.ram[0x2000]), 0x1234u);
+    t.cpu.set_uncached_store_check(false);
+    t.cpu.set_pc(kCode);
+    t.steps(1);
+    CHECK_EQ(seen.size(), 2u);
+}
+
+// IP28 code puts a Cache Barrier ahead of stores and at branch targets. It
+// changes nothing, so a poll loop holding one is still skipped while idle,
+// ending exactly where spinning would have.
+TEST(r10000_idle_skip_sees_through_cache_barriers) {
+    auto setup = [](Rig& t) {
+        t.cpu.gpr[t0] = 0xFFFFFFFF80002000ull;
+        t.cpu.gpr[sp] = 0xFFFFFFFF80004000ull;
+        t.load({I(0x2F, sp, 0x14, 0), LW(t1, 0, t0), BEQ(t1, zero, -3), NOP});  // CACHE 0x14, 0(sp)
+        t.load({BEQ(zero, zero, -1), NOP}, 0x180);
+        t.cpu.cp0_write(cop0::Compare, 50000);  // Count == Compare at cycle 100000
+        t.cpu.cp0_write(cop0::Status, sr::CU1 | sr::KX | sr::IE | (1u << 15));
+    };
+    Rig fast, slow;
+    setup(fast);
+    setup(slow);
+    slow.cpu.set_idle_skip(false);
+    fast.cpu.run_until(150000);
+    slow.cpu.run_until(150000);
+    CHECK_EQ(fast.cpu.cycles(), slow.cpu.cycles());
+    CHECK_EQ(fast.cpu.pc, slow.cpu.pc);
+    CHECK_EQ(fast.cpu.cp0_read(cop0::EPC), slow.cpu.cp0_read(cop0::EPC));
+    CHECK(fast.cpu.idle_skipped_cycles() > 140000);
+    CHECK_EQ(slow.cpu.idle_skipped_cycles(), 0u);
 }

@@ -1908,3 +1908,64 @@ TEST(cpu_jit_takes_back_translations_of_evicted_blocks) {
     CHECK(t.cpu.jit_reuses() > 20);
     CHECK(t.cpu.jit_compiles() < 20);
 }
+
+// Watch: a store to the watched doubleword (W set) takes a Watch exception
+// before it is done, EPC at the store; a load there with only W set does
+// not; while EXL is set the access completes and the exception waits until
+// EXL clears. The R5000 has no watch registers.
+TEST(cpu_watch_exception_precise_and_delayed) {
+    for (const bool r10k : {false, true}) {
+        R4000::Options o;
+        if (r10k) o.core = Core::R10000, o.prid = 0x0926, o.config = R4000::kR10000Config;
+        Rig t(o);
+        t.load({LUI(t1, 0x8000), ORI(t1, t1, 0x2008), ADDIU(t0, zero, 7), LW(t2, 4, t1), SW(t0, 4, t1), NOP, NOP});
+        t.load({NOP, NOP}, 0x180);
+        t.cpu.cp0_write(cop0::WatchHi, 0);
+        t.cpu.cp0_write(cop0::WatchLo, 0x2008 | 1);  // stores to physical 0x2008-0x200F
+        t.steps(4);  // the load passes
+        CHECK_EQ(t.cpu.pc, kCode + 16);
+        t.steps(1);
+        CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::WATCH));
+        CHECK_EQ(t.cpu.cp0_read(cop0::EPC), kCode + 16);
+        CHECK_EQ(t.r32(0x200C), 0u);  // not stored
+        // Delayed: with EXL set the store completes; clearing EXL takes it.
+        t.cpu.cp0_write(cop0::Status, sr::EXL);
+        t.cpu.set_pc(kCode + 16);
+        t.steps(1);
+        CHECK_EQ(t.r32(0x200C), 7u);
+        CHECK_EQ(t.cpu.pc, kCode + 20);
+        t.cpu.cp0_write(cop0::Status, 0);
+        t.steps(1);
+        CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::WATCH));
+        CHECK_EQ(t.cpu.cp0_read(cop0::EPC), kCode + 20);
+        // A write to WatchLo clears a delayed watch.
+        t.cpu.cp0_write(cop0::Status, sr::EXL);
+        t.cpu.set_pc(kCode + 16);
+        t.steps(1);
+        t.cpu.cp0_write(cop0::WatchLo, 0);
+        t.cpu.cp0_write(cop0::Status, 0);
+        t.steps(1);
+        CHECK_EQ(t.cpu.pc, kCode + 24);
+    }
+    Rig r5(r5000_options());
+    r5.load({LUI(t1, 0x8000), SW(t0, 0x2008, t1), NOP});
+    r5.cpu.cp0_write(cop0::WatchLo, 0x2008 | 1);
+    r5.steps(2);
+    CHECK_EQ(r5.cpu.pc, kCode + 8);
+}
+
+// A watch armed after a store loop has been translated still catches the
+// store: the watched page gets no soft-TLB entry, translated code or not.
+TEST(cpu_watch_catches_translated_stores) {
+    Rig t;
+    // t1 = 0x80002008; loop: sw t0,0(t1); addiu t2,t2,1; bne t2,t3,loop; nop; then spin.
+    t.load({LUI(t1, 0x8000), ORI(t1, t1, 0x2008), ADDIU(t3, zero, 1000), SW(t2, 0, t1), ADDIU(t2, t2, 1),
+            BNE(t2, t3, -3), NOP, BEQ(zero, zero, -1), NOP});
+    t.load({NOP, NOP}, 0x180);
+    t.cpu.run_until(600);  // well into the loop
+    CHECK(t.cpu.gpr[t2] > 50 && t.cpu.gpr[t2] < 1000);
+    t.cpu.cp0_write(cop0::WatchLo, 0x2008 | 1);
+    t.cpu.run_until(1200);
+    CHECK_EQ(t.exc_code(), static_cast<unsigned>(Exc::WATCH));
+    CHECK_EQ(t.cpu.cp0_read(cop0::EPC), kCode + 12);
+}

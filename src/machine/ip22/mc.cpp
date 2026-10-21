@@ -23,6 +23,7 @@ constexpr u32 kCpuCtrl0WarmRestart = 1u << 16;  // WR_ST: the CPU's reset sequen
 constexpr u32 kCpuCtrl0WarmReset = 1u << 19;    // WRST: a warm reset of the CPU
 constexpr u32 kGioErrStatProm = 1u << 11;
 constexpr u32 kDogBits = 20;
+constexpr u32 kEccErrStatFuw = 1u << 0;  // ECC memory: an uncached write in fast mode
 constexpr u32 kErrStatAddr = 1u << 10;  // CPU: bad address; GIO: timeout uses the same bit position
 constexpr u32 kEeromCs = 1u << 1;
 constexpr u32 kEeromSck = 1u << 2;
@@ -35,7 +36,9 @@ constexpr u32 kBankSubbanks = 1u << 14;
 
 // Main memory may only be decoded into the low and high system memory windows.
 constexpr u32 kLowWindow = 0x08000000, kLowWindowEnd = 0x18000000;
-constexpr u32 kHighWindow = 0x20000000, kHighWindowEnd = 0x30000000, kHighWindowEndLarge = 0x40000000;
+// Revision 5 (the R10000 Indigo2) decodes up to 1 GiB above 0x20000000,
+// to where its ECC board's register is mapped.
+constexpr u32 kHighWindow = 0x20000000, kHighWindowEnd = 0x30000000, kHighWindowEndLarge = 0x60000000;
 constexpr u32 kLowAliasSize = 0x80000;
 constexpr u32 kCpuMemAccAliasBig = 1u << 29;
 
@@ -80,10 +83,10 @@ Mc::Mc(Bus& bus, Scheduler& scheduler, u8* ram, u64 ram_size, double cpu_hz, dou
     std::fill(cpu_eeprom_.words().begin(), cpu_eeprom_.words().end(), u16{0});
     // Split installed memory into decodable banks, largest first.
     u64 remaining = ram_size, offset = 0;
-    const u64 largest = u64{large_banks ? 256u : 128u} << 20, smallest = u64{large_banks ? 64u : 4u} << 20;
+    const u64 largest = u64{large_banks ? 512u : 128u} << 20, smallest = u64{large_banks ? 64u : 4u} << 20;
     for (u64 size = largest; size >= smallest && banks_.size() < 4;) {
         if (remaining >= size) {
-            const bool double_sided = size == (u64{256} << 20) || size == (u64{128} << 20) ||
+            const bool double_sided = size == (u64{512} << 20) || size == (u64{256} << 20) || size == (u64{128} << 20) ||
                                       size == (u64{32} << 20) || size == (u64{8} << 20);
             Bank b;
             b.offset = offset;
@@ -469,6 +472,15 @@ void Mc::report_bus_error(u64 paddr, unsigned size, bool is_write) {
         irq_ = true;
         if (irq_cb_) irq_cb_(true);
     }
+}
+
+void Mc::report_fast_uncached_write(u64 paddr) {
+    if (!cpu_error_stat_) {
+        cpu_error_addr_ = static_cast<u32>(paddr);
+        cpu_error_stat_ = kEccErrStatFuw;
+    }
+    irq_ = true;
+    if (irq_cb_) irq_cb_(true);
 }
 
 void Mc::update_irq() {

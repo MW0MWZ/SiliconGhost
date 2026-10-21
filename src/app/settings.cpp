@@ -70,7 +70,7 @@ ip22::Board board_of(const Settings& s) {
 std::vector<unsigned> ram_sizes(ip22::Board board, const CpuModel* cpu) {
     (void)cpu;
     std::vector<unsigned> sizes;
-    for (unsigned mb = 16; mb <= 768; mb += 16)
+    for (unsigned mb = 16; mb <= 1024; mb += 16)
         if (ip22::ram_size_fits(mb, board)) sizes.push_back(mb);
     return sizes;
 }
@@ -299,7 +299,7 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
     else if (key == "machine") ok = find_platform(v) && (s.machine = v, true);
     else if (key == "cpu") ok = find_cpu_model(v) && (s.cpu = v, true);
     else if (key == "cpu_mhz") ok = parse_number(v, n) && n >= 10 && n <= 1000 && (s.cpu_mhz = n, true);
-    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 768 && n == static_cast<unsigned>(n) &&
+    else if (key == "ram_mb") ok = parse_number(v, n) && n >= 16 && n <= 1024 && n == static_cast<unsigned>(n) &&
                                   (ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2) ||
                                    ip22::ram_size_fits(static_cast<unsigned>(n), ip22::Board::Indigo2R10000)) &&
                                   (s.ram_mb = static_cast<unsigned>(n), true);  // checked against the board at power-on

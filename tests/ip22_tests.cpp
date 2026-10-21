@@ -1137,13 +1137,15 @@ TEST(ip22_mc_dma_from_unaligned_memory_feeds_the_aligned_data_port) {
 }
 
 // Latching an 8254 count (as boot code does to time the CPU) ends run() and
-// marks the next half second of guest time as timing the CPU.
+// marks the next 50 ms of guest time as timing the CPU.
 TEST(ip22_pit_latch_marks_cpu_timing) {
     IndyRig t;
     CHECK(!t.m.timing_cpu());
     t.w8(ioc_addr(0xBC), 0x80);  // latch counter 2
     CHECK(t.m.timing_cpu());
-    t.m.run(static_cast<u64>(t.m.cycles_per_second()));
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 50));
+    CHECK(t.m.timing_cpu());
+    t.m.run(static_cast<u64>(t.m.cycles_per_second() / 25));
     CHECK(!t.m.timing_cpu());
 }
 

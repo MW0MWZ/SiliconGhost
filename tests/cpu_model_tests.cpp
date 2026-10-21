@@ -140,7 +140,9 @@ TEST(cpu_models_config_and_watch_registers) {
 
     Rig r44(model(Core::R4000));
     r44.cpu.cp0_write(cop0::WatchLo, 0x1234);
-    CHECK_EQ(r44.cpu.cp0_read(cop0::WatchLo), 0x1234ull);
+    CHECK_EQ(r44.cpu.cp0_read(cop0::WatchLo), 0x1230ull);  // bit 2 reserved: reads 0
+    r44.cpu.cp0_write(cop0::WatchHi, 0xFFFFFFFFu);
+    CHECK_EQ(r44.cpu.cp0_read(cop0::WatchHi), 0xFull);  // physical address bits 35:32
 }
 
 TEST(cpu_mips4_instructions_are_reserved_before_the_r5000) {

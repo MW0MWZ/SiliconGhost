@@ -360,6 +360,7 @@ void R4000::fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd) {
         if (func == 0x11) move = ((fcr31 & fcc_bit(ft >> 2)) != 0) == ((ft & 1) != 0);
         else move = (gpr[ft] == 0) == (func == 0x12);
         if (move) write(fd, read(fs));
+        else if (kSingle && r10k_) write(fd, read(fd));  // the R10000 clears the upper half regardless
         return;
     }
 
@@ -475,7 +476,10 @@ void R4000::fp_compute(unsigned func, unsigned ft, unsigned fs, unsigned fd) {
             const double r = round_integral(v, mode);
             const bool inexact = r != v;
             if (to_long) {
-                if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0)) {
+                // The R10000 converts results of up to 51 bits; beyond that
+                // the operation is left to software.
+                const double limit = r10k_ ? 2251799813685248.0 : 9223372036854775808.0;
+                if (!(r >= -limit && r < limit)) {
                     fp_unimplemented();
                     return;
                 }
@@ -553,7 +557,7 @@ void R4000::execute_cop1(u32 inst) {
     switch (fmt) {
         case 0x00: gpr[ft] = sext32(fpr_read32(fs)); return;  // MFC1
         case 0x01:                                            // DMFC1
-            if (!ops64_enabled()) return fp_unimplemented();
+            if (!ops64_enabled()) return r10k_ ? raise(Exc::RI) : fp_unimplemented();
             gpr[ft] = fpr_read64(fs);
             return;
         case 0x02:  // CFC1
@@ -562,7 +566,7 @@ void R4000::execute_cop1(u32 inst) {
             return;
         case 0x04: fpr_write32(fs, static_cast<u32>(gpr[ft])); return;  // MTC1
         case 0x05:                                                     // DMTC1
-            if (!ops64_enabled()) return fp_unimplemented();
+            if (!ops64_enabled()) return r10k_ ? raise(Exc::RI) : fp_unimplemented();
             fpr_write64(fs, gpr[ft]);
             return;
         case 0x06:  // CTC1
@@ -587,7 +591,14 @@ void R4000::execute_cop1(u32 inst) {
         case 19:
         case 22:
         case 23: fp_unimplemented(); return;
-        default: raise(Exc::RI); return;
+        default:
+            // Undefined encodings: the R4000 leaves them all to software
+            // (Unimplemented Operation); the R10000 too for undefined formats
+            // (bits 25:24 = 2 or 3), but undefined opcodes are reserved
+            // instructions there.
+            if (opts_.core == Core::R4000 || (r10k_ && fmt >= 0x10)) fp_unimplemented();
+            else raise(Exc::RI);
+            return;
     }
 }
 

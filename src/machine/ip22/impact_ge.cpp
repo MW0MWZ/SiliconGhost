@@ -886,8 +886,7 @@ bool ImpactGe::token(u32 cmd, const u32* d, unsigned n) {
 std::array<float, 4> ImpactGe::light(const std::array<float, 4>& eye, const std::array<float, 3>& n0, bool back) const {
     const State& s = s_;
     // The normal to eye space: times the inverse transpose of the modelview.
-    Mat4 inv;
-    if (!invert(s.mv.m[s.mv.top], inv)) inv = identity();
+    const Mat4& inv = mv_inverse();
     std::array<float, 3> n{n0[0] * inv.m[0] + n0[1] * inv.m[1] + n0[2] * inv.m[2], n0[0] * inv.m[4] + n0[1] * inv.m[5] + n0[2] * inv.m[6],
                            n0[0] * inv.m[8] + n0[1] * inv.m[9] + n0[2] * inv.m[10]};
     if (s.normalize) n = normalised(n);
@@ -1654,6 +1653,18 @@ u32 ImpactGe::te_reg(u32 reg) const {
 // context's TEXMODE1 enables the TE.
 bool ImpactGe::texturing() const { return s_.tex_on && (s_.te[0] & 1); }
 
+// The inverse of the current modelview (identity when it has none), kept
+// until the modelview changes: lighting needs it for every vertex.
+const ImpactGe::Mat4& ImpactGe::mv_inverse() const {
+    const Mat4& m = s_.mv.m[s_.mv.top];
+    if (!inv_valid_ || inv_of_.m != m.m) {
+        if (!invert(m, inv_)) inv_ = identity();
+        inv_of_ = m;
+        inv_valid_ = true;
+    }
+    return inv_;
+}
+
 // The texture registers as the TE samples with them.
 GeTexture ImpactGe::tex_state() const {
     const State& s = s_;
@@ -1677,8 +1688,7 @@ std::array<float, 4> ImpactGe::texgen(const std::array<float, 4>& obj, const std
     std::array<float, 2> sphere{};
     if (s.texgen_on & 3 && (s.texgen_mode[0] == 2 || s.texgen_mode[1] == 2)) {
         // The reflection of the eye-space view vector about the normal.
-        Mat4 inv;
-        if (!invert(s.mv.m[s.mv.top], inv)) inv = identity();
+        const Mat4& inv = mv_inverse();
         const auto& n0 = s.normal;
         std::array<float, 3> nn = normalised({n0[0] * inv.m[0] + n0[1] * inv.m[1] + n0[2] * inv.m[2],
                                               n0[0] * inv.m[4] + n0[1] * inv.m[5] + n0[2] * inv.m[6],

@@ -186,6 +186,30 @@ TEST(ds1386_time_freeze_and_set) {
     CHECK_EQ(rtc.read(0x100), 0x5A);
 }
 
+// Polled finely, the hundredths register steps through every value, each
+// for a hundredth of a second (the PROM times the CPU's clock this way).
+TEST(ds1386_hundredths_never_skip) {
+    Ds1386 rtc;
+    const double base = 1792591877.0;  // a large epoch time, where rounding bites
+    u64 cycles = 0;
+    rtc.set_time_source([&] { return base + static_cast<double>(cycles) / 195e6; });
+    rtc.power_on();
+    auto from_bcd_test = [](u8 v) { return (v >> 4) * 10u + (v & 0x0Fu); };
+    unsigned last = from_bcd_test(rtc.read(0x0));
+    u64 changed_at = 0;
+    unsigned steps = 0;
+    for (; cycles < 195000000; cycles += 97) {
+        const unsigned h = from_bcd_test(rtc.read(0x0));
+        if (h == last) continue;
+        CHECK_EQ(h, (last + 1) % 100);
+        if (steps > 0) CHECK(cycles - changed_at < 1950000 + 200 && cycles - changed_at > 1950000 - 200);
+        changed_at = cycles;
+        last = h;
+        ++steps;
+    }
+    CHECK(steps >= 99);
+}
+
 namespace {
 void ee_cmd(Eeprom93Cxx& ee, u32 bits, unsigned n) {
     ee.set_lines(true, false, false);

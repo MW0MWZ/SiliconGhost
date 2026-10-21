@@ -397,3 +397,24 @@ TEST(pacer_max_mode_follows_the_wall_clock_and_is_never_capped) {
     p.update(cycles + static_cast<u64>(hz / 10), instructions + 1000);
     CHECK(host.slept - slept >= 98000000 && host.slept - slept <= 100000000);
 }
+
+#include <atomic>
+
+#include "core/worker_pool.h"
+
+// Every index of a job is handed out exactly once, whatever the pool's size,
+// and run() returns only when all of it is done.
+TEST(worker_pool_covers_the_range_once) {
+    for (unsigned threads : {0u, 1u, 3u}) {
+        WorkerPool pool(threads);
+        for (unsigned count : {0u, 1u, 7u, 1024u}) {
+            std::vector<std::atomic<unsigned>> seen(count);
+            for (auto& s : seen) s = 0;
+            pool.run(count, [&](unsigned begin, unsigned end) {
+                CHECK(begin < end && end <= count);
+                for (unsigned i = begin; i < end; ++i) ++seen[i];
+            });
+            for (auto& s : seen) CHECK_EQ(s.load(), 1u);
+        }
+    }
+}

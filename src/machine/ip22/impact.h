@@ -29,6 +29,7 @@
 // here answers are logged (debug level) so they can be traced.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <map>
@@ -145,9 +146,9 @@ private:
     u32 cmap_read(unsigned which, unsigned crs);
     void dac_write(unsigned crs, unsigned width, u32 data);
     u32 dac_read(unsigned crs);
-    void xmap_write(unsigned crs, unsigned width, u32 data);
+    bool xmap_write(unsigned crs, unsigned width, u32 data);  // true: what is shown may have changed
     u32 xmap_read(unsigned crs, unsigned width);
-    void vc3_write(unsigned crs, unsigned width, u32 data);
+    bool vc3_write(unsigned crs, unsigned width, u32 data);   // likewise
     u32 vc3_read(unsigned crs, unsigned width);
     u32 vc3_scanline() const;
     static u32 be_bytes(const u8* p, unsigned n);
@@ -196,6 +197,7 @@ private:
     bool gl_to_framebuffer(const GeDraw& d, int x, int y, int& fx, int& fy) const;
     bool gl_visible(const GeDraw& d, int fx, int fy) const;
     void gl_fragment(const GeDraw& d, int x, int y, const float* rgba, float z);
+    void gl_fragment_at(const GeDraw& d, int x, int y, int fx, int fy, const float* rgba, float z);
     bool gl_clear_rect(const GeDraw& d, int& x0, int& x1, int& y0, int& y1) const;
     u32& zst_at(int fx, int fy);
     // Whether a framebuffer pixel may be written: its clip ID matches and it
@@ -204,16 +206,50 @@ private:
     void store_overlay(const PixelTarget& t, int fx, int fy, u32 value);
     u64* overlay_word(unsigned page, int fx, int fy, unsigned& shift);
     const u64* overlay_word(unsigned page, int fx, int fy, unsigned& shift) const;
-    u64* word_at(unsigned page, int fx, int fy);
-    const u64* word_at(unsigned page, int fx, int fy) const;
     unsigned engines() const { return ((rss_[kDrbSize] >> 6) & 3) + 1; }
+    unsigned engine_of(int fy) const { return engines() == 2 && !pixmem_[1].empty() ? fy & 1 : 0; }
+    // Pixel memory: a buffer is a run of pages from `page`, each a 192 x 16
+    // tile, DRBsize bits 5:2 tiles to a row. With two raster engines each
+    // holds every other row. (Here, as they are on every pixel's way.)
+    std::size_t word_index(unsigned page, int fx, unsigned row) const {
+        const unsigned tiles = std::max(1u, (rss_[kDrbSize] >> 2) & 15);
+        const unsigned pg = (page + row / kTileRows * tiles + static_cast<unsigned>(fx) / kTileWidth) & (kPages - 1);
+        return std::size_t{pg} * kTileWidth * kTileRows + (row % kTileRows) * kTileWidth + static_cast<unsigned>(fx) % kTileWidth;
+    }
+    const u64* word_at(unsigned page, int fx, int fy) const {
+        const bool two = engines() == 2 && !pixmem_[1].empty();
+        const unsigned engine = two ? fy & 1 : 0;
+        return &pixmem_[engine][word_index(page, fx, two ? static_cast<unsigned>(fy) >> 1 : static_cast<unsigned>(fy))];
+    }
+    // The writable form notes the page row written for render().
+    u64* word_at(unsigned page, int fx, int fy) {
+        const bool two = engines() == 2 && !pixmem_[1].empty();
+        const unsigned engine = two ? fy & 1 : 0;
+        const std::size_t i = word_index(page, fx, two ? static_cast<unsigned>(fy) >> 1 : static_cast<unsigned>(fy));
+        row_written_[engine][i / kTileWidth] = 1;
+        return &pixmem_[engine][i];
+    }
+    void mark_written(unsigned engine, const u64* p) {
+        row_written_[engine][static_cast<std::size_t>(p - pixmem_[engine].data()) / kTileWidth] = 1;
+    }
 
     // ---- scan-out ----
+    // What a picture's rows depend on besides pixel memory and the state
+    // whose change redraws everything.
+    struct Shown {
+        bool cursor = false, two = false;
+        int cursor_x = 0, cursor_y = 0, cursor_size = 0;
+        u32 cursor_base = 0;  // its colour map entries
+        unsigned tiles = 0, overlay_tiles = 0, width = 0, height = 0;
+        bool operator==(const Shown&) const = default;
+    };
+    Shown shown() const;
+    // The screen rows whose row is set (all with none) as 0xAARRGGBB pixels.
+    void scan_out(std::vector<u32>& argb, unsigned width, unsigned height, const u8* rows) const;
     void retrace();
     unsigned did_table_lines(u32 table) const;
     void did_row(u32 table, unsigned row, unsigned width, std::vector<u8>& dids) const;
     void display_size(unsigned& width, unsigned& height) const;
-    u32 scan_pixel(unsigned x, unsigned row, unsigned height, u8 did, u8 odid) const;
 
     Scheduler& scheduler_;
     double cpu_hz_;
@@ -346,6 +382,9 @@ private:
         u32 colour = 0, background = 0;
     } stipple_;
     std::array<std::vector<u64>, 2> pixmem_;  // per raster engine: kPages pages of 36-bit words
+    // Per raster engine, each page row (kTileWidth words) written since the
+    // last render(), so that it converts only the screen rows that show one.
+    std::array<std::vector<u8>, 2> row_written_;
     // The two clip-ID planes, 2 bits a framebuffer pixel. Where the board
     // keeps them is not known; nothing reads them back but the CID match.
     static constexpr unsigned kFbSize = 2048;
@@ -360,6 +399,11 @@ private:
     u64 last_retrace_ = 0;
     u64 frames_ = 0;
     u64 display_version_ = 0;
+    // render() converts everything again after a change to the colour maps,
+    // RAMDAC, XMAP or VC3 (but for the cursor's place and colours), or to
+    // the layout.
+    bool full_redraw_ = true;
+    Shown shown_;  // what the last render() showed
     u64 pixels_drawn_ = 0;
     u32 unhandled_pp1_ = ~0u;  // the last PP1 fill mode logged as not drawn
 };

@@ -192,7 +192,7 @@ TEST(settings_platform_limits_processor_clock_and_memory) {
     CHECK(!app::find_cpu_model("r10000")->fits(Board::Indigo2));
     CHECK(!app::find_cpu_model("r4400sc")->fits(Board::Indigo2R10000));
     CHECK_EQ(app::ram_sizes(Board::Indigo2R10000, nullptr).front(), 64u);
-    CHECK_EQ(app::ram_sizes(Board::Indigo2R10000, nullptr).back(), 768u);
+    CHECK_EQ(app::ram_sizes(Board::Indigo2R10000, nullptr).back(), 1024u);
     {
         app::Settings r;
         r.machine = "indigo2-r10000";

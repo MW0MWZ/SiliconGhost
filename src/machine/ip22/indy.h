@@ -94,8 +94,11 @@ public:
     int exit_code() const { return exit_code_; }
     // True while software is timing the CPU against the 8254 (the PROM and
     // the kernels calibrate their delay loops at boot by latching counter 2),
-    // and for half a second of guest time after its last latch. Each such
-    // stretch starts by ending run(), so the CPU's speed can be fixed first.
+    // and for 50 ms of guest time after its last latch: the latches of one
+    // calibration come at most a few milliseconds apart, and a longer hold
+    // keeps a host that cannot reach the timed speed behind the wall clock
+    // (starving the boot chime). Each such stretch starts by ending run(),
+    // so the CPU's speed can be fixed first.
     bool timing_cpu() const { return cpu_.cycles() < timing_cpu_until_; }
 
     // Thread-safe: put the next CD-ROM disc in the drive (after the last,
@@ -204,17 +207,23 @@ private:
     // The R10000 Indigo2's ECC memory board: its control register appears
     // where a memory bank is pointed at 0x60000000 (software maps it there
     // through MEMCFG1 to switch between the slow and fast memory modes and
-    // clear errors). The memory is never in error, so writes only set modes.
+    // clear errors). In fast (normal) mode the memory system does not take
+    // uncached CPU writes: each is reported as an error (FUW) through the
+    // MC. ECC errors themselves never occur here.
     class EccBoard final : public Device {
     public:
+        explicit EccBoard(Indy& indy) : indy_(indy) {}
         const char* name() const override { return "ip28-ecc"; }
         bool read(u32, unsigned, u64& value) override {
             value = 0;
             return true;
         }
         bool write(u32 offset, unsigned, u64 value) override;
+
+    private:
+        Indy& indy_;
     };
-    EccBoard ecc_board_;
+    EccBoard ecc_board_{*this};
     static constexpr u32 kEccBoard = 0x60000000;
     static constexpr u64 kEccBoardSize = 0x10000;
     // Full House, board revision 13: IRIX takes revisions below 13 for the

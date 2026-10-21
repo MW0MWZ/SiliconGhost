@@ -31,7 +31,52 @@ bool compare(u32 func, double a, double b) {
     }
 }
 
-u8 to8(float c) { return static_cast<u8>(std::lround(std::clamp(c, 0.0f, 1.0f) * 255.0f)); }
+// Rounded half away from zero, as lround() but without the library call
+// (adding the half in double is exact for any float).
+u8 to8(float c) { return static_cast<u8>(static_cast<int>(static_cast<double>(std::clamp(c, 0.0f, 1.0f) * 255.0f) + 0.5)); }
+
+// The part of framebuffer row fy, cut to [x0, x1], inside every screen mask
+// that keeps its inside; false if there is none.
+bool mask_span(const GeDraw& d, int fy, int& x0, int& x1) {
+    for (unsigned n = 0; n < 4; ++n) {
+        if ((d.winmode & (0x11u << n)) != (0x11u << n)) continue;
+        const u32 mx = d.masks[n][0], my = d.masks[n][1];
+        if (fy < half(my >> 16) || fy > half(my)) return false;
+        x0 = std::max(x0, half(mx >> 16)), x1 = std::min(x1, half(mx));
+    }
+    return x0 <= x1;
+}
+
+// What gl_visible() asks of a pixel of one framebuffer row beyond
+// mask_span(): the clip-ID match, and the spans that screen masks keeping
+// their outside take away.
+struct RowTest {
+    const u8* cid = nullptr;  // the row's clip IDs, when there is a match
+    u32 match = 0;
+    int out[4][2] = {};
+    unsigned outs = 0;
+    bool any() const { return cid || outs; }
+    bool operator()(int fx) const {
+        if (cid && !((match >> cid[fx]) & 1)) return false;
+        for (unsigned i = 0; i < outs; ++i)
+            if (fx >= out[i][0] && fx <= out[i][1]) return false;
+        return true;
+    }
+};
+
+RowTest row_test(const GeDraw& d, const u8* cid_row, int fy) {
+    RowTest r;
+    r.match = (d.pp1winmode >> 4) & 0xF;
+    if (r.match) r.cid = cid_row;
+    for (unsigned n = 0; n < 4; ++n) {
+        if ((d.winmode & (0x11u << n)) != (1u << n)) continue;
+        const u32 mx = d.masks[n][0], my = d.masks[n][1];
+        if (fy < half(my >> 16) || fy > half(my)) continue;
+        r.out[r.outs][0] = half(mx >> 16), r.out[r.outs][1] = half(mx);
+        ++r.outs;
+    }
+    return r;
+}
 
 float blend_factor(u32 f, unsigned k, const float* s, const float* d, const std::array<float, 4>& kc) {
     switch (f) {
@@ -120,6 +165,12 @@ void Impact::gl_fragment(const GeDraw& d, int x, int y, const float* c, float z)
     if (d.scissor && (x < d.scissor_box[0] || x > d.scissor_box[1] || y < d.scissor_box[2] || y > d.scissor_box[3])) return;
     int fx, fy;
     if (!gl_to_framebuffer(d, x, y, fx, fy) || !gl_visible(d, fx, fy)) return;
+    gl_fragment_at(d, x, y, fx, fy, c, z);
+}
+
+// The rest of a fragment's stages, once it is known to be in the
+// framebuffer, the scissor box and the window.
+void Impact::gl_fragment_at(const GeDraw& d, int x, int y, int fx, int fy, const float* c, float z) {
     if (d.poly_stipple && !((d.stipple[static_cast<unsigned>(y) & 31] >> (31 - (static_cast<unsigned>(x) & 31))) & 1)) return;
     if (d.alpha_test && !d.ci && !compare(d.alpha_func, c[3], d.alpha_ref)) return;
     if (d.stencil || d.depth_test) {
@@ -223,9 +274,34 @@ void Impact::ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, 
     }
     float tq[3][3];  // s/w, t/w, q/w a vertex
     for (unsigned i = 0; i < 3; ++i) tq[i][0] = v[i]->t[0] * v[i]->w, tq[i][1] = v[i]->t[1] * v[i]->w, tq[i][2] = v[i]->t[3] * v[i]->w;
-    for (int y = y0; y <= y1; ++y) {
+    // Only the rows and spans of the framebuffer, the scissor box and the
+    // window are visited (what gl_fragment would turn away).
+    const int ox = half(d.origin), oy = half(d.origin >> 16), fb = static_cast<int>(kFbSize);
+    int ya = std::max(y0, -oy), yb = std::min(y1, fb - 1 - oy);
+    if (d.scissor) ya = std::max(ya, d.scissor_box[2]), yb = std::min(yb, d.scissor_box[3]);
+    for (int y = ya; y <= yb; ++y) {
         const float py = static_cast<float>(y) + 0.5f;
-        for (int x = x0; x <= x1; ++x) {
+        int xa = std::max(x0, -ox), xb = std::min(x1, fb - 1 - ox);
+        if (d.scissor) xa = std::max(xa, d.scissor_box[0]), xb = std::min(xb, d.scissor_box[1]);
+        int fa = xa + ox, fz = xb + ox;
+        if (!mask_span(d, y + oy, fa, fz)) continue;
+        xa = fa - ox, xb = fz - ox;
+        const RowTest visible = row_test(d, &cid_[std::size_t{static_cast<unsigned>(y + oy)} * kFbSize], y + oy);
+        const bool checks = visible.any();
+        // Each edge's crossing of the row bounds the span, widened by more
+        // than the rounding of the edge test below, which still decides.
+        for (unsigned i = 0; i < 3 && xa <= xb; ++i) {
+            if (ey[i] == 0) continue;
+            const GeVertex& p = *v[i];
+            const double dy = static_cast<double>(py) - p.y;
+            const double cross = p.x + ex[i] * dy / ey[i];
+            const double far = std::max(std::abs(xa + 0.5 - p.x), std::abs(xb + 0.5 - p.x));
+            const double margin = 1e-6 * (std::abs(ex[i] * dy) + std::abs(ey[i]) * far) / std::abs(ey[i]) + 1;
+            if (!(margin < 1e6) || !(std::abs(cross) < 1e6)) continue;
+            if (ey[i] > 0) xb = std::min(xb, static_cast<int>(std::floor(cross + margin - 0.5)));
+            else xa = std::max(xa, static_cast<int>(std::ceil(cross - margin - 0.5)));
+        }
+        for (int x = xa; x <= xb; ++x) {
             const float px = static_cast<float>(x) + 0.5f;
             float w[3];
             bool in = true;
@@ -235,7 +311,7 @@ void Impact::ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, 
                 in = e > 0 || (e == 0 && incl[i]);
                 w[(i + 2) % 3] = e;  // the edge opposite vertex i+2
             }
-            if (!in) continue;
+            if (!in || (checks && !visible(x + ox))) continue;
             const float l0 = w[0] / A, l1 = w[1] / A, l2 = w[2] / A;
             float col[4];
             for (unsigned k = 0; k < 4; ++k) col[k] = l0 * v[0]->c[k] + l1 * v[1]->c[k] + l2 * v[2]->c[k];
@@ -260,7 +336,7 @@ void Impact::ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, 
                 const float fog = l0 * v[0]->fog + l1 * v[1]->fog + l2 * v[2]->fog;
                 gl_shade(d, col, s0, t0, 1, tex_lambda(d.tex, sx - s0, tx - t0, sy - s0, ty - t0), fog);
             }
-            gl_fragment(d, x, y, col, l0 * v[0]->z + l1 * v[1]->z + l2 * v[2]->z);
+            gl_fragment_at(d, x, y, x + ox, y + oy, col, l0 * v[0]->z + l1 * v[1]->z + l2 * v[2]->z);
         }
     }
     ++display_version_;
@@ -390,9 +466,14 @@ void Impact::ge_clear_colour(const GeDraw& d, u32 colour) {
     int x0, x1, y0, y1;
     if (!gl_clear_rect(d, x0, x1, y0, y1)) return;
     const PixelTarget t = gl_target(d);
-    for (int fy = y0; fy <= y1; ++fy)
-        for (int fx = x0; fx <= x1; ++fx)
-            if (gl_visible(d, fx, fy)) store_pixel_to(t, fx, fy, colour);
+    for (int fy = y0; fy <= y1; ++fy) {
+        int a = x0, b = x1;
+        if (!mask_span(d, fy, a, b)) continue;
+        const RowTest visible = row_test(d, &cid_[std::size_t{static_cast<unsigned>(fy)} * kFbSize], fy);
+        const bool checks = visible.any();
+        for (int fx = a; fx <= b; ++fx)
+            if (!checks || visible(fx)) store_pixel_to(t, fx, fy, colour);
+    }
     ++display_version_;
 }
 
@@ -401,12 +482,18 @@ void Impact::ge_clear_zst(const GeDraw& d, bool depth, u32 value, u32 mask) {
     if (!gl_clear_rect(d, x0, x1, y0, y1)) return;
     const u32 m = depth ? mask & 0xFFFFFF : (mask & 0xFF) << 24;
     const u32 v = depth ? value & 0xFFFFFF : (value & 0xFF) << 24;
-    for (int fy = y0; fy <= y1; ++fy)
-        for (int fx = x0; fx <= x1; ++fx)
-            if (gl_visible(d, fx, fy)) {
-                u32& z = zst_at(fx, fy);
-                z = (z & ~m) | (v & m);
-            }
+    for (int fy = y0; fy <= y1; ++fy) {
+        int a = x0, b = x1;
+        if (!mask_span(d, fy, a, b)) continue;
+        const RowTest visible = row_test(d, &cid_[std::size_t{static_cast<unsigned>(fy)} * kFbSize], fy);
+        u32* row = &zst_at(a, fy);  // a row is contiguous
+        if (!visible.any()) {
+            for (int fx = a; fx <= b; ++fx, ++row) *row = (*row & ~m) | (v & m);
+            continue;
+        }
+        for (int fx = a; fx <= b; ++fx, ++row)
+            if (visible(fx)) *row = (*row & ~m) | (v & m);
+    }
 }
 
 }  // namespace sg::ip22

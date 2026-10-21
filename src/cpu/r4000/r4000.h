@@ -249,6 +249,13 @@ public:
     // Status before the exception).
     std::function<void(unsigned code, u64 pc, u64 status)> exception_hook;
 
+    // A system that faults uncached stores to memory (the R10000 Indigo2's
+    // ECC board in its fast mode): while on, a store to RAM through an
+    // uncached address is reported to `uncached_store_hook` (physical
+    // address); the store itself is done.
+    void set_uncached_store_check(bool on);
+    std::function<void(u64 paddr)> uncached_store_hook;
+
     // Side-effect-free translation and read, for debuggers and tracing.
     bool debug_translate(u64 vaddr, u64& paddr) const;
     bool debug_read32(u64 vaddr, u32& value) const;
@@ -472,11 +479,30 @@ private:
     void raise(Exc code, bool tlb_refill = false, bool xtlb = false, unsigned ce = 0);
     void address_error(u64 vaddr, Access acc);
     void tlb_exception(Exc code, u64 vaddr, bool refill, bool xtlb);
+    // An interrupt, or a delayed Watch exception whose EXL / ERL wait is over.
     bool interrupt_pending() const {
-        return (cause_ & status_ & sr::IM_MASK) != 0 && (status_ & (sr::IE | sr::EXL | sr::ERL)) == sr::IE;
+        return ((cause_ & status_ & sr::IM_MASK) != 0 && (status_ & (sr::IE | sr::EXL | sr::ERL)) == sr::IE) ||
+               (watch_delayed_ && !(status_ & (sr::EXL | sr::ERL)));
     }
+    void take_interrupt() {
+        if (watch_delayed_ && !(status_ & (sr::EXL | sr::ERL))) {
+            watch_delayed_ = false;
+            raise(Exc::WATCH);
+        } else {
+            raise(Exc::Int);
+        }
+    }
+    void watch_update();
     void timer_fire();
     void reschedule_timer();
+    void update_ip7();
+    u32 perf_mode_bit() const;
+    unsigned perf_kind(unsigned k) const;
+    void perf_sync();
+    bool perf_overflow() const;
+    u64 perf_overflow_time() const;
+    void perf_changed();
+    void perf_tlb_refill();
 
     // Address translation
     template <bool kRaise>
@@ -627,7 +653,9 @@ private:
     u64 weight_ = u64{1} << kCycleFracBits;    // charged per instruction
     u64 delay_weight_ = 0;                     // least charged per delay-loop instruction
     u64 instret_base_ = 0, instret_time_fp_ = 0, instret_skip_fp_ = 0;  // instructions() at the last re-base
-    u64 timer_event_fp_ = ~u64{0};             // Count == Compare, in time_fp_ units
+    u64 timer_event_fp_ = ~u64{0};             // Count == Compare or a counter overflow, in time_fp_ units
+    u64 compare_event_fp_ = ~u64{0};           // Count == Compare
+    bool timer_ip7_ = false;                   // Count reached Compare (cleared by a Compare write)
 
     // Loops are tracked per backward branch (nested loops each get an entry),
     // in a small direct-mapped table.
@@ -714,8 +742,20 @@ private:
     u32 index_ = 0, wired_ = 0, status_ = 0, cause_ = 0, compare_ = 0;
     u32 config_ = 0, prid_ = 0, pagemask_ = 0, count_offset_ = 0;
     u32 watchlo_ = 0, watchhi_ = 0, ecc_ = 0, cacheerr_ = 0, taglo_ = 0, taghi_ = 0, lladdr_ = 0;
+    // Watch: R (2) / W (1) enables, the watched doubleword's physical
+    // address, and a Watch exception waiting for EXL and ERL to clear.
+    u32 watch_ = 0;
+    u64 watch_addr_ = 0;
+    bool watch_delayed_ = false;
+    bool uncached_store_check_ = false;
     u32 framemask_ = 0;                 // R10000
     std::array<u32, 4> perf_{};         // R10000: control 0, counter 0, control 1, counter 1
+    // R10000 counters: any mode bit set in a control register; the control
+    // mode bit counting applies in now; the time counted up to, and the
+    // part of an instruction's time not yet counted.
+    bool perf_active_ = false;
+    u32 perf_bit_ = 0;
+    u64 perf_mark_fp_ = 0, perf_insn_rem_ = 0;
     u64 llvaddr_ = 0;  // the virtual address of the last LL (primary caches are virtually indexed)
     u64 entrylo0_ = 0, entrylo1_ = 0, context_ = 0, xcontext_ = 0, badvaddr_ = 0;
     u64 entryhi_ = 0, epc_ = 0, errorepc_ = 0;

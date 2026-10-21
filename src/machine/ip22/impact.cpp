@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "core/log.h"
+#include "core/worker_pool.h"
 
 namespace sg::ip22 {
 
@@ -95,7 +96,10 @@ Impact::Impact(Scheduler& scheduler, double cpu_hz)
       priv_(kPrivSize / 4),
       retrace_timer_(scheduler, [this] { retrace(); }),
       retrace_end_timer_(scheduler, [this] { set_line(kIrqRetrace, false); }) {
-    for (unsigned e = 0; e < 2; ++e) pixmem_[e].assign(std::size_t{kPages} * kTileWidth * kTileRows, 0);
+    for (unsigned e = 0; e < 2; ++e) {
+        pixmem_[e].assign(std::size_t{kPages} * kTileWidth * kTileRows, 0);
+        row_written_[e].assign(std::size_t{kPages} * kTileRows, 0);
+    }
     reset();
 }
 
@@ -160,6 +164,7 @@ void Impact::reset() {
     retrace_end_timer_.cancel();
     last_retrace_ = scheduler_.now();
     retrace_timer_.schedule_in(static_cast<u64>(cpu_hz_ / 60));
+    full_redraw_ = true;
     ++display_version_;
 }
 
@@ -879,13 +884,23 @@ void Impact::dcb_device_write(unsigned dev, unsigned crs, unsigned width, u32 da
         case kDevCmap0: cmap_write(0, crs, width, data); break;
         case kDevCmap1: cmap_write(1, crs, width, data); break;
         case kDevDac: dac_write(crs, width, data); break;
-        case kDevXmap: xmap_write(crs, width, data); break;
-        case kDevVc3: vc3_write(crs, width, data); break;
+        // The X server sets the XMAP's index every frame to poll it: only a
+        // write that changes what is shown makes the picture out of date.
+        case kDevXmap:
+            if (!xmap_write(crs, width, data)) return;
+            break;
+        case kDevVc3:
+            if (!vc3_write(crs, width, data)) return;
+            break;
         case kDevBoardVersion:
             if (crs == 1) board_version_written_ = static_cast<u8>(data);
             return;
         default: unknown("dcb write", dev << 10 | crs << 7, data); return;
     }
+    // The VC3 says for itself (a cursor move changes only its rows); the
+    // XMAP's config word shows only as the cursor's colours, which the X
+    // server switches back and forth while idle.
+    if (dev != kDevVc3 && !(dev == kDevXmap && crs == 2)) full_redraw_ = true;
     ++display_version_;
 }
 
@@ -964,23 +979,29 @@ u32 Impact::dac_read(unsigned crs) {
 
 // XMAP (in the PP1s): register files addressed by INDEX, written big-endian
 // a transfer's width at a time.
-void Impact::xmap_write(unsigned crs, unsigned width, u32 data) {
+bool Impact::xmap_write(unsigned crs, unsigned width, u32 data) {
     Xmap& x = xmap_;
     u8* file = nullptr;
     unsigned size = 0;
     switch (crs) {
-        case 0: x.pp1_select = static_cast<u8>(data); return;
-        case 1: x.index = static_cast<u8>(data); return;
+        case 0: x.pp1_select = static_cast<u8>(data); return false;
+        case 1: x.index = static_cast<u8>(data); return false;
         case 2: file = x.config.data(), size = 4; break;
         case 3: file = x.buf_select.data(), size = 4; break;
         case 4: file = x.main_mode.data(), size = 128; break;
         case 5: file = x.overlay_mode.data(), size = 128; break;
         case 6: file = x.dib.data(), size = static_cast<unsigned>(x.dib.size()); break;
-        default: unknown("xmap write", crs, data); return;
+        default: unknown("xmap write", crs, data); return false;
     }
-    if (x.index + width <= size) put_be_bytes(file + x.index, width, data);
-    else unknown("xmap index", crs << 8 | x.index, data);
+    bool changed = false;
+    if (x.index + width <= size) {
+        changed = be_bytes(file + x.index, width) != (width < 4 ? data & ((1u << (8 * width)) - 1) : data);
+        put_be_bytes(file + x.index, width, data);
+    } else {
+        unknown("xmap index", crs << 8 | x.index, data);
+    }
     if (crs >= 3 && (be_bytes(x.config.data(), 4) & (1u << 19))) x.index = static_cast<u8>(x.index + width);
+    return changed;
 }
 
 u32 Impact::xmap_read(unsigned crs, unsigned width) {
@@ -1006,29 +1027,45 @@ u32 Impact::xmap_read(unsigned crs, unsigned width) {
 
 // VC3: 32 indexed 16-bit registers and 32K words of SRAM (timing, window ID
 // tables, cursor glyph).
-void Impact::vc3_write(unsigned crs, unsigned width, u32 data) {
+bool Impact::vc3_write(unsigned crs, unsigned width, u32 data) {
     Vc3& v = vc3_;
+    // A register write shows only if its value changes (the SRAM pointer
+    // never shows); an SRAM write likewise. Only a move of the cursor
+    // leaves the rest of the picture as it was.
+    auto set_reg = [this, &v](unsigned r, u16 value) {
+        const bool changed = v.regs[r] != value && r != kVc3SramPtr;
+        v.regs[r] = value;
+        if (changed && r != kVc3CursorX && r != kVc3CursorY) full_redraw_ = true;
+        return changed;
+    };
+    auto set_sram = [this, &v](u32 at, u16 value) {
+        const bool changed = v.sram[at & 0x7FFF] != value;
+        v.sram[at & 0x7FFF] = value;
+        if (changed) full_redraw_ = true;
+        return changed;
+    };
     switch (crs) {
         case 0:
-            if (width == 3) v.regs[(data >> 16) & 31] = static_cast<u16>(data);
-            else if (width == 1) v.index = data & 31;
+            if (width == 3) return set_reg((data >> 16) & 31, static_cast<u16>(data));
+            if (width == 1) v.index = data & 31;
             else unknown("vc3 crs0", width, data);
-            break;
-        case 1: v.regs[v.index] = static_cast<u16>(data); break;
+            return false;
+        case 1: return set_reg(v.index, static_cast<u16>(data));
         case 3: {
             u32 ptr = v.regs[kVc3SramPtr] & 0x7FFF;
+            bool changed;
             if (width == 4) {
-                v.sram[ptr] = static_cast<u16>(data >> 16);
-                v.sram[(ptr + 1) & 0x7FFF] = static_cast<u16>(data);
+                changed = set_sram(ptr, static_cast<u16>(data >> 16));
+                changed |= set_sram(ptr + 1, static_cast<u16>(data));
                 ptr += 2;
             } else {
-                v.sram[ptr] = static_cast<u16>(data);
+                changed = set_sram(ptr, static_cast<u16>(data));
                 ptr += 1;
             }
             v.regs[kVc3SramPtr] = static_cast<u16>(ptr & 0x7FFF);
-            break;
+            return changed;
         }
-        default: unknown("vc3 write", crs, data); break;
+        default: unknown("vc3 write", crs, data); return false;
     }
 }
 
@@ -1604,21 +1641,6 @@ void Impact::dma_run(u32 word) {
     }
 }
 
-u64* Impact::word_at(unsigned page, int fx, int fy) {
-    return const_cast<u64*>(static_cast<const Impact*>(this)->word_at(page, fx, fy));
-}
-
-// Pixel memory: a buffer is a run of pages from `page`, each a 192 x 16 tile,
-// DRBsize bits 5:2 tiles to a row. With two raster engines each holds every
-// other row.
-const u64* Impact::word_at(unsigned page, int fx, int fy) const {
-    const unsigned two = engines() == 2 && !pixmem_[1].empty();
-    const unsigned engine = two ? fy & 1 : 0, row = two ? static_cast<unsigned>(fy) >> 1 : static_cast<unsigned>(fy);
-    const unsigned tiles = std::max(1u, (rss_[kDrbSize] >> 2) & 15);
-    const unsigned pg = (page + row / kTileRows * tiles + static_cast<unsigned>(fx) / kTileWidth) & (kPages - 1);
-    return &pixmem_[engine][std::size_t{pg} * kTileWidth * kTileRows + (row % kTileRows) * kTileWidth + fx % kTileWidth];
-}
-
 u64 Impact::pixel_word(unsigned page, int fx, int fy) const { return *word_at(page, fx, fy); }
 
 // The overlay: 768 x 16 pixel pages of 9-bit pixels, four to a word.
@@ -1632,8 +1654,11 @@ const u64* Impact::overlay_word(unsigned page, int fx, int fy, unsigned& shift) 
     return &pixmem_[engine][std::size_t{pg} * kTileWidth * kTileRows + p / 4];
 }
 
+// The writable form notes the page row written for render().
 u64* Impact::overlay_word(unsigned page, int fx, int fy, unsigned& shift) {
-    return const_cast<u64*>(static_cast<const Impact*>(this)->overlay_word(page, fx, fy, shift));
+    u64* p = const_cast<u64*>(static_cast<const Impact*>(this)->overlay_word(page, fx, fy, shift));
+    mark_written(engine_of(fy), p);  // an overlay page row is one main page row's words
+    return p;
 }
 
 u32 Impact::overlay_pixel(unsigned page, int fx, int fy) const {
@@ -1768,15 +1793,17 @@ unsigned Impact::did_table_lines(u32 table) const {
 // line table, each lasting until the next starts.
 void Impact::did_row(u32 table, unsigned row, unsigned width, std::vector<u8>& dids) const {
     dids.assign(width, 0);
-    u32 line = vc3_.sram[(table + row) & 0x7FFF];
+    u8* d = dids.data();
+    const u16* sram = vc3_.sram.data();
+    const u32 line = sram[(table + row) & 0x7FFF];
     for (unsigned k = 0; k < 256; ++k) {
-        const u16 e = vc3_.sram[(line + k) & 0x7FFF];
+        const u16 e = sram[(line + k) & 0x7FFF];
         const unsigned x = e >> 5;
         if (x >= 0x7FF) break;
-        const u16 next = vc3_.sram[(line + k + 1) & 0x7FFF];
+        const u16 next = sram[(line + k + 1) & 0x7FFF];
         unsigned end = next >> 5;
         if (end <= x || end > width) end = width;
-        for (unsigned i = x; i < end && i < width; ++i) dids[i] = e & 31;
+        if (x < end) std::fill(d + x, d + end, static_cast<u8>(e & 31));
     }
 }
 
@@ -1794,81 +1821,213 @@ void Impact::display_size(unsigned& width, unsigned& height) const {
         if (s.h == lines) width = s.w, height = s.h;
 }
 
-u32 Impact::scan_pixel(unsigned x, unsigned row, unsigned height, u8 did, u8 odid) const {
-    const int fx = static_cast<int>(x), fy = static_cast<int>(height - 1 - row);
-    const u32 dib = be_bytes(xmap_.dib.data(), 4);
-    const std::vector<u32>& cmap = cmap_[0].entries;
-    u32 rgb;
-    const u32 omode = be_bytes(xmap_.overlay_mode.data() + 4 * odid, 4);
-    const u32 ov = omode ? overlay_pixel((dib >> 20) & 0x3FF, fx, fy) & 0xFF : 0;
-    if (ov) {
-        rgb = cmap[(((omode >> 3) & 31) * 256 + ov) & 0x1FFF];
-        rgb = ((rgb >> 16) & 0xFF) | (rgb & 0xFF00) | ((rgb & 0xFF) << 16);  // as 0xBBGGRR below
-    } else {
-        const u32 mode = be_bytes(xmap_.main_mode.data() + 4 * did, 4), fmt = mode & 31;
-        const bool buf_b = (be_bytes(xmap_.buf_select.data(), 4) >> did) & 1;
-        const unsigned page_a = dib & 0x3FF, page_b = (dib >> 10) & 0x3FF;
-        if (fmt < 4) {  // colour index
-            const u64 w = pixel_word(page_a, fx, fy);
-            u32 idx = static_cast<u32>(buf_b ? w >> 12 : w) & 0xFFF;
-            if (fmt == 1) idx &= 0xFF;
-            const u32 c = cmap[(((mode >> 5) & 31) * 256 + idx) & 0x1FFF];
-            rgb = ((c >> 16) & 0xFF) | (c & 0xFF00) | ((c & 0xFF) << 16);
-        } else if (fmt == 5) {  // 4:4:4 pairs
-            const u32 h = static_cast<u32>(pixel_word(page_a, fx, fy) >> (buf_b ? 12 : 0)) & 0xFFF;
-            rgb = ((h & 15) * 17) | (((h >> 4) & 15) * 17) << 8 | (((h >> 8) & 15) * 17) << 16;
-        } else if (fmt == 7) {  // 5:5:5 pairs
-            const u32 h = static_cast<u32>(pixel_word(page_a, fx, fy) >> (buf_b ? 15 : 0)) & 0x7FFF;
-            auto e = [](u32 c) { return (c << 3) | (c >> 2); };
-            rgb = e(h & 31) | e((h >> 5) & 31) << 8 | e((h >> 10) & 31) << 16;
-        } else {  // 24-bit (and 12:12:12): 0x00BBGGRR
-            rgb = static_cast<u32>(pixel_word(buf_b ? page_b : page_a, fx, fy)) & 0xFFFFFF;
-        }
-    }
-    return rgb;  // 0x00BBGGRR
+Impact::Shown Impact::shown() const {
+    Shown s;
+    const u16 cc = vc3_.regs[kVc3CursorControl];
+    s.cursor = (cc & 3) == 3;
+    s.cursor_size = (cc & 8) ? 64 : 32;
+    s.cursor_x = static_cast<int>(vc3_.regs[kVc3CursorX]) - 31;
+    s.cursor_y = static_cast<int>(vc3_.regs[kVc3CursorY]) - 31;
+    s.cursor_base = be_bytes(xmap_.config.data(), 4) & 0x7FF;
+    s.two = engines() == 2 && !pixmem_[1].empty();
+    s.tiles = std::max(1u, (rss_[kDrbSize] >> 2) & 15);
+    s.overlay_tiles = std::max(1u, rss_[kDrbSize] & 3);
+    display_size(s.width, s.height);
+    return s;
 }
 
+// As render_full(), but converting only the rows that show a page row
+// written since the last call, or that the cursor left or entered.
 bool Impact::render(std::vector<u32>& argb, unsigned& width, unsigned& height) {
-    return render_full(argb, width, height);
+    const Shown now = shown();
+    width = now.width, height = now.height;
+    const std::size_t total = std::size_t{width} * height;
+    if (!dac_.regs[4]) {  // pixel read mask 0: blank
+        argb.assign(total, 0xFF000000u);
+        full_redraw_ = true;
+        return true;
+    }
+    const bool full = full_redraw_ || argb.size() != total || now.two != shown_.two || now.tiles != shown_.tiles ||
+                      now.overlay_tiles != shown_.overlay_tiles || now.width != shown_.width ||
+                      now.height != shown_.height;
+    std::vector<u8> rows;
+    if (full) {
+        argb.resize(total);
+    } else {
+        rows.assign(height, 0);
+        bool any = false;
+        // The page rows a screen row shows: both buffers and the overlay.
+        const u32 dib = be_bytes(xmap_.dib.data(), 4);
+        const unsigned pages[] = {dib & 0x3FF, (dib >> 10) & 0x3FF};
+        const unsigned overlay_page = (dib >> 20) & 0x3FF;
+        const unsigned spans = (width + kTileWidth - 1) / kTileWidth, ospans = (width + kOverlayTileWidth - 1) / kOverlayTileWidth;
+        for (unsigned row = 0; row < height; ++row) {
+            const unsigned fy = height - 1 - row;
+            const unsigned engine = now.two ? fy & 1 : 0, mrow = now.two ? fy >> 1 : fy;
+            const u8* written = row_written_[engine].data();
+            auto shows = [&](unsigned page, unsigned tiles, unsigned n) {
+                for (unsigned k = 0; k < n; ++k)
+                    if (written[((page + mrow / kTileRows * tiles + k) & (kPages - 1)) * kTileRows + mrow % kTileRows]) return true;
+                return false;
+            };
+            if (shows(pages[0], now.tiles, spans) || shows(pages[1], now.tiles, spans) ||
+                shows(overlay_page, now.overlay_tiles, ospans))
+                rows[row] = 1, any = true;
+        }
+        if (!(now == shown_)) {  // the cursor moved, came or went, or changed colour
+            for (const Shown* c : {static_cast<const Shown*>(&shown_), &now}) {
+                if (!c->cursor) continue;
+                for (int y = std::max(c->cursor_y, 0); y < std::min(c->cursor_y + c->cursor_size, static_cast<int>(height)); ++y)
+                    rows[static_cast<unsigned>(y)] = 1, any = true;
+            }
+        }
+        if (!any) rows.clear();  // nothing to convert
+    }
+    if (full || !rows.empty()) scan_out(argb, width, height, full ? nullptr : rows.data());
+    for (auto& w : row_written_) std::fill(w.begin(), w.end(), u8{0});
+    full_redraw_ = false;
+    shown_ = now;
+    return true;
 }
 
 bool Impact::render_full(std::vector<u32>& argb, unsigned& width, unsigned& height) const {
     display_size(width, height);
     argb.assign(std::size_t{width} * height, 0xFF000000u);
     if (!dac_.regs[4]) return true;  // pixel read mask 0: blank
+    scan_out(argb, width, height, nullptr);
+    return true;
+}
+
+void Impact::scan_out(std::vector<u32>& argb, unsigned width, unsigned height, const u8* rows) const {
     const u32 main_table = vc3_.regs[kVc3MainDids], overlay_table = vc3_.regs[kVc3OverlayDids];
-    std::vector<u8> dids, odids;
     const u16 cc = vc3_.regs[kVc3CursorControl];
     const bool cursor = (cc & 3) == 3;
     const int csize = (cc & 8) ? 64 : 32, cwords = csize / 16;
     const int cx = static_cast<int>(vc3_.regs[kVc3CursorX]) - 31, cy = static_cast<int>(vc3_.regs[kVc3CursorY]) - 31;
     const u32 cbase = (be_bytes(xmap_.config.data(), 4) & 0x7FF) * 4;
-    for (unsigned row = 0; row < height; ++row) {
-        if (main_table) did_row(main_table, row, width, dids);
-        else dids.assign(width, 0);
-        if (overlay_table) did_row(overlay_table, row, width, odids);
-        else odids.assign(width, 0);
-        for (unsigned x = 0; x < width; ++x) {
-            u32 bgr = scan_pixel(x, row, height, dids[x], odids[x]);
-            if (cursor) {
-                const int gx = static_cast<int>(x) - cx, gy = static_cast<int>(row) - cy;
-                if (gx >= 0 && gy >= 0 && gx < csize && gy < csize) {
+
+    // What stays the same for the whole frame, worked out once: the XMAP's
+    // modes for each window ID, the buffer pages, the memory layout and the
+    // RAMDAC's gamma as ready ARGB parts.
+    const u32 dib = be_bytes(xmap_.dib.data(), 4), buf_select = be_bytes(xmap_.buf_select.data(), 4);
+    const unsigned page_a = dib & 0x3FF, page_b = (dib >> 10) & 0x3FF, overlay_page = (dib >> 20) & 0x3FF;
+    std::array<u32, 32> modes{}, omodes{};
+    for (unsigned d = 0; d < 32; ++d) {
+        modes[d] = be_bytes(xmap_.main_mode.data() + 4 * d, 4);
+        omodes[d] = be_bytes(xmap_.overlay_mode.data() + 4 * d, 4);
+    }
+    const u32* cmap = cmap_[0].entries.data();
+    auto bgr_of = [](u32 c) { return ((c >> 16) & 0xFF) | (c & 0xFF00) | ((c & 0xFF) << 16); };
+    std::array<u32, 256> gr{}, gg{}, gb{};
+    for (unsigned i = 0; i < 256; ++i) {
+        gr[i] = 0xFF000000u | (u32{dac_.gamma[i][0]} >> 2) << 16;
+        gg[i] = (u32{dac_.gamma[i][1]} >> 2) << 8;
+        gb[i] = u32{dac_.gamma[i][2]} >> 2;
+    }
+    const u32 *r_of = gr.data(), *g_of = gg.data(), *b_of = gb.data();
+    auto argb_of = [=](u32 bgr) { return r_of[bgr & 0xFF] | g_of[(bgr >> 8) & 0xFF] | b_of[(bgr >> 16) & 0xFF]; };
+    // The colour map as shown, through the gamma tables.
+    std::vector<u32> shown(8192);
+    for (unsigned i = 0; i < 8192; ++i) shown[i] = argb_of(bgr_of(cmap[i]));
+    const u32* shown_cmap = shown.data();
+    const bool two = engines() == 2 && !pixmem_[1].empty();
+    const unsigned tiles = std::max(1u, (rss_[kDrbSize] >> 2) & 15), otiles = std::max(1u, rss_[kDrbSize] & 3);
+    constexpr std::size_t kPageWords = std::size_t{kTileWidth} * kTileRows;
+
+    // Rows are independent: several threads share them out (the machine is
+    // stopped meanwhile).
+    WorkerPool::shared().run(height, [&](unsigned first, unsigned last) {
+        std::vector<u8> dids, odids;
+        for (unsigned row = first; row < last; ++row) {
+            if (rows && !rows[row]) continue;
+            if (main_table) did_row(main_table, row, width, dids);
+            else dids.assign(width, 0);
+            if (overlay_table) did_row(overlay_table, row, width, odids);
+            else odids.assign(width, 0);
+            // This row's place in pixel memory (see word_at and overlay_word).
+            const unsigned fy = height - 1 - row;
+            const unsigned engine = two ? fy & 1 : 0, mrow = two ? fy >> 1 : fy;
+            const u64* mem = pixmem_[engine].data();
+            const unsigned row_pages = mrow / kTileRows * tiles, orow_pages = mrow / kTileRows * otiles;
+            const std::size_t row_off = std::size_t{mrow % kTileRows} * kTileWidth;
+            const unsigned orow_off = (mrow % kTileRows) * kOverlayTileWidth;
+            u32* out = &argb[std::size_t{row} * width];
+
+            // The main planes, a run of one window ID at a time, a page row
+            // at a time within it.
+            for (unsigned x0 = 0; x0 < width;) {
+                const u8 did = dids[x0];
+                unsigned x1 = x0 + 1;
+                while (x1 < width && dids[x1] == did) ++x1;
+                const u32 mode = modes[did], fmt = mode & 31;
+                const bool buf_b = (buf_select >> did) & 1;
+                const unsigned page = fmt != 5 && fmt != 7 && fmt >= 4 && buf_b ? page_b : page_a;
+                auto each = [=](auto convert) {
+                    for (unsigned x = x0; x < x1;) {
+                        const unsigned tile = x / kTileWidth, end = std::min(x1, (tile + 1) * kTileWidth);
+                        const u64* w = mem + ((page + row_pages + tile) & (kPages - 1)) * kPageWords + row_off + x % kTileWidth;
+                        for (u32 *o = out + x, *e = out + end; o < e; ++o, ++w) *o = convert(*w);
+                        x = end;
+                    }
+                };
+                if (fmt < 4) {  // colour index
+                    const unsigned shift = buf_b ? 12 : 0, keep = fmt == 1 ? 0xFF : 0xFFF, base = ((mode >> 5) & 31) * 256;
+                    each([=](u64 w) { return shown_cmap[(base + (static_cast<u32>(w >> shift) & keep)) & 0x1FFF]; });
+                } else if (fmt == 5) {  // 4:4:4 pairs
+                    const unsigned shift = buf_b ? 12 : 0;
+                    each([=](u64 w) {
+                        const u32 h = static_cast<u32>(w >> shift) & 0xFFF;
+                        return argb_of(((h & 15) * 17) | (((h >> 4) & 15) * 17) << 8 | (((h >> 8) & 15) * 17) << 16);
+                    });
+                } else if (fmt == 7) {  // 5:5:5 pairs
+                    const unsigned shift = buf_b ? 15 : 0;
+                    each([=](u64 w) {
+                        const u32 h = static_cast<u32>(w >> shift) & 0x7FFF;
+                        auto e = [](u32 c) { return (c << 3) | (c >> 2); };
+                        return argb_of(e(h & 31) | e((h >> 5) & 31) << 8 | e((h >> 10) & 31) << 16);
+                    });
+                } else {  // 24-bit (and 12:12:12): 0x00BBGGRR
+                    each([=](u64 w) { return argb_of(static_cast<u32>(w) & 0xFFFFFF); });
+                }
+                x0 = x1;
+            }
+
+            // The overlay, where its window's mode shows it and it is not 0.
+            for (unsigned x0 = 0; x0 < width;) {
+                const u8 odid = odids[x0];
+                unsigned x1 = x0 + 1;
+                while (x1 < width && odids[x1] == odid) ++x1;
+                if (const u32 omode = omodes[odid]) {
+                    // Four pixels to a word, most of them usually clear.
+                    constexpr u64 kAll = 0xFFull | 0xFFull << 9 | 0xFFull << 18 | 0xFFull << 27;
+                    const unsigned base = ((omode >> 3) & 31) * 256;
+                    for (unsigned x = x0; x < x1;) {
+                        const unsigned pg = (overlay_page + orow_pages + x / kOverlayTileWidth) & (kPages - 1);
+                        const unsigned p = orow_off + x % kOverlayTileWidth;
+                        const u64 word = mem[pg * kPageWords + p / 4];
+                        const unsigned end = std::min(x1, x + 4 - p % 4);
+                        if (word & kAll)
+                            for (unsigned i = x, q = p % 4; i < end; ++i, ++q)
+                                if (const u32 ov = static_cast<u32>(word >> (9 * q)) & 0xFF) out[i] = shown_cmap[(base + ov) & 0x1FFF];
+                        x = end;
+                    }
+                }
+                x0 = x1;
+            }
+
+            // The cursor on top.
+            const int gy = static_cast<int>(row) - cy;
+            if (cursor && gy >= 0 && gy < csize) {
+                for (int gx = std::max(0, -cx); gx < csize && cx + gx < static_cast<int>(width); ++gx) {
                     const u32 at = vc3_.regs[kVc3CursorGlyph] + gy * cwords + gx / 16;
                     const unsigned bit = 15 - gx % 16;
                     const unsigned v = ((vc3_.sram[at & 0x7FFF] >> bit) & 1) |
                                        (((vc3_.sram[(at + csize * cwords) & 0x7FFF] >> bit) & 1) << 1);
-                    if (v) {
-                        const u32 c = cbase + v < 8192 ? cmap_[0].entries[cbase + v] : 0xFFFFFF;
-                        bgr = ((c >> 16) & 0xFF) | (c & 0xFF00) | ((c & 0xFF) << 16);
-                    }
+                    if (v) out[cx + gx] = argb_of(bgr_of(cbase + v < 8192 ? cmap_[0].entries[cbase + v] : 0xFFFFFF));
                 }
             }
-            const u32 r = dac_.gamma[bgr & 0xFF][0] >> 2, g = dac_.gamma[(bgr >> 8) & 0xFF][1] >> 2,
-                      b = dac_.gamma[(bgr >> 16) & 0xFF][2] >> 2;
-            argb[std::size_t{row} * width + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
-    }
-    return true;
+    });
 }
 
 bool Impact::cursor_position(int& x, int& y) const {
