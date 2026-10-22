@@ -34,8 +34,8 @@ bool prom_fits(const PromImage& p, const Settings& s, std::string& why);
 // The folder searched for PROMs: the setting, else "roms" in the current
 // folder if there is one, else the user's SiliconGhost roms folder.
 std::string prom_folder(const Settings& s);
-// The PROM for the configuration: the chosen file (`s.prom`) if any, else
-// the newest suitable one in the PROM folder. False, with a message saying
+// The PROM for the configuration: the newest suitable one in the PROM
+// folder. False, with a message saying
 // what is needed and where it was looked for, if there is none.
 bool select_prom(const Settings& s, PromImage& out, std::string& error);
 

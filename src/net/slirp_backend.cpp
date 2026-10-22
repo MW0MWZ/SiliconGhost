@@ -4,10 +4,15 @@
 
 #if defined(SG_HAVE_SLIRP)
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#endif
 
 #include <libslirp.h>  // pkg-config's include path is the slirp directory itself
 
@@ -19,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 // libslirp 4.9 replaced the descriptor-based polling interface with a
 // socket-based one (SlirpConfig version 6); older releases only have the
@@ -28,10 +34,31 @@
 #define SG_SLIRP_SOCKETS 1
 #endif
 #endif
+#if defined(_WIN32) && !defined(SG_SLIRP_SOCKETS)
+#error "user-mode networking on Windows needs libslirp 4.9 or later"
+#endif
 
 namespace sg::net {
 
 namespace {
+
+// What libslirp's polling hands over, and the loop's own wake-up channel: a
+// pipe on Unix, a connected pair of loopback UDP sockets on Windows (whose
+// WSAPoll takes only sockets).
+#if defined(SG_SLIRP_SOCKETS)
+using PollHandle = slirp_os_socket;
+#else
+using PollHandle = int;
+#endif
+#if defined(_WIN32)
+using WakeHandle = SOCKET;
+constexpr WakeHandle kNoWake = INVALID_SOCKET;
+int poll_handles(pollfd* fds, std::size_t n, int timeout) { return WSAPoll(fds, static_cast<ULONG>(n), timeout); }
+#else
+using WakeHandle = int;
+constexpr WakeHandle kNoWake = -1;
+int poll_handles(pollfd* fds, std::size_t n, int timeout) { return poll(fds, n, timeout); }
+#endif
 
 // libslirp is not thread-safe: every call into it holds `mutex_`. It runs on
 // its own thread, which polls its sockets; the guest's frames are handed to
@@ -39,11 +66,7 @@ namespace {
 class SlirpBackend final : public NetBackend {
 public:
     bool start(const std::vector<PortForward>& forwards, std::string& error) {
-        if (pipe(wake_) != 0) {
-            error = "cannot create a pipe";
-            return false;
-        }
-        for (int fd : wake_) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        if (!make_wake(error)) return false;
 
         SlirpConfig cfg{};
 #if defined(SG_SLIRP_SOCKETS)
@@ -65,9 +88,11 @@ public:
         static std::once_flag callbacks_set;
         std::call_once(callbacks_set, [] {
             SlirpCb& cb = callbacks;
-            cb.send_packet = [](const void* buf, size_t len, void* opaque) -> slirp_ssize_t {
+            // (Its result type is slirp_ssize_t from 4.8, ssize_t before.)
+            using Sent = std::invoke_result_t<decltype(SlirpCb::send_packet), const void*, size_t, void*>;
+            cb.send_packet = [](const void* buf, size_t len, void* opaque) -> Sent {
                 static_cast<SlirpBackend*>(opaque)->deliver(static_cast<const u8*>(buf), len);
-                return static_cast<slirp_ssize_t>(len);
+                return static_cast<Sent>(len);
             };
             cb.guest_error = [](const char*, void*) {};
             cb.clock_get_ns = [](void*) -> int64_t {
@@ -123,8 +148,8 @@ public:
         wake();
         if (thread_.joinable()) thread_.join();
         if (slirp_) slirp_cleanup(slirp_);
-        for (int fd : wake_)
-            if (fd >= 0) close(fd);
+        for (WakeHandle h : wake_)
+            if (h != kNoWake) close_wake(h);
     }
 
     void send(const u8* frame, std::size_t length) override {
@@ -142,10 +167,60 @@ private:
         int64_t expire_ms;  // -1: not armed
     };
 
+#if defined(_WIN32)
+    bool make_wake(std::string& error) {
+        static std::once_flag started;
+        std::call_once(started, [] {
+            WSADATA data;
+            WSAStartup(MAKEWORD(2, 2), &data);
+        });
+        sockaddr_in at{};
+        at.sin_family = AF_INET;
+        at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int len = sizeof at;
+        wake_[0] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        wake_[1] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (wake_[0] == INVALID_SOCKET || wake_[1] == INVALID_SOCKET ||
+            bind(wake_[0], reinterpret_cast<sockaddr*>(&at), sizeof at) != 0 ||
+            getsockname(wake_[0], reinterpret_cast<sockaddr*>(&at), &len) != 0 ||
+            connect(wake_[1], reinterpret_cast<sockaddr*>(&at), sizeof at) != 0) {
+            error = "cannot create the network thread's wake-up sockets";
+            return false;
+        }
+        u_long on = 1;
+        for (SOCKET h : wake_) ioctlsocket(h, FIONBIO, &on);
+        return true;
+    }
+    static void close_wake(WakeHandle h) { closesocket(h); }
+    void wake() {
+        const char c = 0;
+        ::send(wake_[1], &c, 1, 0);
+    }
+    void drain_wake() {
+        char buf[64];
+        while (::recv(wake_[0], buf, sizeof buf, 0) > 0) {
+        }
+    }
+#else
+    bool make_wake(std::string& error) {
+        if (pipe(wake_) != 0) {
+            error = "cannot create a pipe";
+            return false;
+        }
+        for (int fd : wake_) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        return true;
+    }
+    static void close_wake(WakeHandle h) { close(h); }
     void wake() {
         const char c = 0;
         [[maybe_unused]] const ssize_t n = write(wake_[1], &c, 1);
     }
+    void drain_wake() {
+        char buf[64];
+        while (read(wake_[0], buf, sizeof buf) > 0) {
+        }
+    }
+#endif
 
     static int64_t now_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -165,12 +240,14 @@ private:
                 slirp_pollfds_fill(
 #endif
                     slirp_, &timeout,
-                    [](int fd, int events, void* opaque) {
+                    [](PollHandle fd, int events, void* opaque) {
                         auto& v = static_cast<SlirpBackend*>(opaque)->fds_;
                         short e = 0;
                         if (events & SLIRP_POLL_IN) e |= POLLIN;
                         if (events & SLIRP_POLL_OUT) e |= POLLOUT;
+#if !defined(_WIN32)  // WSAPoll refuses POLLPRI: urgent data then waits for the next read
                         if (events & SLIRP_POLL_PRI) e |= POLLPRI;
+#endif
                         v->push_back(pollfd{fd, e, 0});
                         return static_cast<int>(v->size() - 1);
                     },
@@ -180,12 +257,8 @@ private:
                         timeout = static_cast<uint32_t>(
                             std::max<int64_t>(0, std::min<int64_t>(timeout, t->expire_ms - now_ms())));
             }
-            const int ready = poll(fds.data(), fds.size(), static_cast<int>(timeout));
-            if (fds[0].revents & POLLIN) {
-                char buf[64];
-                while (read(wake_[0], buf, sizeof buf) > 0) {
-                }
-            }
+            const int ready = poll_handles(fds.data(), fds.size(), static_cast<int>(timeout));
+            if (fds[0].revents & POLLIN) drain_wake();
             std::lock_guard<std::mutex> lock(mutex_);
             fds_ = &fds;
             slirp_pollfds_poll(
@@ -225,7 +298,7 @@ private:
     std::mutex mutex_;
     std::vector<pollfd>* fds_ = nullptr;
     std::vector<std::unique_ptr<Timer>> timers_;
-    int wake_[2] = {-1, -1};
+    WakeHandle wake_[2] = {kNoWake, kNoWake};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };

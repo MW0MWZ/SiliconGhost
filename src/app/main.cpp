@@ -47,11 +47,12 @@ void on_disc_signal(int) { g_next_disc = 1; }
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
+                 "SiliconGhost %s\n"
                  "usage: %s [options]\n"
                  "With no options the window opens with the machine off and the last settings.\n"
+                 "  --version        print the version and exit\n"
                  "  --prom-dir DIR   folder of boot PROM images; the one the machine needs is chosen\n"
                  "                   (default: ./roms, else roms in the SiliconGhost folder)\n"
-                 "  --prom FILE      a specific boot PROM image instead (raw, big-endian)\n"
                  "  --nvram FILE     DS1386 NVRAM image, loaded at start and saved when it changes\n"
                  "  --disk FILE      SCSI disk image (ID 1)\n"
                  "  --cdrom FILE     SCSI CD-ROM image (ID 4), e.g. a raw dump of IRIX media; give it\n"
@@ -64,7 +65,7 @@ void usage(const char* argv0) {
                  "  --settings FILE  start from a settings file saved by the window (options after it\n"
                  "                   override it)\n"
                  "  --mac ADDR       Ethernet address stored in NVRAM (default 08:00:69:0c:5e:01 if unset)\n",
-                 argv0);
+                 SG_VERSION, argv0);
     // Only the network connections this build and host can make.
     const bool user = sg::net::slirp_available(), tap = sg::net::tap_available();
     std::fputs("  --net MODE       ", stderr);
@@ -104,18 +105,12 @@ void usage(const char* argv0) {
                  "  --timing MODE    realtime: guest clocks follow the host clock and the CPU runs as\n"
                  "                             fast as the host allows (default)\n"
                  "                   cycle:    one cycle per instruction, reproducible; waits when ahead\n"
-                 "                   max:      as realtime without --max-speed, and disk and Ethernet as\n"
-                 "                             fast as the host allows\n"
+                 "                   max:      as realtime, with disk and Ethernet as fast as the\n"
+                 "                             host allows\n"
                  "                   free:     no waiting; guest time runs ahead (default with --max)\n"
-                 "  --timed-speed X  realtime, max: the CPU runs X times as fast as the real one while the\n"
-                 "                   system times it (default 2; delay loops run at the real speed,\n"
-                 "                   or this one if slower)\n"
-                 "  --max-speed X    realtime: run the CPU at most X times as fast as the real one\n"
-                 "                   (default 0: as fast as the host allows)\n"
                  "  --no-idle-skip   execute idle loops instead of skipping to the next event\n"
-                 "  --quick-scsi-scan     realtime, cycle: absent SCSI targets answer within 1 ms instead of\n"
-                 "                        the controller's programmed timeout (always so with max timing)\n"
-                 "  --no-quick-scsi-scan  full selection timeouts in every timing mode\n"
+                 "  --no-quick-scsi-scan  absent SCSI targets answer after the controller's programmed\n"
+                 "                   timeout, not within 1 ms\n"
                  "  --no-block-cache interpret every instruction individually (for comparison)\n"
                  "%s"
                  "  --no-audio       do not play the machine's audio output\n"
@@ -278,12 +273,12 @@ int main(int argc, char** argv) {
         static const struct {
             const char* flag;
             const char* key;
-        } kValued[] = {{"--prom", "prom"},   {"--prom-dir", "prom_dir"},  {"--nvram", "nvram"},     {"--disk", "disk"},
+        } kValued[] = {{"--prom-dir", "prom_dir"},  {"--nvram", "nvram"},     {"--disk", "disk"},
                        {"--cdrom", "cdrom"}, {"--mac", "mac"},         {"--net", "net"},
                        {"--hostfwd", "hostfwd"}, {"--ram", "ram_mb"},  {"--cpu", "cpu"},  {"--machine", "machine"},
                        {"--cpu-mhz", "cpu_mhz"}, {"--graphics", "graphics"},
                        {"--graphics-rev", "graphics_rev"}, {"--console", "console"}, {"--timing", "timing"},
-                       {"--timed-speed", "timed_speed"}, {"--max-speed", "max_speed"},
+
                        {"--log", "log"}};
         static const struct {
             const char* flag;
@@ -291,7 +286,7 @@ int main(int argc, char** argv) {
             const char* value;
         } kSwitches[] = {{"--no-graphics", "graphics", "0"}, {"--no-idle-skip", "idle_skip", "0"},
                          {"--no-block-cache", "block_cache", "0"}, {"--no-jit", "jit", "0"},
-                         {"--quick-scsi-scan", "quick_scsi_scan", "1"}, {"--no-quick-scsi-scan", "quick_scsi_scan_all", "0"},
+                         {"--no-quick-scsi-scan", "quick_scsi_scan", "0"},
                          {"--no-audio", "audio", "0"},        {"--audio-in", "audio_in", "1"}};
         std::string key, value, error;
         for (const auto& v : kValued)
@@ -328,7 +323,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--dump-state")) dump = true;
         else if (!std::strcmp(a, "--headless")) headless = true;
         else if (!std::strcmp(a, "--foreground")) foreground = true;
-        else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
+        else if (!std::strcmp(a, "--version")) {
+            std::printf("SiliconGhost %s\n", SG_VERSION);
+            return 0;
+        } else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) {
             usage(argv[0]);
             return 0;
         } else {

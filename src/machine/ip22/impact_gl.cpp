@@ -35,6 +35,10 @@ bool compare(u32 func, double a, double b) {
 // (adding the half in double is exact for any float).
 u8 to8(float c) { return static_cast<u8>(static_cast<int>(static_cast<double>(std::clamp(c, 0.0f, 1.0f) * 255.0f) + 0.5)); }
 
+// A colour as RGBA 8888; a depth in buffer units as the stored 24 bits.
+u32 pack(const float* c) { return to8(c[0]) | to8(c[1]) << 8 | to8(c[2]) << 16 | u32{to8(c[3])} << 24; }
+u32 depth_value(float z) { return static_cast<u32>(std::clamp(z, 0.0f, ImpactGe::kZMax) + 0.5f) & 0xFFFFFF; }
+
 // The part of framebuffer row fy, cut to [x0, x1], inside every screen mask
 // that keeps its inside; false if there is none.
 bool mask_span(const GeDraw& d, int fy, int& x0, int& x1) {
@@ -161,22 +165,22 @@ bool Impact::gl_visible(const GeDraw& d, int fx, int fy) const {
 
 // One fragment at window (x, y): colour RGBA 0..1 (an index in red), depth
 // in buffer units.
-void Impact::gl_fragment(const GeDraw& d, int x, int y, const float* c, float z) {
+void Impact::gl_fragment(const GeDraw& d, const StorePlan& plan, int x, int y, const float* c, float z) {
     if (d.scissor && (x < d.scissor_box[0] || x > d.scissor_box[1] || y < d.scissor_box[2] || y > d.scissor_box[3])) return;
     int fx, fy;
     if (!gl_to_framebuffer(d, x, y, fx, fy) || !gl_visible(d, fx, fy)) return;
-    gl_fragment_at(d, x, y, fx, fy, c, z);
+    gl_fragment_at(d, plan, x, y, fx, fy, c, z);
 }
 
 // The rest of a fragment's stages, once it is known to be in the
 // framebuffer, the scissor box and the window.
-void Impact::gl_fragment_at(const GeDraw& d, int x, int y, int fx, int fy, const float* c, float z) {
+void Impact::gl_fragment_at(const GeDraw& d, const StorePlan& plan, int x, int y, int fx, int fy, const float* c, float z) {
     if (d.poly_stipple && !((d.stipple[static_cast<unsigned>(y) & 31] >> (31 - (static_cast<unsigned>(x) & 31))) & 1)) return;
     if (d.alpha_test && !d.ci && !compare(d.alpha_func, c[3], d.alpha_ref)) return;
     if (d.stencil || d.depth_test) {
         u32& zst = zst_at(fx, fy);
         const u32 s_old = zst >> 24, zold = zst & 0xFFFFFF;
-        const u32 zv = static_cast<u32>(std::clamp(z, 0.0f, ImpactGe::kZMax) + 0.5f) & 0xFFFFFF;
+        const u32 zv = depth_value(z);
         const bool spass = !d.stencil || compare(d.st_func, d.st_ref & d.st_cmask, s_old & d.st_cmask);
         const bool zpass = spass && (!d.depth_test || compare(d.depth_func, zv, zold));
         u32 n = zst;
@@ -198,12 +202,11 @@ void Impact::gl_fragment_at(const GeDraw& d, int x, int y, int fx, int fy, const
         zst = n;
         if (!zpass) return;
     }
-    const PixelTarget t = gl_target(d);
     u32 colour;
     if (d.ci) {
         colour = static_cast<u32>(std::lround(std::clamp(c[0], 0.0f, 1.0f) * 4095.0f)) & 0xFFF;
     } else if (d.blend) {
-        const u32 dst = target_colour(t, fx, fy);
+        const u32 dst = target_colour(plan.t, fx, fy);
         const float dc[4] = {(dst & 0xFF) / 255.0f, ((dst >> 8) & 0xFF) / 255.0f, ((dst >> 16) & 0xFF) / 255.0f, (dst >> 24) / 255.0f};
         float sc[4];
         for (unsigned k = 0; k < 4; ++k) sc[k] = std::clamp(c[k], 0.0f, 1.0f);
@@ -218,11 +221,11 @@ void Impact::gl_fragment_at(const GeDraw& d, int x, int y, int fx, int fy, const
                 default: o[k] = sc[k] * fs + dc[k] * fd; break;
             }
         }
-        colour = to8(o[0]) | to8(o[1]) << 8 | to8(o[2]) << 16 | u32{to8(o[3])} << 24;
+        colour = pack(o);
     } else {
-        colour = to8(c[0]) | to8(c[1]) << 8 | to8(c[2]) << 16 | u32{to8(c[3])} << 24;
+        colour = pack(c);
     }
-    store_pixel_to(t, fx, fy, colour);
+    store_planned(plan, fx, fy, colour);
 }
 
 // A textured fragment's colour: the texel at (s, t) / q (level of detail
@@ -272,6 +275,7 @@ void Impact::ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, 
         // A left edge runs downwards; a bottom edge runs to the right.
         incl[i] = ey[i] < 0 || (ey[i] == 0 && ex[i] > 0);
     }
+    const StorePlan plan = store_plan(gl_target(d));
     float tq[3][3];  // s/w, t/w, q/w a vertex
     for (unsigned i = 0; i < 3; ++i) tq[i][0] = v[i]->t[0] * v[i]->w, tq[i][1] = v[i]->t[1] * v[i]->w, tq[i][2] = v[i]->t[3] * v[i]->w;
     // Only the rows and spans of the framebuffer, the scissor box and the
@@ -301,18 +305,32 @@ void Impact::ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, 
             if (ey[i] > 0) xb = std::min(xb, static_cast<int>(std::floor(cross + margin - 0.5)));
             else xa = std::max(xa, static_cast<int>(std::ceil(cross - margin - 0.5)));
         }
-        for (int x = xa; x <= xb; ++x) {
-            const float px = static_cast<float>(x) + 0.5f;
-            float w[3];
-            bool in = true;
-            for (unsigned i = 0; i < 3 && in; ++i) {
-                const GeVertex& p = *v[i];
-                const float e = ex[i] * (py - p.y) - ey[i] * (px - p.x);
-                in = e > 0 || (e == 0 && incl[i]);
-                w[(i + 2) % 3] = e;  // the edge opposite vertex i+2
+        if (xa > xb) continue;
+        // The edge tests and weights for the whole span first, in plain
+        // loops the compiler can run several pixels at a time.
+        const unsigned n = static_cast<unsigned>(xb - xa + 1);
+        if (gl_span_.size() < 4 * std::size_t{n}) gl_span_.resize(4 * std::size_t{n});
+        float* const L0 = gl_span_.data();
+        float* const L1 = L0 + n;
+        float* const L2 = L1 + n;
+        float* const IN = L2 + n;  // 1: inside all three edges
+        {
+            float r[3], vx[3];  // each edge's row term; its start's x
+            for (unsigned i = 0; i < 3; ++i) r[i] = ex[i] * (py - v[i]->y), vx[i] = v[i]->x;
+            for (unsigned j = 0; j < n; ++j) {
+                const float px = static_cast<float>(xa + static_cast<int>(j)) + 0.5f;
+                const float e0 = r[0] - ey[0] * (px - vx[0]), e1 = r[1] - ey[1] * (px - vx[1]), e2 = r[2] - ey[2] * (px - vx[2]);
+                const bool in = (e0 > 0 || (e0 == 0 && incl[0])) && (e1 > 0 || (e1 == 0 && incl[1])) && (e2 > 0 || (e2 == 0 && incl[2]));
+                IN[j] = in ? 1.0f : 0.0f;
+                // Edge i's value weights the vertex opposite it, i+2.
+                L0[j] = e1 / A, L1[j] = e2 / A, L2[j] = e0 / A;
             }
-            if (!in || (checks && !visible(x + ox))) continue;
-            const float l0 = w[0] / A, l1 = w[1] / A, l2 = w[2] / A;
+        }
+        for (int x = xa; x <= xb; ++x) {
+            const unsigned j = static_cast<unsigned>(x - xa);
+            if (IN[j] == 0 || (checks && !visible(x + ox))) continue;
+            const float px = static_cast<float>(x) + 0.5f;
+            const float l0 = L0[j], l1 = L1[j], l2 = L2[j];
             float col[4];
             for (unsigned k = 0; k < 4; ++k) col[k] = l0 * v[0]->c[k] + l1 * v[1]->c[k] + l2 * v[2]->c[k];
             if (d.tex.on) {
@@ -336,7 +354,7 @@ void Impact::ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, 
                 const float fog = l0 * v[0]->fog + l1 * v[1]->fog + l2 * v[2]->fog;
                 gl_shade(d, col, s0, t0, 1, tex_lambda(d.tex, sx - s0, tx - t0, sy - s0, ty - t0), fog);
             }
-            gl_fragment_at(d, x, y, x + ox, y + oy, col, l0 * v[0]->z + l1 * v[1]->z + l2 * v[2]->z);
+            gl_fragment_at(d, plan, x, y, x + ox, y + oy, col, l0 * v[0]->z + l1 * v[1]->z + l2 * v[2]->z);
         }
     }
     ++display_version_;
@@ -358,6 +376,7 @@ void Impact::ge_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, floa
     else i0 = static_cast<int>(std::floor(s0 - 0.5f)), i1 = static_cast<int>(std::floor(s1 - 0.5f)), step = -1;
     if (step > 0 && i1 - i0 > 8192) return;
     if (step < 0 && i0 - i1 > 8192) return;
+    const StorePlan plan = store_plan(gl_target(d));
     for (int i = i0; i != i1; i += step) {
         const float sc = static_cast<float>(i) + 0.5f, t = (sc - s0) / da;
         const unsigned p = pos++;
@@ -378,15 +397,15 @@ void Impact::ge_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, floa
             gl_shade(d, col, s, tt, 1, tex_lambda(d.tex, sn - s, tn - tt, 0, 0), a.fog + (b.fog - a.fog) * t);
         }
         for (int k = j - (w - 1) / 2; k <= j + w / 2; ++k) {
-            if (xmajor) gl_fragment(d, i, k, col, z);
-            else gl_fragment(d, k, i, col, z);
+            if (xmajor) gl_fragment(d, plan, i, k, col, z);
+            else gl_fragment(d, plan, k, i, col, z);
         }
     }
     ++display_version_;
 }
 
 void Impact::ge_fragment(const GeDraw& d, int x, int y, const std::array<float, 4>& colour, float z) {
-    gl_fragment(d, x, y, colour.data(), z);
+    gl_fragment(d, store_plan(gl_target(d)), x, y, colour.data(), z);
     ++display_version_;
 }
 
@@ -442,8 +461,9 @@ void Impact::ge_point(const GeDraw& d, const GeVertex& v, float size) {
     const int x0 = start(v.x), y0 = start(v.y);
     std::array<float, 4> c = v.c;
     if (d.tex.on) gl_shade(d, c.data(), v.t[0], v.t[1], v.t[3], 0, v.fog);
+    const StorePlan plan = store_plan(gl_target(d));
     for (int y = y0; y < y0 + n; ++y)
-        for (int x = x0; x < x0 + n; ++x) gl_fragment(d, x, y, c.data(), v.z);
+        for (int x = x0; x < x0 + n; ++x) gl_fragment(d, plan, x, y, c.data(), v.z);
     ++display_version_;
 }
 
@@ -465,14 +485,14 @@ bool Impact::gl_clear_rect(const GeDraw& d, int& x0, int& x1, int& y0, int& y1) 
 void Impact::ge_clear_colour(const GeDraw& d, u32 colour) {
     int x0, x1, y0, y1;
     if (!gl_clear_rect(d, x0, x1, y0, y1)) return;
-    const PixelTarget t = gl_target(d);
+    const StorePlan plan = store_plan(gl_target(d));
     for (int fy = y0; fy <= y1; ++fy) {
         int a = x0, b = x1;
         if (!mask_span(d, fy, a, b)) continue;
         const RowTest visible = row_test(d, &cid_[std::size_t{static_cast<unsigned>(fy)} * kFbSize], fy);
         const bool checks = visible.any();
         for (int fx = a; fx <= b; ++fx)
-            if (!checks || visible(fx)) store_pixel_to(t, fx, fy, colour);
+            if (!checks || visible(fx)) store_planned(plan, fx, fy, colour);
     }
     ++display_version_;
 }

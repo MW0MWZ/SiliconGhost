@@ -5,7 +5,8 @@
 #pragma once
 
 #include <cstddef>
-#include <vector>
+#include <cstring>
+#include <memory>
 
 #include "core/types.h"
 
@@ -26,9 +27,9 @@ enum class Cond : unsigned {
 
 class Emitter {
 public:
-    Emitter() { buf_.reserve(8192); }
-    const std::vector<u8>& code() const { return buf_; }
-    std::size_t size() const { return buf_.size(); }
+    Emitter() : buf_(new u8[8192]), cap_(8192) {}
+    const u8* code() const { return buf_.get(); }
+    std::size_t size() const { return n_; }
 
     void push(Reg r) { rex_opt(false, 0, r), byte(0x50 + (r & 7)); }
     void pop(Reg r) { rex_opt(false, 0, r), byte(0x58 + (r & 7)); }
@@ -236,42 +237,57 @@ public:
     std::size_t jcc(Cond c) {
         byte(0x0F), byte(0x80 + static_cast<unsigned>(c));
         u32v(0);
-        return buf_.size();
+        return n_;
     }
     std::size_t jmp() {
         byte(0xE9);
         u32v(0);
-        return buf_.size();
+        return n_;
     }
     // Jumps back to an earlier position.
     void jmp_to(std::size_t target) {
         byte(0xE9);
-        u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(buf_.size() + 4)));
+        u32v(static_cast<u32>(static_cast<s64>(target) - static_cast<s64>(n_ + 4)));
     }
     // A jump to `target`, this code being placed at `base`.
     void jmp_abs(const u8* target, const u8* base) {
         byte(0xE9);
-        u32v(static_cast<u32>(target - (base + buf_.size() + 4)));
+        u32v(static_cast<u32>(target - (base + n_ + 4)));
     }
     // LEA r, [rip + rel32], bound like a jump; returns the patch site.
     std::size_t lea_rip(Reg r) {
         rex(true, r, 0), byte(0x8D), byte(((r & 7) << 3) | 5);
         u32v(0);
-        return buf_.size();
+        return n_;
     }
     // Points the jump ending at `site` to the current position.
     void bind(std::size_t site) {
-        const u32 rel = static_cast<u32>(buf_.size() - site);
+        const u32 rel = static_cast<u32>(n_ - site);
         for (int i = 0; i < 4; ++i) buf_[site - 4 + i] = static_cast<u8>(rel >> (8 * i));
     }
 
 private:
-    void byte(unsigned b) { buf_.push_back(static_cast<u8>(b)); }
+    // (Stores into a buffer grown by hand: a vector's push_back for every
+    // byte made up much of the time spent translating.)
+    void room(std::size_t n) {
+        if (n_ + n <= cap_) [[likely]]
+            return;
+        std::unique_ptr<u8[]> bigger(new u8[2 * cap_]);
+        std::memcpy(bigger.get(), buf_.get(), n_);
+        buf_ = std::move(bigger);
+        cap_ *= 2;
+    }
+    void byte(unsigned b) {
+        room(1);
+        buf_[n_++] = static_cast<u8>(b);
+    }
     void u32v(u32 v) {
-        for (int i = 0; i < 4; ++i) byte((v >> (8 * i)) & 0xFF);
+        room(4);
+        for (int i = 0; i < 4; ++i) buf_[n_++] = static_cast<u8>(v >> (8 * i));
     }
     void u64v(u64 v) {
-        for (int i = 0; i < 8; ++i) byte((v >> (8 * i)) & 0xFF);
+        room(8);
+        for (int i = 0; i < 8; ++i) buf_[n_++] = static_cast<u8>(v >> (8 * i));
     }
     void rex(bool w, unsigned reg, unsigned rm) { byte(0x40 | (w << 3) | ((reg >> 3) << 2) | (rm >> 3)); }
     void rex_opt(bool w, unsigned reg, unsigned rm) {
@@ -318,7 +334,8 @@ private:
         byte(0xC0 | ((reg & 7) << 3) | (rm & 7));
     }
 
-    std::vector<u8> buf_;
+    std::unique_ptr<u8[]> buf_;
+    std::size_t cap_, n_ = 0;
 };
 
 }  // namespace sg::jit::x64

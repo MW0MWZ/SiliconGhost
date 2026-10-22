@@ -55,27 +55,9 @@ std::string folder_of(const std::string& path) {
 
 std::string default_settings_path() { return user_file("settings.ini"); }
 
-// Where settings were kept before the SiliconGhost folder (SDL's preferences
-// folder, worked out here so that looking does not create it).
-std::string old_user_file(const std::string& name) {
-    namespace fs = std::filesystem;
-    fs::path dir;
-#if defined(_WIN32)
-    if (const char* appdata = std::getenv("APPDATA")) dir = appdata;
-#elif defined(__APPLE__)
-    if (const char* home = std::getenv("HOME")) dir = fs::path(home) / "Library" / "Application Support";
-#else
-    if (const char* data = std::getenv("XDG_DATA_HOME"); data && *data) dir = data;
-    else if (const char* home = std::getenv("HOME")) dir = fs::path(home) / ".local" / "share";
-#endif
-    if (dir.empty()) return name;
-    return (dir / "SiliconGhost" / "SiliconGhost" / name).string();
-}
-
 // What a file chooser was opened for.
-enum class Pick { Prom, PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
+enum class Pick { PromDir, Nvram, NewNvram, Disk, NewDisk, AddDisc, InsertDisc, OpenSettings, SaveSettings };
 
-constexpr SDL_DialogFileFilter kPromFilters[] = {{"PROM images", "bin;rom;img"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kNvramFilters[] = {{"NVRAM images", "bin;nvram;nvr"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kDiskFilters[] = {{"Disk images", "img;raw;dsk;hd;hdd"}, {"All files", "*"}};
 constexpr SDL_DialogFileFilter kDiscFilters[] = {{"CD-ROM images", "iso;img;bin;raw;cdr"}, {"All files", "*"}};
@@ -192,6 +174,7 @@ private:
     // until the pointer has been off the screen.
     bool capture_armed_ = true;
     unsigned buttons_ = 0;
+    float wheel_ = 0;  // wheel movement not yet sent: less than a step
     float dx_ = 0, dy_ = 0;
     std::bitset<SDL_SCANCODE_COUNT> keys_down_;
     std::optional<ip22::Ioc2::PanelButton> volume_held_;
@@ -232,7 +215,7 @@ private:
 };
 
 const Gui::PromChoice& Gui::prom_choice(const Settings& s) {
-    const std::string key = s.prom_dir + '\n' + s.prom + '\n' + s.machine + '\n' + s.cpu + (s.graphics ? "\ng" : "");
+    const std::string key = s.prom_dir + '\n' + s.machine + '\n' + s.cpu + (s.graphics ? "\ng" : "");
     if (key == prom_choice_.key) return prom_choice_;
     prom_choice_.key = key;
     PromImage p;
@@ -253,13 +236,6 @@ int Gui::run() {
         return -1;
     }
     settings_path_ = options_.settings_file.empty() ? default_settings_path() : options_.settings_file;
-    {
-        // Settings saved before the SiliconGhost folder existed move into it.
-        std::error_code ec;
-        const std::string old = old_user_file("settings.ini");
-        if (old != settings_path_ && !std::filesystem::exists(settings_path_, ec) && std::filesystem::exists(old, ec))
-            std::filesystem::copy_file(old, settings_path_, ec);
-    }
     if (!options_.power_on && options_.settings_file.empty()) {
         Settings saved;
         std::string error;
@@ -709,6 +685,8 @@ void Gui::handle_event(const SDL_Event& ev) {
                 const unsigned bit = ev.button.button == SDL_BUTTON_LEFT    ? 1u
                                      : ev.button.button == SDL_BUTTON_RIGHT ? 2u
                                      : ev.button.button == SDL_BUTTON_MIDDLE ? 4u
+                                     : ev.button.button == SDL_BUTTON_X1     ? 8u
+                                     : ev.button.button == SDL_BUTTON_X2     ? 16u
                                                                              : 0u;
                 if (bit && machine) {
                     buttons_ = ev.button.down ? (buttons_ | bit) : (buttons_ & ~bit);
@@ -724,7 +702,25 @@ void Gui::handle_event(const SDL_Event& ev) {
             }
             break;
         case SDL_EVENT_MOUSE_WHEEL:
-            if (captured_) return;
+            if (captured_) {
+                // Whole steps (a trackpad's fractions add up) to the guest's
+                // wheel, where up, away from the user, counts negative; or,
+                // if its driver never switched the mouse to a wheel mouse
+                // (IRIX's does not) and the setting asks, as Page Up/Down.
+                wheel_ += ev.wheel.y;
+                const int steps = static_cast<int>(wheel_);
+                wheel_ -= static_cast<float>(steps);
+                if (!steps || !machine) return;
+                if (machine->ioc().kbc().mouse_id() >= 3) {
+                    machine->ioc().kbc().mouse_motion(0, 0, buttons_, -steps);
+                } else if (const std::string& keys = session_.settings().wheel_keys; keys != "off") {
+                    const bool pages = keys == "pages";
+                    const SDL_Scancode key = steps > 0 ? (pages ? SDL_SCANCODE_PAGEUP : SDL_SCANCODE_UP)
+                                                       : (pages ? SDL_SCANCODE_PAGEDOWN : SDL_SCANCODE_DOWN);
+                    for (int i = 0; i < std::abs(steps); ++i) send_key(*machine, key, true), send_key(*machine, key, false);
+                }
+                return;
+            }
             break;
         default: break;
     }
@@ -1191,12 +1187,14 @@ void Gui::draw_settings() {
         ImGui::TextUnformatted(text);
         ImGui::SameLine(label_w);
     };
-    auto path_row = [&](const char* text, const char* id, std::string& path, Pick browse, std::optional<Pick> create) {
+    auto path_row = [&](const char* text, const char* id, std::string& path, Pick browse, std::optional<Pick> create,
+                        const char* hint = nullptr) {
         ImGui::PushID(id);
         label(text);
         const float buttons = (create ? 140.0f : 70.0f) * scale_;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - buttons);
-        ImGui::InputText("##path", &path);
+        if (hint) ImGui::InputTextWithHint("##path", hint, &path);
+        else ImGui::InputText("##path", &path);
         ImGui::SameLine();
         if (ImGui::Button("Browse...")) choose(browse, path);
         if (create) {
@@ -1307,12 +1305,9 @@ void Gui::draw_settings() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Storage")) {
-            path_row("PROM folder", "promdir", edit_.prom_dir, Pick::PromDir, std::nullopt);
-            ImGui::SetCursorPosX(label_w);
-            ImGui::TextDisabled("Empty: %s", prom_folder(Settings{}).c_str());
-            path_row("Specific PROM", "prom", edit_.prom, Pick::Prom, std::nullopt);
-            ImGui::SetCursorPosX(label_w);
-            ImGui::TextDisabled("Optional: leave empty to use the right one from the folder");
+            // Left empty, the usual folder (shown in the box) is searched.
+            const std::string default_folder = prom_folder(Settings{});
+            path_row("PROM folder", "promdir", edit_.prom_dir, Pick::PromDir, std::nullopt, default_folder.c_str());
             {
                 const PromChoice& pc = prom_choice(edit_);
                 ImGui::SetCursorPosX(label_w);
@@ -1471,49 +1466,15 @@ void Gui::draw_settings() {
             int timing = edit_.timing == Pacer::Mode::Realtime ? 0 : edit_.timing == Pacer::Mode::Cycle ? 1 : 2;
             if (ImGui::Combo("##timing", &timing,
                              "Real time: guest clocks follow the host's\0Cycle: one cycle per instruction, reproducible\0"
-                             "Maximum: no speed limit, fast disk and network, guest clocks follow the host's\0"))
+                             "Maximum: fast disk and network, guest clocks follow the host's\0"))
                 edit_.timing = timing == 0 ? Pacer::Mode::Realtime : timing == 1 ? Pacer::Mode::Cycle : Pacer::Mode::Max;
-            if (timing != 1) {
-                label("Timed speed");
-                ImGui::SetNextItemWidth(200 * scale_);
-                float timed = static_cast<float>(edit_.timed_speed);
-                ImGui::SliderFloat("##timedspeed", &timed, 1.0f, 4.0f, "%.1fx the real CPU");
-                edit_.timed_speed = timed;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("The CPU's speed while the system times it at boot. Its delays keep that\n"
-                                      "length; everything else runs as fast as the host allows.");
-                ImGui::SameLine();
-                const double timed_mhz = edit_.cpu_mhz * edit_.timed_speed;
-                ImGui::TextDisabled("%.0f MHz", timed_mhz);
-                if (timing == 0) {
-                    label("Speed limit");
-                    bool cap = edit_.max_speed > 0;
-                    if (ImGui::Checkbox("##cap", &cap)) edit_.max_speed = cap ? std::max(4.0, edit_.timed_speed) : 0;
-                    ImGui::SameLine();
-                    if (cap) {
-                        ImGui::SetNextItemWidth(200 * scale_);
-                        float limit = static_cast<float>(edit_.max_speed);
-                        ImGui::SliderFloat("##maxspeed", &limit, 1.0f, 16.0f, "%.1fx the real CPU");
-                        edit_.max_speed = limit;
-                    } else {
-                        ImGui::TextDisabled("none: as fast as the host allows");
-                    }
-                }
-            }
-            ImGui::Spacing();
-            label("Quick SCSI scan");
-            static const char* const kQuickScsiTip =
-                "Absent SCSI devices answer within a millisecond instead of after the controller's\n"
-                "programmed timeout, which takes the PROM's bus scan about two seconds";
-            ImGui::Checkbox("Real time and cycle##quickscsi", &edit_.quick_scsi_scan);
-            ImGui::SetItemTooltip("%s", kQuickScsiTip);
-            ImGui::SameLine();
-            ImGui::Checkbox("Maximum and turbo##quickscsimax", &edit_.quick_scsi_scan_max);
-            ImGui::SetItemTooltip("%s", kQuickScsiTip);
             ImGui::Spacing();
             ImGui::Checkbox("Skip idle loops", &edit_.idle_skip);
+            ImGui::Checkbox("Quick SCSI scan", &edit_.quick_scsi_scan);
+            ImGui::SetItemTooltip("Absent SCSI devices answer within a millisecond instead of after the controller's\n"
+                                  "programmed timeout, which takes the PROM's bus scan about two seconds");
             if (mips::R4000::jit_available())
-                ImGui::Checkbox("Recompiler (translate guest code to host code)", &edit_.jit);
+                ImGui::Checkbox("JIT", &edit_.jit);
             ImGui::Checkbox("Block cache (decode guest code once)", &edit_.block_cache);
             ImGui::Spacing();
             label("Log level");
@@ -1539,6 +1500,15 @@ void Gui::draw_settings() {
             edit_.mouse_auto_capture = capture == 0;
             ImGui::TextDisabled("Moving onto the screen captures the mouse once the system shows its pointer");
             ImGui::TextDisabled("(the IRIX desktop); a click always captures it. Ctrl+%s+G releases it.", kAlt);
+            ImGui::Spacing();
+            label("Scroll wheel");
+            ImGui::SetNextItemWidth(-1);
+            static const char* const kWheelKeys[] = {"off", "arrows", "pages"};
+            int wheel = edit_.wheel_keys == "arrows" ? 1 : edit_.wheel_keys == "pages" ? 2 : 0;
+            if (ImGui::Combo("##wheel", &wheel, "Wheel only\0As the Up and Down arrow keys\0As Page Up and Page Down\0"))
+                edit_.wheel_keys = kWheelKeys[wheel];
+            ImGui::TextDisabled("As keys for systems whose mouse driver has no wheel, such as IRIX; systems");
+            ImGui::TextDisabled("that switch the mouse to a wheel mouse get the wheel itself.");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1611,7 +1581,7 @@ void Gui::draw_popups() {
     }
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About##about", nullptr, flags)) {
-        ImGui::Text("%s: an SGI Indy (IP22) emulator", kAppName);
+        ImGui::Text("%s %s: an SGI Indy (IP22) emulator", kAppName, SG_VERSION);
         ImGui::TextUnformatted("Copyright (C) 2026 Andy Taylor");
         ImGui::TextUnformatted("GNU General Public License, version 2 or later");
         ImGui::Spacing();
@@ -1659,7 +1629,7 @@ void Gui::choose(Pick what, const std::string& current) {
     // SiliconGhost folder.
     std::string start = folder_of(current);
     if (start.empty() && !user_data_folder().empty()) {
-        const char* sub = what == Pick::Prom || what == Pick::PromDir ? "roms"
+        const char* sub = what == Pick::PromDir ? "roms"
                           : what == Pick::Nvram || what == Pick::NewNvram ? "nvram"
                           : what == Pick::OpenSettings || what == Pick::SaveSettings ? ""
                                                                          : "diskImages";
@@ -1670,7 +1640,6 @@ void Gui::choose(Pick what, const std::string& current) {
     auto* req = new PickRequest{this, what, start};
     const char* location = req->location.empty() ? nullptr : req->location.c_str();
     switch (what) {
-        case Pick::Prom: SDL_ShowOpenFileDialog(on_chosen, req, window_, kPromFilters, 2, location, false); break;
         case Pick::PromDir: SDL_ShowOpenFolderDialog(on_chosen, req, window_, location, false); break;
         case Pick::Nvram: SDL_ShowOpenFileDialog(on_chosen, req, window_, kNvramFilters, 2, location, false); break;
         case Pick::NewNvram: SDL_ShowSaveFileDialog(on_chosen, req, window_, kNvramFilters, 2, location); break;
@@ -1697,7 +1666,6 @@ void Gui::on_chosen(void* userdata, const char* const* files, int) {
 void Gui::apply_choice(const PickResult& r) {
     std::string error;
     switch (r.what) {
-        case Pick::Prom: edit_.prom = r.path; break;
         case Pick::PromDir: edit_.prom_dir = r.path; break;
         case Pick::Nvram: edit_.nvram = r.path; break;
         case Pick::NewNvram:
@@ -1743,7 +1711,7 @@ void Gui::apply_choice(const PickResult& r) {
 
 std::string user_file(const std::string& name) {
     const std::string base = user_data_folder();
-    if (base.empty()) return old_user_file(name);
+    if (base.empty()) return name;
     make_user_data_folders();
     return (std::filesystem::path(base) / name).string();
 }

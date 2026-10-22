@@ -55,6 +55,9 @@ void Kbc8042::reset() {
     translate_break_ = false;
     mouse_reporting_ = false;
     mouse_buttons_ = 0;
+    mouse_id_ = 0;
+    mouse_rate_ = 100;
+    mouse_rates_ = {};
     update_irq();
 }
 
@@ -227,28 +230,44 @@ void Kbc8042::keyboard_command(u8 value) {
 
 void Kbc8042::mouse_command(u8 value) {
     if (mouse_arg_command_) {
+        const u8 command = mouse_arg_command_;
         mouse_arg_command_ = 0;
         push(kAck, true);
+        if (command == 0xF3) {
+            // Sample rates 200, 100, 80 in a row switch on the wheel (ID 3);
+            // then 200, 200, 80 the fourth and fifth buttons too (ID 4).
+            mouse_rate_ = value;
+            mouse_rates_ = {mouse_rates_[1], mouse_rates_[2], value};
+            if (mouse_rates_ == std::array<u8, 3>{200, 100, 80} && mouse_id_ < 3) mouse_id_ = 3;
+            else if (mouse_rates_ == std::array<u8, 3>{200, 200, 80} && mouse_id_ == 3) mouse_id_ = 4;
+        }
         return;
     }
     switch (value) {
-        case 0xFF:  // reset
+        case 0xFF:  // reset: back to a standard mouse
             mouse_reporting_ = false;
+            mouse_id_ = 0;
+            mouse_rate_ = 100;
+            mouse_rates_ = {};
             push(kAck, true);
             push(kSelfTestPassed, true);
             push(0x00, true);
             break;
-        case 0xF2:  // identify: standard PS/2 mouse
+        case 0xF2:  // identify
             push(kAck, true);
-            push(0x00, true);
+            push(mouse_id_, true);
             break;
         case 0xF4:  // enable data reporting
             mouse_reporting_ = true;
             push(kAck, true);
             break;
         case 0xF5:  // disable data reporting
+            mouse_reporting_ = false;
+            push(kAck, true);
+            break;
         case 0xF6:  // set defaults
             mouse_reporting_ = false;
+            mouse_rate_ = 100;
             push(kAck, true);
             break;
         case 0xE9:  // status request: stream mode, scaling 1:1, 4 counts/mm, 100 samples/s
@@ -257,7 +276,7 @@ void Kbc8042::mouse_command(u8 value) {
                                  (mouse_buttons_ & 4 ? 2 : 0) | (mouse_buttons_ & 2 ? 1 : 0)),
                  true);
             push(0x02, true);
-            push(0x64, true);
+            push(mouse_rate_, true);
             break;
         case 0xE8:  // set resolution
         case 0xF3:  // set sample rate
@@ -276,20 +295,26 @@ void Kbc8042::mouse_input(u8 byte) {
     if (!held_ && !(command_byte_ & kCmdAuxDisable)) push(byte, true);
 }
 
-void Kbc8042::mouse_motion(int dx, int dy, unsigned buttons) {
+void Kbc8042::mouse_motion(int dx, int dy, unsigned buttons, int dz) {
     if (held_ || !mouse_reporting_ || (command_byte_ & kCmdAuxDisable)) return;
-    buttons &= 7;
+    buttons &= mouse_id_ == 4 ? 31 : 7;
+    if (mouse_id_ < 3) dz = 0;
     do {
-        // Movement is a 9-bit two's complement count per packet.
+        // Movement is a 9-bit two's complement count per packet; the wheel
+        // a 4-bit one (-8 to 7) here, as in Explorer mode.
         const int px = dx < -256 ? -256 : dx > 255 ? 255 : dx;
         const int py = dy < -256 ? -256 : dy > 255 ? 255 : dy;
+        const int pz = dz < -8 ? -8 : dz > 7 ? 7 : dz;
         dx -= px;
         dy -= py;
-        const u8 first = static_cast<u8>(0x08 | buttons | (px < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0));
+        dz -= pz;
+        const u8 first = static_cast<u8>(0x08 | (buttons & 7) | (px < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0));
         push(first, true);
         push(static_cast<u8>(px & 0xFF), true);
         push(static_cast<u8>(py & 0xFF), true);
-    } while (dx != 0 || dy != 0);
+        if (mouse_id_ == 3) push(static_cast<u8>(pz & 0xFF), true);
+        else if (mouse_id_ == 4) push(static_cast<u8>((pz & 0x0F) | (buttons & 8 ? 0x10 : 0) | (buttons & 16 ? 0x20 : 0)), true);
+    } while (dx != 0 || dy != 0 || dz != 0);
     mouse_buttons_ = buttons;
 }
 

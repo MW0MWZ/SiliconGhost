@@ -104,7 +104,6 @@ TEST(terminal_reports_cursor_position) {
 TEST(settings_round_trip_and_validation) {
     app::Settings s;
     std::string error;
-    CHECK(app::set_option(s, "prom", "roms/x.bin", error));
     CHECK(app::set_option(s, "cdrom", "a.iso", error));
     CHECK(app::set_option(s, "cdrom", "b.iso", error));
     CHECK(app::set_option(s, "cpu", "r4000sc", error));
@@ -115,11 +114,12 @@ TEST(settings_round_trip_and_validation) {
     CHECK(app::set_option(s, "timing", "cycle", error));
     CHECK(app::set_option(s, "jit", "0", error));
     CHECK(app::set_option(s, "mouse_auto_capture", "0", error));
+    CHECK(app::set_option(s, "wheel_keys", "arrows", error));
+    CHECK(!app::set_option(s, "wheel_keys", "1", error));
     CHECK(app::set_option(s, "console", "serial", error));
     CHECK(!app::set_option(s, "console", "d", error));
-    CHECK(!s.quick_scsi_scan && s.quick_scsi_scan_max);  // the defaults
-    CHECK(app::set_option(s, "quick_scsi_scan", "1", error));
-    CHECK(app::set_option(s, "quick_scsi_scan_max", "0", error));
+    CHECK(s.quick_scsi_scan);  // the default
+    CHECK(app::set_option(s, "quick_scsi_scan", "0", error));
     CHECK(!app::set_option(s, "ram_mb", "100", error));  // not a multiple of 16
     CHECK(!app::set_option(s, "cpu", "r12000", error));
     CHECK(!app::set_option(s, "hostfwd", "tcp:0:22", error));
@@ -129,7 +129,6 @@ TEST(settings_round_trip_and_validation) {
     CHECK(app::save_settings(path, s, error));
     app::Settings loaded;
     CHECK(app::load_settings(path, loaded, error));
-    CHECK_STR(loaded.prom, std::string("roms/x.bin"));
     CHECK_EQ(loaded.cdroms.size(), 2u);
     CHECK_STR(loaded.cdroms[1], std::string("b.iso"));
     CHECK_STR(loaded.cpu, std::string("r4000sc"));
@@ -141,10 +140,9 @@ TEST(settings_round_trip_and_validation) {
     CHECK(loaded.timing == Pacer::Mode::Cycle);
     CHECK(!loaded.jit);
     CHECK(!loaded.mouse_auto_capture);
+    CHECK_STR(loaded.wheel_keys, std::string("arrows"));
     CHECK_STR(loaded.console, std::string("serial"));
-    CHECK(loaded.quick_scsi_scan && !loaded.quick_scsi_scan_max);
-    CHECK(app::set_option(loaded, "quick_scsi_scan_all", "0", error));  // --no-quick-scsi-scan
-    CHECK(!loaded.quick_scsi_scan && !loaded.quick_scsi_scan_max);
+    CHECK(!loaded.quick_scsi_scan);
     const auto config = loaded.indy_config();
     CHECK_EQ(config.prid, 0x0430u);
     CHECK_EQ(config.cpu_hz, 175.0e6);
@@ -152,27 +150,35 @@ TEST(settings_round_trip_and_validation) {
     std::filesystem::remove(path);
 }
 
-// Files from before the timed speed have only max_speed, which capped the CPU
-// at all times: it becomes the speed the guest times, with no cap after.
-TEST(settings_older_max_speed_becomes_the_timed_speed) {
+// An older file's timed speed and speed limit (no longer settings) are
+// skipped.
+TEST(settings_older_speed_lines_are_skipped) {
     const std::string path = temp_path("sg_settings_speed.ini");
     std::string error;
     {
         std::ofstream f(path);
-        f << "timing=realtime\nmax_speed=1.2\n";
+        f << "timing=max\ntimed_speed=1.2\nmax_speed=3\n";
     }
     app::Settings loaded;
     CHECK(app::load_settings(path, loaded, error));
-    CHECK_EQ(loaded.timed_speed, 1.2);
-    CHECK_EQ(loaded.max_speed, 0.0);
+    CHECK(loaded.timing == Pacer::Mode::Max);
     app::Settings s;
-    CHECK(app::set_option(s, "timed_speed", "1.5", error));
-    CHECK(app::set_option(s, "max_speed", "3", error));
-    CHECK(!app::set_option(s, "timed_speed", "0", error));
-    CHECK(app::save_settings(path, s, error));
+    CHECK(!app::set_option(s, "timed_speed", "1.5", error));
+    CHECK(!app::set_option(s, "max_speed", "2", error));
+    std::filesystem::remove(path);
+}
+
+TEST(settings_older_prom_line_is_ignored) {
+    const std::string path = temp_path("sg_settings_prom.ini");
+    std::string error;
+    {
+        std::ofstream f(path);
+        f << "prom=roms/x.bin\nnvram=n.bin\n";
+    }
+    app::Settings loaded;
     CHECK(app::load_settings(path, loaded, error));
-    CHECK_EQ(loaded.timed_speed, 1.5);
-    CHECK_EQ(loaded.max_speed, 3.0);
+    CHECK_STR(loaded.nvram, std::string("n.bin"));
+    CHECK(!app::set_option(loaded, "prom", "roms/x.bin", error));
     std::filesystem::remove(path);
 }
 
@@ -293,12 +299,7 @@ TEST(proms_are_identified_and_chosen_for_the_machine) {
     CHECK(!app::select_prom(s, p, error));
     CHECK(error.find("without a graphics board") != std::string::npos);
     s.graphics = true;
-    // A specific file must suit the machine.
-    s.prom = (dir / "c.bin").string();
-    CHECK(!app::select_prom(s, p, error));
-    CHECK(error.find("Indigo2 (IP22) PROM") != std::string::npos);
     // No PROM at all for the Indigo2.
-    s.prom.clear();
     fs::remove(dir / "c.bin");
     s.machine = "indigo2", s.cpu = "r4400sc";
     CHECK(!app::select_prom(s, p, error));

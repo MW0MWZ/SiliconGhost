@@ -209,18 +209,6 @@ std::string prom_folder(const Settings& s) {
 
 bool select_prom(const Settings& s, PromImage& out, std::string& error) {
     std::string why;
-    if (!s.prom.empty()) {  // a file chosen by hand: it must suit the machine
-        out = identify_prom(s.prom);
-        if (!std::ifstream(s.prom)) {
-            error = "cannot open the boot PROM " + s.prom;
-            return false;
-        }
-        if (!prom_fits(out, s, why)) {
-            error = why;
-            return false;
-        }
-        return true;
-    }
     const std::string folder = prom_folder(s);
     const PromImage* best = nullptr;
     std::vector<std::string> unsuitable;

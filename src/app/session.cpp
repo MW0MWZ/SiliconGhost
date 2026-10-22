@@ -91,11 +91,9 @@ bool Session::power_on(std::string& error) {
                                              ? Pacer::Mode::Max
                                              : s.timing,
                                          machine->cycles_per_second());
-        pacer_->set_timed_speed(s.timed_speed);
-        pacer_->set_max_speed(s.max_speed);
         cpu.set_delay_cycles_per_instruction(pacer_->delay_cycles_per_instruction());
         machine->set_fast_io(pacer_->mode() == Pacer::Mode::Max);
-        machine->set_quick_scsi_scan(pacer_->mode() == Pacer::Mode::Max ? s.quick_scsi_scan_max : s.quick_scsi_scan);
+        machine->set_quick_scsi_scan(s.quick_scsi_scan);
         pacer_->update(cpu.cycles(), cpu.instructions(), false, cpu.idle_skipped_cycles());
         nvram_saved_ = machine->nvram_changes();
         network_ = std::move(network);
@@ -130,7 +128,6 @@ void Session::set_turbo(bool on) {
     pacer_->set_mode(timing());
     machine_->cpu().set_delay_cycles_per_instruction(pacer_->delay_cycles_per_instruction());
     machine_->set_fast_io(timing() == Pacer::Mode::Max);
-    machine_->set_quick_scsi_scan(timing() == Pacer::Mode::Max ? settings_.quick_scsi_scan_max : settings_.quick_scsi_scan);
 }
 
 void Session::set_serial_output(ip22::Indy::SerialOutput out) {

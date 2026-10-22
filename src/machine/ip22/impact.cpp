@@ -1715,58 +1715,31 @@ void Impact::store_pixel(int fx, int fy, u32 colour) {
 
 // The PP1s: the colour formatted for the pixel type, through the logic op
 // and the plane masks into the buffers the draw field names.
-void Impact::store_pixel_to(const PixelTarget& t, int fx, int fy, u32 colour) {
+Impact::StorePlan Impact::store_plan(const PixelTarget& t) const {
+    StorePlan p;
+    p.t = t;
     const u32 pp1 = t.pp1;
-    const unsigned type = (pp1 >> 8) & 7, field = (pp1 >> 14) & 0x7F;
-    if ((field & 0x70) == 0x40) {
-        store_overlay(t, fx, fy, colour & 0xFF);
-        ++pixels_drawn_;
-        return;
-    }
-    const bool size36 = pp1 & (1u << 13);
-    const u32 r = colour & 0xFF, g = (colour >> 8) & 0xFF, b = (colour >> 16) & 0xFF, a = colour >> 24;
-    u64 w;
-    switch (type) {
-        case 0:
-        case 1: {  // pixel pairs (4:4:4 or 5:5:5): the colour in both halves
-            const unsigned bits = type == 0 ? 4 : 5;
-            auto q = [&](u32 c) {
-                if (!(pp1 & 8)) return c >> (8 - bits);
-                const u32 th = kBayer[fy & 3][fx & 3];
-                const u32 v = (c * ((1u << bits) - 1) * 16 + th * 255) / (255 * 16);
-                return std::min(v, (1u << bits) - 1);
-            };
-            const u64 v = q(r) | (q(g) << bits) | (q(b) << (2 * bits));
-            if (type == 0) w = v | (v << 12) | (u64{a >> 4} << 24) | (u64{a >> 4} << 28);
-            else w = v | (v << 15) | (u64{a >> 7} << 30) | (u64{a >> 7} << 31);
-            break;
-        }
-        case 2: w = colour; break;  // RGBA 8888
-        case 3:
-            w = colour & 0xFFFFFF;
-            if (size36) w |= u64{(r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8)} << 24;  // 12:12:12 low nibbles
-            break;
-        default: w = (colour & 0xFFF) | (u64{colour & 0xFFF} << 12); break;  // colour index, both buffers
-    }
-    if (field > 5) {
-        if (pp1 != unhandled_pp1_) unknown("draw field", kPp1FillMode, pp1);  // once per mode
-        unhandled_pp1_ = pp1;
-        return;
-    }
+    const unsigned field = (pp1 >> 14) & 0x7F;
+    p.type = (pp1 >> 8) & 7;
+    p.overlay = (field & 0x70) == 0x40;
+    p.unhandled = !p.overlay && field > 5;
+    p.size36 = pp1 & (1u << 13);
+    p.dither = pp1 & 8;
+    p.logic = pp1 & 4;
+    p.op = pp1 >> 26;
     // Buffer B is DRBpointers' second page (19:10), except where pixel
     // pairs and colour indices keep both buffers in one word (the plane
     // mask picks the half). Both buffers on one page are written once (an
     // XOR is not undone).
     const u32 drb = t.drb;
     const unsigned page_a = drb & 0x3FF;
-    const bool same_word = type <= 1 || type >= 4;
+    const bool same_word = p.type <= 1 || p.type >= 4;
     const unsigned page_b = same_word || !((drb >> 10) & 0x3FF) ? page_a : (drb >> 10) & 0x3FF;
     const u64 msbs = u64{t.msbs & 0xF} << 32;
     const u64 mask_a = t.lsb_a | msbs, mask_b = t.lsb_b | msbs;
     auto put = [&](unsigned page, u64 mask) {
-        u64* p = word_at(page, fx, fy);
-        const u64 v = (pp1 & 4) ? logic_op(pp1 >> 26, w, *p) : w;
-        *p = ((*p & ~mask) | (v & mask)) & kWord36;
+        p.page[p.puts] = page;
+        p.mask[p.puts++] = mask;
     };
     switch (field) {
         case 2:
@@ -1777,6 +1750,49 @@ void Impact::store_pixel_to(const PixelTarget& t, int fx, int fy, u32 colour) {
             else put(page_a, mask_a), put(page_b, mask_b);
             break;
         default: put(page_a, mask_a); break;
+    }
+    return p;
+}
+
+void Impact::store_planned(const StorePlan& p, int fx, int fy, u32 colour) {
+    if (p.overlay) {
+        store_overlay(p.t, fx, fy, colour & 0xFF);
+        ++pixels_drawn_;
+        return;
+    }
+    if (p.unhandled) {
+        if (p.t.pp1 != unhandled_pp1_) unknown("draw field", kPp1FillMode, p.t.pp1);  // once per mode
+        unhandled_pp1_ = p.t.pp1;
+        return;
+    }
+    const u32 r = colour & 0xFF, g = (colour >> 8) & 0xFF, b = (colour >> 16) & 0xFF, a = colour >> 24;
+    u64 w;
+    switch (p.type) {
+        case 0:
+        case 1: {  // pixel pairs (4:4:4 or 5:5:5): the colour in both halves
+            const unsigned bits = p.type == 0 ? 4 : 5;
+            auto q = [&](u32 c) {
+                if (!p.dither) return c >> (8 - bits);
+                const u32 th = kBayer[fy & 3][fx & 3];
+                const u32 v = (c * ((1u << bits) - 1) * 16 + th * 255) / (255 * 16);
+                return std::min(v, (1u << bits) - 1);
+            };
+            const u64 v = q(r) | (q(g) << bits) | (q(b) << (2 * bits));
+            if (p.type == 0) w = v | (v << 12) | (u64{a >> 4} << 24) | (u64{a >> 4} << 28);
+            else w = v | (v << 15) | (u64{a >> 7} << 30) | (u64{a >> 7} << 31);
+            break;
+        }
+        case 2: w = colour; break;  // RGBA 8888
+        case 3:
+            w = colour & 0xFFFFFF;
+            if (p.size36) w |= u64{(r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8)} << 24;  // 12:12:12 low nibbles
+            break;
+        default: w = (colour & 0xFFF) | (u64{colour & 0xFFF} << 12); break;  // colour index, both buffers
+    }
+    for (unsigned k = 0; k < p.puts; ++k) {
+        u64* q = word_at(p.page[k], fx, fy);
+        const u64 v = p.logic ? logic_op(p.op, w, *q) : w;
+        *q = ((*q & ~p.mask[k]) | (v & p.mask[k])) & kWord36;
     }
     ++pixels_drawn_;
 }

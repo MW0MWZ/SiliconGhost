@@ -10,8 +10,15 @@ R10000 Indigo², IP28): MIPS R4000, R4400, R4600, R5000 and R10000
 processors, the MC/HPC3/IOC2 chipset, **Newport (REX3)** graphics and, on
 the Indigo², **IMPACT** graphics. The aim is to run the
 original boot PROM and IRIX unmodified, at or above the speed of the real
-machine. Linux is the primary host; it also builds and runs on macOS, and
-builds for Windows.
+machine. Linux is the primary host; it also builds and runs on macOS and
+Windows.
+
+Ready-made builds are on the [releases page](https://github.com/MW0MWZ/SiliconGhost/releases):
+a `.zip` for Windows (x64), a `.dmg` for macOS (Apple silicon or Intel) and
+an AppImage for Linux (x86-64; Ubuntu 24.04, Debian 13 or later). They are
+alpha releases: expect rough edges. The macOS build is not notarised by
+Apple: the first time it is opened, macOS refuses; allow it with *Open
+Anyway* in System Settings > Privacy & Security.
 
 ## Status
 
@@ -129,6 +136,16 @@ No `sudo` is needed: an administrator account can write to /Applications.
 (The `install_name_tool` warnings about invalidated signatures are expected:
 the copy is signed again as the last step.)
 
+On **Windows**, with [MSYS2](https://www.msys2.org): in its UCRT64 shell,
+
+```sh
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+          mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-libslirp
+```
+
+`build/siliconghost.exe` then runs from that shell; to run it elsewhere,
+copy the DLLs it uses from `/ucrt64/bin` next to it.
+
 TAP networking is Linux-only; user-mode networking works everywhere.
 
 Ubuntu 24.04 LTS and older releases do not package SDL3; build and install
@@ -162,9 +179,7 @@ with an R4600, an IP22 PROM for the Indigo². An Indy without a graphics
 board needs a 5.3 PROM: earlier ones set up the graphics board without first
 checking that one is fitted, and stop with a bus error. If there is none
 that fits, it says which it needs. Dumps read with each pair of
-bytes swapped are recognised and put right as they are loaded. `--prom FILE`
-(*Specific PROM* in the settings) chooses one by hand; it must suit the
-machine too.
+bytes swapped are recognised and put right as they are loaded.
 
 Started with no arguments, SiliconGhost opens its window with the machine
 powered off: choose the NVRAM, disk and CD-ROM images and the rest in
@@ -184,7 +199,6 @@ Main options (`siliconghost --help` lists them all):
 | Option | Meaning |
 |---|---|
 | `--prom-dir DIR` | folder of boot PROM dumps, from which the one the machine needs is chosen (default `./roms`, else `roms` in the SiliconGhost folder) |
-| `--prom FILE` | a specific boot PROM image instead (raw, big-endian); it must suit the machine |
 | `--machine indy\|indigo2\|indigo2-r10000` | the system board (default Indy); each Indigo² needs its own PROM; the IP22 Indigo² takes R4000/R4400 modules, the IP28 an R10000 at 175 or 195 MHz. Impossible combinations of platform, processor, clock and memory are refused with the choices that would fit |
 | `--nvram FILE` | NVRAM (the DS1386, and on the Indigo² the serial EEPROM), loaded at start and saved whenever the guest changes it |
 | `--disk FILE` / `--cdrom FILE` | SCSI disk (ID 1) / CD-ROM (ID 4) image; repeat `--cdrom` for a set of discs |
@@ -198,16 +212,14 @@ Main options (`siliconghost --help` lists them all):
 | `--headless` | no window: both serial ports use the terminal |
 | `--foreground` | keep the window's messages on the terminal instead of in the background |
 | `--settings FILE` | start from a settings file saved by the window |
+| `--version` | print the version and exit |
 | `--timing realtime\|cycle\|max\|free` | how guest time relates to host time (see below) |
-| `--timed-speed X` | in realtime mode, the CPU's speed (X times real) while the system times it at boot (default 2); delay loops run at the real CPU's speed, or this one if slower |
-| `--max-speed X` | in realtime mode, run the CPU at most X times real speed (default 0: as fast as the host allows) |
 | `--no-audio` | do not play the machine's audio |
 | `--audio-in` | let the machine record from the host's audio input (off by default) |
 | `--net user\|tap:NAME\|none` | Ethernet through user-mode NAT (default), a TAP interface, or none |
 | `--hostfwd tcp\|udp:HOST:GUEST` | with `--net user`, forward a host port to the guest |
 | `--no-jit`, `--no-block-cache`, `--no-idle-skip` | turn off the speed-ups |
-| `--quick-scsi-scan` | with realtime or cycle timing, absent SCSI devices answer within 1 ms instead of after the controller's programmed timeout (as with max timing) |
-| `--no-quick-scsi-scan` | the full selection timeout with every timing, max included |
+| `--no-quick-scsi-scan` | absent SCSI devices answer after the controller's programmed selection timeout instead of within 1 ms |
 | `--dump-state` | print the CPU registers when the emulator stops (for debugging) |
 | `--load-elf FILE` | run a bare-metal MIPS ELF program instead of the PROM (no PROM needed); implies `--headless` and, unless `--timing` is given, `free` |
 | `--test-device` | fit the bare-metal test device in GIO expansion slot 0: console output, a host clock, an instruction count and an exit code, for bare-metal test and benchmark programs |
@@ -216,11 +228,11 @@ Main options (`siliconghost --help` lists them all):
 ### The window
 
 SiliconGhost keeps its files in one folder, made on first start:
-`~/Documents/SiliconGhost` on macOS, `Documents\SiliconGhost` on Windows and
-`~/.SiliconGhost` on Linux. It holds `settings.ini`, the message log
+`SiliconGhost` in your Documents folder (`~/Documents/SiliconGhost`, or
+`Documents\SiliconGhost` on Windows). It holds `settings.ini`, the message log
 `siliconghost.log`, and `roms`, `diskImages` and `nvram` folders for PROM
 dumps, disk and CD-ROM images and NVRAM files, where the file choosers
-start. (Settings from an earlier version are copied in.)
+start. Started headless, it looks for PROMs in the same `roms` folder.
 
 Started from a terminal, the window carries on in the background and the
 terminal is free again at once; its messages go to `siliconghost.log`
@@ -273,7 +285,11 @@ why it could not open a window.
   sets this to capture on a click only), and
   pushing it against an edge of the screen releases the mouse there, as
   virtual machines do. A click captures it anywhere, with the pointer
-  brought to where you clicked.
+  brought to where you clicked. The mouse is a PS/2 wheel mouse to systems
+  that ask for one (IntelliMouse, with buttons 4 and 5 as the side
+  buttons); IRIX's driver does not, and Settings > Mouse can send the
+  wheel to it as the Up and Down arrow keys or Page Up and Page Down
+  instead.
 - **Keys kept by the window:** Ctrl+Alt+G (release the mouse), Ctrl+Alt+P
   (power button), Ctrl+Alt+E (next disc), Ctrl+Alt+F (full screen).
 - **Keyboard:** keys are sent by position as a PS/2 keyboard would send
@@ -492,24 +508,20 @@ so guest clocks always agree with each other.
 
 - **realtime** (default): guest time follows the wall clock. A fast host
   makes the CPU look faster, while a guest second stays a second.
-  While the PROM or a kernel times the CPU at boot, the CPU runs at
-  `--timed-speed`. Delay loops (a register counted down, nothing else) run
-  at the real CPU's speed, or the timed speed if that is slower: systems
-  calibrate their delays by timing one against a timer, and at the real
-  speed enough of it is timed for the timer's resolution, so delays come
-  out their real length and never short. Everything else runs as fast as
-  the host allows, or up to `--max-speed`.
+  While the PROM or a kernel times the CPU at boot, the CPU runs at the
+  real CPU's speed, and delay loops (a register counted down, nothing else)
+  run at it throughout: systems calibrate their delays by timing one
+  against a timer, and at the real speed enough of it is timed for the
+  timer's resolution, so delays come out their real length and never short. Everything else runs as fast as
+  the host allows.
   If the host falls behind (a busy start, a stall), guest time catches up
   afterwards; only a gap of more than 10 seconds, such as the host
   sleeping, is skipped.
 - **cycle**: one cycle per instruction, reproducible from run to run.
-- **max**: as realtime, with the CPU as fast as the host allows (the timed
-  speed at boot and the speed of delay loops stay, keeping the guest's
-  delays right, but `--max-speed` is ignored), and with disk and Ethernet
+- **max**: as realtime (the real CPU's speed at boot and for delay loops
+  stays, keeping the guest's delays right), with disk and Ethernet
   not held to their real rates: SCSI data moves as fast as the host reads it (each
-  command still takes its usual fraction of a millisecond, and by default
-  selecting an absent device gives up within a millisecond, which takes
-  seconds off the PROM's bus scan), Ethernet carries frames at 1 Gbit/s, holding each until
+  command still takes its usual fraction of a millisecond), Ethernet carries frames at 1 Gbit/s, holding each until
   the system has a buffer for it instead of dropping it, and the memory
   controller's DMA (with which the PROM clears memory) runs 32 times as fast.
 - **free**: no waiting and one cycle per instruction, with guest time
@@ -524,7 +536,7 @@ with performance layers on top that must give exactly the same results:
 - a soft-TLB for fast address translation;
 - a cache of decoded blocks, invalidated when code is written by the CPU or
   by DMA;
-- a recompiler for hot blocks (x86-64 and AArch64), with guest registers held in host
+- a JIT for hot blocks (x86-64 and AArch64), with guest registers held in host
   registers and direct links between translated blocks;
 - exact idle-loop skipping: a loop whose iterations leave the machine in the
   same state is fast-forwarded to the next timer or device event.
@@ -547,17 +559,17 @@ with performance layers on top that must give exactly the same results:
   tested so far (on the Indigo², IRIX: its 5.1 PROM loads only ECOFF
   programs, and the NetBSD and OpenBSD boot loaders are ELF); Linux has not been tried. (Current Debian releases no longer include
   Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
-- The recompiler runs on x86-64 (Linux, Windows) and AArch64 (Linux,
+- The JIT runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
   Linux is the host tested most. macOS on Apple silicon has run the IRIX
-  desktop. The Windows build is cross-compiled with MinGW-w64 and tested
-  under Wine; a native Windows build (MSVC, SDL3, libslirp) has not been
-  tried yet.
+  desktop. Windows builds with MSYS2 (MinGW-w64, SDL3, libslirp) and passes
+  the unit tests; it has been used less than the others. MSVC builds have
+  not been tried.
 
 ## Roadmap
 
 - Linux/mips; NetBSD on the graphics console
-- Native Windows builds (MSVC or MSYS2 with SDL3 and libslirp)
+- An MSVC build for Windows
 - IMPACT: the remaining OpenGL details; the IP22 PROM
   has no IMPACT console (IRIX still drives the board)
 - Indigo² graphics GR2 (XZ/Extreme)

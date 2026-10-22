@@ -1283,6 +1283,40 @@ TEST(kbc_mouse_reports_movement_only_when_enabled) {
     CHECK(!(k.read_status() & 0x01));
 }
 
+// The IntelliMouse knock: sample rates 200, 100, 80 make it a wheel mouse
+// (ID 3, a fourth byte with the wheel); then 200, 200, 80 an Explorer
+// (ID 4, the fourth byte's low nibble the wheel, bits 4-5 buttons 4 and 5).
+// Without the knock the wheel is not reported; reset ends either mode.
+TEST(kbc_mouse_wheel_modes) {
+    Kbc8042 k;
+    auto rate = [&](u8 r) {
+        CHECK(to_mouse(k, 0xF3) == std::vector<u8>{0xFA});
+        CHECK(to_mouse(k, r) == std::vector<u8>{0xFA});
+    };
+    auto packet = [&] {
+        std::vector<u8> b;
+        while (k.read_status() & 0x01) b.push_back(k.read_data());
+        return b;
+    };
+    CHECK(to_mouse(k, 0xF2) == (std::vector<u8>{0xFA, 0x00}));
+    to_mouse(k, 0xF4);
+    k.mouse_motion(0, 0, 0, 2);  // a standard mouse has no wheel
+    CHECK(packet() == (std::vector<u8>{0x08, 0x00, 0x00}));
+    rate(200), rate(100), rate(80);
+    CHECK(to_mouse(k, 0xF2) == (std::vector<u8>{0xFA, 0x03}));
+    CHECK(to_mouse(k, 0xE9) == (std::vector<u8>{0xFA, 0x20, 0x02, 80}));
+    k.mouse_motion(1, 0, 0, -1);  // up one step
+    CHECK(packet() == (std::vector<u8>{0x08, 0x01, 0x00, 0xFF}));
+    k.mouse_motion(0, 0, 0, 10);  // more than a packet holds
+    CHECK(packet() == (std::vector<u8>{0x08, 0x00, 0x00, 0x07, 0x08, 0x00, 0x00, 0x03}));
+    rate(200), rate(200), rate(80);
+    CHECK(to_mouse(k, 0xF2) == (std::vector<u8>{0xFA, 0x04}));
+    k.mouse_motion(0, 0, 8 | 16, -2);  // both side buttons, up two steps
+    CHECK(packet() == (std::vector<u8>{0x08, 0x00, 0x00, 0x3E}));
+    CHECK(to_mouse(k, 0xFF) == (std::vector<u8>{0xFA, 0xAA, 0x00}));
+    CHECK(to_mouse(k, 0xF2) == (std::vector<u8>{0xFA, 0x00}));
+}
+
 TEST(kbc_mouse_splits_large_movements_into_packets) {
     Kbc8042 k;
     to_mouse(k, 0xF4);

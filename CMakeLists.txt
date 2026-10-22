@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
-project(SiliconGhost VERSION 0.1.0 DESCRIPTION "SGI IP22 (Indy) emulator" LANGUAGES CXX)
+project(SiliconGhost VERSION 0.9.0 DESCRIPTION "SGI IP22 (Indy) emulator" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
+
+# The version as shown: the project version and its stage.
+set(SG_VERSION "${PROJECT_VERSION}-alpha")
 
 option(SG_BUILD_TESTS "Build unit tests" ON)
 option(SG_WERROR "Treat warnings as errors" OFF)
@@ -84,6 +87,9 @@ if(SG_WITH_SLIRP)
   if(SLIRP_FOUND)
     target_compile_definitions(sg_emu PRIVATE SG_HAVE_SLIRP=1)
     target_link_libraries(sg_emu PUBLIC PkgConfig::SLIRP)
+    if(WIN32)
+      target_link_libraries(sg_emu PUBLIC ws2_32)  # the network thread's own sockets
+    endif()
   else()
     message(WARNING "libslirp not found: building without user-mode networking")
   endif()
@@ -94,6 +100,12 @@ if(MSVC)
   set_source_files_properties(src/cpu/r4000/fpu.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
 else()
   set_source_files_properties(src/cpu/r4000/fpu.cpp PROPERTIES COMPILE_OPTIONS "-frounding-math;-ffp-contract=off")
+endif()
+
+# IMPACT's GL rasteriser runs its per-row loops several pixels at a time
+# at -O3 (MSVC's /O2 already does).
+if(NOT MSVC)
+  set_source_files_properties(src/machine/ip22/impact_gl.cpp PROPERTIES COMPILE_OPTIONS "$<$<NOT:$<CONFIG:Debug>>:-O3>")
 endif()
 
 # Front-end pieces without a window: settings, power control, terminal screen
@@ -111,6 +123,7 @@ endif()
 
 add_executable(siliconghost src/app/main.cpp)
 target_link_libraries(siliconghost PRIVATE sg_app sg_warnings)
+target_compile_definitions(siliconghost PRIVATE SG_VERSION="${SG_VERSION}")
 
 option(SG_WITH_SDL3 "Build the SDL3 display front end" ON)
 if(SG_WITH_SDL3)

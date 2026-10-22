@@ -48,7 +48,6 @@ const Platform* find_platform(const std::string& id);
 
 struct Settings {
     std::string prom_dir;  // folder of PROM images; empty: see prom_folder()
-    std::string prom;      // a specific PROM image instead of choosing from the folder
     std::string nvram, disk;
     std::vector<std::string> cdroms;
     std::string machine = "indy";  // indy | indigo2 | indigo2-r10000
@@ -68,14 +67,16 @@ struct Settings {
     // Realtime timing, as multiples of the real CPU: its speed while the
     // guest times it (and its delay loops' from then on), and a cap on it
     // otherwise (0: none).
-    double timed_speed = 2.0, max_speed = 0;
     bool idle_skip = true, block_cache = true, jit = true;
     // An absent SCSI target's selection times out within a millisecond
     // instead of its programmed period, shortening the PROM's bus scan: with
     // Realtime or Cycle timing, and with Max timing (or turbo).
-    bool quick_scsi_scan = false, quick_scsi_scan_max = true;
+    bool quick_scsi_scan = true;
     bool audio = true, audio_in = false;
     bool mouse_auto_capture = true;  // the window captures the mouse when the pointer moves onto the screen
+    // The wheel, for a system whose mouse driver has none (IRIX), as keys:
+    // "off" (none), "arrows" (Up and Down) or "pages" (Page Up and Down).
+    std::string wheel_keys = "off";
     std::string log = "warn";
     // Command line only, never saved: a bare-metal program to run instead of
     // the PROM, and the test device it can talk to the host through.
@@ -87,8 +88,7 @@ struct Settings {
 };
 
 // What the window offers on first start, with no settings file yet: the
-// best-equipped Indy (256 MiB, the 24-bit board, a 200 MHz CPU), timed at
-// 1.2x the real CPU.
+// best-equipped Indy (256 MiB, the 24-bit board, a 200 MHz CPU).
 Settings first_run_settings();
 
 ip22::Board board_of(const Settings& s);
@@ -122,9 +122,8 @@ void apply_log_level(const std::string& level);
 bool set_option(Settings& s, const std::string& key, const std::string& value, std::string& error);
 
 // The user's folder for SiliconGhost: the settings, the log, and roms,
-// diskImages and nvram folders for machine files: Documents/SiliconGhost on
-// macOS and Windows, ~/.SiliconGhost elsewhere. Empty if the home folder is
-// unknown.
+// diskImages and nvram folders for machine files: SiliconGhost in the
+// user's Documents folder. Empty if the home folder is unknown.
 std::string user_data_folder();
 // Makes the folder and its subfolders where they are missing.
 void make_user_data_folders();

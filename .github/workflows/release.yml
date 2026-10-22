@@ -1,0 +1,172 @@
+# Builds SiliconGhost for Windows, macOS and Linux, runs the unit tests on
+# each, and packages it: a .zip for Windows, a .dmg for each Mac processor,
+# an AppImage for Linux. A pushed release tag (release/X or vX) makes a
+# GitHub release with them; run by hand, it gathers them without one.
+name: Release
+
+on:
+  push:
+    tags: ['release/*', 'v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      name: ${{ steps.v.outputs.name }}
+    steps:
+      - id: v
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${ref#release/}"; v="${v#v}"; else v="build-${GITHUB_SHA::7}"; fi
+          echo "name=$v" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-libslirp
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSG_WERROR=ON
+          cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          d="SiliconGhost-${{ needs.version.outputs.name }}-windows-x64"
+          mkdir "$d"
+          cp build/siliconghost.exe README.md LICENSE "$d"/
+          # The DLLs it uses from the toolchain's own folder
+          ldd build/siliconghost.exe | awk '/\/ucrt64\/bin\// {print $3}' | sort -u | xargs -I{} cp {} "$d"/
+          ls "$d"
+          zip -r "$d.zip" "$d"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: SiliconGhost-*.zip
+
+  macos:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Dependencies
+        run: brew install sdl3 libslirp pkgconf ninja
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSG_WERROR=ON
+          cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          cmake --install build --prefix "$PWD/dist"
+          ln -s /Applications dist/Applications
+          cp README.md LICENSE dist/
+          hdiutil create -volname "Silicon Ghost" -srcfolder dist -ov -format UDZO \
+            "SiliconGhost-${{ needs.version.outputs.name }}-macos-${{ matrix.arch }}.dmg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: SiliconGhost-*.dmg
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build pkg-config libslirp-dev file imagemagick \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgl-dev libgles-dev \
+            libdrm-dev libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev
+      - name: SDL3
+        # Ubuntu 24.04 has no SDL3 package; built here, the AppImage runs on
+        # this release and later.
+        run: |
+          git clone --depth 1 --branch release-3.4.18 https://github.com/libsdl-org/SDL.git sdl
+          cmake -S sdl -B sdl/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DSDL_TESTS=OFF
+          cmake --build sdl/build
+          sudo cmake --install sdl/build
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSG_WERROR=ON
+          cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          convert graphics/SiliconGhost_icon_1024.png -resize 256x256 siliconghost.png
+          cat > siliconghost.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Silicon Ghost
+          Comment=SGI Indy and Indigo2 emulator
+          Exec=siliconghost
+          Icon=siliconghost
+          Categories=System;Emulator;
+          EOF
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --executable build/siliconghost \
+            --desktop-file siliconghost.desktop --icon-file siliconghost.png --output appimage
+          mv Silicon_Ghost-*.AppImage "SiliconGhost-${{ needs.version.outputs.name }}-linux-x86_64.AppImage"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: SiliconGhost-*.AppImage
+
+  release:
+    needs: [version, windows, macos, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Assets
+        run: ls -l assets
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.version.outputs.name }}"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # The tag was moved: new files for the release, its notes kept
+            gh release upload "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            pre=""; case "$v" in *-*) pre="--prerelease";; esac
+            gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "SiliconGhost $v" --notes "SiliconGhost $v" $pre
+          fi

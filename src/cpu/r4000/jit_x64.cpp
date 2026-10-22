@@ -191,7 +191,7 @@ bool R4000::jit_compile(Block& b) {
         }
         for (std::size_t site : miss) s.bind(site);
         s.jmp(r11);
-        const u8* at = static_cast<const u8*>(jit_buf_->add(s.code().data(), s.size()));
+        const u8* at = static_cast<const u8*>(jit_buf_->add(s.code(), s.size()));
         if (!at) return false;
         for (unsigned a = 0; a < 2; ++a) jit_enter_stub_[a] = at + enter_at[a], jit_lookup_stub_[a] = at + lookup_at[a];
         jit_stub_generation_ = jit_generation_;
@@ -2393,7 +2393,7 @@ bool R4000::jit_compile(Block& b) {
     e.pop(r15), e.pop(r14), e.pop(r13), e.pop(r12), e.pop(rbp), e.pop(rbx);
     e.ret();
 
-    const void* fn = jit_buf_->add(e.code().data(), e.size());
+    const void* fn = jit_buf_->add(e.code(), e.size());
     if (fn != base) return false;  // full
     b.code = reinterpret_cast<JitFn>(const_cast<void*>(fn));
     b.jit_region = rb.size() > 1;

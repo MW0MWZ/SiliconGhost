@@ -209,7 +209,6 @@ Settings first_run_settings() {
     Settings s;
     s.ram_mb = 256;
     s.cpu_mhz = 200;  // the fastest Indy R4400SC
-    s.timed_speed = 1.2;
     return s;
 }
 
@@ -291,8 +290,7 @@ bool parse_number(const std::string& v, double& out) {
 bool set_option(Settings& s, const std::string& key, const std::string& v, std::string& error) {
     double n = 0;
     bool ok = true;
-    if (key == "prom") s.prom = v;
-    else if (key == "prom_dir") s.prom_dir = v;
+    if (key == "prom_dir") s.prom_dir = v;
     else if (key == "nvram") s.nvram = v;
     else if (key == "disk") s.disk = v;
     else if (key == "cdrom") s.cdroms.push_back(v);
@@ -327,17 +325,14 @@ bool set_option(Settings& s, const std::string& key, const std::string& v, std::
         net::PortForward f;
         ok = parse_forward(v, f) && (s.forwards.push_back(f), true);
     } else if (key == "timing") ok = parse_timing(v, s.timing);
-    else if (key == "timed_speed") ok = parse_number(v, n) && n > 0 && (s.timed_speed = n, true);
-    else if (key == "max_speed") ok = parse_number(v, n) && n >= 0 && (s.max_speed = n, true);
     else if (key == "idle_skip") ok = parse_bool(v, s.idle_skip);
     else if (key == "quick_scsi_scan") ok = parse_bool(v, s.quick_scsi_scan);
-    else if (key == "quick_scsi_scan_max") ok = parse_bool(v, s.quick_scsi_scan_max);
-    else if (key == "quick_scsi_scan_all") ok = parse_bool(v, s.quick_scsi_scan) && parse_bool(v, s.quick_scsi_scan_max);
     else if (key == "block_cache") ok = parse_bool(v, s.block_cache);
     else if (key == "jit") ok = parse_bool(v, s.jit);
     else if (key == "audio") ok = parse_bool(v, s.audio);
     else if (key == "audio_in") ok = parse_bool(v, s.audio_in);
     else if (key == "mouse_auto_capture") ok = parse_bool(v, s.mouse_auto_capture);
+    else if (key == "wheel_keys") ok = (v == "off" || v == "arrows" || v == "pages") && (s.wheel_keys = v, true);
     else if (key == "log") ok = (v == "trace" || v == "debug" || v == "info" || v == "warn" || v == "error") && (s.log = v, true);
     else {
         error = "unknown setting \"" + key + "\"";
@@ -358,11 +353,7 @@ std::string user_data_folder() {
 #else
     const char* home = std::getenv("HOME");
     if (!home || !*home) return {};
-#if defined(__APPLE__)
     return (std::filesystem::path(home) / "Documents" / "SiliconGhost").string();
-#else
-    return (std::filesystem::path(home) / ".SiliconGhost").string();
-#endif
 #endif
 }
 
@@ -385,25 +376,22 @@ bool load_settings(const std::string& path, Settings& s, std::string& error) {
     Settings loaded;
     std::string line;
     unsigned number = 0;
-    bool timed_speed = false;
     while (std::getline(f, line)) {
         ++number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         const auto eq = line.find('=');
-        if (line.compare(0, eq, "timed_speed") == 0) timed_speed = true;
+        // Older files: a PROM chosen by hand, the CPU's speed while the guest
+        // timed it and a cap on it otherwise, all no longer settings.
+        if (line.compare(0, eq, "prom") == 0 || line.compare(0, eq, "timed_speed") == 0 ||
+            line.compare(0, eq, "max_speed") == 0)
+            continue;
         std::string why;
         if (eq == std::string::npos || !set_option(loaded, line.substr(0, eq), line.substr(eq + 1), why)) {
             // An unknown or bad line is skipped, so a file from another
             // version still loads.
             SG_LOG(Warn, "settings", "%s:%u: %s", path.c_str(), number, why.empty() ? "not key=value" : why.c_str());
         }
-    }
-    // Older files have only max_speed, which then capped the CPU at all
-    // times: it is the speed the guest times.
-    if (!timed_speed) {
-        loaded.timed_speed = loaded.max_speed > 0 ? loaded.max_speed : Settings{}.timed_speed;
-        loaded.max_speed = 0;
     }
     s = std::move(loaded);
     return true;
@@ -414,18 +402,16 @@ bool save_settings(const std::string& path, const Settings& s, std::string& erro
     {
         std::ofstream f(tmp, std::ios::trunc);
         f << "# SiliconGhost settings\n";
-        f << "prom_dir=" << s.prom_dir << "\nprom=" << s.prom << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
+        f << "prom_dir=" << s.prom_dir << "\nnvram=" << s.nvram << "\ndisk=" << s.disk << "\n";
         for (const auto& c : s.cdroms) f << "cdrom=" << c << "\n";
         f << "machine=" << s.machine << "\ncpu=" << s.cpu << "\ncpu_mhz=" << s.cpu_mhz << "\nram_mb=" << s.ram_mb << "\ngraphics=" << graphics_name(s)
           << "\ngraphics_rev=" << (s.graphics_rev >= 0 ? std::to_string(s.graphics_rev) : "")
           << "\nconsole=" << s.console << "\nmac=" << (s.mac ? mac_text(*s.mac) : "") << "\nnet=" << s.net << "\n";
         for (const auto& fw : s.forwards) f << "hostfwd=" << forward_text(fw) << "\n";
-        f << "timing=" << timing_name(s.timing) << "\ntimed_speed=" << s.timed_speed << "\nmax_speed=" << s.max_speed
-          << "\nidle_skip=" << (s.idle_skip ? 1 : 0) << "\nquick_scsi_scan=" << (s.quick_scsi_scan ? 1 : 0)
-          << "\nquick_scsi_scan_max=" << (s.quick_scsi_scan_max ? 1 : 0)
+        f << "timing=" << timing_name(s.timing) << "\nidle_skip=" << (s.idle_skip ? 1 : 0) << "\nquick_scsi_scan=" << (s.quick_scsi_scan ? 1 : 0)
           << "\nblock_cache=" << (s.block_cache ? 1 : 0) << "\njit=" << (s.jit ? 1 : 0) << "\naudio=" << (s.audio ? 1 : 0)
           << "\naudio_in=" << (s.audio_in ? 1 : 0) << "\nlog=" << s.log
-          << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0) << "\n";
+          << "\nmouse_auto_capture=" << (s.mouse_auto_capture ? 1 : 0) << "\nwheel_keys=" << s.wheel_keys << "\n";
         if (!f) {
             error = "cannot write " + tmp;
             return false;

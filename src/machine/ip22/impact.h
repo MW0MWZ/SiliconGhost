@@ -173,7 +173,20 @@ private:
         u32 pp1 = 0, drb = 0, lsb_a = 0, lsb_b = 0, msbs = 0;
     };
     PixelTarget rss_target() const;
-    void store_pixel_to(const PixelTarget& t, int fx, int fy, u32 colour);
+    // What store_pixel_to() decides from the target alone, worked out once
+    // for a whole primitive: the pixel type and buffers, the pages and plane
+    // masks written, and the logic op.
+    struct StorePlan {
+        PixelTarget t;
+        unsigned type = 0;
+        bool overlay = false, unhandled = false, size36 = false, dither = false, logic = false;
+        unsigned op = 0, puts = 0;
+        std::array<unsigned, 2> page{};
+        std::array<u64, 2> mask{};
+    };
+    StorePlan store_plan(const PixelTarget& t) const;
+    void store_planned(const StorePlan& p, int fx, int fy, u32 colour);
+    void store_pixel_to(const PixelTarget& t, int fx, int fy, u32 colour) { store_planned(store_plan(t), fx, fy, colour); }
     u32 target_colour(const PixelTarget& t, int fx, int fy) const;
 
     // ---- GL drawing (the geometry engines' primitives) ----
@@ -196,8 +209,8 @@ private:
     PixelTarget gl_target(const GeDraw& d) const;
     bool gl_to_framebuffer(const GeDraw& d, int x, int y, int& fx, int& fy) const;
     bool gl_visible(const GeDraw& d, int fx, int fy) const;
-    void gl_fragment(const GeDraw& d, int x, int y, const float* rgba, float z);
-    void gl_fragment_at(const GeDraw& d, int x, int y, int fx, int fy, const float* rgba, float z);
+    void gl_fragment(const GeDraw& d, const StorePlan& plan, int x, int y, const float* rgba, float z);
+    void gl_fragment_at(const GeDraw& d, const StorePlan& plan, int x, int y, int fx, int fy, const float* rgba, float z);
     bool gl_clear_rect(const GeDraw& d, int& x0, int& x1, int& y0, int& y1) const;
     u32& zst_at(int fx, int fy);
     // Whether a framebuffer pixel may be written: its clip ID matches and it
@@ -391,6 +404,7 @@ private:
     std::vector<u8> cid_ = std::vector<u8>(kFbSize * kFbSize);
     ImpactTram tram_;
     std::vector<u32> zst_;  // depth (23:0) and stencil (31:24) a framebuffer pixel, made on first use
+    std::vector<float> gl_span_;  // ge_triangle's working rows
     std::optional<std::array<u32, 0x400>> gl_saved_rss_;  // the X server's raster registers during a GL pixel operation
     unsigned gl_read_zst_ = 0;  // a GL read of the depth (1) or stencil (2) buffer is armed
 
