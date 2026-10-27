@@ -53,13 +53,16 @@ SiliconGhost is under active development. What works today:
   PROM (5.1), IRIX 5.3 and 6.5 boot from the same disks as on the Indy, to
   the graphical desktop on a Newport (XL) board; IRIX finds the EISA bus and
   both SCSI controllers. Up to 384 MiB of memory in three banks.
-- **R10000 Indigo² (IP28) with IMPACT (work in progress):** with
-  `--machine indigo2-r10000` and the IP28 PROM, IRIX 6.5 installs from its
-  CDs and boots to the 4Dwm desktop on a Maximum IMPACT board, with keyboard,
-  mouse, networking and sound. OpenGL programs draw through the board's
-  geometry engines (lit and smooth-shaded triangles, lines, points, depth,
-  stencil, blending, mipmapped textures, pixel images, bitmaps and display
-  lists).
+- **R10000 Indigo² (IP28):** with `--machine indigo2-r10000` and the IP28
+  PROM, IRIX 6.5 (up to 6.5.22m, the last release for this machine) installs
+  from its CDs and boots to the 4Dwm desktop, with keyboard, mouse,
+  networking and sound; OpenBSD 6.9 installs and boots too. The R10000
+  processor, ECC memory (up to 1 GiB) and the rest of the board are complete.
+- **Maximum IMPACT graphics (work in progress):** the X server and 2D
+  drawing are complete. OpenGL programs draw through the board's geometry
+  engines (lit and smooth-shaded triangles, lines, points, depth, stencil,
+  blending, mipmapped textures, pixel images, bitmaps and display lists);
+  a few OpenGL details are still to do (see the roadmap).
 - **CPU:** the full R4000/R4400 and R4600 (MIPS III) and R5000 (MIPS IV)
   integer and floating-point instruction sets, TLB, exceptions, 32/64-bit
   addressing and cache tag operations, with or without a secondary cache.
@@ -570,8 +573,10 @@ with performance layers on top that must give exactly the same results:
 
 - Linux/mips; NetBSD on the graphics console
 - An MSVC build for Windows
-- IMPACT: the remaining OpenGL details; the IP22 PROM
-  has no IMPACT console (IRIX still drives the board)
+- Maximum IMPACT: the remaining OpenGL details (polygon offset, smooth
+  lines and points, zoom and decimation, depth and stencil pixel transfers,
+  texture memory paging under load); the IP22 PROM has no IMPACT console
+  (IRIX still drives the board)
 - Indigo² graphics GR2 (XZ/Extreme)
 
 ## Legal
