@@ -36,6 +36,7 @@ constexpr u32 kHqReifContext = 0x200, kHqDmaContext = 0x300;
 constexpr unsigned kDmaPageList = 0x00, kDmaStride = 0x04, kDmaRowOffset = 0x05, kDmaRowStart = 0x06;
 constexpr unsigned kDmaLines = 0x07, kDmaLineBytes = 0x08, kDmaLastBytes = 0x09, kDmaStart = 0x0B;
 constexpr unsigned kDmaDlJump = 0x0C, kDmaDlPush = 0x37, kDmaDlReturn = 0x39, kDmaPoolTable = 0x20, kDmaDlTable = 0x28;
+constexpr unsigned kDmaPageShift = 0x2B;  // + pool: log2 of the pages a page-list entry spans
 constexpr unsigned kDlMaxSegments = 1u << 20, kDlMaxDepth = 64;  // (GL nests lists 64 deep)
 constexpr u32 kFlagContextSaved = 1u << 19, kFlagContextLoaded = 1u << 6;
 constexpr u32 kFlagCp0 = 1u << 10;  // command-processor flag 0: a scheduled buffer swap has happened
@@ -116,6 +117,7 @@ void Impact::reset() {
     for (GeDiag& g : ge_) {
         g.addr = 0;
         g.word = 0;
+        g.control.fill(0);
         std::fill(g.ucode.begin(), g.ucode.end(), std::array<u32, 3>{});
     }
     ge_readback_.clear();
@@ -132,6 +134,7 @@ void Impact::reset() {
     eram_read_ge0_.reset();
     eram_write_ge_.reset();
     eram_out_.clear();
+    te_out_.clear();
     pixel_buf_.clear();
     gl_pixels_.clear();
     zst_.clear();
@@ -407,6 +410,7 @@ void Impact::load_context() {
         gl_.reset();
         user_port_ = FifoPort{};
     }
+    gl_pixels_.clear();  // pixel data the outgoing context was still owed is its own
     GlWindow& w = gl_window_;
     w.origin = ctx_image_[2];
     w.mode = ctx_image_[3];
@@ -459,9 +463,14 @@ void Impact::ge_diag_write(unsigned ge, bool address_port, u32 value) {
             g.word = 0;
             ++g.addr;
         }
-    } else if (g.addr == kGeExecControl && (value & 1)) {
-        ge_answer_ = {0, 1};
-        flags_ |= kFlagGeData;
+    } else if (g.addr >= kGeExecControl && g.addr - kGeExecControl < g.control.size()) {
+        // The kernel sets 0x38 (0xD0 before the download, 0xD1 after), 0x10
+        // and 0x18, then starts the engine: kept as written.
+        g.control[g.addr - kGeExecControl] = value;
+        if (g.addr == kGeExecControl && (value & 1)) {
+            ge_answer_ = {0, 1};
+            flags_ |= kFlagGeData;
+        }
     } else {
         unknown("ge diag write", kPriv + (ge ? kHqGe1Data : kHqGe0Data), value);
     }
@@ -582,7 +591,7 @@ void Impact::pixel_data(FifoPort& port, const std::vector<u8>& bytes) {
     switch (port.last_token) {
         case 0x07F: gl_.rss_list(words.data(), static_cast<unsigned>(words.size()), 2); break;  // RSS_REG_SET: (register, value) pairs
         case 0x07C: gl_.rss_list(words.data(), static_cast<unsigned>(words.size()), 3); break;  // RSS_REG_SHADOW: (register, value, shadow) triples
-        case 0x082: break;  // (with the GE's DMA set-up: nothing drawn)
+        case 0x082: break;  // INIT_TABLES: the GE microcode's lookup tables, not needed here
         default: unknown("pixel data", port.last_token, bytes.size()); break;
     }
 }
@@ -601,6 +610,7 @@ void Impact::run_command(FifoPort& port, u32 cmd, const u32* data, unsigned word
         for (unsigned i = 0; i < words; ++i) rss_write(reg + i, data[i], go && i + 1 == words);
         return;
     }
+    if (cmd == 0xE01) return;  // no data: the kernel's WAIT_FOR_READDMA, before it polls DMABUSY; DMA here is done at once
     if (cmd == 0xE04) {  // SET_DONE_FLAG
         flags_ |= kFlagDone;
         update_irqs();
@@ -717,6 +727,7 @@ void Impact::ge_command(FifoPort& port, u32 cmd, const u32* data, unsigned words
             return;
         }
         case 0x0F4: nosave_next_ = true; return;  // GE_NOSAVE_NEXT_SWITCH
+        case 0x0FF: return;  // CP_GE_SAVE_IDLE_HQ_STATE: the kernel's, at start-up, around its first switch
         case 0x0FA:
         case 0x0FB:
         case 0x0FC:
@@ -895,6 +906,10 @@ void Impact::dcb_device_write(unsigned dev, unsigned crs, unsigned width, u32 da
         case kDevBoardVersion:
             if (crs == 1) board_version_written_ = static_cast<u8>(data);
             return;
+        // The flat panel adapter's I2C controller (CRS 0 data, 1 control),
+        // whose data register the kernel also probes for a multi-channel
+        // option: neither is fitted, and the data register reads 0.
+        case kDevI2c: return;
         default: unknown("dcb write", dev << 10 | crs << 7, data); return;
     }
     // The VC3 says for itself (a cursor move changes only its rows); the
@@ -987,10 +1002,15 @@ bool Impact::xmap_write(unsigned crs, unsigned width, u32 data) {
         case 0: x.pp1_select = static_cast<u8>(data); return false;
         case 1: x.index = static_cast<u8>(data); return false;
         case 2: file = x.config.data(), size = 4; break;
-        case 3: file = x.buf_select.data(), size = 4; break;
+        case 3: file = x.buf_select.data(), size = 8; break;
         case 4: file = x.main_mode.data(), size = 128; break;
         case 5: file = x.overlay_mode.data(), size = 128; break;
         case 6: file = x.dib.data(), size = static_cast<unsigned>(x.dib.size()); break;
+        // RE_RAC: the links from the RE to the PP1s. The kernel writes a
+        // control word at INDEX 0 (sync: 0x50214, 0x70214 to retry, 0x10214
+        // when done; the current control value from INDEX 6 in bits 15:10,
+        // bit 8 pulsed) and one at 28; nothing shows.
+        case 7: file = x.re_rac.data(), size = static_cast<unsigned>(x.re_rac.size()); break;
         default: unknown("xmap write", crs, data); return false;
     }
     bool changed = false;
@@ -1001,7 +1021,7 @@ bool Impact::xmap_write(unsigned crs, unsigned width, u32 data) {
         unknown("xmap index", crs << 8 | x.index, data);
     }
     if (crs >= 3 && (be_bytes(x.config.data(), 4) & (1u << 19))) x.index = static_cast<u8>(x.index + width);
-    return changed;
+    return changed && crs != 7;
 }
 
 u32 Impact::xmap_read(unsigned crs, unsigned width) {
@@ -1014,11 +1034,11 @@ u32 Impact::xmap_read(unsigned crs, unsigned width) {
             if (x.index == 4) return 1;     // PP1 revision
             if (x.index == 8) return 0x10;  // room for a mode update
             return x.index + width <= 4 ? be_bytes(x.config.data() + x.index, width) : 0;
-        case 3: v = x.index + width <= 4 ? be_bytes(x.buf_select.data() + x.index, width) : 0; break;
+        case 3: v = x.index + width <= 8 ? be_bytes(x.buf_select.data() + x.index, width) : 0; break;
         case 4: v = x.index + width <= 128 ? be_bytes(x.main_mode.data() + x.index, width) : 0; break;
         case 5: v = x.index + width <= 128 ? be_bytes(x.overlay_mode.data() + x.index, width) : 0; break;
         case 6: v = x.index + width <= x.dib.size() ? be_bytes(x.dib.data() + x.index, width) : 0; break;
-        case 7: return 0x00010101;  // RE-to-PP1 links in sync
+        case 7: return 0x00010101;  // link status: in sync (INDEX 7), current control value 1 (INDEX 6)
         default: return 0;
     }
     if (be_bytes(x.config.data(), 4) & (1u << 19)) x.index = static_cast<u8>(x.index + width);
@@ -1119,6 +1139,15 @@ void Impact::rss_write(u32 reg, u32 value, bool go) {
     if (reg == kIrAlias) rss_[kIr] = value;
     if (reg == kXfrControl && (value & 0xF) == 9 && dma_read_pending_)  // the raster side of a DMA read
         dma_run(std::exchange(dma_read_pending_, 0));
+    // XFRCONTROL: start by DMA or PIO (bits 0, 1), the texture side (bit 2),
+    // read (bit 3); 0 ends a transfer. A write to the texture side is a
+    // texture load straight from the host (IRIS traced the diagnostics' TRAM
+    // load writing 5; IRIX's own restores go through the GE, token 0xD8).
+    if (reg == kXfrControl) {
+        te_load_ = (value & 3) && (value & 4) && !(value & 8);
+        te_load_n_ = 0;
+        te_load_part_.clear();
+    }
     if (!go) return;
     if (reg == kCharH && stipple_.armed) return char_stipple(u64{value} << 32, 32);
     if (reg == kCharL && stipple_.armed) return char_stipple((u64{rss_[kCharH]} << 32) | value, 64);
@@ -1356,7 +1385,10 @@ void Impact::pixel_to_host(u32 px, std::vector<u8>& out) const {
         return;
     }
     const u32 r = px & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF, a = px >> 24;
-    if (gl_read_zst_ == 1) return put(px, transfer_bpp(mode));
+    if (gl_read_zst_ == 1) {  // depth: 24 bits to the host's 32 (full scale both)
+        const u32 z = px & 0xFFFFFF;
+        return put(z << 8 | z >> 16, transfer_bpp(mode));
+    }
     if (f == 0) return put(px & (comp_size(t) == 1 ? 0xFF : 0xFFF), comp_size(t));
     if (f == 8 && t == 8) return put((r >> 4) | ((g >> 4) << 4) | ((b >> 4) << 8), 2);
     if (f == 8 && t == 10) return put((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10), 2);
@@ -1518,7 +1550,10 @@ u32 Impact::pio_read_hi() {
 void Impact::dma_start(u32 word) {
     if (!(word & 1)) return;
     if (word & 8) {
-        if (xfer_.armed && xfer_.read && !xfer_.pio && (rss_[kXfrControl] & 0xF) == 9) dma_run(word);
+        // A texture read starts its raster side itself (READ_TEXTURE's
+        // start word, 0x400D: DMA, texture side, read), so its texels are
+        // already waiting.
+        if (!te_out_.empty() || (xfer_.armed && xfer_.read && !xfer_.pio && (rss_[kXfrControl] & 0xF) == 9)) dma_run(word);
         else dma_read_pending_ = word;
         return;
     }
@@ -1563,67 +1598,82 @@ void Impact::dma_run(u32 word) {
     const unsigned pool = (word >> 1) & 3;
     const u32 table = dma_regs_[kDmaPoolTable + 2 * pool + 1] & ~3u;
     if (table < 0x1000) return;  // a parked pool (the kernel's dummy table): no transfer
-    // List mode: up to eight 16-bit indices into the pool's table, bit 15
-    // on the last (just [0x8000]: normal mode).
+    // The page list: up to eight 16-bit entries, bit 15 on the last. Each
+    // names a slot of the pool's page table, 1 << PAGE_SHIFT pages long
+    // (register 0x2B + pool; the kernel sets it with the table: 10, 4 MB,
+    // for its TRAM backing store), and the addresses (ROW_START,
+    // ROW_OFFSET) are byte offsets within a slot. One entry: LINES lines
+    // of LINE_BYTES, STRIDE apart, from ROW_START + ROW_OFFSET (running on
+    // into the slots that follow). The kernel's TRAM save and restore
+    // write 0x8000 | slot with the offset in ROW_START; libGLcore's own
+    // transfers use slot 0. More (libGLcore's pixel tiles, a tile to a
+    // slot): each line gathers LINE_BYTES from ROW_OFFSET in the first
+    // slot, STRIDE bytes from each middle one and LAST_BYTES from the last,
+    // all from ROW_START + line * STRIDE.
     std::vector<u32> list;
     for (unsigned i = 0; i < 4 && (list.empty() || !(list.back() & 0x8000)); ++i)
         for (u32 h : {dma_regs_[kDmaPageList + i] >> 16, dma_regs_[kDmaPageList + i] & 0xFFFF})
             if (list.empty() || !(list.back() & 0x8000)) list.push_back(h);
-    if (list.empty() || !(list.back() & 0x8000) || (list.size() == 1 && list[0] == 0x8000)) list.clear();
-    u32 base, stride, lines, len;
-    if (list.empty()) {
-        base = dma_regs_[kDmaRowStart] + dma_regs_[kDmaRowOffset];
-        stride = dma_regs_[kDmaStride], lines = dma_regs_[kDmaLines], len = dma_regs_[kDmaLineBytes];
-    } else {
-        const u32 n = static_cast<u32>(list.size());
-        base = dma_regs_[kDmaRowOffset] & 0xFFF, stride = 0, lines = 1;
-        len = n == 1 ? dma_regs_[kDmaLineBytes] : dma_regs_[kDmaLineBytes] + 0x1000 * (n - 2) + dma_regs_[kDmaLastBytes];
-        for (u32& h : list) h &= 0x7FFF;
-    }
+    if (list.empty() || !(list.back() & 0x8000)) list.assign(1, 0);
+    for (u32& h : list) h &= 0x7FFF;
+    const u32 shift = std::min<u32>(dma_regs_[kDmaPageShift + pool] & 0x1F, 16);
+    const u32 start = dma_regs_[kDmaRowStart], stride = dma_regs_[kDmaStride], lines = dma_regs_[kDmaLines];
+    struct Piece {
+        u32 slot, offset, len;  // of line 0
+    };
+    std::vector<Piece> pieces{{list[0], start + dma_regs_[kDmaRowOffset], dma_regs_[kDmaLineBytes]}};
+    for (std::size_t k = 1; k < list.size(); ++k)
+        pieces.push_back({list[k], start, k + 1 < list.size() ? stride : dma_regs_[kDmaLastBytes]});
+    u64 len = 0;
+    for (const Piece& p : pieces) len += p.len;
     if (lines > 4096 || len > (1u << 24)) return;
-    u32 cached_page = ~0u, cached_frame = 0;
-    auto phys = [&](u32 logical, u64& pa) {
-        const u32 page = logical >> 12;
-        if (page != cached_page) {
-            const u32 index = list.empty() ? page : page < list.size() ? list[page] : ~0u;
-            if (index == ~0u) return false;
-            u8 f[4];
-            host_read(table + 4ull * index, f, 4);
-            cached_page = page, cached_frame = be_value(f, 4);
+    u64 cached_index = ~u64{0};
+    u32 cached_frame = 0;
+    // Each run of a line within one host page, in order: (address, offset
+    // in the line, bytes). False when a page cannot be had.
+    auto runs = [&](u32 line, auto&& fn) {
+        u32 at = 0;
+        for (const Piece& p : pieces) {
+            const u32 o = p.offset + line * stride;
+            for (u32 k = 0; k < p.len;) {
+                const u64 index = (u64{p.slot} << shift) + ((u64{o} + k) >> 12);
+                if (index >= (1u << 26)) return false;
+                if (index != cached_index) {
+                    u8 f[4];
+                    host_read(table + 4 * index, f, 4);
+                    cached_index = index, cached_frame = be_value(f, 4);
+                }
+                const u32 run = std::min<u32>(p.len - k, 0x1000 - ((o + k) & 0xFFF));
+                fn((u64{cached_frame} << 12) | ((o + k) & 0xFFF), at + k, run);
+                k += run;
+            }
+            at += p.len;
         }
-        pa = (u64{cached_frame} << 12) | (logical & 0xFFF);
         return true;
     };
     std::deque<u8> stream;  // board to host: the raster side's bytes across its lines
     std::vector<u8> bytes;
     for (u32 i = 0; i < lines; ++i) {
-        const u32 a = base + i * stride;
         bytes.assign(len, 0);
         if (read) {
-            while (stream.size() < len && !eram_out_.empty()) stream.push_back(eram_out_.front()), eram_out_.pop_front();
+            std::deque<u8>& from = te_out_.empty() ? eram_out_ : te_out_;
+            while (stream.size() < len && !from.empty()) stream.push_back(from.front()), from.pop_front();
             while (stream.size() < len && xfer_.armed && xfer_.read && xfer_.line < xfer_.lines) {
                 const std::vector<u8> l = transfer_line_out();
                 stream.insert(stream.end(), l.begin(), l.end());
             }
             for (u32 k = 0; k < len && !stream.empty(); ++k) bytes[k] = stream.front(), stream.pop_front();
             format_bytes(bytes);
-            for (u32 k = 0; k < len;) {
-                u64 pa;
-                if (!phys(a + k, pa)) return;
-                const u32 run = std::min<u32>(len - k, 0x1000 - ((a + k) & 0xFFF));
-                bus_->write_block(pa, bytes.data() + k, run);
-                k += run;
-            }
+            if (!runs(i, [&](u64 pa, u32 k, u32 run) { bus_->write_block(pa, bytes.data() + k, run); })) return;
         } else {
-            for (u32 k = 0; k < len;) {
-                u64 pa;
-                if (!phys(a + k, pa)) return;
-                const u32 run = std::min<u32>(len - k, 0x1000 - ((a + k) & 0xFFF));
-                host_read(pa, bytes.data() + k, run);
-                k += run;
-            }
+            if (!runs(i, [&](u64 pa, u32 k, u32 run) { host_read(pa, bytes.data() + k, run); })) return;
             if (eram_in_) {  // ERAM write data
                 for (std::size_t k = 0; k + 3 < bytes.size(); k += 4) eram_in_->push_back(be_value(&bytes[k], 4));
+                continue;
+            }
+            if (te_load_) {  // texels for the texture loader
+                format_bytes(bytes);
+                te_load_bytes(bytes);
                 continue;
             }
             if (gl_.wants_pixel_data()) {  // an image for the GE (glDrawPixels by DMA)
@@ -1639,6 +1689,39 @@ void Impact::dma_run(u32 word) {
             transfer_line_in(bytes.data(), bytes.size());
         }
     }
+}
+
+// Host texels into the texture loader, as one stream across DMA lines: texel
+// n goes to row n / width, column n % width of the level the loader
+// registers describe (TL_SPEC's width), from TL_S_LEFT / TL_T_BOTTOM; each
+// texel the transfer mode's size, its bytes kept as they come. Pages are
+// relative to the context's TRAM base, as the GE's loads are.
+void Impact::te_load_bytes(const std::vector<u8>& bytes) {
+    const unsigned bpt = std::max(1u, ImpactTram::read_texel_bytes(rss_[kXfrMode]));
+    GeTexLoad l;
+    l.mode = rss_[kTlMode];
+    l.spec = rss_[kTlSpec];
+    l.page = (rss_[kTlMipmap] + gl_.tex_base()) & 0xFF;
+    l.border_page = (rss_[kTlBorder] + gl_.tex_base()) & 0xFF;
+    const unsigned w = 1u << ((l.spec >> 4) & 0xF);
+    const s32 s0 = static_cast<s32>(rss_[kTlSLeft]);
+    l.t0 = static_cast<s32>(rss_[kTlTBottom]);
+    std::vector<u8> in = std::move(te_load_part_);
+    in.insert(in.end(), bytes.begin(), bytes.end());
+    std::vector<u8> row;
+    std::size_t at = 0;
+    while (at + bpt <= in.size()) {
+        const unsigned col = static_cast<unsigned>(te_load_n_ % w), line = static_cast<unsigned>(te_load_n_ / w);
+        const unsigned n = static_cast<unsigned>(std::min<std::size_t>(w - col, (in.size() - at) / bpt));
+        row.assign(std::size_t{n} * 4, 0);
+        for (unsigned k = 0; k < n; ++k)
+            std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(at + std::size_t{k} * bpt), std::min(bpt, 4u), row.begin() + 4 * k);
+        l.s0 = s0 + static_cast<s32>(col);
+        tram_.load_line(l, line, row.data(), n);
+        at += std::size_t{n} * bpt;
+        te_load_n_ += n;
+    }
+    te_load_part_.assign(in.begin() + static_cast<std::ptrdiff_t>(at), in.end());
 }
 
 u64 Impact::pixel_word(unsigned page, int fx, int fy) const { return *word_at(page, fx, fy); }

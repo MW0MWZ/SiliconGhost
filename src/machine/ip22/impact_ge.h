@@ -92,6 +92,7 @@ struct GeDraw {
     std::array<float, 4> blend_color{};
     bool poly_stipple = false;
     std::array<u32, 32> stipple{};
+    bool line_smooth = false, point_smooth = false;  // antialiased lines, points
     bool overlay = false;  // drawing the overlay planes
     GeTexture tex;
 };
@@ -105,6 +106,10 @@ public:
     virtual void ge_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, float width, bool stipple,
                          u32 pattern, u32 repeat, u32& stipple_pos) = 0;
     virtual void ge_point(const GeDraw& d, const GeVertex& v, float size) = 0;
+    // A depth (24 bits) or stencil value straight into the buffer at window
+    // (x, y), where the window and scissor box allow; stencil through its
+    // write mask.
+    virtual void ge_zst_put(const GeDraw& d, int x, int y, bool depth, u32 v) = 0;
     // One fragment at window (x, y) (bitmaps, images).
     virtual void ge_fragment(const GeDraw& d, int x, int y, const std::array<float, 4>& colour, float z) = 0;
     // A host pixel in the raster engine's transfer format `xfrmode`: its
@@ -157,10 +162,12 @@ public:
         std::array<float, 3> indexes{};
     };
     // The vertex as the pipeline carries it: clip position, eye position,
-    // front and back colours, texture coordinates, fog factor.
+    // front and back colours, texture coordinates, fog factor, and its edge
+    // flag (the edge it starts is a boundary edge).
     struct PVertex {
         std::array<float, 4> h{}, e{}, c{}, cb{}, t{};
         float fog = 1;
+        u32 edge = 1;
     };
     static constexpr unsigned kMaxPoly = 64;
 
@@ -200,14 +207,21 @@ public:
         u32 clip_on = 0;
         std::array<std::array<float, 4>, 6> clip_planes{};
         // rasterisation
-        u32 smooth = 1, cull = 0, cull_mode = 0x405, front_ccw = 1;
+        u32 smooth = 1, cull = 0, cull_mode = 0x405, front_ccw = 1, edge_flag = 1;
         std::array<u32, 2> polygon_mode{0x1B02, 0x1B02};
         float line_width = 1, point_size = 1;
         u32 line_smooth = 0, point_smooth = 0;
         u32 line_stipple = 0, line_repeat = 0, line_pattern = 0xFFFF, stipple_pos = 0;
         u32 poly_stipple = 0;
         std::array<u32, 32> stipple_rows{};
-        std::array<float, 2> polygon_offset{};
+        // glPolygonOffset's factor and units, the third word libGLcore
+        // sends (1.1 for glPolygonOffset, 1.0 for glPolygonOffsetEXT), and
+        // the modes offset (POLYGON_OFFSET_MODES: 1 fill, 2 line, 4 point).
+        // The context's place in TRAM (TEX_BASE): a page offset the TE adds
+        // to every page it is given, modulo TRAM's 256 pages.
+        u32 tex_base = 0;
+        std::array<float, 3> polygon_offset{};
+        u32 polygon_offset_on = 0;
         // fragments
         u32 scissor_test = 0;
         std::array<int, 4> scissor{0, 1279, 0, 1023};  // as sent: x, width - 1, y, height - 1
@@ -278,6 +292,8 @@ public:
         u32 pixel_op = 0, pixel_planes = 0;
         std::array<u32, 8> send_pixels{};
         u32 send_pixels_pending = 0;
+        // A kernel TRAM restore (0xD8): the texel words still to come.
+        u32 tram_restore_words = 0;
         // GE memory words set by SET_DATA (0xB00-0xBFF)
         std::array<u32, 0x100> set_data{};
         std::array<u32, 8> set_data_valid{};
@@ -299,7 +315,9 @@ public:
 
     // Pixel data the GE takes (glBitmap rows): whether it waits for some,
     // and how many words before it can draw.
-    bool wants_pixel_data() const { return s_.bitmap_pending || s_.send_pixels_pending; }
+    bool wants_pixel_data() const { return s_.bitmap_pending || s_.send_pixels_pending || s_.tram_restore_words; }
+    // The current context's first TRAM page (TEX_BASE).
+    u32 tex_base() const { return s_.tex_base; }
     bool wants_image() const { return s_.send_pixels_pending != 0; }
     unsigned pixel_words_needed() const;
     void pixel_data(const u32* words, unsigned n);
@@ -339,6 +357,9 @@ private:
     void vertex(const std::array<float, 4>& obj);
     void end_primitive();
     void polygon(PVertex* v, unsigned n, const PVertex& provoking);
+    void offset_depth(GeVertex* w, unsigned n) const;
+    unsigned xzoom_rep() const;
+    void tram_restore(const u32* words, unsigned n);
     void line(PVertex a, PVertex b, bool restart);
     void point(const PVertex& v);
     unsigned clip_polygon(PVertex* v, unsigned n) const;
