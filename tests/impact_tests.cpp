@@ -102,6 +102,43 @@ TEST(impact_reports_idle_and_ready) {
     CHECK_EQ(t.r(dcb(7, 7, 0)), 0x00010101u);  // links in sync
 }
 
+// XMAP BUF_SELECT holds two words, at INDEX 0 and 4: the kernel's retrace
+// handler writes both at every swap.
+TEST(impact_xmap_buf_select_has_two_words) {
+    Rig t;
+    t.w(dcb(7, 1, 1), 4u << 24);
+    t.w(dcb(7, 3, 0), 0x12345678);
+    t.w(dcb(7, 1, 1), 0u << 24);
+    t.w(dcb(7, 3, 0), 0x00000005);
+    CHECK_EQ(t.r(dcb(7, 3, 0)), 0x5u);
+    t.w(dcb(7, 1, 1), 4u << 24);
+    CHECK_EQ(t.r(dcb(7, 3, 0)), 0x12345678u);
+}
+
+// The kernel's start-up: the RE link sync writes RE_RAC control words and
+// waits for the status to show the links in sync; nothing on screen changes.
+// The flat panel probe writes 0x55 to the I2C data register and finds no
+// panel when it does not read back.
+TEST(impact_start_up_link_sync_and_flat_panel_probe) {
+    Rig t;
+    const u64 v = t.board.display_version();
+    t.w(dcb(7, 1, 1), 0u << 24);
+    t.w(dcb(7, 7, 0), 0x50214);
+    t.w(dcb(7, 1, 1), 28u << 24);
+    t.w(dcb(7, 7, 0), 0x653);
+    t.w(dcb(7, 1, 1), 0u << 24);
+    t.w(dcb(7, 7, 0), 0x414);
+    t.w(dcb(7, 7, 0), 0x514);
+    t.w(dcb(7, 1, 1), 7u << 24);
+    const u32 s = t.r(dcb(7, 7, 0));
+    CHECK_EQ(s & 0xF, (s >> 8) & 0xF);
+    CHECK_EQ((s >> 16) & 0xF, 1u);
+    CHECK_EQ(t.board.display_version(), v);
+    t.w(dcb(11, 0, 1), 0x55u << 24);
+    t.w(dcb(11, 1, 1), 0x40u << 24);
+    CHECK(t.r(dcb(11, 0, 1)) >> 24 != 0x55u);
+}
+
 TEST(impact_block_fill_lands_in_buffer_a_and_is_displayed) {
     Rig t;
     t.console_setup();
@@ -309,6 +346,9 @@ TEST(impact_ge_microcode_download_readback_and_start) {
     CHECK_EQ(t.r(0x5022C), 0u);
     CHECK_EQ(t.r(0x5022C), 0u);
     CHECK_EQ(t.r(0x5022C), 0x1003u);
+    t.w(0x50044, 0x40038);  // the kernel's other control registers do not start it
+    t.w(0x50040, 0xD1);
+    CHECK(!(t.r(0x70008) & (1u << 17)));
     t.w(0x50044, 0x40000);  // execution control: start
     t.w(0x50040, 1);
     CHECK(t.r(0x70008) & (1u << 17));
@@ -475,6 +515,79 @@ TEST(impact_dma_pixel_transfers) {
     CHECK_EQ(load_be<u32>(&ram[0x30008]) & 0xFFFFFF, 0x0000FFu);
 }
 
+// A page-list entry names a slot of the pool's table, 1 << PAGE_SHIFT
+// pages (0x2B + pool); ROW_START is an offset within it, as the kernel's
+// TRAM backing store uses with 4 MB slots (shift 10).
+TEST(impact_dma_page_list_windows) {
+    Rig t;
+    std::vector<u8> ram(1u << 20);
+    Bus bus;
+    bus.map_ram(0, ram.size(), ram.data());
+    t.board.set_bus(&bus);
+    t.console_setup();
+    // Pool 1's table at 0x10000: window 0 page 1 -> frame 0x30, window 1 page 1 -> frame 0x40.
+    store_be<u32>(&ram[0x10000 + 4 * 1], 0x30);
+    store_be<u32>(&ram[0x10000 + 4 * (1024 + 1)], 0x40);
+    for (u32 i = 0; i < 3; ++i) {
+        store_be<u32>(&ram[0x30000 + 4 * i], 0xFF000000u);                          // black in window 0
+        store_be<u32>(&ram[0x40000 + 4 * i], 0x00FF0000u >> (8 * i) | 0xFF000000u);  // colours in window 1
+    }
+    dma_reg(t, 0x22, 0);
+    dma_reg(t, 0x23, 0x10000);
+    dma_reg(t, 0x2C, 10);          // pool 1: 1024 pages to an entry
+    dma_reg(t, 0x00, 0x80010000);  // page list: window 1, the last entry
+    dma_reg(t, 0x04, 0x100);
+    dma_reg(t, 0x05, 0);
+    dma_reg(t, 0x06, 0x1000);      // offset 0x1000 within the window
+    dma_reg(t, 0x07, 1);
+    dma_reg(t, 0x08, 12);
+    arm(t, 0, 0, 3, 1, 5, 0x80);
+    dma_reg(t, 0x0B, 0x3);
+    CHECK_EQ(t.pixel(0, 0), 0xFF0000u);
+    CHECK_EQ(t.pixel(1, 0), 0x00FF00u);
+    CHECK_EQ(t.pixel(2, 0), 0x0000FFu);
+}
+
+// Several entries (libGLcore's pixel tiles, a tile to a slot): each line
+// takes LINE_BYTES from ROW_OFFSET in the first tile, STRIDE bytes of each
+// middle one and LAST_BYTES of the last, from ROW_START + line * STRIDE.
+TEST(impact_dma_page_list_tiles) {
+    Rig t;
+    std::vector<u8> ram(1u << 20);
+    Bus bus;
+    bus.map_ram(0, ram.size(), ram.data());
+    t.board.set_bus(&bus);
+    t.console_setup();
+    // Pool 1, four pages to an entry: tiles in slots 1, 3 and 0, rows of
+    // two pixels; word k of tile n reads n << 16 | k.
+    const u32 frame[] = {0x60, 0x40, 0, 0x50};
+    for (u32 slot : {0u, 1u, 3u}) {
+        store_be<u32>(&ram[0x10000 + 4 * (slot * 4)], frame[slot]);
+        for (u32 k = 0; k < 16; ++k) store_be<u32>(&ram[(frame[slot] << 12) + 4 * k], 0xFF000000u | slot << 16 | k);
+    }
+    dma_reg(t, 0x22, 0);
+    dma_reg(t, 0x23, 0x10000);
+    dma_reg(t, 0x2C, 2);
+    dma_reg(t, 0x00, 0x00010003);  // page list: slots 1, 3,
+    dma_reg(t, 0x01, 0x80000000);  // and 0, the last
+    dma_reg(t, 0x04, 8);           // tile rows of 8 bytes
+    dma_reg(t, 0x05, 4);           // from the second pixel of the first tile
+    dma_reg(t, 0x06, 8);           // from tile row 1
+    dma_reg(t, 0x07, 2);           // two lines
+    dma_reg(t, 0x08, 4);           // first tile: 4 bytes
+    dma_reg(t, 0x09, 4);           // last tile: 4 bytes
+    arm(t, 0, 0, 4, 2, 5, 0x80);
+    dma_reg(t, 0x0B, 0x3);
+    CHECK_EQ(t.pixel(0, 0), 0x10003u);
+    CHECK_EQ(t.pixel(1, 0), 0x30002u);
+    CHECK_EQ(t.pixel(2, 0), 0x30003u);
+    CHECK_EQ(t.pixel(3, 0), 0x00002u);
+    CHECK_EQ(t.pixel(0, 1), 0x10005u);
+    CHECK_EQ(t.pixel(1, 1), 0x30004u);
+    CHECK_EQ(t.pixel(2, 1), 0x30005u);
+    CHECK_EQ(t.pixel(3, 1), 0x00004u);
+}
+
 namespace {
 
 u32 fbits(float f) {
@@ -589,6 +702,119 @@ TEST(impact_gl_depth_test_keeps_the_nearer_surface) {
 
 // SCHEDULE_SWAP raises command-processor flag 0 (bit 10); a state readback
 // (0xA2) answers in GE readback low and raises flag 17.
+// glPolygonOffset (0xE7: factor, units, 1.1) with GL_POLYGON_OFFSET_FILL
+// (bit 0 of 0xE8): a second quad at the same depth passes LESS once pulled
+// nearer, and fails without the offset.
+TEST(impact_gl_polygon_offset_pulls_a_coplanar_quad_nearer) {
+    Rig t;
+    gl_context(t, 0x1000, true);
+    gl_rgb24(t);
+    tok(t, 0x0BC, {0xFFFFFF});
+    tok(t, 0x04A);
+    tok(t, 0x066, {1});
+    auto quad = [&](float r, float g, float b) {
+        tok(t, 0x01D);
+        colour(t, r, g, b);
+        vertex(t, -1, -1, 0), vertex(t, 1, -1, 0), vertex(t, 1, 1, 0), vertex(t, -1, 1, 0);
+        tok(t, 0x027);
+    };
+    quad(1, 0, 0);
+    tok(t, 0x0E7, {fbits(0), fbits(-2), fbits(1.1f)});
+    quad(0, 1, 0);  // offset off: hidden
+    CHECK_EQ(gl_pixel(t, 30, 30), 0x0000FFu);
+    tok(t, 0x0E8, {2});  // lines only
+    quad(0, 1, 0);
+    CHECK_EQ(gl_pixel(t, 30, 30), 0x0000FFu);
+    tok(t, 0x0E8, {1});  // fill
+    quad(0, 1, 0);
+    CHECK_EQ(gl_pixel(t, 30, 30), 0x00FF00u);
+    tok(t, 0x0E7, {fbits(0), fbits(2), fbits(1.1f)});  // pushed away again
+    quad(0, 0, 1);
+    CHECK_EQ(gl_pixel(t, 30, 30), 0x00FF00u);
+}
+
+// Edge flags (0x0F true, 0x10 false): in line and point polygon modes a
+// separate triangle's edge is drawn only when the vertex starting it was
+// flagged; strips draw every edge.
+TEST(impact_gl_edge_flags_hide_polygon_edges) {
+    Rig t;
+    gl_context(t, 0x1000, true);
+    gl_rgb24(t);
+    auto lit = [&](int x, int y) {  // anything drawn at (x, y) or next to it
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+                if (gl_pixel(t, x + dx, y + dy)) return true;
+        return false;
+    };
+    auto diagonal = [&] {  // the edge from (48, 16) to (16, 48)
+        for (int x = 22; x <= 42; ++x)
+            if (lit(x, 64 - x)) return true;
+        return false;
+    };
+    auto triangle = [&](u32 begin, u32 end) {
+        tok(t, begin);
+        colour(t, 1, 1, 1);
+        tok(t, 0x00F), vertex(t, -0.5f, -0.5f);
+        tok(t, 0x010), vertex(t, 0.5f, -0.5f);
+        tok(t, 0x00F), vertex(t, -0.5f, 0.5f);
+        tok(t, end);
+    };
+    tok(t, 0x0A8, {0x408, 0x1B01});  // POLYGON_MODE: both faces, lines
+    triangle(0x01A, 0x024);          // triangles
+    CHECK(lit(32, 16));               // from the first vertex
+    CHECK(lit(16, 32));               // from the third
+    CHECK(!diagonal());               // from the second, unflagged
+    triangle(0x01B, 0x025);          // a strip
+    CHECK(diagonal());
+    tok(t, 0x0BA, {fbits(0), fbits(0), fbits(0), fbits(0)});
+    tok(t, 0x015);
+    CHECK(!lit(48, 16));
+    tok(t, 0x04D, {fbits(3)});
+    tok(t, 0x0A8, {0x408, 0x1B00});  // points
+    triangle(0x01A, 0x024);
+    CHECK(lit(16, 16));
+    CHECK(lit(16, 48));
+    CHECK(!lit(48, 16));
+}
+
+// Antialiased points and lines: coverage scales alpha, so with
+// SRC_ALPHA / ONE_MINUS_SRC_ALPHA blending the inside is solid and the
+// edges partly drawn; aliased ones stay square and hard.
+TEST(impact_gl_smooth_points_and_lines_blend_their_edges) {
+    Rig t;
+    gl_context(t, 0x1000, true);
+    gl_rgb24(t);
+    tok(t, 0x03F, {0x302, 0x303});
+    tok(t, 0x065, {1});
+    tok(t, 0x04D, {fbits(8)});  // point size 8
+    tok(t, 0x06C, {1});         // GL_POINT_SMOOTH
+    tok(t, 0x016);
+    colour(t, 1, 1, 1);
+    vertex(t, -0.5f, -0.5f);    // window (16, 16)
+    tok(t, 0x020);
+    CHECK_EQ(gl_pixel(t, 15, 15), 0xFFFFFFu);
+    CHECK_EQ(gl_pixel(t, 12, 12), 0u);  // the square's corner is outside the disc
+    const u32 edge = gl_pixel(t, 12, 13) & 0xFF;
+    CHECK(edge > 0 && edge < 0xFF);
+    tok(t, 0x06C, {0});
+    tok(t, 0x016);
+    vertex(t, 0.5f, -0.5f);     // window (48, 16): a hard 8 x 8 square
+    tok(t, 0x020);
+    CHECK_EQ(gl_pixel(t, 44, 12), 0xFFFFFFu);
+    CHECK_EQ(gl_pixel(t, 51, 19), 0xFFFFFFu);
+    CHECK_EQ(gl_pixel(t, 52, 19), 0u);
+    tok(t, 0x069, {1});         // GL_LINE_SMOOTH
+    tok(t, 0x045, {fbits(3)});  // width 3
+    tok(t, 0x017);
+    vertex(t, -1, 0.5f), vertex(t, 1, 0.5f);  // along y = 48
+    tok(t, 0x021);
+    CHECK_EQ(gl_pixel(t, 30, 48), 0xFFFFFFu);
+    CHECK_EQ(gl_pixel(t, 30, 47), 0xFFFFFFu);
+    const u32 side = gl_pixel(t, 30, 49) & 0xFF;  // centre 48.0 + 1.5: half of row 49
+    CHECK(side > 0x40 && side < 0xC0);
+    CHECK_EQ(gl_pixel(t, 30, 50), 0u);
+}
+
 TEST(impact_gl_swap_flag_and_state_readback) {
     Rig t;
     gl_context(t, 0x1000, true);
@@ -740,7 +966,8 @@ TEST(impact_display_list_runs_segments_and_returns) {
 // texture registers from a register list and the indexed shadow token,
 // the destination page and the sub-image from the GE pixel state, the
 // texels by SEND_PIXELS with a texture-load routine; nearest sampling
-// modulates the (white) fragment colour.
+// modulates the (white) fragment colour. Pages are relative to the
+// context's TRAM base.
 TEST(impact_gl_texture_load_and_textured_quad) {
     Rig t;
     gl_context(t, 0x1000, true);
@@ -785,12 +1012,121 @@ TEST(impact_gl_texture_load_and_textured_quad) {
     CHECK_EQ(gl_pixel(t, 50, 10), 0x00FF00u);
     CHECK_EQ(gl_pixel(t, 10, 50), 0xFF0000u);
     CHECK_EQ(gl_pixel(t, 50, 50), 0xFFFFFFu);
+    // TEX_BASE (0xEB): the context moved to TRAM page 0x20. The same
+    // relative page now holds other texels, and the first ones are still
+    // there at base 0.
+    tok(t, 0x0EB, {0x20});
+    tok(t, 0x08D, {2, 0, 0, 2, 0, 1, 0x5114, 0});
+    t.w(kFifo, 0x80000000u | 16);
+    for (int k = 0; k < 4; ++k) t.w(kFifo, 0x808080FFu);
+    // Notes with no texture base in them leave it where it is.
+    for (u32 c : {0x001u, 0x006u, 0x096u, 0x097u, 0x0F2u, 0x102u}) tok(t, c);
+    tok(t, 0x08C, {1});
+    tok(t, 0x01D);
+    colour(t, 1, 1, 1);
+    tc(0, 0), vertex(t, -1, -1), tc(1, 0), vertex(t, 1, -1), tc(1, 1), vertex(t, 1, 1), tc(0, 1), vertex(t, -1, 1);
+    tok(t, 0x027);
+    CHECK_EQ(gl_pixel(t, 10, 10), 0x808080u);
+    tok(t, 0x0EB, {0});
+    tok(t, 0x01D);
+    tc(0, 0), vertex(t, -1, -1), tc(1, 0), vertex(t, 1, -1), tc(1, 1), vertex(t, 1, 1), tc(0, 1), vertex(t, -1, 1);
+    tok(t, 0x027);
+    CHECK_EQ(gl_pixel(t, 10, 10), 0x0000FFu);
     tok(t, 0x00C);  // TEX_OFF: untextured again
     tok(t, 0x01D);
     colour(t, 0, 1, 0);
     vertex(t, -1, -1), vertex(t, 1, -1), vertex(t, 1, 1), vertex(t, -1, 1);
     tok(t, 0x027);
     CHECK_EQ(gl_pixel(t, 10, 10), 0x00FF00u);
+}
+
+// libGLcore's restore of saved TRAM: XFRCONTROL to the texture side (5:
+// DMA, texture) arms the loader, and host DMA bytes become texels of the
+// level TL_SPEC describes, as one stream (here 2 x 2 in one DMA line), at
+// TL_MIPMAP's page past the context's TRAM base. The save reads them back.
+TEST(impact_texture_load_by_host_dma) {
+    Rig t;
+    std::vector<u8> ram(1u << 20);
+    Bus bus;
+    bus.map_ram(0, ram.size(), ram.data());
+    t.board.set_bus(&bus);
+    gl_context(t, 0x1000, true);
+    gl_rgb24(t);
+    tok(t, 0x0EB, {0x10});  // TEX_BASE
+    store_be<u32>(&ram[0x10000], 0x20);
+    const u32 texels[4] = {0xFF0000FFu, 0x00FF00FFu, 0x0000FFFFu, 0xFFFFFFFFu};
+    for (u32 i = 0; i < 4; ++i) store_be<u32>(&ram[0x20000 + 4 * i], texels[i]);
+    t.reg(0x1A1, 0x34E26);  // TL_MODE: RGBA, 8-bit
+    t.reg(0x1A2, 0x110);    // TL_SPEC: 2 x 2
+    t.reg(0x1A4, 3);        // TL_MIPMAP: page 3 (TRAM page 0x13)
+    t.reg(0x1A5, 4);
+    t.reg(0x1AB, 0);
+    t.reg(0x1AC, 0);
+    t.reg(0x159, 0xC00080);  // XFRMODE: RGBA bytes
+    t.reg(0x102, 5);         // XFRCONTROL: DMA to the texture side
+    dma_reg(t, 0x22, 0);
+    dma_reg(t, 0x23, 0x10000);
+    dma_reg(t, 0x00, 0x80000000);
+    dma_reg(t, 0x04, 16);
+    dma_reg(t, 0x05, 0);
+    dma_reg(t, 0x06, 0);
+    dma_reg(t, 0x07, 1);
+    dma_reg(t, 0x08, 16);
+    dma_reg(t, 0x0B, 0x3);  // run, pool 1, host to board
+    t.reg(0x102, 0);
+    // Sample it: TEXMODE1 on, modulate, RGBA; TEXMODE2 8-bit nearest; TXSIZE 2 x 2; TXMIPMAP[0] page 3.
+    tok(t, 0x07C, {1, 4});
+    const u32 regs[] = {0x111, 0x819, 0x1F8, 0x180, 0x4, 0x262, 0x181, 0x11, 0x264, 0x190, 0, 0xBA6};
+    t.w(kFifo, 0x80000000u | static_cast<u32>(sizeof regs));
+    for (u32 x : regs) t.w(kFifo, x);
+    tok(t, 0x0EC, {0xBA6, 0xBA7, 0x191, 3});
+    tok(t, 0x00B);
+    tok(t, 0x01D);
+    colour(t, 1, 1, 1);
+    auto tc = [&](float s, float u) { tok(t, 0x008, {fbits(s), fbits(u)}); };
+    tc(0, 0), vertex(t, -1, -1), tc(1, 0), vertex(t, 1, -1), tc(1, 1), vertex(t, 1, 1), tc(0, 1), vertex(t, -1, 1);
+    tok(t, 0x027);
+    CHECK_EQ(gl_pixel(t, 10, 10), 0x0000FFu);
+    CHECK_EQ(gl_pixel(t, 50, 10), 0x00FF00u);
+    CHECK_EQ(gl_pixel(t, 10, 50), 0xFF0000u);
+    CHECK_EQ(gl_pixel(t, 50, 50), 0xFFFFFFu);
+    // Save and restore go through a view of whole pages as a level 64
+    // texels wide (TL_SPEC / TXSIZE 64 x 8192): restore four texels to page
+    // 7, then save them: a raw read of the sampler's pages (READ_TEXTURE_RAW:
+    // rows, transfer mode, its raster start word) and the host's DMA read,
+    // which runs at once with the texels waiting.
+    t.reg(0x1A2, 0xD60);
+    t.reg(0x1A4, 7);
+    t.reg(0x102, 5);
+    dma_reg(t, 0x0B, 0x3);
+    t.reg(0x102, 0);
+    tok(t, 0x07C, {1, 4});
+    t.w(kFifo, 0x80000000u | 24);
+    for (u32 x : {0x181u, 0xD6u, 0x264u, 0x190u, 0u, 0xBA6u}) t.w(kFifo, x);  // TXSIZE 64 x 8192, TXADDR 0
+    tok(t, 0x0EC, {0xBA6, 0xBA7, 0x191, 7});
+    tok(t, 0x0E5, {1, 0xC00080, 0x400D});
+    dma_reg(t, 0x06, 0x100);
+    dma_reg(t, 0x0B, 0xB);  // run, pool 1, board to host
+    for (u32 i = 0; i < 4; ++i) CHECK_EQ(load_be<u32>(&ram[0x20100 + 4 * i]), texels[i]);
+    // The kernel's restore (MgrasRestoreTexData): the loader registers by
+    // RSS_REG_SET, then 0xD8 with the word count in 9-bit parts (4 words),
+    // and the texels by host DMA into the GE; here to page 9.
+    const u32 more[4] = {0x11223344u, 0x55667788u, 0x99AABBCCu, 0xDDEEFF00u};
+    for (u32 i = 0; i < 4; ++i) store_be<u32>(&ram[0x20200 + 4 * i], more[i]);
+    tok(t, 0x07F, {1, 2});
+    t.w(kFifo, 0x80000000u | 32);
+    for (u32 x : {0x1A1u, 0x34E26u, 0x1A2u, 0xD60u, 0x1A4u, 9u, 0x159u, 0xC00080u}) t.w(kFifo, x);
+    tok(t, 0x0E3);
+    tok(t, 0x0D8, {0, 0, 4});
+    dma_reg(t, 0x06, 0x200);
+    dma_reg(t, 0x0B, 0x3);
+    tok(t, 0x07C, {1, 4});
+    t.w(kFifo, 0x80000000u | 24);
+    for (u32 x : {0x190u, 0u, 0xBA6u, 0x191u, 9u, 0xBA7u}) t.w(kFifo, x);  // TXADDR 0, TXMIPMAP[0] page 9
+    tok(t, 0x0E5, {1, 0xC00080, 0x400D});
+    dma_reg(t, 0x06, 0x300);
+    dma_reg(t, 0x0B, 0xB);
+    for (u32 i = 0; i < 4; ++i) CHECK_EQ(load_be<u32>(&ram[0x20300 + 4 * i]), more[i]);
 }
 
 // TRAM: small levels share a page without overlapping; clamped sampling

@@ -193,7 +193,10 @@ private:
     void ge_triangle(const GeDraw& d, const GeVertex& a, const GeVertex& b, const GeVertex& c) override;
     void ge_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, float width, bool stipple, u32 pattern, u32 repeat,
                  u32& stipple_pos) override;
+    void smooth_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, float width, bool stipple, u32 pattern, u32 repeat,
+                     u32& pos);
     void ge_point(const GeDraw& d, const GeVertex& v, float size) override;
+    void ge_zst_put(const GeDraw& d, int x, int y, bool depth, u32 v) override;
     void ge_fragment(const GeDraw& d, int x, int y, const std::array<float, 4>& colour, float z) override;
     unsigned ge_host_bpp(u32 xfrmode) const override { return transfer_bpp(xfrmode); }
     u32 ge_host_pixel(const u8* p, u32 xfrmode) const override { return host_to_pixel(p, xfrmode); }
@@ -278,6 +281,13 @@ private:
     u32 formatter_ = 0;
     Bus* bus_ = nullptr;
     u32 dma_read_pending_ = 0;  // a board-to-host start word waiting for the raster side
+    // A texture load by host DMA (XFRCONTROL to the texture side): the
+    // texels the loader has taken so far, and a texel split across lines.
+    std::deque<u8> te_out_;  // a texture read's texels, waiting for the host's DMA
+    bool te_load_ = false;
+    u64 te_load_n_ = 0;
+    std::vector<u8> te_load_part_;
+    void te_load_bytes(const std::vector<u8>& bytes);
     // The armed pixel transfer (FILLMODE block types 2-5).
     struct Xfer {
         bool armed = false, read = false, pio = false;
@@ -294,10 +304,12 @@ private:
 
     // The geometry engines as their diagnostic ports see them (the engines
     // themselves are modelled at command level): a diagnostic address, and
-    // microcode lines of 72 bits as three words, downloaded and read back.
+    // microcode lines of 72 bits as three words, downloaded and read back,
+    // and the control registers from the execution control register up.
     struct GeDiag {
         u32 addr = 0;
         unsigned word = 0;  // of the line being written
+        std::array<u32, 64> control{};
         std::vector<std::array<u32, 3>> ucode = std::vector<std::array<u32, 3>>(kGeUcodeLines);
     };
     static constexpr unsigned kGeUcodeLines = 0x20000;
@@ -366,10 +378,11 @@ private:
     struct Xmap {
         u8 pp1_select = 0, index = 0;
         std::array<u8, 16> config{};    // INDEX 0-3: the config word
-        std::array<u8, 4> buf_select{};
+        std::array<u8, 8> buf_select{};  // INDEX 0: buffer B per DID; INDEX 4: a second word (kernel writes, meaning unknown)
         std::array<u8, 128> main_mode{};
         std::array<u8, 128> overlay_mode{};
         std::array<u8, 64> dib{};  // index 0: the scanout page pointers; the rest kept as written
+        std::array<u8, 32> re_rac{};  // the RE link control words as written (reads give link status)
     } xmap_;
     struct Vc3 {
         u8 index = 0;
@@ -387,6 +400,8 @@ private:
     static constexpr u32 kPp1FillMode = 0x161, kMaskMsbs = 0x162, kMaskLsbsA = 0x163, kMaskLsbsB = 0x164;
     static constexpr u32 kScrMask1X = 0x147, kPp1WinMode = 0x17B;
     static constexpr u32 kXfrControl = 0x102, kXfrSize = 0x153, kXfrMode = 0x159;
+    // Texture loader registers (TE1).
+    static constexpr u32 kTlMode = 0x1A1, kTlSpec = 0x1A2, kTlMipmap = 0x1A4, kTlBorder = 0x1A5, kTlSLeft = 0x1AB, kTlTBottom = 0x1AC;
     static constexpr u32 kDrbPointers = 0x16D, kDrbSize = 0x16E, kPixColorR = 0x176;
     std::array<u32, 0x400> rss_{};
     struct Stipple {

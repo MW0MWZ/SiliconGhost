@@ -9,6 +9,7 @@
 // processors place it in RDRAM is not known, and nothing but GL reads it.
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "machine/ip22/impact.h"
 
@@ -370,6 +371,10 @@ void Impact::ge_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, floa
     if (da == 0 || !std::isfinite(da)) return;
     const float s0 = xmajor ? a.x : a.y, s1 = xmajor ? b.x : b.y;
     const float m0 = xmajor ? a.y : a.x, dm = (xmajor ? dy : dx) / da;
+    if (d.line_smooth) {
+        smooth_line(d, a, b, width, stipple, pattern, repeat, pos);
+        return;
+    }
     const int w = std::max(1, static_cast<int>(std::lround(width)));
     int i0, i1, step;
     if (da > 0) i0 = static_cast<int>(std::ceil(s0 - 0.5f)), i1 = static_cast<int>(std::ceil(s1 - 0.5f)), step = 1;
@@ -402,6 +407,69 @@ void Impact::ge_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, floa
         }
     }
     ++display_version_;
+}
+
+// Coverage of pixel (px, py) by an area, from 4 x 4 samples: 0..16.
+template <typename Inside>
+static unsigned coverage(int px, int py, Inside inside) {
+    unsigned n = 0;
+    for (unsigned k = 0; k < 16; ++k)
+        n += inside(static_cast<float>(px) + ((k % 4) + 0.5f) / 4, static_cast<float>(py) + ((k / 4) + 0.5f) / 4);
+    return n;
+}
+
+// An antialiased line (GL_LINE_SMOOTH): the rectangle `width` wide (not
+// rounded) along the segment; each pixel it touches is drawn with its
+// coverage multiplying alpha, which the application's blending turns into
+// soft edges (OpenGL 1.1 3.4.2). Colour index has no alpha: a pixel at least
+// half covered is drawn. How the GE11 computes coverage is not known; the
+// stipple counts pixels along the major axis, as for aliased lines.
+void Impact::smooth_line(const GeDraw& d, const GeVertex& a, const GeVertex& b, float width, bool stipple, u32 pattern,
+                         u32 repeat, u32& pos) {
+    const float dx = b.x - a.x, dy = b.y - a.y, len2 = dx * dx + dy * dy;
+    if (len2 == 0 || !std::isfinite(len2)) return;
+    const float len = std::sqrt(len2), hw = std::max(width, 1.0f) / 2;
+    const float ux = dx / len, uy = dy / len;
+    const float major = std::max(std::abs(dx), std::abs(dy));
+    if (major > 8192) return;
+    const int x0 = static_cast<int>(std::floor(std::min(a.x, b.x) - hw)), x1 = static_cast<int>(std::ceil(std::max(a.x, b.x) + hw));
+    const int y0 = static_cast<int>(std::floor(std::min(a.y, b.y) - hw)), y1 = static_cast<int>(std::ceil(std::max(a.y, b.y) + hw));
+    const bool xmajor = std::abs(dx) >= std::abs(dy);
+    const StorePlan plan = store_plan(gl_target(d));
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x) {
+            const unsigned n = coverage(x, y, [&](float sx, float sy) {
+                const float rx = sx - a.x, ry = sy - a.y, along = rx * ux + ry * uy, across = rx * uy - ry * ux;
+                return along >= 0 && along < len && std::abs(across) <= hw;
+            });
+            if (n == 0 || (d.ci && n < 8)) continue;
+            const float cx = static_cast<float>(x) + 0.5f, cy = static_cast<float>(y) + 0.5f;
+            const float t = std::clamp(((cx - a.x) * ux + (cy - a.y) * uy) / len, 0.0f, 1.0f);
+            if (stipple) {
+                const unsigned p = pos + static_cast<unsigned>(std::abs(xmajor ? cx - a.x : cy - a.y));
+                if (!((pattern >> (15 - ((p / (repeat + 1)) & 15))) & 1)) continue;
+            }
+            float col[4];
+            for (unsigned k = 0; k < 4; ++k) col[k] = a.c[k] + (b.c[k] - a.c[k]) * t;
+            if (d.tex.on) {
+                const float qs = a.t[0] * a.w + (b.t[0] * b.w - a.t[0] * a.w) * t, qt = a.t[1] * a.w + (b.t[1] * b.w - a.t[1] * a.w) * t;
+                const float qq = a.t[3] * a.w + (b.t[3] * b.w - a.t[3] * a.w) * t;
+                gl_shade(d, col, qq != 0 ? qs / qq : qs, qq != 0 ? qt / qq : qt, 1, 0, a.fog + (b.fog - a.fog) * t);
+            }
+            if (!d.ci) col[3] *= static_cast<float>(n) / 16;
+            gl_fragment(d, plan, x, y, col, a.z + (b.z - a.z) * t);
+        }
+    pos += static_cast<unsigned>(std::lround(major));
+    ++display_version_;
+}
+
+void Impact::ge_zst_put(const GeDraw& d, int x, int y, bool depth, u32 v) {
+    if (d.scissor && (x < d.scissor_box[0] || x > d.scissor_box[1] || y < d.scissor_box[2] || y > d.scissor_box[3])) return;
+    int fx, fy;
+    if (!gl_to_framebuffer(d, x, y, fx, fy) || !gl_visible(d, fx, fy)) return;
+    u32& zst = zst_at(fx, fy);
+    if (depth) zst = (zst & 0xFF000000u) | (v & 0xFFFFFF);
+    else zst = (zst & ~(d.st_wmask << 24)) | (v & d.st_wmask) << 24;
 }
 
 void Impact::ge_fragment(const GeDraw& d, int x, int y, const std::array<float, 4>& colour, float z) {
@@ -448,14 +516,37 @@ void Impact::ge_read_pixels(const GeDraw& d, u32 block_start, u32 block_end, u32
 // A texture readback: its rows go to the host's DMA reads.
 void Impact::ge_tex_read(const GeTexture& t, u32 xfrmode, bool raw, unsigned rows, unsigned w) {
     if (!w || w > 8192 || rows > 8192) return;
+    te_out_.clear();
     for (unsigned r = 0; r < rows; ++r) {
         const std::vector<u8> l = raw ? tram_.read_raw(t, xfrmode, r, w) : tram_.read_line(t, xfrmode, r, w);
-        eram_out_.insert(eram_out_.end(), l.begin(), l.end());
+        te_out_.insert(te_out_.end(), l.begin(), l.end());
     }
+    if (dma_read_pending_) dma_run(std::exchange(dma_read_pending_, 0));
 }
 
-// Points: a square of the point's size (rounded) about its position.
+// Points: a square of the point's size (rounded) about its position. An
+// antialiased point (GL_POINT_SMOOTH) is a disc of the size's diameter (not
+// rounded), each pixel drawn with its coverage multiplying alpha (at least
+// half covered in colour index); the GE11's own coverage is not known.
 void Impact::ge_point(const GeDraw& d, const GeVertex& v, float size) {
+    if (d.point_smooth) {
+        const float r = std::max(size, 1.0f) / 2;
+        std::array<float, 4> c = v.c;
+        if (d.tex.on) gl_shade(d, c.data(), v.t[0], v.t[1], v.t[3], 0, v.fog);
+        const StorePlan plan = store_plan(gl_target(d));
+        for (int y = static_cast<int>(std::floor(v.y - r)); y < static_cast<int>(std::ceil(v.y + r)); ++y)
+            for (int x = static_cast<int>(std::floor(v.x - r)); x < static_cast<int>(std::ceil(v.x + r)); ++x) {
+                const unsigned n = coverage(x, y, [&](float sx, float sy) {
+                    return (sx - v.x) * (sx - v.x) + (sy - v.y) * (sy - v.y) <= r * r;
+                });
+                if (n == 0 || (d.ci && n < 8)) continue;
+                std::array<float, 4> f = c;
+                if (!d.ci) f[3] *= static_cast<float>(n) / 16;
+                gl_fragment(d, plan, x, y, f.data(), v.z);
+            }
+        ++display_version_;
+        return;
+    }
     const int n = std::max(1, static_cast<int>(std::lround(size)));
     auto start = [&](float c) { return n & 1 ? static_cast<int>(std::floor(c)) - (n - 1) / 2 : static_cast<int>(std::floor(c + 0.5f)) - n / 2; };
     const int x0 = start(v.x), y0 = start(v.y);

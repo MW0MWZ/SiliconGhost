@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andy Taylor
 #include "machine/ip22/impact_ge.h"
+
+#include "core/endian.h"
 #include "machine/ip22/impact_te.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 namespace sg::ip22 {
 
@@ -14,7 +17,8 @@ namespace {
 // Tokens (command numbers below 0x200).
 enum : u32 {
     kVertex = 0x000, kColour = 0x002, kNormal = 0x007, kTexCoord = 0x008, kInitRgb = 0x009, kInitCi = 0x00A,
-    kTexOn = 0x00B, kTexOff = 0x00C, kLightingOn = 0x00D, kLightingOff = 0x00E, kMaterial = 0x011,
+    kTexOn = 0x00B, kTexOff = 0x00C, kLightingOn = 0x00D, kLightingOff = 0x00E, kEdgeFlagOn = 0x00F,
+    kEdgeFlagOff = 0x010, kMaterial = 0x011,
     kLightAmbient = 0x012, kLightDiffuse = 0x013, kLightSpecular = 0x014, kClear = 0x015,
     kBeginPoints = 0x016, kBeginPolygon = 0x01F, kEndPoints = 0x020, kEndPolygon = 0x029,
     kMatrixMode = 0x02A, kLoadMatrix = 0x02B, kLoadIdentity = 0x02C, kMultMatrix = 0x02D, kPopMatrix = 0x02E,
@@ -35,14 +39,16 @@ enum : u32 {
     kClearDepth = 0x0BC, kClearIndex = 0x0BD, kClearStencil = 0x0BE, kColourMaterialFront = 0x0BF,
     kColourMaterialBack = 0x0C0, kColourMaterialBoth = 0x0C1, kColourMaterialOn = 0x0C2, kColourMaterialOff = 0x0C3,
     kUpdateRasterPos = 0x0D6, kLoadRasterPosInfo = 0x0D7, kBlendColour = 0x0D9, kSwapTmesh = 0x0DC,
-    kLmcColourOn = 0x0DD, kLmcColourOff = 0x0DE, kIrisNormal = 0x0DF, kPolygonOffset = 0x0E7,
+    kLmcColourOn = 0x0DD, kLmcColourOff = 0x0DE, kIrisNormal = 0x0DF, kPolygonOffset = 0x0E7, kPolygonOffsetModes = 0x0E8,
     kGetMaterial = 0x0EE, kGetLight = 0x0EF, kBitmapRows = 0x090, kGeneralBitmap = 0x091, kBitmapMove = 0x092,
     kBitmap = 0x094, kRssRegShadow = 0x07C, kRssRegSet = 0x07F, kPixelState = 0x080, kSendPixels = 0x08D,
     kInitColourTable = 0x089, kTlNoTable = 0x09B, kTlSubloadEnd = 0x09C, kWriteDmaGeSetup = 0x09D,
     kInitPixelStateEram = 0x0CD, kSaveRss = 0x0D2, kRestoreRss = 0x0D3, kGetPixels = 0x0DB, kSaveTexmode = 0x0E9,
     kRestoreTexmode = 0x0EA, kRssRegShadowIdx = 0x0EC, kTexGeniv = 0x05A, kTexGenPlaneHeader = 0x05B,
     kTexGenPlaneData = 0x05C, kReadTexture = 0x0F0, kReadTextureRaw = 0x0E5,
-    kDisable = 0x05F, kSetData = 0x0ED, kToken0Eb = 0x0EB,
+    kDisable = 0x05F, kSetData = 0x0ED, kTexBase = 0x0EB, kRenderModeNote = 0x08C, kSyncForRead = 0x0F2,
+    kTramRestore = 0x0D8, kTramRestorePrep = 0x0E3, kReadBegin = 0x096, kReadEnd = 0x097, kIglooNote = 0x102,
+    kTramSaveEnd = 0x0DA, kPad = 0x001, kMakeCurrentRead = 0x006, kInitTables = 0x082,
 };
 
 // GE microcode routines are named by the source file they lie in (the
@@ -584,7 +590,12 @@ bool ImpactGe::token(u32 cmd, const u32* d, unsigned n) {
         case kPointSmooth: s.point_smooth = on; break;
         case kPolygonOffset:
             if (n < 2) return false;
-            s.polygon_offset = {f32(d[0]), f32(d[1])};
+            s.polygon_offset = {f32(d[0]), f32(d[1]), n >= 3 ? f32(d[2]) : 1.1f};
+            break;
+        case kPolygonOffsetModes:
+            // glEnable(GL_POLYGON_OFFSET_FILL / LINE / POINT) set bits 0 / 1 / 2
+            // of the word libGLcore keeps, sent whole each time.
+            s.polygon_offset_on = w0 & 7;
             break;
         case kGetLight:
         case kGetMaterial: {
@@ -679,6 +690,8 @@ bool ImpactGe::token(u32 cmd, const u32* d, unsigned n) {
         case kCullOff: s.cull = 0; break;
         case kCullFace: s.cull_mode = n ? w0 : 0x405; break;
         case kFrontFace: s.front_ccw = w0 != 0x900; break;
+        case kEdgeFlagOn: s.edge_flag = 1; break;  // glEdgeFlag(GL_TRUE), and a new context's default
+        case kEdgeFlagOff: s.edge_flag = 0; break;
         case kPolygonMode:
             if (n < 2) return false;
             if (w0 == 0x404) s.polygon_mode[0] = d[1];
@@ -813,10 +826,54 @@ bool ImpactGe::token(u32 cmd, const u32* d, unsigned n) {
                 s.set_data_valid[(d[0] - 0xB00) / 32] |= 1u << (d[0] % 32);
             }
             break;
+        case kTramRestore:
+            // The kernel's restore of a context's TRAM pages (MgrasRestoreTexData,
+            // its __glMgr_WriteDMAGESetup): the word count of the texels the
+            // host DMA brings next, in three 9-bit parts, high first. The
+            // texture loader registers came before, through RSS_REG_SET.
+            if (n < 3) return false;
+            s.tram_restore_words = (d[0] & 0x1FF) << 18 | (d[1] & 0x1FF) << 9 | (d[2] & 0x1FF);
+            break;
+        case kReadBegin:
+        case kReadEnd:
+            // No data: libGLcore brackets its pixel reads with them
+            // (__glMgrim_ReadPixels, __glMgrSlowCopyPixels, around
+            // __glMgrDoReadPixels).
+        case kIglooNote:
+            // No data: the IRIS GL interface (__glMgrim_IglooInterfaceSGIX)
+            // sends it as IRIS GL programs start drawing.
+        case kTramSaveEnd:      // no data: the kernel's TRAM save ends with it, before RESTORE_RSS
+        case kTramRestorePrep:  // no data, just before 0xD8
+        case kSyncForRead:
+            // No data: libGLcore's host-DMA read set-up (histogram, minmax,
+            // reads by DMA) sends it, then polls for the GE to drain before
+            // it programs the DMA engine itself. Commands here finish as
+            // they come, so there is nothing to wait for.
+        case kRenderModeNote:
+            // glRenderMode sends it (a byte of its state, after token 6) on
+            // the way into or out of feedback / selection, and so does a
+            // new context's set-up; drawing here does not depend on it.
+        case kMakeCurrentRead:  // no data: before 0x8C, as above
+        case kPad:
+            // No data: the kernel's ERAM reads (MgrasEramRead) send their
+            // pass-through commands a doubleword at a time, the last one
+            // filled out with it.
+        case kInitTables:
+            // A new context's set-up (libGLcore, after its 0x8C): five
+            // lookup tables for the GE microcode, each as pixel data that
+            // follows (exponentials for fog and lighting, and constant
+            // tables). The fog and lighting here are computed directly.
+            break;
+        case kTexBase:
+            // The kernel's texture manager places each context in TRAM
+            // (MgrasPlaceBaseAddr: a run of 16 KB pages out of 256) and
+            // sends the first page here (_MgrasWriteTexBase); libGLcore's
+            // pages are relative to it. 0 for contexts without textures.
+            s.tex_base = w0 & 0xFF;
+            break;
         case kDisable:
-        case kToken0Eb:
-            // Sent with a zero word (0x5F around texture register lists,
-            // 0xEB after clears); no effect on drawing has been found.
+            // Sent with a zero word around texture register lists; no
+            // effect on drawing has been found.
             break;
         case kReadTexture:
             // glGetTexImage: [width, height, s and t offsets, transfer mode,
@@ -954,6 +1011,7 @@ float ImpactGe::fog_factor(const std::array<float, 4>& eye) const {
 ImpactGe::PVertex ImpactGe::transform(const std::array<float, 4>& obj) {
     State& s = s_;
     PVertex v;
+    v.edge = s.edge_flag;
     v.e = xform(s.mv.m[s.mv.top], obj);
     v.h = xform(s.proj.m[s.proj.top], v.e);
     v.c = v.cb = s.colour_now;
@@ -1001,6 +1059,11 @@ void ImpactGe::vertex(const std::array<float, 4>& obj) {
     const PVertex v = transform(obj);
     const unsigned n = s.nv++;
     PVertex poly[kMaxPoly];
+    // Edge flags count in separate triangles, quads and polygons only.
+    const auto strip = [&](unsigned m) {
+        for (unsigned k = 0; k < m; ++k) poly[k].edge = 1;
+        polygon(poly, m, v);
+    };
     switch (s.prim) {
         case kPoints: point(v); break;
         case kLines:
@@ -1029,7 +1092,7 @@ void ImpactGe::vertex(const std::array<float, 4>& obj) {
                 poly[1] = s.tflip ? s.vb[0] : s.vb[1];
                 poly[2] = v;
                 s.tflip ^= 1;
-                polygon(poly, 3, v);
+                strip(3);
             }
             s.vb[0] = s.vb[1];
             s.vb[1] = v;
@@ -1041,7 +1104,7 @@ void ImpactGe::vertex(const std::array<float, 4>& obj) {
             }
             if (n >= 2) {
                 poly[0] = s.vb[0], poly[1] = s.vb[1], poly[2] = v;
-                polygon(poly, 3, v);
+                strip(3);
             }
             s.vb[1] = v;
             break;
@@ -1056,7 +1119,7 @@ void ImpactGe::vertex(const std::array<float, 4>& obj) {
             s.vb[n % 4] = v;
             if (n >= 3 && n % 2 == 1) {
                 poly[0] = s.vb[(n - 3) % 4], poly[1] = s.vb[(n - 2) % 4], poly[2] = s.vb[n % 4], poly[3] = s.vb[(n - 1) % 4];
-                polygon(poly, 4, v);
+                strip(4);
             }
             break;
         case kPolygon:
@@ -1108,7 +1171,12 @@ unsigned ImpactGe::clip_polygon(PVertex* v, unsigned n) const {
             const PVertex& b = v[(i + 1) % n];
             const float da = dist(a), db = dist(b);
             if (da >= 0 && m < kMaxPoly) tmp[m++] = a;
-            if ((da >= 0) != (db >= 0) && m < kMaxPoly) tmp[m++] = lerp(a, b, da / (da - db));
+            if ((da >= 0) != (db >= 0) && m < kMaxPoly) {
+                // Leaving, the new edge runs along the clip boundary: a
+                // boundary edge. Entering, it is the rest of a's edge.
+                tmp[m] = lerp(a, b, da / (da - db));
+                tmp[m++].edge = da >= 0 ? 1 : a.edge;
+            }
         }
         std::copy(tmp, tmp + m, v);
         n = m;
@@ -1172,18 +1240,40 @@ void ImpactGe::polygon(PVertex* v, unsigned n, const PVertex& provoking) {
         for (unsigned i = 0; i < n; ++i) w[i].c = c;
     }
     const u32 mode = s.polygon_mode[front ? 0 : 1];
+    if (s.polygon_offset_on & (mode == 0x1B00 ? 4u : mode == 0x1B01 ? 2u : 1u)) offset_depth(w, n);
     const GeDraw& d = draw();
+    // Points and lines only where a vertex starts a boundary edge.
     if (mode == 0x1B00) {
-        for (unsigned i = 0; i < n; ++i) raster_.ge_point(d, w[i], s.point_size);
+        for (unsigned i = 0; i < n; ++i)
+            if (v[i].edge) raster_.ge_point(d, w[i], s.point_size);
         return;
     }
     if (mode == 0x1B01) {
         u32 pos = 0;
         for (unsigned i = 0; i < n; ++i)
-            raster_.ge_line(d, w[i], w[(i + 1) % n], s.line_width, s.line_stipple, s.line_pattern, s.line_repeat, pos);
+            if (v[i].edge) raster_.ge_line(d, w[i], w[(i + 1) % n], s.line_width, s.line_stipple, s.line_pattern, s.line_repeat, pos);
         return;
     }
     for (unsigned k = 1; k + 1 < n; ++k) raster_.ge_triangle(d, w[0], w[k], w[k + 1]);
+}
+
+// glPolygonOffset: the polygon's depths move by factor x its largest depth
+// slope (window units a pixel) plus units x the smallest resolvable step. The
+// GE's own arithmetic is not known: this is OpenGL 1.1's rule, with the third
+// word libGLcore sends taken as that step in depth-buffer units (1.1), and
+// glPolygonOffsetEXT's bias (third word 1.0) as a fraction of the depth range.
+void ImpactGe::offset_depth(GeVertex* w, unsigned n) const {
+    const auto& po = s_.polygon_offset;
+    float m = 0;
+    for (unsigned k = 1; k + 1 < n && m == 0; ++k) {
+        const float ux = w[k].x - w[0].x, uy = w[k].y - w[0].y, uz = w[k].z - w[0].z;
+        const float vx = w[k + 1].x - w[0].x, vy = w[k + 1].y - w[0].y, vz = w[k + 1].z - w[0].z;
+        const float a = ux * vy - uy * vx;
+        if (a == 0) continue;
+        m = std::max(std::abs((uz * vy - uy * vz) / a), std::abs((ux * vz - uz * vx) / a));
+    }
+    const float off = po[0] * m + (po[2] == 1.0f ? po[1] * kZMax : po[1] * po[2]);
+    for (unsigned i = 0; i < n; ++i) w[i].z = std::clamp(w[i].z + off, 0.0f, kZMax);
 }
 
 void ImpactGe::line(PVertex a, PVertex b, bool restart) {
@@ -1207,12 +1297,18 @@ void ImpactGe::point(const PVertex& v) {
 // Words a waiting bitmap or image needs: a bitmap's data words; an
 // image's words a row (header words 0 + 1) times its rows (3 + 3 * 4).
 unsigned ImpactGe::pixel_words_needed() const {
+    if (s_.tram_restore_words) return std::min<u32>(s_.tram_restore_words, 1u << 22);
     if (!s_.send_pixels_pending) return s_.bitmap_pending ? s_.bitmap[7] : 0;
     const auto& h = s_.send_pixels;
     return std::min<u32>((h[0] + h[1]) * (h[3] + 3 * h[4]), 1u << 22);
 }
 
 void ImpactGe::pixel_data(const u32* words, unsigned n) {
+    if (s_.tram_restore_words) {
+        s_.tram_restore_words = 0;
+        tram_restore(words, n);
+        return;
+    }
     if (s_.send_pixels_pending) {
         s_.send_pixels_pending = 0;
         if (module_at(s_.send_pixels[6]) == kModTexLoad) tex_load(words, n);
@@ -1527,6 +1623,21 @@ bool ImpactGe::pipeline(const std::vector<u8>& bytes, unsigned w, unsigned h, un
     return true;
 }
 
+// The pixel pipeline's x-zoom replication: its XZOOM module's index table
+// (from state word 7) gives each output pixel's source offset, so the
+// first source pixel's run is the replication. 1 without the module.
+unsigned ImpactGe::xzoom_rep() const {
+    const unsigned len = std::min<u32>(s_.pix.prog_len, 32) & ~1u;
+    for (unsigned k = 0; 2 * k + 3 < len; ++k) {
+        if (module_at(pix_read(kPixProgram + 2 * k)) != kModXZoom) continue;
+        const u32 st = pix_read(kPixProgram + 2 * k + 3);
+        unsigned n = 0;
+        while (n < 64 && pix_read(st + 7 + n) == 0) ++n;
+        return std::clamp(n, 1u, 64u);
+    }
+    return 1;
+}
+
 // glDrawPixels: the rows (bottom first) through the GE's pipeline into the
 // raster engine's transfer format, drawn at the raster position (plus the
 // rectangle's offset within the image, for an image sent in pieces) with
@@ -1550,7 +1661,12 @@ void ImpactGe::draw_pixels(const u32* words, unsigned n) {
     const unsigned out_comps = fmt == 7 ? 3 : fmt == 8 ? 4 : fmt == 10 ? 2 : 1;
     std::vector<std::vector<double>> prow;
     unsigned w = xs & 0xFFFF, h = xs >> 16;
-    if (s.zoom_inv > 0 && s.zoom_inv != 1) h = rows;
+    // Zoomed: 0xDA8's size is the GE's output (rows repeated, columns
+    // replicated `rep` times); the source is the transport rows, of the
+    // columns over the replication.
+    const unsigned rep = xzoom_rep();
+    const bool zoomed = rep > 1 || (mode & (3u << 19)) || (s.zoom_inv > 0 && s.zoom_inv != 1);
+    if (zoomed) w /= rep, h = rows;
     if (s.pix.prog_len >= 2 && pix_read(kPixProgram) && w && h &&
         pipeline(bytes, w, h, rows == h ? wpr * 4 : static_cast<unsigned>(bytes.size() / h), out_comps, prow)) {
         const bool index = fmt == 0 || fmt == 1;
@@ -1590,31 +1706,69 @@ void ImpactGe::draw_pixels(const u32* words, unsigned n) {
     // GE pixels are RGBA: bytes in ABGR order (RGBorder clear) go to the
     // raster engine alpha first.
     const bool rev = bpp == 4 && (mode & 0xFF) == 0x80 && !(mode & (1u << 22));
-    const float zoom = s.zoom_inv > 0 ? std::clamp(1.0f / s.zoom_inv, 1.0f / 64, 64.0f) : 1.0f;
-    const bool rect = xs && (xs >> 16) == rows && (xs & 0xFFFF) == src_w;
-    const float ox = rect ? static_cast<float>(static_cast<s32>(s.tl_rect[0])) * zoom : 0;
-    const float oy = rect ? static_cast<float>(static_cast<s32>(s.tl_rect[1])) * zoom : 0;
-    const bool flip_x = rect && static_cast<s32>(s.tl_rect[2]) < static_cast<s32>(s.tl_rect[0]);
-    const bool flip_y = rect && static_cast<s32>(s.tl_rect[3]) < static_cast<s32>(s.tl_rect[1]);
-    const int x0 = static_cast<int>(std::floor(s.raster[0] + ox)), y0 = static_cast<int>(std::floor(s.raster[1] + oy));
-    const int out_w = std::max(1, static_cast<int>(std::lround(src_w * zoom))), out_h = std::max(1, static_cast<int>(std::lround(rows * zoom)));
     const GeDraw& d = draw();
+    // Where each destination pixel takes its source. Zoomed images cover
+    // 0xDA8's rectangle (x0, y0, x1, y1 from the raster position, signed)
+    // as the board draws them (IRIS's trace, pixtest): rows by 1 / zoom
+    // (0x192), columns by the GE's replication and then the raster
+    // engine's XFRFACTOR (8.8): XFRMODE bit 19 zooms by it, bit 20
+    // decimates by it; each sampled at the destination pixel's centre.
+    // Otherwise pixel i takes floor(i / zoom) both ways.
+    int x0, y0, out_w, out_h, step_x = 1, step_y = 1;
+    std::function<unsigned(unsigned)> src_col, src_row;
+    if (zoomed && xs) {
+        const s32 r0 = static_cast<s32>(s.tl_rect[0]), r1 = static_cast<s32>(s.tl_rect[1]);
+        const s32 r2 = static_cast<s32>(s.tl_rect[2]), r3 = static_cast<s32>(s.tl_rect[3]);
+        out_w = std::abs(r2 - r0) + 1, out_h = std::abs(r3 - r1) + 1;
+        step_x = r2 < r0 ? -1 : 1, step_y = r3 < r1 ? -1 : 1;
+        x0 = static_cast<int>(std::floor(s.raster[0] + static_cast<float>(r0)));
+        y0 = static_cast<int>(std::floor(s.raster[1] + static_cast<float>(r1)));
+        const unsigned f = std::max(1u, s.xfr_factor & 0xFFFF);
+        src_col = [=](unsigned j) {
+            const unsigned g = (mode & (1u << 19)) ? (2 * j + 1) * 256 / (2 * f) : (mode & (1u << 20)) ? (2 * j + 1) * f / 512 : j;
+            return std::min(src_w - 1, g / rep);
+        };
+        const double inv = s.zoom_inv > 0 ? s.zoom_inv : 1.0;
+        src_row = [=](unsigned j) { return std::min(rows - 1, static_cast<unsigned>((j + 0.5) * inv)); };
+    } else {
+        const float zoom = s.zoom_inv > 0 ? std::clamp(1.0f / s.zoom_inv, 1.0f / 64, 64.0f) : 1.0f;
+        const bool rect = xs && (xs >> 16) == rows && (xs & 0xFFFF) == src_w;
+        const float ox = rect ? static_cast<float>(static_cast<s32>(s.tl_rect[0])) * zoom : 0;
+        const float oy = rect ? static_cast<float>(static_cast<s32>(s.tl_rect[1])) * zoom : 0;
+        if (rect && static_cast<s32>(s.tl_rect[2]) < static_cast<s32>(s.tl_rect[0])) step_x = -1;
+        if (rect && static_cast<s32>(s.tl_rect[3]) < static_cast<s32>(s.tl_rect[1])) step_y = -1;
+        x0 = static_cast<int>(std::floor(s.raster[0] + ox)), y0 = static_cast<int>(std::floor(s.raster[1] + oy));
+        out_w = std::max(1, static_cast<int>(std::lround(src_w * zoom))), out_h = std::max(1, static_cast<int>(std::lround(rows * zoom)));
+        src_col = [=](unsigned i) { return std::min(src_w - 1, static_cast<unsigned>(i / zoom)); };
+        src_row = [=](unsigned j) { return std::min(rows - 1, static_cast<unsigned>(j / zoom)); };
+    }
+    // Depth (transfer format 2, 32-bit) and stencil images (SAVE_RSS's
+    // planes, as for reads) go into the depth / stencil buffer as they are.
+    const u32 planes = s.pixel_planes;
+    const bool stencil = (planes & 0x1C00000) == 0x1800000 || (planes & 0x1C0000) == 0x180000;
+    const bool depth = !stencil && fmt == 2 && ty == 3;
     std::array<float, 4> c{};
     for (int j = 0; j < out_h; ++j) {
-        const unsigned sr = std::min(rows - 1, static_cast<unsigned>(j / zoom));
-        const int y = flip_y ? y0 - j : y0 + j;
+        const unsigned sr = src_row(static_cast<unsigned>(j));
+        const int y = y0 + step_y * j;
         for (int i = 0; i < out_w; ++i) {
-            const unsigned sc = std::min(src_w - 1, static_cast<unsigned>(i / zoom));
+            const unsigned sc = src_col(static_cast<unsigned>(i));
+            const int x = x0 + step_x * i;
             const std::size_t at = std::size_t{sr} * out_wpr * 4 + std::size_t{sc} * bpp;
             if (at + bpp > px.size()) continue;
             u8 p[16];
             std::copy(px.begin() + static_cast<std::ptrdiff_t>(at), px.begin() + static_cast<std::ptrdiff_t>(at + bpp), p);
+            if (stencil || depth) {
+                const u32 raw = bpp >= 4 ? load_be<u32>(p) : p[bpp - 1];
+                raster_.ge_zst_put(d, x, y, depth, depth ? raw >> 8 : raw & 0xFF);
+                continue;
+            }
             if (rev) std::reverse(p, p + 4);
             const u32 v = raster_.ge_host_pixel(p, mode);
             if (s.ci) c = {static_cast<float>(v & 0xFFF) / 4095.0f, 0, 0, 1};
             else c = {(v & 0xFF) / 255.0f, ((v >> 8) & 0xFF) / 255.0f, ((v >> 16) & 0xFF) / 255.0f, (v >> 24) / 255.0f};
             if (!s.ci && fmt == 7) c[3] = 1;
-            raster_.ge_fragment(d, flip_x ? x0 - i : x0 + i, y, c, s.raster[2]);
+            raster_.ge_fragment(d, x, y, c, s.raster[2]);
         }
     }
 }
@@ -1673,7 +1827,8 @@ GeTexture ImpactGe::tex_state() const {
     t.mode1 = te_reg(kTexMode1), t.mode2 = te_reg(kTexMode2), t.size = te_reg(kTxSize), t.lod = te_reg(kTxLod);
     t.env_rg = te_reg(kTxEnvRg), t.env_b = te_reg(kTxEnvB);
     t.bcolour_rg = te_reg(kTxBColourRg), t.bcolour_ba = te_reg(kTxBColourBa);
-    for (unsigned k = 0; k < 16; ++k) t.pages[k] = s.te_tables[0][k] & 0xFF, t.border_pages[k] = s.te_tables[1][k] & 0xFF;
+    for (unsigned k = 0; k < 16; ++k)
+        t.pages[k] = (s.te_tables[0][k] + s.tex_base) & 0xFF, t.border_pages[k] = (s.te_tables[1][k] + s.tex_base) & 0xFF;
     t.fog = s.fog != 0;
     t.fog_colour = {s.fog_colour[0], s.fog_colour[1], s.fog_colour[2]};
     return t;
@@ -1730,8 +1885,8 @@ void ImpactGe::tex_load(const u32* words, unsigned n) {
     GeTexLoad l;
     l.mode = te_reg(kTlMode);
     l.spec = te_reg(kTlSpec);
-    l.page = raw ? te_reg(kTlMipmap) & 0xFF : s.tl_dest[3] & 0xFF;
-    l.border_page = raw ? te_reg(kTlBorder) & 0xFF : s.tl_dest[4] & 0xFF;
+    l.page = ((raw ? te_reg(kTlMipmap) : s.tl_dest[3]) + s.tex_base) & 0xFF;
+    l.border_page = ((raw ? te_reg(kTlBorder) : s.tl_dest[4]) + s.tex_base) & 0xFF;
     l.s0 = s0, l.t0 = t0;
     std::vector<u8> bytes(std::size_t{n} * 4);
     for (unsigned i = 0; i < n; ++i)
@@ -1797,6 +1952,36 @@ void ImpactGe::tex_load(const u32* words, unsigned n) {
             std::copy(px.begin(), px.end(), line.begin() + 4 * k);
         }
         raster_.ge_tex_load(l, r, line.data(), w);
+    }
+}
+
+// A kernel TRAM restore's texels: one stream through the loader's view of
+// the pages (TL_SPEC, as saved: a level 64 texels wide), texel n at column
+// n % width, row n / width from TL_S_LEFT / TL_T_BOTTOM, each texel the
+// transfer mode's size and copied as it comes, at TL_MIPMAP's page past the
+// context's TRAM base.
+void ImpactGe::tram_restore(const u32* words, unsigned n) {
+    const State& s = s_;
+    GeTexLoad l;
+    l.mode = te_reg(kTlMode);
+    l.spec = te_reg(kTlSpec);
+    l.page = (te_reg(kTlMipmap) + s.tex_base) & 0xFF;
+    l.border_page = (te_reg(kTlBorder) + s.tex_base) & 0xFF;
+    l.t0 = static_cast<s32>(te_reg(kTlTBottom));
+    const s32 s0 = static_cast<s32>(te_reg(kTlSLeft));
+    const unsigned w = 1u << ((l.spec >> 4) & 0xF), bpt = std::max(1u, ImpactTram::read_texel_bytes(s.xfrmode));
+    const std::size_t texels = std::size_t{n} * 4 / bpt;
+    std::vector<u8> row(std::size_t{w} * 4);
+    auto byte = [&](std::size_t i) { return static_cast<u8>(words[i / 4] >> (24 - 8 * (i % 4))); };
+    for (std::size_t k = 0; k < texels;) {
+        const unsigned col = static_cast<unsigned>(k % w), line = static_cast<unsigned>(k / w);
+        const unsigned m = static_cast<unsigned>(std::min<std::size_t>(w - col, texels - k));
+        std::fill(row.begin(), row.end(), u8{0});
+        for (unsigned j = 0; j < m; ++j)
+            for (unsigned b = 0; b < std::min(bpt, 4u); ++b) row[4 * j + b] = byte((k + j) * bpt + b);
+        l.s0 = s0 + static_cast<s32>(col);
+        raster_.ge_tex_load(l, line, row.data(), m);
+        k += m;
     }
 }
 
@@ -1966,6 +2151,7 @@ const GeDraw& ImpactGe::draw() {
     d.blend_color = s.blend_colour;
     d.poly_stipple = s.poly_stipple;
     d.stipple = s.stipple_rows;
+    d.line_smooth = s.line_smooth, d.point_smooth = s.point_smooth;
     d.tex = GeTexture{};
     if (texturing() && !s.ci) d.tex = tex_state();
     return d;

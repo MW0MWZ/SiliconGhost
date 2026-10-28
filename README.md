@@ -13,12 +13,52 @@ original boot PROM and IRIX unmodified, at or above the speed of the real
 machine. Linux is the primary host; it also builds and runs on macOS and
 Windows.
 
+<p align="center">
+  <img src="docs/screenshots/irix65-max-impact.png" alt="IRIX 6.5.22 on the emulated R10000 Indigo² with Maximum IMPACT: Open Inventor models of an Indigo² and a Lego dog, and hinv listing the hardware" width="100%"><br>
+  <sub>IRIX 6.5.22 on the R10000 Indigo² with Maximum IMPACT graphics: OpenGL through the board's geometry engines</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/indy-prom-menu.png" alt="The Indy boot PROM's System Maintenance Menu"></td>
+    <td width="33%"><img src="docs/screenshots/irix53-login.png" alt="The IRIX 5.3 graphical login on the Indy"></td>
+    <td width="33%"><img src="docs/screenshots/irix53-indy.png" alt="IRIX 5.3 on the Indy running the atlantis and ideas demos, with hinv"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>The Indy's boot PROM</sub></td>
+    <td align="center"><sub>IRIX 5.3 login on Newport</sub></td>
+    <td align="center"><sub>IRIS GL demos on the Indy</sub></td>
+  </tr>
+</table>
+
 Ready-made builds are on the [releases page](https://github.com/MW0MWZ/SiliconGhost/releases):
 a `.zip` for Windows (x64), a `.dmg` for macOS (Apple silicon or Intel) and
 an AppImage for Linux (x86-64; Ubuntu 24.04, Debian 13 or later). They are
 alpha releases: expect rough edges. The macOS build is not notarised by
 Apple: the first time it is opened, macOS refuses; allow it with *Open
 Anyway* in System Settings > Privacy & Security.
+
+## Quick start
+
+SiliconGhost does not include any SGI software: you need a dump of the
+machine's boot PROM and, for IRIX, your own installation CDs (raw images of
+the discs).
+
+1. Download the build for your system from the
+   [releases page](https://github.com/MW0MWZ/SiliconGhost/releases) and start
+   it once. It makes a `SiliconGhost` folder in your Documents folder.
+2. Put your PROM dump in its `roms` folder, under any name. SiliconGhost
+   recognises it and picks the right one for each machine.
+3. Open *Machine > Settings*: choose the machine, make a new NVRAM and a new
+   blank disk image (the 4 GB default suits IRIX 5.3 and 6.5), and choose
+   your IRIX CD image as the CD-ROM. Then power on.
+4. At the System Maintenance Menu, label the disk with `fx` and install
+   IRIX from the CD as on a real machine: see
+   [Installing IRIX on a new disk](#installing-irix-on-a-new-disk).
+
+To get to the PROM's menu without any disks, step 2 is all you need. The
+rest of this page covers building from source, every option, and running
+NetBSD and OpenBSD.
 
 ## Status
 
@@ -58,11 +98,14 @@ SiliconGhost is under active development. What works today:
   from its CDs and boots to the 4Dwm desktop, with keyboard, mouse,
   networking and sound; OpenBSD 6.9 installs and boots too. The R10000
   processor, ECC memory (up to 1 GiB) and the rest of the board are complete.
-- **Maximum IMPACT graphics (work in progress):** the X server and 2D
-  drawing are complete. OpenGL programs draw through the board's geometry
-  engines (lit and smooth-shaded triangles, lines, points, depth, stencil,
-  blending, mipmapped textures, pixel images, bitmaps and display lists);
-  a few OpenGL details are still to do (see the roadmap).
+- **Maximum IMPACT graphics:** complete. The X server and 2D drawing
+  work, and OpenGL programs draw through the board's geometry engines
+  (lit and smooth-shaded triangles, lines, points, depth, stencil,
+  blending, mipmapped textures, pixel images, bitmaps and display lists,
+  polygon offset, antialiased lines and points, pixel zoom, depth and
+  stencil images); several programs can share texture memory, with IRIX
+  paging their textures in and out when together they need more than it
+  holds.
 - **CPU:** the full R4000/R4400 and R4600 (MIPS III) and R5000 (MIPS IV)
   integer and floating-point instruction sets, TLB, exceptions, 32/64-bit
   addressing and cache tag operations, with or without a secondary cache.
@@ -88,7 +131,7 @@ See [Known limitations](#known-limitations) and the [Roadmap](#roadmap).
 | SCSI | WD33C93 with disk and CD-ROM targets (a second controller on the Indigo²) | working |
 | EISA (Indigo²) | the bus, with no cards fitted | working |
 | Graphics | Newport XL24 (REX3, VC2, XMAP9, CMAP, RAMDAC) | working |
-| Graphics (Indigo²) | Maximum IMPACT with 4 MB texture memory (HQ3, two GE11s and RE4s, PP1, TE1, VC3, XMAP, CMAP, RAMDAC) | in progress: 2D and the X server complete; OpenGL mostly |
+| Graphics (Indigo²) | Maximum IMPACT with 4 MB texture memory (HQ3, two GE11s and RE4s, PP1, TE1, VC3, XMAP, CMAP, RAMDAC) | complete |
 | Keyboard / mouse | 8042-compatible PS/2 | working |
 | Ethernet | Seeq 80C03 | working |
 | Audio | HAL2 | working (playback and recording) |
@@ -562,6 +605,8 @@ with performance layers on top that must give exactly the same results:
   tested so far (on the Indigo², IRIX: its 5.1 PROM loads only ECOFF
   programs, and the NetBSD and OpenBSD boot loaders are ELF); Linux has not been tried. (Current Debian releases no longer include
   Indy support: the Debian 10 MIPS CD carries Malta and Octeon kernels only.)
+- Maximum IMPACT on the R4400 Indigo²: the IP22 PROM has no IMPACT
+  console (IRIX still drives the board).
 - The JIT runs on x86-64 (Linux, Windows) and AArch64 (Linux,
   macOS); elsewhere the slower block cache and interpreter run everything.
   Linux is the host tested most. macOS on Apple silicon has run the IRIX
@@ -573,10 +618,6 @@ with performance layers on top that must give exactly the same results:
 
 - Linux/mips; NetBSD on the graphics console
 - An MSVC build for Windows
-- Maximum IMPACT: the remaining OpenGL details (polygon offset, smooth
-  lines and points, zoom and decimation, depth and stencil pixel transfers,
-  texture memory paging under load); the IP22 PROM has no IMPACT console
-  (IRIX still drives the board)
 - Indigo² graphics GR2 (XZ/Extreme)
 
 ## Legal
