@@ -1581,7 +1581,7 @@ void Gui::draw_popups() {
     }
     ImGui::SetNextWindowPos(centre, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About##about", nullptr, flags)) {
-        ImGui::Text("%s %s: an SGI Indy (IP22) emulator", kAppName, SG_VERSION);
+        ImGui::Text("%s %s: an SGI Indy and Indigo2 emulator", kAppName, SG_VERSION);
         ImGui::TextUnformatted("Copyright (C) 2026 Andy Taylor");
         ImGui::TextUnformatted("GNU General Public License, version 2 or later");
         ImGui::Spacing();

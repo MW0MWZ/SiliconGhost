@@ -33,10 +33,10 @@ Windows.
 
 Ready-made builds are on the [releases page](https://github.com/MW0MWZ/SiliconGhost/releases):
 a `.zip` for Windows (x64), a `.dmg` for macOS (Apple silicon or Intel) and
-an AppImage for Linux (x86-64; Ubuntu 24.04, Debian 13 or later). They are
-alpha releases: expect rough edges. The macOS build is not notarised by
-Apple: the first time it is opened, macOS refuses; allow it with *Open
-Anyway* in System Settings > Privacy & Security.
+an AppImage for Linux (x86-64; Ubuntu 24.04, Debian 13 or later). The
+macOS build is not notarised by Apple: the first time it is opened, macOS
+refuses; allow it with *Open Anyway* in System Settings > Privacy &
+Security.
 
 ## Quick start
 

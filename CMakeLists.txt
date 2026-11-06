@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Andy Taylor
 cmake_minimum_required(VERSION 3.21)
-project(SiliconGhost VERSION 0.9.0 DESCRIPTION "SGI IP22 (Indy) emulator" LANGUAGES CXX)
+project(SiliconGhost VERSION 1.0.0 DESCRIPTION "SGI Indy and Indigo2 emulator" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,8 +12,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-# The version as shown: the project version and its stage.
-set(SG_VERSION "${PROJECT_VERSION}-alpha")
+# The version as shown (a stage such as "-beta" may follow the project version).
+set(SG_VERSION "${PROJECT_VERSION}")
 
 option(SG_BUILD_TESTS "Build unit tests" ON)
 option(SG_WERROR "Treat warnings as errors" OFF)

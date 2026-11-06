@@ -1,0 +1,82 @@
+# Keeps at a release until it has every download. GitHub can fail to find a runner for a job
+# (as it can when its macOS runners are short; the job is then marked cancelled or failed):
+# such jobs are run again, after a pause that grows from 5 to 30 minutes, for as long as it
+# takes. And every hour, a recent release missing a download, with no build of it running, has
+# its build started again. Jobs that ran and failed are not retried: they are left for a person.
+name: Retry release
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  checks: read
+  contents: read
+
+jobs:
+  retry:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN: ${{ github.event.workflow_run.id }}
+      ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+    steps:
+      - name: Retry jobs that found no runner
+        run: |
+          repo=$GITHUB_REPOSITORY
+          failed=$(gh api "repos/$repo/actions/runs/$RUN/attempts/$ATTEMPT/jobs" --paginate \
+                     --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
+          [ -n "$failed" ] || exit 0
+          for id in $failed; do
+            gh api "repos/$repo/check-runs/$id/annotations" --jq '.[].message' |
+              grep -q 'was not acquired by Runner' || { echo "job $id ran and failed: not retried"; exit 0; }
+          done
+          wait=$((ATTEMPT * 5)); [ $wait -le 30 ] || wait=30
+          echo "no runner for: $failed (attempt $ATTEMPT); trying again in $wait minutes"
+          sleep $((wait * 60))
+          gh run rerun "$RUN" --failed --repo "$repo"
+
+  check:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Rebuild releases missing a download
+        run: |
+          repo=$GITHUB_REPOSITORY
+          # The jobs of a run's attempt that ran and failed (not those that found no runner).
+          ran_and_failed() {
+            gh api "repos/$repo/actions/runs/$1/attempts/$2/jobs" --paginate \
+              --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .id' | while read -r id; do
+              gh api "repos/$repo/check-runs/$id/annotations" --jq '.[].message' |
+                grep -q 'was not acquired by Runner' || echo "$id"
+            done
+          }
+          for tag in $(gh release list --repo "$repo" --limit 5 --json tagName --jq '.[].tagName'); do
+            assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
+            missing=
+            for kind in windows-x64.zip macos-arm64.dmg macos-x86_64.dmg linux-x86_64.AppImage; do
+              echo "$assets" | grep -q -- "-$kind\$" || missing="$missing $kind"
+            done
+            [ -n "$missing" ] || continue
+            # Its latest build: running (left to finish), or failed in a job that ran (left for a
+            # person; GitHub has emailed about it).
+            last=$(gh api "repos/$repo/actions/workflows/release.yml/runs?per_page=50" \
+                     --jq "[.workflow_runs[] | select(.display_title == \"Release $tag\")][0] // empty | \"\(.id) \(.status) \(.conclusion) \(.run_attempt)\"")
+            if [ -n "$last" ]; then
+              set -- $last
+              if [ "$2" != completed ]; then echo "$tag: missing$missing, build $1 running"; continue; fi
+              if [ "$3" = failure ] && [ -n "$(ran_and_failed $1 $4)" ]; then
+                echo "$tag: missing$missing, build $1 failed: left for a person"; continue
+              fi
+            fi
+            echo "$tag: missing$missing; building it again"
+            gh workflow run release.yml --repo "$repo" -f tag="$tag"
+          done

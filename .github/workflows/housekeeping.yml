@@ -1,0 +1,37 @@
+# Deletes finished workflow runs (with their logs and artifacts) once they are no longer needed:
+# after each release build and once a day. The hourly checks of "Retry release" go after a day,
+# everything else after a week. Runs still going, and failed release builds that are waiting to
+# be tried again, are kept.
+name: Housekeeping
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  tidy:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete old runs
+        run: |
+          repo=$GITHUB_REPOSITORY
+          day=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
+          week=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          # The newest run of each release tag is kept whatever its age: "Retry release" reads it.
+          keep=$(gh api "repos/$repo/actions/workflows/release.yml/runs?per_page=100" \
+                   --jq '[.workflow_runs[] | select(.display_title | startswith("Release v"))] | group_by(.display_title)[] | max_by(.created_at) | .id')
+          gh api "repos/$repo/actions/runs?status=completed&per_page=100" --paginate \
+            --jq ".workflow_runs[] | select((.name == \"Retry release\" and .updated_at < \"$day\") or .updated_at < \"$week\") | .id" |
+          while read -r id; do
+            echo "$keep" | grep -qx "$id" && continue
+            gh api -X DELETE "repos/$repo/actions/runs/$id" && echo "deleted run $id"
+          done

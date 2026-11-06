@@ -1,27 +1,57 @@
 # Builds SiliconGhost for Windows, macOS and Linux, runs the unit tests on
 # each, and packages it: a .zip for Windows, a .dmg for each Mac processor,
-# an AppImage for Linux. A pushed release tag (release/X or vX) makes a
-# GitHub release with them; run by hand, it gathers them without one.
+# an AppImage for Linux. A version tag (vX.Y.Z) puts them in a draft release,
+# whose notes are the tag's message, and publishes it once it has all of
+# them. The draft is made once the Windows and Linux downloads are built; the
+# macOS ones, which can wait a while for a runner (see retry.yml), are added
+# when they are ready.
+# Run it by hand to rebuild an existing tag, or with a branch to build the
+# downloads (kept with the run for a week) without releasing them.
 name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
-    tags: ['release/*', 'v*']
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag (or branch) to build
+        required: true
 
 permissions:
   contents: write
+
+# One build of a tag at a time; another waits for it.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   version:
     runs-on: ubuntu-24.04
     outputs:
       name: ${{ steps.v.outputs.name }}
+      release: ${{ steps.v.outputs.release }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - id: v
         run: |
-          ref="${GITHUB_REF_NAME}"
-          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${ref#release/}"; v="${v#v}"; else v="build-${GITHUB_SHA::7}"; fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null && [ "${TAG#v}" != "$TAG" ]; then
+            v="${TAG#v}"
+            # The tag must match the version the program reports.
+            p=$(sed -n 's/^project(SiliconGhost VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+            [ "${v%%-*}" = "$p" ] || { echo "tag $TAG does not match project version $p in CMakeLists.txt"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            v="build-$(git rev-parse --short=7 HEAD)"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "name=$v" >> "$GITHUB_OUTPUT"
 
   windows:
@@ -32,6 +62,8 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -63,19 +95,22 @@ jobs:
         with:
           name: windows
           path: SiliconGhost-*.zip
+          retention-days: 7
 
   macos:
     needs: version
     strategy:
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
           - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - name: Dependencies
         run: brew install sdl3 libslirp pkgconf ninja
       - name: Build
@@ -95,12 +130,15 @@ jobs:
         with:
           name: macos-${{ matrix.arch }}
           path: SiliconGhost-*.dmg
+          retention-days: 7
 
   linux:
     needs: version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
       - name: Dependencies
         run: |
           sudo apt-get update
@@ -145,28 +183,57 @@ jobs:
         with:
           name: linux
           path: SiliconGhost-*.AppImage
+          retention-days: 7
 
   release:
-    needs: [version, windows, macos, linux]
+    needs: [version, windows, linux]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
       - uses: actions/download-artifact@v8
         with:
           path: assets
           merge-multiple: true
-      - name: Assets
-        run: ls -l assets
-      - name: Publish
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+      - run: |
+          ls -l assets
           v="${{ needs.version.outputs.name }}"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # The tag was moved: new files for the release, its notes kept
-            gh release upload "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A rebuild: new files for the release, its notes kept
+            gh release upload "$TAG" assets/* --clobber
           else
+            git tag -l --format='%(contents:body)' "$TAG" > notes.md
             pre=""; case "$v" in *-*) pre="--prerelease";; esac
-            gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "SiliconGhost $v" --notes "SiliconGhost $v" $pre
+            gh release create "$TAG" assets/* --draft --verify-tag $pre \
+              --title "SiliconGhost $v" --notes-file notes.md
+          fi
+
+  release-macos:
+    needs: [version, macos, release]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: macos-*
+          path: assets
+          merge-multiple: true
+      - run: gh release upload "$TAG" assets/* --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Publish the release once every download is in
+        run: |
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for kind in windows-x64.zip macos-arm64.dmg macos-x86_64.dmg linux-x86_64.AppImage; do
+            echo "$have" | grep -q -- "-$kind\$" || { echo "missing $kind: left as it is"; exit 1; }
+          done
+          # (A release published already, rebuilt by hand, is left as it is.)
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+            latest="--latest"; case "${{ needs.version.outputs.name }}" in *-*) latest="";; esac
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false $latest
           fi
